@@ -17,6 +17,8 @@ install_manifest.txt
 *.lib
 *.dll
 *.exe
+*.ilk
+*.pdb
 
 # ==== IDE / 编辑器 ====
 # .vscode/ 含本机绝对路径 (cmake.sourceDirectory), 不入库
