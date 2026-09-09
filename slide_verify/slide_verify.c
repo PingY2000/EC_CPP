@@ -25,6 +25,10 @@
  *   slide_verify [ifname]
  *     ifname   网卡名。Windows Npcap 形如  \Device\NPF_{GUID} ,
  *              例如: slide_verify '\Device\NPF_{7C64E0FA-D69A-4C92-A821-E5D341E63575}'
+ *                                              809345E5-15B7-4552-B72E-9B9C4722D44C
+ *     slide_verify ['\Device\NPF_{809345E5-15B7-4552-B72E-9B9C4722D44C}']
+ * build\slide_verify\Release\slide_verify.exe "\Device\NPF_{809345E5-15B7-4552-B72E-9B9C4722D44C}"
+
  *              不带 ifname 时仅列出可用网卡。
  *
  * 退出码:
