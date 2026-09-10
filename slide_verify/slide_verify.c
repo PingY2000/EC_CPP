@@ -578,7 +578,7 @@ int main(int argc, char *argv[])
    printf("\n等待从站进入 PRE_OP ...\n");
    for (slave = 1; slave <= cnt; slave++)
       ecx_statecheck(&ctx, slave, EC_STATE_PRE_OP, EC_TIMEOUTSTATE);
-   ecx_readstate(&ctx);
+   printf("总线状态: 0x%04X\n", ecx_readstate(&ctx));
 
    /* ---- 身份表 ---- */
    printf("\n");
@@ -638,7 +638,7 @@ int main(int argc, char *argv[])
                 slave - 1);
       }
    }
-
+   printf("总线状态: 0x%04X\n", ecx_readstate(&ctx));
    /* ---- P2A: 对每台已进 PRE_OP 的 YKD 做对象级验证 ---- */
    for (slave = 1; slave <= cnt; slave++)
    {
@@ -648,7 +648,7 @@ int main(int argc, char *argv[])
 
    /* ---- P2B: 可选 SAFE_OP 探针 (失败不致命, 记 WARN) ---- */
    sv_probe_safeop();
-
+   printf("总线状态: 0x%04X\n", ecx_readstate(&ctx));
    ecx_close(&ctx);
 
    /* ---- 汇总 ---- */
