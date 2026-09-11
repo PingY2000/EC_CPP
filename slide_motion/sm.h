@@ -259,10 +259,16 @@ typedef struct
 
 typedef struct
 {
-   uint32_t cw;     /* 写入的 6040h */
-   uint16_t sw;     /* 读到的 6041h */
-   uint32_t ms;     /* 相对本轴开始的毫秒 */
-   int      step;   /* 步骤编号 */
+   uint32_t cw;        /* 写入的 6040h */
+   uint16_t sw;        /* 读到的 6041h, 仅在 sw_valid=1 时有意义 */
+   /*
+    * sw 是不是一次**真实读数**。0 号值不是"没读到"的哨兵 —— 0x0000 在
+    * CiA402 里是合法的 "Not ready to switch on"。一条没写出去的轨迹不应该
+    * 看起来像"驱动器报了个状态", 报告与 CSV 在 sw_valid=0 时必须打 "----"。
+    */
+   char     sw_valid;
+   uint32_t ms;        /* 相对本轴开始的毫秒 */
+   int      step;      /* 步骤编号 */
 } sm_trace_t;
 
 typedef struct
@@ -386,8 +392,12 @@ int sm_wr_u32(int slave, uint16_t index, uint8_t sub, uint32_t v, const char *wh
 int sm_wr_i32(int slave, uint16_t index, uint8_t sub, int32_t v, const char *why);
 /* 写控制字 (6040h), 自动记录轨迹与 ds402_enabled 状态 */
 int sm_set_cw(sm_axis_t *ax, uint16_t cw, const char *why);
-/* 把刚读到的 6041h 回填进最近一条轨迹记录 (轨迹表用) */
-void sm_trace_fill_sw(sm_axis_t *ax, uint16_t sw);
+/*
+ * 把刚读到的 6041h 回填进最近一条轨迹记录 (轨迹表用)。
+ * valid=0 表示这次压根没读到: 不写 sw, 该条记录保持 sw_valid=0,
+ * 报告与 CSV 会打 "----" 而不是拿 0x0000 冒充一个驱动器状态。
+ */
+void sm_trace_fill_sw(sm_axis_t *ax, uint16_t sw, int valid);
 
 /*
  * 急停 (尽力而为) 与收尾 (幂等, 含所有错误路径)。
@@ -406,6 +416,8 @@ void sm_guard_feed(void);
  * 掉线的量。返回非 0 = 已超时, 调用者应当中止。
  */
 int sm_guard_watchdog_expired(void);
+/* 距上一次成功总线交互的毫秒数 (失联日志用) */
+uint32_t sm_guard_io_idle_ms(void);
 /* 返回非 0 表示应中止 (只看标志, 不做 I/O) */
 int sm_guard_should_abort(void);
 
@@ -446,6 +458,31 @@ int sm_diag_counters(int slave, uint32_t *rxerr, uint32_t *frxerr,
 
 /* 把已确认的 YKD 从站置入要求的 AL 状态; 成功返回 0 */
 int sm_enter_state(int requested_state, int verbose);
+
+/* ======================================================================
+ * SDO 事务日志 (实现见 sm_bus.c)
+ *
+ * 为什么要它: 读路径以前完全静默, 于是 S3 失败时日志只剩一句 6041h=----,
+ * 把"写 6040h 没被接受"和"读 6041h 没拿到回音"合并成了一个现象。而
+ * SM_RD_TIMEOUT 本身是个合并错误码 (wkc<=0 且 ecaterror 为假, 至少覆盖
+ * 邮箱帧没发出去 / 发出去了没等到回信 / 邮箱缓冲耗尽 三种情况)。
+ *
+ * 归并: **只对读**。连续若干笔"结果签名"相同的读折叠成一行, 签名 =
+ * (slave, index, sub, rc, abort) —— S4 的 jog_leg 是没有 sleep 的忙轮询,
+ * 每秒上千笔, 不折叠会淹掉日志。签名一变就落一行, 所以日志呈现的是
+ * "驱动器应答的变化", 而不是"我们轮询了多少次"。
+ * 写**不归并**: 写频率低, 且"写的是哪个控制字"正是要看的东西 ——
+ * 把 0x0006/0x0007/0x000F 折叠成一行 "×3" 等于把使能序列抹掉。
+ * ====================================================================== */
+/* 运动窗口开关。关的时候会先把未收尾的一行打出来。 */
+void sm_xfer_set_active(int on);
+/* 记一笔 SDO 事务。size/bytes 是驱动器自报的字节数与原始字节;
+ * 读失败时传 size=0, bytes=NULL —— 不能拿清过零的缓冲冒充一个读数。 */
+void sm_xfer_note(char dir, int slave, uint16_t index, uint8_t sub,
+                  int rc, int32_t abort, int wkc, int ecerr, int size,
+                  const uint8_t *bytes, uint32_t ms);
+/* 把当前未收尾的 run 打出来。结论(PASS/FAIL)前必须调一次, 免得证据迟到。 */
+void sm_xfer_flush(void);
 
 /* 打印 SOEM 错误栈 (排空), 返回排空的条数。用于运动期捕获 EMCY/SDO 错误。 */
 int sm_drain_errors(int slave, int print_emcy);

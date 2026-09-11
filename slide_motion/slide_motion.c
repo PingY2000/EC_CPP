@@ -310,6 +310,22 @@ static void sm_report_identity_header(void)
           "----------", "----------", "------", "----");
 }
 
+/*
+ * 渲染一条轨迹里的 6041h。没读到 -> "----"。
+ *
+ * 不能用 0x0000 顶替: 那是 CiA402 合法的 "Not ready to switch on", 会把
+ * "我们没读到" 伪装成 "驱动器报了个状态", 读报告的人会去查一个不存在的故障。
+ * CSV 同理写 "----" 不写空字段 —— 空字段和输出被截断分不开, "----" 自解释
+ * 且搜得出来。缓冲由调用者给 (报告里一处 printf 只用一次)。
+ */
+static void trace_sw_str(char *dst, size_t n, const sm_trace_t *t)
+{
+   if (t->sw_valid)
+      snprintf(dst, n, "0x%04X", (unsigned)t->sw);
+   else
+      snprintf(dst, n, "----");
+}
+
 static void sm_report_s3(const sm_axis_t *ax)
 {
    int i;
@@ -324,12 +340,14 @@ static void sm_report_s3(const sm_axis_t *ax)
    printf("  %-4s %-9s %-9s %-10s\n", "----", "-------", "-------", "-------");
    for (i = 0; i < ax->trace_n; i++)
    {
-      printf("  %-4d 0x%04X    0x%04X    %u\n",
+      char sws[8];
+
+      trace_sw_str(sws, sizeof(sws), &ax->trace[i]);
+      printf("  %-4d 0x%04X    %-8s  %u\n",
              ax->trace[i].step, (unsigned)ax->trace[i].cw,
-             (unsigned)ax->trace[i].sw, (unsigned)ax->trace[i].ms);
-      CSV("S3,%d,%d,%u,0x%04X,0x%04X\n", ax->pos, ax->trace[i].step,
-          (unsigned)ax->trace[i].ms, (unsigned)ax->trace[i].cw,
-          (unsigned)ax->trace[i].sw);
+             sws, (unsigned)ax->trace[i].ms);
+      CSV("S3,%d,%d,%u,0x%04X,%s\n", ax->pos, ax->trace[i].step,
+          (unsigned)ax->trace[i].ms, (unsigned)ax->trace[i].cw, sws);
    }
 }
 
@@ -408,6 +426,8 @@ int main(int argc, char *argv[])
    verify_rc = sm_guard_check_authorization(o.want_motion, o.want_jog);
    if (verify_rc != 0)
       return verify_rc;
+
+
 
    if (o.ifname == NULL)
    {
@@ -874,11 +894,14 @@ int main(int argc, char *argv[])
                 (unsigned)b_ll);
    }
 
+
+
    /* ---- S3 / S4 ---- */
    for (i = 0; i < cnt; i++)
    {
       sm_axis_t *ax = &axes[i];
       int        v;
+
 
       mv[i] = SM_V_SKIP;
 
@@ -897,6 +920,7 @@ int main(int argc, char *argv[])
 
       v = sm_stage_enable(ax, SM_ENABLE_HOLD_MS);
       mv[i] = v;
+
 
       if (v == SM_V_FAIL)
       {

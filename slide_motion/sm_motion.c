@@ -25,18 +25,57 @@
 #include "sm.h"
 
 /* ======================================================================
+ * 状态字出参: 值 + "这个值到底读到了没有"
+ *
+ * 为什么必须两个一起带: 没读到时若只剩一个 uint16_t, 打印出来就是 0x0000,
+ * 而 0x0000 在 CiA402 里是**合法的** "Not ready to switch on" —— 一次读失败
+ * 会被伪装成一个驱动器状态, 看日志的人会去查一个并不存在的故障。0x0000 是
+ * 陷阱值, 不是哨兵值, 所以这里不能用哨兵, 只能显式带一个有效位。
+ * ====================================================================== */
+typedef struct
+{
+   uint16_t v;   /* 6041h 的值, 仅在 ok=1 时有意义 */
+   int      ok;  /* 1 = 真实读到; 0 = 从未读到, 值无意义 */
+} sm_sw_t;
+
+/*
+ * 把状态字渲染成可打印片段。没读到 -> "----"。
+ * 只在失败路径才需要 (调一次), 所以由调用者给缓冲, 不共用静态缓冲 ——
+ * 静态缓冲会让同一个 printf 里的两次调用互相覆盖。
+ */
+static void sw_str(char *dst, size_t n, const sm_sw_t *s)
+{
+   if (s->ok)
+      snprintf(dst, n, "0x%04X", (unsigned)s->v);
+   else
+      snprintf(dst, n, "----");
+}
+
+/* ======================================================================
  * 等待状态字某组位
  *
  * fault_aborts = 1 时, 等到 Fault 位置起就立即中止 (运动期应该这样 —— 有故障就停)。
  * fault_aborts = 0 时忽略 Fault 位, 只按 mask/want 判 (故障复位等待要用这个:
  * 复位过程中 Fault 位本来就是 1, 不能因此中止)。
  *
- * 返回: 1 = 满足; 0 = 超时; -1 = 已中止 (Fault / Ctrl-C / 掉线 / 读失败)
+ * 返回: 1 = 满足; 0 = 超时; -1 = 已中止 (Fault / Ctrl-C / 掉线)
+ *
+ * **读失败不再在这里中止**。以前 SM_RD_TIMEOUT 一命中就 abort(SM_ABORT_IO),
+ * 于是单次 200ms 邮箱往返慢一拍 = 整轮动作报废, 日志还写着"总线读写失败" ——
+ * 而"这次没读到"和"总线坏了"是两回事 (诊断计数全 0 时尤其明显)。现在读失败
+ * 只是重试, 窗口内一直读不到就由 return 0 如实报告为超时。
+ * 副作用是把"总线还活着吗"整个交给看门狗 —— 所以下面那个 watchdog 检查不是
+ * 可选项, 它是被让出去的那份责任的新承担者。
+ *
+ * *last 同时带回有效位, 调用者在 FAIL 路径上必须用 sw_str() 打印。
  * ====================================================================== */
 static int wait_sw(sm_axis_t *ax, uint16_t mask, uint16_t want,
-                   uint32_t tmo_ms, uint16_t *last_sw, int fault_aborts)
+                   uint32_t tmo_ms, sm_sw_t *last, int fault_aborts)
 {
-   uint32_t deadline = sm_now_ms() + tmo_ms;
+   uint32_t t0 = sm_now_ms();
+
+   if (last != NULL)
+      last->ok = 0;
 
    for (;;)
    {
@@ -45,31 +84,57 @@ static int wait_sw(sm_axis_t *ax, uint16_t mask, uint16_t want,
       int      rc;
 
       if (sm_guard_should_abort())
+      {
+         sm_xfer_flush();
          return -1;
+      }
+
+      /*
+       * 掉线判定: 看"距上一次成功交互多久", 不是"这一次失败没有"。
+       * 判据必须是前者 —— 一次失败说明不了什么, 一直失败才是掉线。
+       * 读失败路径已经不自己中止了, 这是唯一的兜底。
+       */
+      if (sm_guard_watchdog_expired())
+      {
+         sm_xfer_flush();   /* 掉线证据要出现在这条结论之前 */
+         printf("      [失联] 已 %ums 没有一次成功的总线交互 (看门狗 %ums) "
+                "—— 视为掉线, 立即中止。\n",
+                (unsigned)sm_guard_io_idle_ms(),
+                (unsigned)g_guard.watchdog_ms);
+         sm_guard_abort(SM_ABORT_LOST);
+         return -1;
+      }
 
       rc = sm_rd_u16(ax->slave, SM_OID_STATUSWORD, 0, &sw,
                      SM_SDO_TMO_MOTION, &ab);
       if (rc == SM_RD_OK)
       {
-         if (last_sw != NULL)
-            *last_sw = sw;
+         if (last != NULL)
+         {
+            last->v = sw;
+            last->ok = 1;
+         }
          sm_guard_feed();
          if ((sw & mask) == want)
+         {
+            sm_xfer_flush();
             return 1;
+         }
          if (fault_aborts && (sw & SM_SW_FAULT) != 0)
          {
+            sm_xfer_flush();
             sm_guard_abort(SM_ABORT_FAULT);
             return -1;
          }
       }
-      else if (rc == SM_RD_TIMEOUT)
-      {
-         sm_guard_abort(SM_ABORT_IO);
-         return -1;
-      }
+      /* 读失败 (超时 / 从站 abort): 下一轮再试, 不中止 */
 
-      if (sm_now_ms() >= deadline)
+      /* 差值法比较, 回绕安全 (理由见 sm_guard.c 的 guard_wait_sw) */
+      if ((int32_t)(sm_now_ms() - t0) >= (int32_t)tmo_ms)
+      {
+         sm_xfer_flush();
          return 0;
+      }
    }
 }
 
@@ -84,6 +149,7 @@ static int read_i32_or_abort(sm_axis_t *ax, uint16_t index, int32_t *v)
       sm_guard_feed();
       return 0;
    }
+   sm_xfer_flush();   /* 读失败的原因要出现在这条中止之前 */
    sm_guard_abort(SM_ABORT_IO);
    return -1;
 }
@@ -141,6 +207,9 @@ void sm_snapshot_pp(sm_axis_t *ax)
          ax->have_mode = 1;
       }
    }
+
+   /* 快照这几笔读单独成行, 不和随后的使能序列混在一起 */
+   sm_xfer_flush();
 }
 
 /* ======================================================================
@@ -375,11 +444,22 @@ int sm_preflight(sm_axis_t *ax, int nslaves, int32_t delta)
  * ====================================================================== */
 int sm_stage_enable(sm_axis_t *ax, uint32_t enable_hold_ms)
 {
-   uint16_t last = 0;
+   sm_sw_t  last = { 0, 0 };   /* 值 + 有效位: FAIL 路径要靠 sw_str() 打印 */
+   uint16_t hold_sw = 0;       /* 第 4 步保持观察用, 只在该步内有效 */
    int      r = 0;
+   char     sws[16];           /* sw_str() 的输出缓冲 */
 
    printf("\n  === 位置 %d: 使能状态机 (S3) ===\n", ax->pos);
    g_guard.t_start_ms = sm_now_ms();
+
+   /*
+    * 从这里起打开 SDO 事务日志, 一直到收尾 (sm_guard_teardown) 才关。
+    * 范围刻意只覆盖运动窗口: S0/S1/预检的读已经有自己的报告 (逐项参数表),
+    * 这里再叠一层只是重复; 而 S3/S4/S5 以前是**完全静默**的 —— 6041h 被
+    * 轮询几十次, 每次的结果一个字都没落下来, 于是 S3 失败时日志只剩一句
+    * 6041h=----。新观测放在唯一缺观测的位置。
+    */
+   sm_xfer_set_active(1);
 
    /*
     * 从这里起这根轴归本次运行接管。收尾与急停只处理 engaged 的轴, 所以
@@ -413,11 +493,16 @@ int sm_stage_enable(sm_axis_t *ax, uint32_t enable_hold_ms)
       /* 复位过程中 Fault 位本来就是 1, 所以这一等不把 Fault 当致命 */
       if (wait_sw(ax, SM_SW_FAULT, 0, SM_ENABLE_TMO_MS, &last, 0) != 1)
       {
-         printf("      [FAIL] 故障复位无效, bit3 仍为 1 (6041h=0x%04X)。\n",
-                (unsigned)last);
+         sw_str(sws, sizeof(sws), &last);
+         /*
+          * 这里只说"没等到 bit3 清零", 不能说"bit3 仍为 1" —— 后者是一句
+          * 关于驱动器的话。最后一次读失败时我们压根不知道 bit3 是什么,
+          * (6041h=----) 正是这个意思, 别让措辞把不确定说成确定。
+          */
+         printf("      [FAIL] 故障复位后未等到 bit3 清零 (6041h=%s)。\n", sws);
          return SM_V_FAIL;
       }
-      printf("      [PASS] 故障已清除 (6041h=0x%04X)\n", (unsigned)last);
+      printf("      [PASS] 故障已清除 (6041h=0x%04X)\n", (unsigned)last.v);
    }
 
    /* 1. Shutdown */
@@ -425,30 +510,32 @@ int sm_stage_enable(sm_axis_t *ax, uint32_t enable_hold_ms)
       return SM_V_FAIL;
    r = wait_sw(ax, SM_SW_RTSO | SM_SW_SWITCHED, SM_SW_RTSO | SM_SW_SWITCHED,
                SM_ENABLE_TMO_MS, &last, 1);
-   sm_trace_fill_sw(ax, last);
+   sm_trace_fill_sw(ax, last.v, last.ok);
    if (r != 1)
    {
+      sw_str(sws, sizeof(sws), &last);
       printf("      [FAIL] 写 0x0006 后未等到 Ready to switch on + Switched on "
-             "(6041h=0x%04X)%s\n", (unsigned)last,
-             (r < 0) ? " —— 被故障/中止打断" : " —— 超时");
+             "(6041h=%s)%s\n", sws,
+             (r < 0) ? " —— 被故障位/中止请求/掉线打断" : " —— 超时");
       return SM_V_FAIL;
    }
    printf("      [PASS] Ready to switch on + Switched on (6041h=0x%04X)\n",
-          (unsigned)last);
+          (unsigned)last.v);
 
    /* 2. Switch On */
    if (sm_set_cw(ax, SM_CW_SWITCHON, "S3-2 Switch On") != 0)
       return SM_V_FAIL;
    r = wait_sw(ax, SM_SW_SWITCHED | SM_SW_FAULT, SM_SW_SWITCHED,
                SM_ENABLE_TMO_MS, &last, 1);
-   sm_trace_fill_sw(ax, last);
+   sm_trace_fill_sw(ax, last.v, last.ok);
    if (r != 1)
    {
+      sw_str(sws, sizeof(sws), &last);
       printf("      [FAIL] 写 0x0007 后未保持 Switched on 且无故障 "
-             "(6041h=0x%04X)\n", (unsigned)last);
+             "(6041h=%s)\n", sws);
       return SM_V_FAIL;
    }
-   printf("      [PASS] Switched on (6041h=0x%04X)\n", (unsigned)last);
+   printf("      [PASS] Switched on (6041h=0x%04X)\n", (unsigned)last.v);
 
    /* 3. Enable Operation —— 这是本工具最关键的一步, 也是"PRE_OP/SAFE_OP 下
       SDO 写 6040h 到底能不能真的把功率级打开"这个未知问题的答案所在。 */
@@ -456,12 +543,13 @@ int sm_stage_enable(sm_axis_t *ax, uint32_t enable_hold_ms)
       return SM_V_FAIL;
    r = wait_sw(ax, SM_SW_OP_ENABLED, SM_SW_OP_ENABLED,
                SM_ENABLE_OP_TMO_MS, &last, 1);
-   sm_trace_fill_sw(ax, last);
+   sm_trace_fill_sw(ax, last.v, last.ok);
    if (r != 1)
    {
       struct ec_slave *s = &g_ctx.slavelist[ax->slave];
-      printf("      [FAIL] 未能进入 Operation enabled (6041h=0x%04X, "
-             "AL 状态 0x%02X)\n", (unsigned)last, (unsigned)s->state);
+      sw_str(sws, sizeof(sws), &last);
+      printf("      [FAIL] 未能进入 Operation enabled (6041h=%s, "
+             "AL 状态 0x%02X)\n", sws, (unsigned)s->state);
       printf("      >>> 这通常意味着该驱动器不允许在 %s 下用 SDO 打开功率级。\n",
              (s->state == EC_STATE_PRE_OP) ? "PRE_OP" : "SAFE_OP");
       printf("      >>> 可尝试: --state safe-op / --state pre-op 换一个状态再试。\n");
@@ -473,7 +561,7 @@ int sm_stage_enable(sm_axis_t *ax, uint32_t enable_hold_ms)
    }
    ax->enable_ok = 1;
    printf("      [PASS] Operation enabled (6041h=0x%04X) —— 功率级已打开\n",
-          (unsigned)last);
+          (unsigned)last.v);
 
    /* 4. 保持观察 */
    {
@@ -484,28 +572,32 @@ int sm_stage_enable(sm_axis_t *ax, uint32_t enable_hold_ms)
          int32_t ab = 0;
          if (sm_guard_should_abort())
          {
+            sm_xfer_flush();
             printf("      [中止] 保持观察期间收到中止请求。\n");
             return SM_V_FAIL;
          }
-         if (sm_rd_u16(ax->slave, SM_OID_STATUSWORD, 0, &last,
+         if (sm_rd_u16(ax->slave, SM_OID_STATUSWORD, 0, &hold_sw,
                        SM_SDO_TMO_MOTION, &ab) == SM_RD_OK)
          {
             sm_guard_feed();
-            if ((last & SM_SW_FAULT) != 0)
+            if ((hold_sw & SM_SW_FAULT) != 0)
             {
+               sm_xfer_flush();
                printf("      [FAIL] 保持期间出现故障 (6041h=0x%04X)\n",
-                      (unsigned)last);
+                      (unsigned)hold_sw);
                sm_guard_abort(SM_ABORT_FAULT);
                return SM_V_FAIL;
             }
-            if ((last & SM_SW_OP_ENABLED) == 0)
+            if ((hold_sw & SM_SW_OP_ENABLED) == 0)
             {
+               sm_xfer_flush();
                printf("      [FAIL] 保持期间掉出 Operation enabled "
-                      "(6041h=0x%04X)\n", (unsigned)last);
+                      "(6041h=0x%04X)\n", (unsigned)hold_sw);
                return SM_V_FAIL;
             }
          }
       }
+      sm_xfer_flush();
       printf("      [PASS] 保持 %ums 期间稳定在使能态\n",
              (unsigned)enable_hold_ms);
    }
@@ -519,6 +611,7 @@ int sm_stage_enable(sm_axis_t *ax, uint32_t enable_hold_ms)
       if (sm_wr_u8(ax->slave, SM_OID_MODES, 0, (uint8_t)SM_MODE_PP,
                    "S3-5 设 PP 模式") != 0)
       {
+         sm_xfer_flush();
          printf("      [WARN] 6060h 写入失败, PP 模式未能设定。\n");
          return SM_V_WARN;
       }
@@ -535,6 +628,7 @@ int sm_stage_enable(sm_axis_t *ax, uint32_t enable_hold_ms)
          if (sm_now_ms() - t0 > SM_STEP_TMO_MS)
             break;
       }
+      sm_xfer_flush();   /* 回读结论之前先交出这几笔 */
 
       if (disp == SM_MODE_PP)
       {
@@ -665,7 +759,10 @@ static int jog_leg(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
       uint32_t now = sm_now_ms();
 
       if (sm_guard_should_abort())
+      {
+         sm_xfer_flush();
          return -1;
+      }
 
       /*
        * dead-man 检查。掉线不会自己举手 —— 这份 SOEM 里 islost 从不被置位,
@@ -674,9 +771,11 @@ static int jog_leg(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
        */
       if (sm_guard_watchdog_expired())
       {
+         sm_xfer_flush();
          printf("      [失联] 已 %ums 没有一次成功的总线交互 "
                 "(看门狗 %ums) —— 视为掉线, 立即中止。\n",
-                (unsigned)g_guard.watchdog_ms, (unsigned)g_guard.watchdog_ms);
+                (unsigned)sm_guard_io_idle_ms(),
+                (unsigned)g_guard.watchdog_ms);
          sm_guard_abort(SM_ABORT_LOST);
          return -1;
       }
@@ -684,11 +783,13 @@ static int jog_leg(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
       if (sm_rd_u16(ax->slave, SM_OID_STATUSWORD, 0, &sw,
                     SM_SDO_TMO_MOTION, &ab) != SM_RD_OK)
       {
+         sm_xfer_flush();
          sm_guard_abort(SM_ABORT_IO);
          return -1;
       }
       if ((sw & SM_SW_FAULT) != 0)
       {
+         sm_xfer_flush();
          printf("      [FAULT] 6041h=0x%04X 故障位 bit3=1\n", (unsigned)sw);
          sm_guard_abort(SM_ABORT_FAULT);
          return -1;
@@ -721,9 +822,13 @@ static int jog_leg(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
 
       /* 结束/失速/超时 */
       if (moved && (now - last_change_ms) >= SM_SETTLE_MS)
+      {
+         sm_xfer_flush();
          break;
+      }
       if (!moved && (now - t0) >= SM_STALL_MS)
       {
+         sm_xfer_flush();
          printf("      [失速] 命令发出 %ums 后位置仍无变化 (pos=%d)\n",
                 SM_STALL_MS, (int)pos);
          sm_guard_abort(SM_ABORT_STALL);
@@ -731,6 +836,7 @@ static int jog_leg(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
       }
       if (now >= deadline)
       {
+         sm_xfer_flush();
          printf("      [超时] 超过本腿时间预算, 位置 %d (起点 %d)\n",
                 (int)pos, (int)p0);
          sm_guard_abort(SM_ABORT_TIMEOUT);
@@ -740,6 +846,7 @@ static int jog_leg(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
       /* 掉线检测 */
       if (g_ctx.slavelist[ax->slave].islost)
       {
+         sm_xfer_flush();
          sm_guard_abort(SM_ABORT_LOST);
          return -1;
       }

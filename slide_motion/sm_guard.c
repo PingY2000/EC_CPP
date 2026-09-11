@@ -147,6 +147,17 @@ int sm_guard_watchdog_expired(void)
            (int32_t)g_guard.watchdog_ms) ? 1 : 0;
 }
 
+/*
+ * 距上一次成功总线交互过去了多少毫秒 (回绕安全)。
+ * 给失联日志用 —— 那里要报的是"已经多久没通上话", 不是阈值。两处失联消息
+ * 曾经把 watchdog_ms 打印了两遍, 于是超时时间显示成 1000 还是 700 全看配置,
+ * 真正想知道的那个数反倒没有。
+ */
+uint32_t sm_guard_io_idle_ms(void)
+{
+   return (uint32_t)(sm_now_ms() - g_guard.last_io_ms);
+}
+
 /* ======================================================================
  * I3: 上限收紧
  * ====================================================================== */
@@ -334,8 +345,10 @@ int sm_guard_confirm(const char *ifname, int nslaves, int n_jog_axes,
 static int guard_write(int slave, uint16_t index, uint8_t sub, int size,
                        const void *p, const char *why)
 {
-   int wkc;
-   int timeo;
+   int      wkc;
+   int      timeo;
+   int      ecerr;
+   uint32_t t0, dt;
 
    /*
     * 运动期与非运动期用不同超时。运动期必须短: 主线程可能正卡在这里,
@@ -344,12 +357,19 @@ static int guard_write(int slave, uint16_t index, uint8_t sub, int size,
    timeo = g_guard.ds402_enabled ? SM_SDO_TMO_MOTION : SM_SDO_TMO_IDLE;
 
    g_ctx.ecaterror = FALSE;   /* 清粘滞位, 与读路径同理 */
+   t0 = sm_now_ms();
    wkc = ecx_SDOwrite(&g_ctx, (uint16_t)slave, index, sub, FALSE,
                       size, p, timeo);
+   dt = sm_now_ms() - t0;
+   /* 同读路径: sm_take_abort() 会排空错误栈并清掉粘滞位, 先存 */
+   ecerr = g_ctx.ecaterror ? 1 : 0;
+
    if (wkc > 0)
    {
       g_guard.wrote_anything = 1;
       sm_guard_feed();
+      sm_xfer_note('W', slave, index, sub, 0, 0, wkc, ecerr, size,
+                   (const uint8_t *)p, dt);
       return 0;
    }
 
@@ -357,9 +377,25 @@ static int guard_write(int slave, uint16_t index, uint8_t sub, int size,
    {
       int32_t abort = sm_take_abort(slave, index, sub);
 
-      printf("      [WRITE-FAIL] 从站%d %04Xh:%02X <- %s 失败 (abort 0x%08X)\n",
+      /*
+       * 以前这里固定打 "abort 0x%08X", 于是 abort 码为 0 时看不出是
+       * "驱动器明确回了 abort 0" 还是 "压根没收到回信, 什么都没捞到" ——
+       * 同一个 0, 两种相反的结论。分开说: 有数就是有数, 没有就说没有。
+       */
+      printf("      [WRITE-FAIL] 从站%d %04Xh:%02X <- %s 失败 "
+             "(wkc=%d ecaterror=%d)\n",
              slave, (unsigned)index, (unsigned)sub,
-             (why != NULL) ? why : "", (unsigned)abort);
+             (why != NULL) ? why : "", wkc, ecerr);
+      if (abort != 0)
+         printf("      [WRITE-FAIL] 驱动器回了 SDO abort 0x%08X\n",
+                (unsigned)abort);
+      else
+         printf("      [WRITE-FAIL] 未取到 abort 码 —— 是没收到应答, "
+                "不是驱动器拒绝。\n");
+
+      /* 失败也把"试图写什么"带上 —— 行首已标 失败, 不会被误读成应答值 */
+      sm_xfer_note('W', slave, index, sub, -1, abort, wkc, ecerr,
+                   size, (const uint8_t *)p, dt);
    }
    return -1;
 }
@@ -425,7 +461,8 @@ static int guard_set_cw(sm_axis_t *ax, uint16_t cw, const char *why)
    if (rc == 0 && ax->trace_n < SM_TRACE_MAX)
    {
       ax->trace[ax->trace_n].cw = cw;
-      ax->trace[ax->trace_n].sw = 0; /* 由调用者读回后回填 */
+      ax->trace[ax->trace_n].sw = 0;       /* 由调用者读回后回填 */
+      ax->trace[ax->trace_n].sw_valid = 0; /* 回填成功前一律不成立 */
       ax->trace[ax->trace_n].ms = t - g_guard.t_start_ms;
       ax->trace[ax->trace_n].step = ax->trace_n;
       ax->trace_n++;
@@ -451,10 +488,21 @@ int sm_set_cw(sm_axis_t *ax, uint16_t cw, const char *why)
 }
 
 /* 由调用者读回的 6041h 回填到最近一条轨迹 (声明见 sm.h) */
-void sm_trace_fill_sw(sm_axis_t *ax, uint16_t sw)
+void sm_trace_fill_sw(sm_axis_t *ax, uint16_t sw, int valid)
 {
-   if (ax != NULL && ax->trace_n > 0)
+   if (ax == NULL || ax->trace_n <= 0)
+      return;
+
+   /*
+    * valid=0 时**什么都不写**: sw_valid 保持 0, 报告与 CSV 就会打 "----"。
+    * 若在这里退而写入 0x0000, 一条"没读到状态字"的记录会伪装成驱动器报的
+    * "Not ready to switch on" —— 那是凭空造出来的现场证据。
+    */
+   if (valid)
+   {
       ax->trace[ax->trace_n - 1].sw = sw;
+      ax->trace[ax->trace_n - 1].sw_valid = 1;
+   }
 }
 
 /* ======================================================================
@@ -635,6 +683,7 @@ void sm_guard_teardown(sm_axis_t *axes, int nslaves)
    {
       /* 一个字节都没写过, 无需恢复, 也不打印噪音 */
       g_guard.ds402_enabled = 0;
+      sm_xfer_set_active(0);   /* 提前返回这条路也要关掉日志窗口 */
       return;
    }
 
@@ -685,4 +734,8 @@ void sm_guard_teardown(sm_axis_t *axes, int nslaves)
          printf("      注意: 有参数未能确认恢复, 该轴下次上电前请核对 "
                 "6081h/6083h/6084h/6060h。\n");
    }
+
+   /* 收尾是日志窗口的最后一站: 里面那些写 (尤其是失能序列与回读确认)
+     正是"电机到底断开没有"的证据, 所以关窗必须放在它们之后。 */
+   sm_xfer_set_active(0);
 }

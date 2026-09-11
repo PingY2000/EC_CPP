@@ -4,6 +4,7 @@
 /SOEM/build/
 /SOEM/build-*/
 /install/
+/out/
 
 # ==== C/C++ / CMake 中间文件 ====
 CMakeCache.txt
