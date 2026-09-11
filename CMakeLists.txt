@@ -3,7 +3,11 @@
 cmake_minimum_required(VERSION 3.28)
 project(EC_CPP LANGUAGES C)
 
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin")
+
 add_subdirectory(SOEM)
 add_subdirectory(aliasinfo)
 add_subdirectory(slide_verify)
 add_subdirectory(slide_motion)
+
+
