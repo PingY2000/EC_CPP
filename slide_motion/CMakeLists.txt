@@ -15,3 +15,12 @@ target_compile_options(slide_motion PRIVATE
   $<$<C_COMPILER_ID:MSVC>:/utf-8 /W3 /D_CRT_SECURE_NO_WARNINGS>
   $<$<C_COMPILER_ID:GNU>:-Wall -Wextra -Wno-unused-parameter>
 )
+
+# sm_state: 独立的 CiA402 状态机切换验证小程序, 刻意不链接 sm_guard.c/sm_bus.c。
+# 它的写入口只有 sm_state.c 里的 st_wr_cw(), 且只写 6040h。
+add_executable(sm_state sm_state.c)
+target_link_libraries(sm_state PRIVATE soem)
+target_compile_options(sm_state PRIVATE
+  $<$<C_COMPILER_ID:MSVC>:/utf-8 /W3 /D_CRT_SECURE_NO_WARNINGS>
+  $<$<C_COMPILER_ID:GNU>:-Wall -Wextra -Wno-unused-parameter>
+)

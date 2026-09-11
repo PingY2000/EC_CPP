@@ -416,7 +416,7 @@ int sm_preflight(sm_axis_t *ax, int nslaves, int32_t delta)
                 (unsigned)ab1, (unsigned)ab2, SM_NO_SOFTLIMIT_CAP);
          if (delta > SM_NO_SOFTLIMIT_CAP || delta < -SM_NO_SOFTLIMIT_CAP)
          {
-            printf("      [拒绝] 本次行程 %d 脉冲超过无软限位时的上限 ±%d "
+            printf("      [拒绝] 本次行程 %d 脉冲超过无软限位时的上限 ±%d "   
                    "—— 没有任何限位兜底, 不动作。\n",
                    (int)delta, SM_NO_SOFTLIMIT_CAP);
             refused = 1;
@@ -506,23 +506,40 @@ int sm_stage_enable(sm_axis_t *ax, uint32_t enable_hold_ms)
    }
 
    /* 1. Shutdown */
+   printf("  1. Shutdown\n"); 
    if (sm_set_cw(ax, SM_CW_SHUTDOWN, "S3-1 Shutdown") != 0)
-      return SM_V_FAIL;
-   r = wait_sw(ax, SM_SW_RTSO | SM_SW_SWITCHED, SM_SW_RTSO | SM_SW_SWITCHED,
-               SM_ENABLE_TMO_MS, &last, 1);
-   sm_trace_fill_sw(ax, last.v, last.ok);
-   if (r != 1)
-   {
-      sw_str(sws, sizeof(sws), &last);
-      printf("      [FAIL] 写 0x0006 后未等到 Ready to switch on + Switched on "
-             "(6041h=%s)%s\n", sws,
-             (r < 0) ? " —— 被故障位/中止请求/掉线打断" : " —— 超时");
-      return SM_V_FAIL;
-   }
-   printf("      [PASS] Ready to switch on + Switched on (6041h=0x%04X)\n",
-          (unsigned)last.v);
+    return SM_V_FAIL;
+
+r = wait_sw(ax,
+            SM_SW_RTSO | SM_SW_SWITCHED | SM_SW_OP_ENABLED | SM_SW_FAULT,
+            SM_SW_RTSO,
+            SM_ENABLE_TMO_MS,
+            &last,
+            1);
+
+sm_trace_fill_sw(ax, last.v, last.ok);
+
+if (r != 1)
+{
+    sw_str(sws, sizeof(sws), &last);
+
+    struct ec_slave *s = &g_ctx.slavelist[ax->slave];
+
+    printf("      [FAIL] 0x0006 后未进入 Ready to switch on\n");
+    printf("             6041h=%s\n", sws);
+    printf("             EtherCAT AL State=0x%02X\n",
+           (unsigned)s->state);
+    printf("             AL Status Code=0x%04X\n",
+           (unsigned)s->ALstatuscode);
+
+    return SM_V_FAIL;
+}
+
+printf("      [PASS] Ready to switch on (6041h=0x%04X)\n",
+       (unsigned)last.v);
 
    /* 2. Switch On */
+   printf("  2. Switch On\n");
    if (sm_set_cw(ax, SM_CW_SWITCHON, "S3-2 Switch On") != 0)
       return SM_V_FAIL;
    r = wait_sw(ax, SM_SW_SWITCHED | SM_SW_FAULT, SM_SW_SWITCHED,
@@ -539,6 +556,7 @@ int sm_stage_enable(sm_axis_t *ax, uint32_t enable_hold_ms)
 
    /* 3. Enable Operation —— 这是本工具最关键的一步, 也是"PRE_OP/SAFE_OP 下
       SDO 写 6040h 到底能不能真的把功率级打开"这个未知问题的答案所在。 */
+   printf("  3. Enable Operation\n");
    if (sm_set_cw(ax, SM_CW_ENABLE_OP, "S3-3 Enable Operation") != 0)
       return SM_V_FAIL;
    r = wait_sw(ax, SM_SW_OP_ENABLED, SM_SW_OP_ENABLED,

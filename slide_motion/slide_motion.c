@@ -610,6 +610,7 @@ int main(int argc, char *argv[])
       else
          n_foreign++;
    }
+   
 
    /* ---- S0: 身份表与门禁 ---- */
    printf("\n---- S0: 身份表 ----\n");

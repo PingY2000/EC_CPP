@@ -431,7 +431,7 @@ static void xfer_emit(const sm_xfer_run_t *r)
    /* 值只在真的读到/写出时才有 (读失败传 size=0, 写失败传 NULL) */
    if (r->nval > 0)
    {
-      printf(" = ");
+      printf(" .= ");
       if (!r->val_overflow)
       {
          for (i = 0; i < r->nval; i++)

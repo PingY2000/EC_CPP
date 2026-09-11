@@ -165,6 +165,9 @@ typedef struct
  * 必需: 6041h/6060h/6061h/6064h/606Ch (CiA402 轴必备)
  * 可选: 607Ah/6081h/6083h/6084h/60FDh/60FEh */
 static const sv_obj_t sv_objs[] = {
+   /*{ 0x0012, 0x00, "0012h A",   SV_DT_U16, SV_ROLE_REQUIRED },
+   { 0x0013, 0x00, "0013h B",   SV_DT_U16, SV_ROLE_REQUIRED },*/
+   { 0x603F, 0x00, "603Fh 故障码",   SV_DT_U16, SV_ROLE_REQUIRED },
    { 0x6041, 0x00, "6041h 状态字",   SV_DT_U16, SV_ROLE_REQUIRED },
    { 0x6060, 0x00, "6060h 操作模式", SV_DT_I8,  SV_ROLE_REQUIRED },
    { 0x6061, 0x00, "6061h 当前模式", SV_DT_I8,  SV_ROLE_REQUIRED },
@@ -176,6 +179,7 @@ static const sv_obj_t sv_objs[] = {
    { 0x6084, 0x00, "6084h 减速度",   SV_DT_U32, SV_ROLE_OPT },
    { 0x60FD, 0x00, "60FDh 数字输入", SV_DT_U32, SV_ROLE_OPT },
    { 0x60FE, 0x00, "60FEh 数字输出", SV_DT_U32, SV_ROLE_OPT },
+   { 0x6502, 0x00, "6502h 支持操作模式", SV_DT_U32, SV_ROLE_OPT },
 };
 #define SV_OBJ_COUNT ((int)(sizeof(sv_objs) / sizeof(sv_objs[0])))
 
@@ -645,10 +649,56 @@ int main(int argc, char *argv[])
       if (g_is_ykd[slave] && g_reached_preop[slave])
          sv_verify_objects(slave);
    }
-
+   printf("总线状态0: 0x%04X\n", ecx_readstate(&ctx));
+   osal_usleep(10000);
+   printf("状态1: 0x%02X\n", ctx.slavelist[slave-1].state);
    /* ---- P2B: 可选 SAFE_OP 探针 (失败不致命, 记 WARN) ---- */
    sv_probe_safeop();
-   printf("总线状态: 0x%04X\n", ecx_readstate(&ctx));
+
+   printf("状态2: 0x%02X\n", ctx.slavelist[slave-1].state);
+
+   /* 请求 OP */
+   ecx_send_processdata(&ctx);
+   printf("OP request sent.\n");
+         osal_usleep(10000);
+
+   
+   /* 持续进行过程数据交换，同时等待 OP 
+   for (int i = 0; i < 40; i++)
+   {
+      int wkc;
+      printf("OP 1.\n");
+      ecx_send_processdata(&ctx);
+      printf("OP 2.\n");
+
+      wkc = ecx_receive_processdata(
+         &ctx,
+         EC_TIMEOUTRET
+      );
+
+      ecx_readstate(&ctx);
+
+      printf("[%02d] state=0x%02X AL=0x%04X WKC=%d\n",
+            i,
+            ctx.slavelist[0].state,
+            ctx.slavelist[0].ALstatuscode,
+            wkc);
+
+      if (ctx.slavelist[0].state == EC_STATE_OPERATIONAL)
+      {
+         printf("OP SUCCESS\n");
+         break;
+      }
+
+      osal_usleep(1000);
+   }
+   */
+   
+   ecx_readstate(&ctx);
+
+   printf("OP 状态 = 0x%02X\n",
+         ctx.slavelist[0].state);
+
    ecx_close(&ctx);
 
    /* ---- 汇总 ---- */

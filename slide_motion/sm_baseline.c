@@ -33,6 +33,8 @@ static const sm_spec_t sm_spec_table[] = {
    { 0x2311, 0x00, SM_DT_U8, SM_CMP_EXACT, 1, 0, "2311h X1 功能" },
    { 0x2312, 0x00, SM_DT_U8, SM_CMP_EXACT, 1, 0, "2312h X2 功能" },
    { 0x2313, 0x00, SM_DT_U8, SM_CMP_EXACT, 1, 0, "2313h X3 功能" },
+   { 0x6041, 0x00, SM_DT_U16, SM_CMP_EXACT, 1, 0, "6041h 控制字" },
+
 
    /* ---- 电子齿轮: 决定脉冲<->位移换算, 漂移即禁止动作 ---- */
    { 0x2408, 0x00, SM_DT_U16, SM_CMP_EXACT, 1, 0, "2408h 电子齿轮 (1~51200)" },
