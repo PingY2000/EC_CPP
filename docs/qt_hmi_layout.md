@@ -11,6 +11,31 @@
 
 ---
 
+## 0. 现状（2026-09-15）：先落了"点击定位"这一个界面
+
+本文件规划的是**工程师调试台**（P0~P4：抽样 / 对象字典 / 基线 diff / 抖动面板 / 报文回放）。
+实际先落地的是它的一个很小的子集：`hmi/` 里一个**两台滑台的 ±500000 脉冲 CSP 点击定位界面**
+（点哪里去哪里 / 开机位置即零点 / 速度可调），见 [README.md](../README.md) 的运行注意。
+
+它与下面的规划有两处**有意的偏离**，将来做 P1 时要收回来：
+
+1. **没有先抽 `ecat_core`。** 这次直接链 `motor_api`（`ec_motor.c` + `ec_motor_motion.c`），
+   界面侧完全不 include SOEM —— 所有 `ecx_*` 都关在 [hmi/ecatworker.cpp](../hmi/ecatworker.cpp)
+   一个文件、一个工作线程里。所以第 1 节说的"同一个东西存在于多处"这个问题**没有被解决，
+   也没有被加重**：`hmi/` 没有新增第三套总线初始化，它只是 `motor_api` 的调用方。
+2. **`hmi/` 这个名字与 P1 的目标目录一致，是故意的。** 将来抽 `ecat_core` 时，把
+   `ecatworker.cpp` 里那些 `em_*` 换成 core 的接口即可，目录名不用动；
+   `axispanel`/`mainwindow` 这两层与总线无关，基本可以原样留用。
+
+另外本节记录的这条环境事实值得单独记住：**界面用的 Qt 必须与 SOEM 同一套 CRT**。
+本机取 **MSYS2 UCRT64 仓库的 Qt 6**（`mingw-w64-ucrt-x86_64-qt6-base`），
+**不能用 Qt 官方安装器那个 msvcrt 版 MinGW** —— 理由（工作线程 `printf` 崩在
+`msvcrt!_lock` 的完整链路）写在 [README.md](../README.md) 的「上位机 `hmi` (Qt)」一节
+和 [CMakePresets.json](../CMakePresets.json) 的 `hmi-qt-ucrt64` 里。
+下面 §12 之后若提到用 Qt 官方 MinGW 搭建，一律以这一条为准。
+
+---
+
 ## 1. 为什么必须先抽 `ecat_core`
 
 现在同一个东西存在于多处：

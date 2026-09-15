@@ -1225,16 +1225,55 @@ void em_bus_free(em_bus_t *bus)
    }
 }
 
-void em_print_adapters(void)
+/*
+ * 往上限 32 块网卡。实机上一般个位数, 这个数只是"别让一个链表把数组写爆"。
+ * 打印与填数组共用它 —— 分开写两份遍历, 迟早会有一份漏掉新字段。
+ */
+#define EM__MAX_ADAPTERS 32
+
+/* 遍历一次 SOEM 的网卡链表, 填进数组。返回**总条数**(可能大于 max) */
+static int em__fill_adapters(em_adapter_t *out, int max)
 {
    ec_adaptert *head;
    ec_adaptert *a;
+   int          n = 0;
 
-   em__console_init();
    head = ec_find_adapters();
    for (a = head; a != NULL; a = a->next)
-      printf("    - %s  (%s)\n", a->name, a->desc);
+   {
+      if (out != NULL && n < max)
+      {
+         /*
+          * 逐个 snprintf 而不是 strcpy: name/desc 与 SOEM 的字段同宽(128), 但同宽不等于
+          * 一定带了结束符 —— 那种情况下 strcpy 会越过本结构读下去。
+          */
+         (void)snprintf(out[n].name, sizeof(out[n].name), "%s", a->name);
+         (void)snprintf(out[n].desc, sizeof(out[n].desc), "%s", a->desc);
+      }
+      n++;
+   }
    ec_free_adapters(head);
+   return n;
+}
+
+int em_list_adapters(em_adapter_t *out, int max)
+{
+   em__console_init();
+   if (out == NULL || max < 0)
+      max = 0;
+   return em__fill_adapters(out, max);
+}
+
+void em_print_adapters(void)
+{
+   static em_adapter_t list[EM__MAX_ADAPTERS];
+   int n, i;
+
+   n = em_list_adapters(list, EM__MAX_ADAPTERS);
+   if (n > EM__MAX_ADAPTERS)
+      n = EM__MAX_ADAPTERS;
+   for (i = 0; i < n; i++)
+      printf("    - %s  (%s)\n", list[i].name, list[i].desc);
 }
 
 int em_open(em_bus_t *bus, const char *ifname)

@@ -11,4 +11,11 @@ add_subdirectory(slide_verify)
 add_subdirectory(slide_motion)
 add_subdirectory(motor_api)
 
+# Qt 上位机。默认 OFF —— 没装 Qt 的人照旧能编 CLI (而且那两条构建不需要 C++ 编译器)。
+# 打开需要 Qt6: cmake --preset hmi-qt-mingw
+option(EC_BUILD_HMI "构建 Qt 上位机 (需要 Qt6 + C++ 编译器)" OFF)
+if(EC_BUILD_HMI)
+  add_subdirectory(hmi)
+endif()
+
 

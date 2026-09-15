@@ -1,0 +1,659 @@
+#include "ecatworker.h"
+
+#include <QElapsedTimer>
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+/* ---------------------------------------------------------------- 构造 */
+
+EcatThread::EcatThread(QObject *parent) : QThread(parent)
+{
+   for (int i = 0; i < EM_MAX_AXES; i++)
+   {
+      m_vel[i]  = HMI_VEL_DEF;
+      m_want[i] = 0;
+   }
+}
+
+EcatThread::~EcatThread()
+{
+   requestQuit();
+   wait(15000);
+}
+
+/*
+ * 记录一句给操作员看的话: 存进遥测 (状态栏一直显示) + 打到控制台 + 发给界面弹一次。
+ * 工作线程调, 所以 emit 是跨线程的排队投递 —— 界面还没起事件循环时也不会卡住这里。
+ */
+void EcatThread::note(const QString &s)
+{
+   {
+      QMutexLocker lk(&m_mtx);
+      m_note = s;
+   }
+   /* 控制台是 UTF-8 (em_console_init), 所以用 toUtf8 而不是 qPrintable (那是本地码页) */
+   std::printf("[hmi] %s\n", s.toUtf8().constData());
+   std::fflush(stdout);
+   emit notify(s);
+}
+
+/* ---------------------------------------------------------------- 命令 */
+
+void EcatThread::postListAdapters()
+{
+   QMutexLocker lk(&m_mtx);
+   Cmd c; c.type = CMD_LIST;
+   m_cmds.enqueue(c);
+}
+
+void EcatThread::postConnect(const QString &ifname)
+{
+   QMutexLocker lk(&m_mtx);
+   Cmd c; c.type = CMD_CONNECT; c.text = ifname;
+   m_cmds.enqueue(c);
+}
+
+void EcatThread::postDisconnect()
+{
+   QMutexLocker lk(&m_mtx);
+   Cmd c; c.type = CMD_DISCONNECT;
+   m_cmds.enqueue(c);
+}
+
+void EcatThread::postEnable()
+{
+   QMutexLocker lk(&m_mtx);
+   Cmd c; c.type = CMD_ENABLE;
+   m_cmds.enqueue(c);
+}
+
+void EcatThread::postDisable()
+{
+   QMutexLocker lk(&m_mtx);
+   Cmd c; c.type = CMD_DISABLE;
+   m_cmds.enqueue(c);
+}
+
+void EcatThread::postStop()
+{
+   QMutexLocker lk(&m_mtx);
+   Cmd c; c.type = CMD_STOP;
+   m_cmds.enqueue(c);
+}
+
+void EcatThread::postZeroHere(int axis)
+{
+   QMutexLocker lk(&m_mtx);
+   Cmd c; c.type = CMD_ZERO; c.axis = axis;
+   m_cmds.enqueue(c);
+}
+
+void EcatThread::postCenter(int axis)
+{
+   QMutexLocker lk(&m_mtx);
+   Cmd c; c.type = CMD_CENTER; c.axis = axis;
+   m_cmds.enqueue(c);
+}
+
+void EcatThread::postCenterAll()
+{
+   QMutexLocker lk(&m_mtx);
+   for (int i = 0; i < EM_MAX_AXES; i++)
+   {
+      Cmd c; c.type = CMD_CENTER; c.axis = i;
+      m_cmds.enqueue(c);
+   }
+}
+
+void EcatThread::setTarget(int axis, int32_t want_disp)
+{
+   if (axis < 0 || axis >= EM_MAX_AXES)
+      return;
+
+   /* 夹在工作范围内。界面也会夹一次, 这里是第二道 —— 越界的目标不该只靠界面拦 */
+   if (want_disp >  HMI_RANGE) want_disp =  HMI_RANGE;
+   if (want_disp < -HMI_RANGE) want_disp = -HMI_RANGE;
+
+   QMutexLocker lk(&m_mtx);
+   m_want[axis] = want_disp;
+}
+
+void EcatThread::setSpeed(int axis, uint32_t vel)
+{
+   if (axis < 0 || axis >= EM_MAX_AXES)
+      return;
+   if (vel < HMI_VEL_MIN) vel = HMI_VEL_MIN;
+   if (vel > HMI_VEL_MAX) vel = HMI_VEL_MAX;
+
+   QMutexLocker lk(&m_mtx);
+   m_vel[axis] = vel;
+}
+
+BusTelem EcatThread::telemetry() const
+{
+   QMutexLocker lk(&m_mtx);
+   return m_telem;
+}
+
+void EcatThread::requestQuit() { m_quit.store(true); }
+
+/* ---------------------------------------------------------------- 主循环 */
+
+void EcatThread::run()
+{
+   QElapsedTimer clk;
+   clk.start();
+   qint64 last = clk.elapsed();
+
+   while (!m_quit.load())
+   {
+      drainCommands();
+
+      if (m_bus != nullptr && m_in_op)
+      {
+         qint64 now = clk.elapsed();
+         uint32_t dt = (uint32_t)(now - last);
+         last = now;
+
+         /*
+          * dt 用**实测值**, 不假设 2ms —— Windows 不是实时系统。卡了一下就按 100ms 封顶:
+          * CSP 下让目标一次跳一大步, 就是一次高速冲刺, 而卡顿本身往往意味着总线不稳。
+          * 这个口径与 motor_api 的 em_csp_move_multi 一致。
+          */
+         if (dt == 0)  dt = 1;
+         if (dt > 100) dt = 100;
+
+         if (m_origin_ready)
+            interpolate(dt);
+
+         int wkc = em_service(m_bus);   /* 每周期都要发帧: 断了驱动器会掉出 OP */
+
+         if (!m_origin_ready)
+            tryInitOrigin();
+
+         publish(wkc);
+      }
+      else
+      {
+         last = clk.elapsed();
+
+         /*
+          * 没进 OP 也要刷一次遥测。**不能只在发帧时刷**: 界面的按钮形态是从遥测推出来的
+          * (in_op || busy), 而"正在连接"和"连接失败"这两件事恰好都发生在不发帧的时候 ——
+          * 不刷的话界面就永远停在点下去之前的样子。
+          */
+         publish(0);
+      }
+
+      em_sleep_ms(HMI_LOOP_MS);
+   }
+
+   teardown();
+}
+
+void EcatThread::drainCommands()
+{
+   for (;;)
+   {
+      Cmd c;
+      {
+         QMutexLocker lk(&m_mtx);
+         if (m_cmds.isEmpty())
+            return;
+         c = m_cmds.dequeue();
+      }
+
+      switch (c.type)
+      {
+         case CMD_LIST:       doListAdapters(); break;
+
+         case CMD_CONNECT:    doConnect(c.text); break;
+
+         case CMD_DISCONNECT: teardown(); break;
+
+         case CMD_ENABLE:     doEnable(); break;
+
+         case CMD_DISABLE:
+            if (m_bus != nullptr && m_in_op)
+            {
+               if (em_disable_all(m_bus) == EM_EXIT_OK)
+                  note(QStringLiteral("已失能 (电机释放)"));
+               else
+                  note(QStringLiteral("失能有轴没退干净 —— **电机可能仍带电**, "
+                                      "看控制台里是哪一根"));
+            }
+            /* 失能后目标跟着实际位置, 免得再使能时把旧目标当成新指令 */
+            {
+               QMutexLocker lk(&m_mtx);
+               for (int i = 0; i < m_naxis; i++)
+                  if (m_ax[i] != nullptr)
+                  {
+                     m_tgt[i]  = em_pos(m_ax[i]) - m_origin[i];
+                     m_want[i] = m_tgt[i];
+                  }
+            }
+            break;
+
+         case CMD_STOP:       doStop(); break;
+         case CMD_ZERO:       doZero(c.axis); break;
+         case CMD_CENTER:     doCenter(c.axis); break;
+      }
+   }
+}
+
+/* ---------------------------------------------------------------- 生命周期 */
+
+/*
+ * 填网卡下拉框。返回的是**这块网卡在 SOEM 里的名字** (`\Device\NPF_{GUID}`), 不是描述 ——
+ * 描述只是给人看的, 名字才是 postConnect 要的东西。
+ */
+void EcatThread::doListAdapters()
+{
+   em_adapter_t list[32];
+   int n = em_list_adapters(list, 32);
+
+   QStringList names, descs;
+   for (int i = 0; i < n && i < 32; i++)
+   {
+      names << QString::fromUtf8(list[i].name);
+      descs << QString::fromUtf8(list[i].desc);
+   }
+
+   if (n == 0)
+      note(QStringLiteral("一块网卡都没找到 —— 多半是 Npcap 没装, 或当前不是管理员"));
+
+   /* 也往控制台打一份。界面上只有描述, 而排查时要看的是那个 `\Device\NPF_{GUID}` 名字 */
+   std::printf("[hmi] 找到 %d 块网卡\n", n);
+   for (int i = 0; i < names.size(); i++)
+      std::printf("    - %s  (%s)\n", names[i].toUtf8().constData(),
+                                     descs[i].toUtf8().constData());
+   std::fflush(stdout);
+
+   emit adaptersListed(names, descs);
+}
+
+void EcatThread::doConnect(const QString &ifname)
+{
+   if (m_bus != nullptr)
+      teardown();
+
+   /* 从这里到函数出口都是"忙" —— 中间每一步都是阻塞的 SDO / 状态机迁移, 界面据此
+    * 把按钮锁住, 免得点两下 */
+   m_busy = true;
+
+   m_bus = em_bus_new();
+   if (m_bus == nullptr)
+   {
+      note(QStringLiteral("em_bus_new 失败"));
+      return;
+   }
+
+   std::printf("\n==== hmi 连接 %s ====\n", ifname.toUtf8().constData());
+   std::fflush(stdout);
+
+   QByteArray ifn = ifname.toUtf8();
+   int n = em_open(m_bus, ifn.constData());
+   if (n <= 0)
+   {
+      note(QStringLiteral("打不开网卡。多半是**被别的程序独占** (Npcap 单进程), "
+                          "或没装 Npcap, 或不是管理员。先确认没有别的东西在用这张卡"));
+      em_bus_free(m_bus);
+      m_bus = nullptr;
+      return;
+   }
+
+   if (n > EM_MAX_AXES)
+   {
+      note(QStringLiteral("总线上有 %1 台从站, 超过本接口的上限 %2 —— 不连")
+              .arg(n).arg(EM_MAX_AXES));
+      teardown();
+      return;
+   }
+
+   /*
+    * 选**总线上全部从站**, 不是"前两台": em_setup 的硬要求 —— 留在 PRE_OP 的从站不参与
+    * 过程数据交换, 会让整帧的 WKC 持续偏短, 与"过程数据没落地"分不开。
+    */
+   em_axis_cfg_t cfg[EM_MAX_AXES];
+   for (int i = 0; i < n; i++)
+   {
+      cfg[i].bus_pos = i;
+      cfg[i].pos_tol = 0;      /* 0 = 用 EM_POS_TOL_DEF */
+   }
+
+   if (em_setup(m_bus, cfg, n, /*allow_remap=*/1) != 0)
+   {
+      note(QStringLiteral("em_setup 失败 —— 上面有具体原因 (缺映射 / 偏移证不出来 / "
+                          "从站不在预期状态)。控制台里每一条都写明了"));
+      teardown();
+      return;
+   }
+
+   if (em_enter_op(m_bus, /*use_dc=*/0, HMI_CYCLE_US) != 0)
+   {
+      note(QStringLiteral("进 OP 失败 —— 见控制台。不要反复点「连接」, 先看原因"));
+      teardown();
+      return;
+   }
+
+   m_in_op = true;
+   m_naxis = em_axis_count(m_bus);
+   for (int i = 0; i < m_naxis; i++)
+      m_ax[i] = em_axis(m_bus, i);
+   m_origin_ready = false;
+   m_fault_latched = false;
+
+   {
+      QMutexLocker lk(&m_mtx);
+      for (int i = 0; i < m_naxis; i++)
+      {
+         m_want[i] = 0;
+         m_tgt[i]  = 0;
+         if (m_vel[i] < HMI_VEL_MIN || m_vel[i] > HMI_VEL_MAX)
+            m_vel[i] = HMI_VEL_DEF;
+      }
+   }
+
+   m_busy = false;
+   note(QStringLiteral("已进 OP, %1 根轴。电机仍未带电 —— 点「使能」才会带电")
+           .arg(m_naxis));
+}
+
+void EcatThread::doEnable()
+{
+   if (m_bus == nullptr || !m_in_op)
+   {
+      note(QStringLiteral("还没连上总线"));
+      return;
+   }
+   if (!m_origin_ready)
+   {
+      note(QStringLiteral("还没收到完整的过程数据帧 -> 位置未知, 拒绝使能"));
+      return;
+   }
+
+   for (int i = 0; i < m_naxis; i++)
+   {
+      if (em_is_enabled(m_ax[i]))
+         continue;
+      if (em_set_mode(m_ax[i], EM_MODE_CSP) != EM_EXIT_OK)
+      {
+         note(QStringLiteral("轴%1: 切到 CSP 模式失败 -> 中止使能 (原因见控制台)")
+                 .arg(i));
+         return;
+      }
+   }
+
+   if (em_enable_all(m_bus) != EM_EXIT_OK)
+   {
+      note(QStringLiteral("使能失败 —— 控制台里写着是哪一步。"
+                          "**不要重复点**: 先看是不是 6041h 报了故障或限位"));
+      return;
+   }
+
+   /*
+    * 使能成功了。把目标钉在"现在这里": em_arm() 在使能前已经把 607Ah 钉在当前实际位置,
+    * 这里把界面侧的目标值也对齐 —— 于是**使能那一帧不会产生任何运动**。
+    */
+   {
+      QMutexLocker lk(&m_mtx);
+      for (int i = 0; i < m_naxis; i++)
+      {
+         m_tgt[i]  = em_pos(m_ax[i]) - m_origin[i];
+         m_want[i] = m_tgt[i];
+      }
+   }
+
+   note(QStringLiteral("已使能 %1 根轴 (有保持力矩)。点画布上的位置就走过去")
+           .arg(m_naxis));
+}
+
+void EcatThread::doStop()
+{
+   /*
+    * 停止 = 把目标冻在当前插值点上。**不写 6040h=0x0000**: 那是卸力, 滑台会自由滑;
+    * 带保持力矩停住才是这里要的。要不要撤电由「失能」决定。
+    */
+   {
+      QMutexLocker lk(&m_mtx);
+      for (int i = 0; i < EM_MAX_AXES; i++)
+         m_want[i] = m_tgt[i];
+   }
+
+   note(QStringLiteral("已停止: 目标冻在当前位置, 仍带保持力矩(未卸力)"));
+}
+
+void EcatThread::doZero(int axis)
+{
+   if (axis < 0 || axis >= m_naxis)
+      return;
+   if (!m_origin_ready)
+      return;
+
+   int32_t disp = em_pos(m_ax[axis]) - m_origin[axis];
+
+   if (m_want[axis] != m_tgt[axis])
+   {
+      note(QStringLiteral("轴%1 还在走 -> 等停稳了再设零 (否则零点会落在半路上)")
+              .arg(axis));
+      return;
+   }
+
+   /*
+    * 原来的显示坐标: disp = pos - origin。要让**现在这点**变成 0:
+    *   origin' = origin + disp   ->  新 disp' = pos - origin' = 0
+    * 光动 origin 会让同一个物理位置换一个显示值, 而 want/tgt 还是老的显示值 ——
+    * 那就等于凭空下了一条新指令。所以 want/tgt 一起平移, **物理目标点一个脉冲都不动**。
+    */
+   m_origin[axis] += disp;
+   m_tgt[axis]    -= disp;
+   {
+      QMutexLocker lk(&m_mtx);
+      m_want[axis] -= disp;
+   }
+
+   note(QStringLiteral("轴%1: 当前位置已设为 0 点 (物理目标未动)").arg(axis));
+}
+
+void EcatThread::doCenter(int axis)
+{
+   if (axis < 0 || axis >= m_naxis)
+      return;
+   setTarget(axis, 0);      /* 显示坐标 0 = 界面上那个正中 */
+}
+
+void EcatThread::tryInitOrigin()
+{
+   if (m_naxis < 1)
+      return;
+
+   /* 等**全部**轴都收到过完整帧 —— 一次完整帧才有可用的 6064h */
+   for (int i = 0; i < m_naxis; i++)
+      if (!em_mirror_ok(m_ax[i]))
+         return;
+
+   for (int i = 0; i < m_naxis; i++)
+   {
+      m_origin[i] = em_pos(m_ax[i]);
+      m_tgt[i]    = 0;
+   }
+   {
+      QMutexLocker lk(&m_mtx);
+      for (int i = 0; i < m_naxis; i++)
+         m_want[i] = 0;
+   }
+
+   m_origin_ready = true;
+   note(QStringLiteral("零点是**连接时读到的位置**: 界面正中 = 现在这里, 可点范围 ±%1 脉冲 "
+                       "(50000 pul/圈 => ±10 圈)。换个零点用「把当前位置设为 0」")
+           .arg(HMI_RANGE));
+}
+
+void EcatThread::interpolate(uint32_t dt_ms)
+{
+   int32_t  want[EM_MAX_AXES];
+   uint32_t vel [EM_MAX_AXES];
+
+   {
+      QMutexLocker lk(&m_mtx);
+      for (int i = 0; i < EM_MAX_AXES; i++)
+      {
+         want[i] = m_want[i];
+         vel[i]  = m_vel[i] ? m_vel[i] : HMI_VEL_DEF;
+      }
+   }
+
+   for (int i = 0; i < m_naxis; i++)
+   {
+      em_axis_t *ax = m_ax[i];
+
+      /* 没使能就不下发目标: 一个"位置指令"在未使能时是没有任何意义的 */
+      if (!em_is_enabled(ax))
+         continue;
+
+      int64_t d = (int64_t)want[i] - (int64_t)m_tgt[i];
+
+      if (d != 0)
+      {
+         double v = (double)vel[i];
+         double a = v / (HMI_STOP_MS / 1000.0);              /* 刹停减速度 */
+         double allow = std::sqrt(2.0 * a * (double)std::llabs(d));
+
+         if (allow < v)
+            v = allow;                                       /* 进近段自动减速, 不冲过头 */
+
+         double stepd = v * (double)dt_ms / 1000.0;
+         if (stepd < 1.0)
+            stepd = 1.0;                                     /* 快到了也得走一步, 否则到不了 */
+
+         int64_t step = (int64_t)(stepd + 0.5);
+         if (step > std::llabs(d))
+            step = std::llabs(d);
+
+         m_tgt[i] += (d > 0) ? step : -step;
+      }
+
+      /* 显示坐标夹在工作范围内 —— 越界的目标不该只靠点击时那道夹 */
+      if (m_tgt[i] >  HMI_RANGE) m_tgt[i] =  HMI_RANGE;
+      if (m_tgt[i] < -HMI_RANGE) m_tgt[i] = -HMI_RANGE;
+
+      /* 这就是 CSP: 每周期一次, 发的是绝对位置 (驱动器坐标) */
+      (void)em_csp_set_target(ax, m_origin[i] + m_tgt[i]);
+   }
+}
+
+void EcatThread::publish(int wkc)
+{
+   int32_t  want[EM_MAX_AXES];
+   uint32_t vel [EM_MAX_AXES];
+
+   {
+      QMutexLocker lk(&m_mtx);
+      for (int i = 0; i < EM_MAX_AXES; i++)
+      {
+         want[i] = m_want[i];
+         vel[i]  = m_vel[i];
+      }
+   }
+
+   BusTelem t;
+   t.connected    = (m_bus != nullptr);
+   t.in_op        = m_in_op;
+   t.busy         = m_busy;
+   t.naxis        = m_naxis;
+   t.wkc          = wkc;
+   t.expected_wkc = (m_bus != nullptr) ? em_expected_wkc(m_bus) : 0;
+
+   for (int i = 0; i < m_naxis; i++)
+   {
+      em_axis_t *ax = m_ax[i];
+      AxisTelem &a  = t.ax[i];
+
+      a.valid     = true;
+      a.mirror_ok = em_mirror_ok(ax) != 0;
+      a.frames    = em_mirror_frames(ax);
+      a.sw        = em_sw(ax);
+      a.state     = QString::fromUtf8(em_sw_state_str(a.sw));
+      a.enabled   = em_is_enabled(ax) != 0;
+      a.fault     = (a.sw & EM_SW_FAULT) != 0;
+      a.pos       = em_pos(ax) - m_origin[i];
+      a.tgt       = m_tgt[i];
+      a.want      = want[i];
+      a.vel       = vel[i];
+      a.at_target = (a.want == a.tgt);
+
+      if (a.fault)
+         t.fault = true;
+   }
+
+   if (t.fault && !m_fault_latched)
+   {
+      m_fault_latched = true;
+      {
+         QMutexLocker lk(&m_mtx);
+         for (int i = 0; i < EM_MAX_AXES; i++)
+            m_want[i] = m_tgt[i];
+      }
+      /* 不写 0x0000: 故障时驱动器自己会退电, 我们只停止下发新目标 */
+      note(QStringLiteral("6041h bit3 = Fault -> 已冻结目标。查清故障原因, "
+                          "再「失能」重新走一遍 (要清故障位得在 CLI 上用复位)"));
+   }
+   else if (!t.fault)
+   {
+      m_fault_latched = false;
+   }
+
+   {
+      QMutexLocker lk(&m_mtx);
+      t.note = m_note;
+      m_telem = t;
+   }
+}
+
+void EcatThread::teardown()
+{
+   /* 有东西要收就是"忙": 收尾里有 SDO 与状态机迁移, 界面此时不该让人再点连接 */
+   m_busy         = (m_bus != nullptr);
+
+   m_in_op        = false;
+   m_naxis        = 0;
+   m_origin_ready = false;
+   m_fault_latched = false;
+   for (int i = 0; i < EM_MAX_AXES; i++)
+   {
+      m_ax[i]     = nullptr;
+      m_tgt[i]    = 0;
+   }
+
+   if (m_bus != nullptr)
+   {
+      int live = 0;
+
+      std::printf("\n==== hmi 收尾 ====\n");
+      std::fflush(stdout);
+
+      /*
+       * em_shutdown 自己会: 给使能中的轴写 6040h=0x0000 -> 打 250ms 过程数据 ->
+       * 用 6041h 确认 bit2 已清 -> 还原 PDO 映射 -> 降回 PRE_OP -> 关网卡。
+       * 这里不再单独调 em_disable_all, 那只会让每根轴多等一次状态机超时。
+       */
+      em_shutdown(m_bus, /*restore_mapping=*/1, &live);
+      if (live)
+         m_maybe_live = true;
+
+      em_bus_free(m_bus);
+      m_bus = nullptr;
+   }
+
+   m_busy = false;
+
+   {
+      QMutexLocker lk(&m_mtx);
+      m_telem = BusTelem();
+      m_note  = QStringLiteral("已断开");
+      for (int i = 0; i < EM_MAX_AXES; i++)
+         m_want[i] = 0;
+   }
+}

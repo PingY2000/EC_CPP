@@ -659,6 +659,29 @@ int em_csp_move_multi(em_axis_t **axes, const int32_t *target, const uint32_t *v
    }
 }
 
+int em_csp_set_target(em_axis_t *ax, int32_t target)
+{
+   if (ax == NULL || ax->out == NULL)
+      return EM_R_FAIL;
+   if (ax->off_target_pos < 0)
+   {
+      /*
+       * 607Ah 不在这一轴实读的映射里。**不退回 SDO**: 这条路径是每周期调的, 一次 SDO
+       * 往返 700ms, 而且 OP 下的 SDO 往返本身就是上一期怀疑会把驱动器踢出 OP 的诱因。
+       * 写不进去就直说写不进去。
+       */
+      em__err("%s: 607Ah 不在本轴实读的映射里 -> 目标位置下发不出去", ax->label);
+      return EM_R_FAIL;
+   }
+
+   /*
+    * 只写镜像。**使能状态与 6061h==CSP 由调用方保证** —— 见 ec_motor.h 的说明:
+    * 这是每周期路径, 上面不能有 SDO。
+    */
+   em__put_i32(ax->out, ax->off_target_pos, target);
+   return EM_R_OK;
+}
+
 int em_csp_move_abs(em_axis_t *ax, int32_t target, uint32_t vel, uint32_t tmo_ms)
 {
    em_axis_t *one[1];

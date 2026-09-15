@@ -299,6 +299,24 @@ int em_open(em_bus_t *bus, const char *ifname);
 void em_print_adapters(void);
 
 /*
+ * 网卡清单。**给界面用的那一份** —— em_print_adapters() 只往 stdout 打印, 而 GUI 要把
+ * 它们填进下拉框, 所以同一份遍历必须能返回数组。
+ *
+ * name 就是 em_open() 要的那个字符串 (Windows Npcap 形如 `\Device\NPF_{GUID}`)。
+ * 128 字节与 SOEM 的 ec_adaptert 同宽, 不截断。
+ *
+ * 返回填进 out 的条数 (0 = 一块网卡都没有, 通常是 Npcap 没装或被独占);
+ * max <= 0 时只数不填。
+ */
+typedef struct
+{
+   char name[128];
+   char desc[128];
+} em_adapter_t;
+
+int em_list_adapters(em_adapter_t *out, int max);
+
+/*
  * 把控制台输出代码页设成 UTF-8。**调用方应当在 main() 的第一句调它。**
  *
  * 本模块内部会在打日志时惰性调用一次, 但那只救得了**那之后**的输出。源码是 UTF-8,
@@ -532,6 +550,21 @@ int em_pv_available(const em_axis_t *ax);    /* 需要 6040h + 60FFh + 6041h */
 /* 绝对 / 相对位置运动 (CSP)。vel 单位 pul/s */
 int em_csp_move_abs(em_axis_t *ax, int32_t target, uint32_t vel, uint32_t tmo_ms);
 int em_csp_move_rel(em_axis_t *ax, int32_t delta,  uint32_t vel, uint32_t tmo_ms);
+
+/*
+ * 把 607Ah 目标位置写进输出镜像。**纯镜像写: 不发帧、不做 SDO、不发任何东西。**
+ *
+ * 这是 CSP 的本来面目: 目标位置**每周期下发一次**, 驱动器跟着它走。em_csp_move_multi()
+ * 内部每个周期做的也正是这一件事, 本函数只是把那一步单独露出来 —— 谁要自己做轨迹
+ * (比如界面上的"点哪去哪、随时改向"), 就用它配 em_service()。
+ *
+ * 注意"纯镜像写"意味着**它自己不产生任何周期**: 写完要有人去打那一帧。调用方还得
+ * 自己保证"这一轴已使能、且 6061h == CSP" —— 本函数**有意不做这些检查**, 因为它是
+ * 每周期都要调的路径, 那上面不能有 SDO 往返 (一次 700ms, 比周期大三个数量级)。
+ *
+ * 返回 0 = 已写进镜像 / -1 = 607Ah 不在本轴实读的映射里 (写不进去)
+ */
+int em_csp_set_target(em_axis_t *ax, int32_t target);
 
 /*
  * 多轴相对运动 (CSP) —— **起点由接口内部取**。

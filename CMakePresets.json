@@ -13,6 +13,21 @@
                 "CMAKE_CXX_COMPILER": "C:/msys64/ucrt64/bin/g++.exe",
                 "CMAKE_BUILD_TYPE": "Debug"
             }
+        },
+        {
+            "name": "hmi-qt-ucrt64",
+            "displayName": "HMI: Qt 6.11.2 (MSYS2 UCRT64) + GCC 16.2.0 (Ninja)",
+            "description": "只编 Qt 上位机。Qt 取自 MSYS2 的 ucrt64 仓库 (pacman -S mingw-w64-ucrt-x86_64-qt6-base), 编译器与上面那条构建同一个 —— 一个进程里只有一套 CRT。Qt 官方那个 MinGW 是 msvcrt 版, 与必须用 UCRT 的 SOEM 混在一个进程里会让 stdio 直接崩, 所以不用它。",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/hmi-qt-ucrt64",
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "C:/msys64/ucrt64/bin/gcc.exe",
+                "CMAKE_CXX_COMPILER": "C:/msys64/ucrt64/bin/g++.exe",
+                "CMAKE_MAKE_PROGRAM": "C:/Qt/Tools/Ninja/ninja.exe",
+                "CMAKE_PREFIX_PATH": "C:/msys64/ucrt64",
+                "CMAKE_BUILD_TYPE": "Release",
+                "EC_BUILD_HMI": "ON"
+            }
         }
     ]
 }
