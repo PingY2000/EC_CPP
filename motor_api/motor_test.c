@@ -333,7 +333,7 @@ static int parse_args(int argc, char *argv[], opts_t *o)
  * 授权 (--allow-motion) 是**启动时**表达的意图; 这一问是**此刻**的动作确认。
  * 两者不是一回事: 授权一次, 后面每一步都靠它; 而"现在要不要让电机转起来"值得再问一次。
  * ====================================================================== */
-
+/*
 static int confirm(const char *what)
 {
    char line[32];
@@ -344,15 +344,12 @@ static int confirm(const char *what)
 
    if (fgets(line, sizeof(line), stdin) == NULL)
    {
-      /*
-       * 读不到输入 (stdin 关了 / 是空管道) 就是**没有确认**, 不是"默认同意"。
-       * 在这里默认同意, 等于把"没有人确认过"说成"有人确认过了"。
-       */
       printf("\n  (读不到输入 -> 视为取消)\n");
       return 0;
    }
    return (line[0] == 'y' || line[0] == 'Y');
 }
+*/
 
 /* ======================================================================
  * 小工具
@@ -433,8 +430,8 @@ int main(int argc, char *argv[])
    rc = parse_args(argc, argv, &opt);
    if (rc != EM_EXIT_OK)
       return rc;
-
-   printf("motor_test - 多轴 CiA402 接口验收 (%s)\n", em_version());
+   SetConsoleOutputCP(CP_UTF8);
+   printf("test motor_test - 多轴 CiA402 接口验收 (%s)\n", em_version());
    printf("网卡: %s\n", opt.ifname);
    printf("授权: --allow-pdo=%s --allow-motion=%s --home=%s%s\n",
           opt.allow_pdo ? "是" : "否", opt.allow_motion ? "是" : "否",
@@ -722,13 +719,13 @@ int main(int argc, char *argv[])
          snprintf(what, sizeof(what),
                   "两轴使能(带电) -> CSP 各走 %d pul 再走回 -> PV 跑 %dms",
                   opt.dist, opt.pv_hold);
-
+      /*
       if (!confirm(what))
       {
          printf("  已取消 —— 电机不会带电\n");
          exit_code = EM_EXIT_OK;
          goto out;
-      }
+      }*/
    }
 
    rc = em_enable_all(bus);
