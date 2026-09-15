@@ -66,20 +66,32 @@ teardown()
 
 ## 4. CSP 插补
 
-界面侧自己按**实测** `dt` 做梯形插补(Windows 不是实时系统,不假设 2 ms):
+CSP 下**规划责任在主站**(手册:「循环同步位置模式下，控制器完成位置指令规划并输出
+规划好的目标位置 `607Ah`…驱动器内部完成位置、速度控制」), 所以这里的形状**就是**
+电机的形状。界面侧按**实测** `dt` 推进目标(Windows 不是实时系统,不假设 2 ms):
 
 ```
 d    = want - tgt
-a    = max(vel, 1000) / 0.3          // 300ms 刹停的减速度
+a    = max(vel, 1000) / 0.3          // 300ms 刹停的减速度 —— **只用于减速**
 v_ok = min(vel, sqrt(2*a*|d|))       // 进近段自动减速, 不冲过头
 step = v_ok * dt / 1000              // 至少 1 个脉冲, 免得无限逼近
 tgt += clamp(d, -step, +step)
 em_csp_set_target(ax, origin + tgt)  // 每周期一次 —— 这就是 CSP
 ```
 
+**`a` 只出现在减速包络里, 加速段没有任何包络** —— 点击那一刻 `|d|` 很大,
+`allow >> vel`, 于是 `v` 直接取滑块满速, 第一个周期就全速。所以实际形状是
+**「速度阶跃加速 → 匀速 → 恒定减速度减速」**, **不是梯形**(真梯形要求加速段也受限;
+`HMI_STOP_MS` 顾名思义是"刹停时间", 只约束减速)。电机会不会因为这记阶跃而丢步/过流,
+取决于驱动器的电流限幅 —— 这是**没有规划**的结果, 不是留了余量。
+
 `dt > 100ms` 时按 100ms 推进(与 `em_csp_move_multi` 同一口径:卡一下就跳一大步
 等于一次高速冲刺)。**不做** S 曲线、不做前瞻 —— 这是调试台,不是运动控制器。
-也不写 `6081h`,不走 `em_csp_move_multi`。
+也**不做**加速段限制(见上)。不写 `6081h`,不走 `em_csp_move_multi`。
+
+> 想真梯形: 在 [ecatworker.cpp:516](../hmi/ecatworker.cpp#L516) 那段给加速段加一条对称的
+> `sqrt(2*a_acc*|已走距离|)` 包络即可。要 S 曲线得再有加加速度限制 —— 那是另一个量级的改动,
+> 已明确不做。改加速段会改变"点远处多久到"的手感, 改完要按 §8 重跑一遍手动验收。
 
 ## 5. 安全护栏(与 CLI 一一对应)
 
@@ -101,6 +113,56 @@ em_csp_set_target(ax, origin + tgt)  // 每周期一次 —— 这就是 CSP
 
 ## 6. 构建与部署
 
+### 6.0 前置条件(每台新机器做一次)
+
+`cmake --preset hmi-qt-ucrt64` **不会**帮你装任何东西。缺一样就停在哪一样上,
+报错信息往往指不到真正的原因(实测: UCRT64 里没装 Qt 时, 报的是
+`Could not find a package configuration file provided by "Qt6"` 加上第二条命令的
+`ninja: error: loading 'build.ninja'`)。所以**先按这张表逐项自检**:
+
+| # | 要有的东西 | 自检(在 MSYS2 UCRT64 shell 里跑) | 没有怎么装 |
+|---|---|---|---|
+| 1 | MSYS2 的 UCRT64 工具链 | `C:/msys64/ucrt64/bin/gcc.exe --version` | 装 MSYS2, 别用别的 MinGW |
+| 2 | **ucrt64 版 Qt6** | `ls C:/msys64/ucrt64/lib/cmake/Qt6/Qt6Config.cmake` | `MSYSTEM=UCRT64 pacman -S --needed mingw-w64-ucrt-x86_64-qt6-base` |
+| 3 | `moc`(Qt 元对象编译器) | `ls C:/msys64/ucrt64/share/qt6/bin/moc.exe` | 同上, 由 2 带出来 |
+| 4 | **`cmake` 本身** | `cmake --version` | `MSYSTEM=UCRT64 pacman -S --needed mingw-w64-ucrt-x86_64-cmake` |
+| 5 | **Ninja**(preset 指到 `C:/Qt/Tools/Ninja/ninja.exe`) | `ls C:/Qt/Tools/Ninja/ninja.exe` | `MSYSTEM=UCRT64 pacman -S --needed mingw-w64-ucrt-x86_64-ninja`, 再把 preset 里那条 `CMAKE_MAKE_PROGRAM` 改指过去 |
+| 6 | PATH 里有 `C:/msys64/ucrt64/bin` | `which gcc` | 用 UCRT64 shell(它的 PATH 本来就是这个), 见 6.2 |
+
+**第 4 项容易漏**: MSYS2 **默认不带 `cmake`**。没有它, 本文件下面那条
+`cmake --preset hmi-qt-ucrt64` 在 UCRT64 shell 里直接是 `command not found` ——
+而报错完全指不到"缺前置条件"。装完 4、5 两项之后, 本节所有命令都能在 UCRT64 shell 里
+原样照抄, 不必再去借 VS 自带的那个 `cmake`
+(`.../Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe`,
+能用来生成/驱动 Ninja, 但没装 4、5 两项时它是唯一能敲的 `cmake`, 容易让人以为
+"MSYS2 这条路走不通")。
+
+**一条命令自检 1-5**:
+
+```bash
+for f in C:/msys64/ucrt64/bin/gcc.exe C:/msys64/ucrt64/lib/cmake/Qt6/Qt6Config.cmake \
+         C:/msys64/ucrt64/share/qt6/bin/moc.exe C:/Qt/Tools/Ninja/ninja.exe; do
+  [ -e "$f" ] && echo "OK   $f" || echo "MISS $f"
+done
+cmake --version >/dev/null 2>&1 && echo "OK   cmake" \
+  || echo "MISS cmake (pacman -S mingw-w64-ucrt-x86_64-cmake)"
+```
+
+> **`moc.exe` 不在 `ucrt64/bin` 下, 在 `ucrt64/share/qt6/bin/` 下** —— MSYS2 把 Qt 的
+> 工具装在那儿, 而 `ucrt64/bin` 里放的是 `Qt6Core.dll` 这些。两者的关系是:
+> CMake 用**绝对路径**找到 `moc.exe`(所以第 3 项不要求它在 PATH 里), 但 `moc.exe`
+> 启动时要从磁盘加载 `ucrt64/bin/Qt6Core.dll` —— 这就是第 6 项存在的原因。
+> 所以**别拿 `ucrt64/bin/moc.exe` 当自检条件**: 它永远不存在, 那是一条假 MISS。
+
+五个 `OK` 才继续。装完 2 之后再
+`pacman -Qq | grep -i qt` 确认能列出 `mingw-w64-ucrt-x86_64-qt6-base`。
+
+> **别拿 `C:/Qt` 那份 Qt 顶上第 2 项。** 那是 Qt 官方安装器的 msvcrt 版 MinGW Qt,
+> 用它编译能过、窗口也能起, 但工作线程第一次 `printf` 就崩 —— 原因见 6.1。
+> 换句话说, 这一项"缺了乱补"比"缺着不补"更危险。
+
+前置条件齐了才跑:
+
 ```bash
 cmake --preset hmi-qt-ucrt64
 cmake --build out/build/hmi-qt-ucrt64 --target hmi
@@ -109,6 +171,8 @@ cmake --build out/build/hmi-qt-ucrt64 --target hmi
 只走 [CMakePresets.json](../CMakePresets.json) 里的 `hmi-qt-ucrt64`(Ninja,
 编译器与其它 CLI 同一个 `C:/msys64/ucrt64`)。顶层 `EC_BUILD_HMI` **默认 OFF**,
 所以没装 Qt 的机器照旧能编那些 CLI。
+configure 失败时 `out/build/hmi-qt-ucrt64/` 里不会有 `build.ninja`,
+**第二条命令报 `ninja: error: loading 'build.ninja'` 永远是连带的** —— 去修第一条的错。
 
 ### 6.1 Qt 必须与 SOEM 同一套 CRT —— 这是本次最大的坑
 

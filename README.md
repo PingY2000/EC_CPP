@@ -52,7 +52,27 @@ cmake --build build-mingw --target slide_verify aliasinfo slide_motion sm_state 
 完整设计、部署细节与**哪些验收做了 / 哪些还没做**见
 [docs/hmi_click_position.md](docs/hmi_click_position.md)。
 
-只走仓库自带的 [CMakePresets.json](CMakePresets.json) 里的 `hmi-qt-ucrt64`
+先装依赖(**新机器做一次**)。Qt 必须取自 **MSYS2 的 UCRT64 仓库**, 与上面那些 CLI 用
+**同一个** `C:/msys64/ucrt64` 工具链:
+
+```bash
+MSYSTEM=UCRT64 pacman -S --needed mingw-w64-ucrt-x86_64-qt6-base
+```
+
+自检(全部 `OK` 才继续; 缺哪个就是上面那条没装成, 或少了 cmake / Ninja):
+
+```bash
+for f in C:/msys64/ucrt64/bin/gcc.exe C:/msys64/ucrt64/lib/cmake/Qt6/Qt6Config.cmake \
+         C:/msys64/ucrt64/share/qt6/bin/moc.exe C:/Qt/Tools/Ninja/ninja.exe; do
+  [ -e "$f" ] && echo "OK   $f" || echo "MISS $f"
+done
+cmake --version >/dev/null 2>&1 && echo "OK   cmake" \
+  || echo "MISS cmake (pacman -S mingw-w64-ucrt-x86_64-cmake)"
+```
+
+注意 `moc.exe` 在 `share/qt6/bin/` 而**不在** `bin/` 下 —— MSYS2 把 Qt 工具装在那儿。
+
+再走仓库自带的 [CMakePresets.json](CMakePresets.json) 里的 `hmi-qt-ucrt64`
 (**生成器是 Ninja, 与上面那条 MinGW Makefiles 的构建目录不能混用**):
 
 ```bash
@@ -60,11 +80,13 @@ cmake --preset hmi-qt-ucrt64
 cmake --build out/build/hmi-qt-ucrt64 --target hmi
 ```
 
-Qt 必须取自 **MSYS2 的 UCRT64 仓库**, 与上面那些 CLI 用**同一个** `C:/msys64/ucrt64` 工具链:
+一条条来。**configure 失败时第二条报的 `ninja: error: loading 'build.ninja'` 是连带的**
+(`out/build/hmi-qt-ucrt64/` 里从没生成过 `build.ninja`), 去修第一条的错。
 
-```bash
-MSYSTEM=UCRT64 pacman -S --needed mingw-w64-ucrt-x86_64-qt6-base
-```
+> 最常见的失败是 **UCRT64 里没装 Qt6**, 现象是第一条报
+> `Could not find a package configuration file provided by "Qt6"`。自检表里第 2、3 项
+> 会同时 `MISS`。完整前置清单与每一项的装法见
+> [docs/hmi_click_position.md](docs/hmi_click_position.md) 的 6.0。
 
 > **不要用 Qt 官方安装器那个 MinGW 版 Qt。** 它自带的是 **msvcrt** 版 MinGW (没有
 > `_UCRT`), 而 SOEM 的 `SOEM/cmake/Windows.cmake` 给 GNU 编译器加了 `-D_UCRT -lucrt`,
