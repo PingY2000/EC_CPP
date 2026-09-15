@@ -11,6 +11,7 @@
 | [slide_verify/](slide_verify/) | 自有工具:滑台设备导入验证 (扫描总线 → 读 CiA402 对象 → PASS/WARN/FAIL → 退出码) |
 | [slide_motion/](slide_motion/) | 自有工具:**带动作**验收验证 (参数基线 → 使能状态机 → 微动与反馈闭环),**默认不动** |
 | ↳ `sm_state` / `sm_pdo` | 同目录下的两个**独立**专项小程序: 只验证 CiA402 状态机切换。`sm_state` 用 **SDO + PRE_OP**, `sm_pdo` 用 **PDO + OP** (会写 PDO 映射, 见下) |
+| [motor_api/](motor_api/) | 自有工具:**多轴 CiA402 运动接口** (位置同步 CSP / 速度 PV / 回零 HM) + 验收程序 `motor_test`。**至少支持同时驱动两台**, 目标值每周期经过程数据下发 |
 | [baseline_ykd2205pe.ini](baseline_ykd2205pe.ini) | 示例参数基线 (由 `slide_motion --dump-baseline` 现场导出后人工审定) |
 | [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md) | YKD2205PE 对象速查与各工具的用法/退出码文档 |
 | [docs/slide_motion_verify.md](docs/slide_motion_verify.md) | `slide_motion` 的完整设计/安全须知/微动判据/实测记录 |
@@ -27,7 +28,7 @@
 ```bash
 cmake -S . -B build-mingw -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_C_COMPILER=C:/msys64/ucrt64/bin/gcc.exe
-cmake --build build-mingw --target slide_verify aliasinfo slide_motion sm_state sm_pdo
+cmake --build build-mingw --target slide_verify aliasinfo slide_motion sm_state sm_pdo motor_test
 ```
 
 产物 (统一输出到仓库根的 `bin/`):
@@ -36,6 +37,7 @@ cmake --build build-mingw --target slide_verify aliasinfo slide_motion sm_state 
 - `bin/slide_motion.exe`
 - `bin/sm_state.exe`
 - `bin/sm_pdo.exe`
+- `bin/motor_test.exe`
 
 ## 运行注意
 
@@ -55,7 +57,17 @@ cmake --build build-mingw --target slide_verify aliasinfo slide_motion sm_state 
   - 两者都发**零运动指令**、不写 `607Ah`/`6060h`/软限位。但走到 Enable Operation
     之后电机会通电 (有保持力矩) —— **真跑时人在设备旁, 手放在物理急停上**。
   - 退出码 **10** 的含义与 `slide_motion` 相同: 收尾未能确认失能, **电机可能仍带电**。
-- 五个工具都依赖 **Npcap** 独占网卡 —— 与仓库的 python 链 (pysoem) 一样,
+- `motor_api` / `motor_test` 是**多轴运动接口** (CSP 位置同步 / PV 速度 / HM 回零),
+  与 `slide_motion` 的 SDO + PP 并列, 区别在于**目标值每周期经过程数据下发** ——
+  CSP/PV 要求目标值每周期刷新, SDO 的 700 ms 往返追不上。同样**默认一个字节都不写**:
+  写 PDO 映射要 `--allow-pdo`, 使能/运动要 `--allow-motion` (+ 交互确认),
+  回零要 `--home` (它会撞限位、会找原点开关)。
+  **先不带任何 `--allow` 参数跑一次**: 它读完总线、打印实读的 PDO 映射与只读参数后
+  就退出 0, 一个字节都不写。退出码 **10** 同理。
+  > 它**不写死** `1600h`/`1A00h`, 而是先读 `1C12h`/`1C13h` 问"哪个 PDO 生效" ——
+  > 本机 `1C12h` 指的是 **`1601h`**, `1600h` 是一张**没生效**的表。
+  > 详见 [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md) 的「PDO 映射」。
+- 全部工具都依赖 **Npcap** 独占网卡 —— 与仓库的 python 链 (pysoem) 一样,
   **勿同时运行**。
 - 参数为网卡名 (Windows Npcap 形如 `\Device\NPF_{GUID}`),不带参数时列出可用网卡。
 - 详细用法、输出示例与退出码见 [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md)

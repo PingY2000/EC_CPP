@@ -9,5 +9,6 @@ add_subdirectory(SOEM)
 add_subdirectory(aliasinfo)
 add_subdirectory(slide_verify)
 add_subdirectory(slide_motion)
+add_subdirectory(motor_api)
 
 
