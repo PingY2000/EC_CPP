@@ -95,11 +95,11 @@
 #define SW_MASK     (SW_RTSO | SW_SWITCHED | SW_OP_EN | SW_FAULT)
 
 /* DC 同步周期 (µs), 手册给的 250~4000 范围内 */
-#define DC_CYCLE_US 1000
+#define DC_CYCLE_US 2000
 
 /* 等待与节拍 */
 #define STEP_TMO_MS 1000  /* 单步等状态字变化的超时 */
-#define HOLD_MS     500   /* 第 3 步之后保持观察多久 */
+#define HOLD_MS     2000   /* 第 3 步之后保持观察多久 */
 #define POLL_MS     5     /* 状态字轮询节拍里的让步 (给从站喘口气) */
 #define OP_TMO_MS   3000  /* 进 OP 的超时 */
 #define IOMAP_MAX   4096
@@ -440,6 +440,29 @@ static int cycle(void)
    ecx_send_processdata(&g_ctx);
    return ecx_receive_processdata(&g_ctx, EC_TIMEOUTRET);
 }
+/*
+static int cycle_debug(void)
+{
+    int wkc;
+
+    printf("    send...\n");
+    fflush(stdout);
+
+    ecx_send_processdata(&g_ctx);
+
+    printf("    send OK\n");
+    fflush(stdout);
+
+    printf("    receive...\n");
+    fflush(stdout);
+
+    wkc = ecx_receive_processdata(&g_ctx, EC_TIMEOUTRET);
+
+    printf("    receive WKC=%d\n", wkc);
+    fflush(stdout);
+
+    return wkc;
+}*/
 
 /*
  * 写 6040h 到输出镜像。必须按小端字节写: SOEM 把 IOmap 原样塞进 EtherCAT 帧, 而
@@ -943,7 +966,8 @@ int main(int argc, char *argv[])
    printf("  bit6, 所以 \"未使能\" 不区分 Not ready / Switch on disabled。\n");
 
    /* 0. 先归到已知起点, 这样入口状态是什么都不影响后面的判定 */
-   if (step(target, "0. 归位 Disable voltage", CW_DISABLE_V, 0x0000) != 0)
+   if (step(target, "0. 归位 Disable voltage",
+         CW_DISABLE_V, SW_RTSO) != 0)
    { exit_code = EXIT_FAIL; goto out; }
    if (step(target, "1. Shutdown", CW_SHUTDOWN, SW_RTSO) != 0)
    { exit_code = EXIT_FAIL; goto out; }
@@ -1004,7 +1028,7 @@ int main(int argc, char *argv[])
    { exit_code = EXIT_FAIL; goto out; }
    if (step(target, "6. Shutdown", CW_SHUTDOWN, SW_RTSO) != 0)
    { exit_code = EXIT_FAIL; goto out; }
-   if (step(target, "7. Disable voltage", CW_DISABLE_V, 0x0000) != 0)
+   if (step(target, "7. Disable voltage", CW_DISABLE_V, SW_RTSO) != 0)
    { exit_code = EXIT_FAIL; goto out; }
 
 out:
