@@ -208,6 +208,12 @@ void em__put_i32(uint8_t *m, int off, int32_t v)
       memcpy(m + off, &v, 4);
 }
 
+void em__put_u32(uint8_t *m, int off, uint32_t v)
+{
+   if (m != NULL && off >= 0)
+      memcpy(m + off, &v, 4);
+}
+
 uint16_t em__get_u16(const uint8_t *m, int off)
 {
    uint16_t v = 0;
@@ -231,6 +237,16 @@ void em__set_cw(em_axis_t *ax, uint16_t cw)
    if (ax == NULL || ax->out == NULL || ax->off_cw < 0)
       return;
    em__put_u16(ax->out, ax->off_cw, cw);
+}
+
+void em__pin_ramp(em_axis_t *ax)
+{
+   if (ax == NULL || ax->out == NULL)
+      return;
+   if (ax->off_prof_acc >= 0)
+      em__put_u32(ax->out, ax->off_prof_acc, ax->prof_acc);
+   if (ax->off_prof_dec >= 0)
+      em__put_u32(ax->out, ax->off_prof_dec, ax->prof_dec);
 }
 
 /* ======================================================================
@@ -613,6 +629,39 @@ static int em__find_field(em_bus_t *bus, int slave, uint16_t pdo_index,
    if (em_map_read(bus, slave, pdo_index, 4, &n, e) != EM_R_OK)
       return -1;
    return em_map_offset(e, n, index, sub, want_bits);
+}
+
+/*
+ * 定 6083h/6084h 的兜底值: 先问驱动器自己, 问不到或问回 0 才用缺省。
+ *
+ * **为什么"实读 0"不能采信**: 这两个对象就在生效的 RxPDO 里, 主站每周期都在下发它们。
+ * 上一次带 --allow-pdo 的运行 (哪怕只是"只读观测") 已经把 0 发进去了, 所以驱动器
+ * 现在回读 0 **不代表它被配置成 0**, 只代表我们上次覆盖过它。拿 0 当"驱动器自己的值"
+ * 会把上一轮的破坏当成这一轮的配置, 然后继续下发 0 —— 自己骗自己, 而且症状正好是
+ * 那个"全 PASS 但电机没转"。
+ *
+ * 此刻仍在 PRE_OP: SDO 便宜, 也不会和过程数据打架。
+ */
+static uint32_t em__pick_ramp(em_bus_t *bus, int slave, uint16_t index,
+                              uint32_t dflt, const char *what)
+{
+   uint32_t v = 0;
+
+   if (em_rd_u32(bus, slave, index, 0, &v) != EM_R_OK)
+   {
+      printf("      %s 读不到 -> 用缺省 %u pul/s²\n",
+             what, (unsigned)dflt);
+      return dflt;
+   }
+   if (v == 0)
+   {
+      printf("      %s 实读 0 —— 它就在生效 RxPDO 里, 说明已被主站下发过 0 "
+             "(不等于驱动器配置成 0)。本次下发 %u pul/s²\n",
+             what, (unsigned)dflt);
+      return dflt;
+   }
+   printf("      %s 实读 %u -> 采信驱动器自己的值\n", what, (unsigned)v);
+   return v;
 }
 
 /* 快照一个映射对象 (写之前取, 供收尾还原) */
@@ -1347,6 +1396,11 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
        * 调 em_set_mode, 就会把运行模式写进控制字里。
        */
       ax->off_modes = -1;
+      /*
+       * 同上, off_prof_acc/off_prof_dec 也必须显式置 -1: calloc 给的 0 是个合法偏移,
+       * 而 +0 正是 6040h 控制字 —— em__pin_ramp 会把加减速度写进控制字里。
+       */
+      ax->off_prof_acc = ax->off_prof_dec = -1;
       snprintf(ax->label, sizeof(ax->label), "轴%d(从站%d)", i, slave);
 
       bus->axis[i] = ax;
@@ -1495,6 +1549,53 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
       {
          printf("  %s: 6060h 不在生效 RxPDO 里 -> 运行模式走 SDO\n", ax->label);
       }
+
+      /*
+       * 6083h / 6084h 轮廓加减速度 —— 和 6060h 同一个类, 但后果更隐蔽。
+       *
+       * 它们在生效映射里就是主站拥有的: 每周期都在下发, 不写就是下发 0。而 6083h = 0
+       * 意味着 PV 的斜坡永远起不来 —— 驱动器收下了速度指令 (6041h bit12 因此清零),
+       * 606Ch 却恒为 0, 6064h 一个计数不动。**断言"驱动器接受了指令"的检查全都会通过**,
+       * 这正是本期要修的那个"全 PASS 但电机没转"。
+       *
+       * 默认值采信**驱动器自己的**值 (此刻还在 PRE_OP, SDO 便宜且不影响过程数据),
+       * 而不是写死一个常数 —— 这与本工程"不写死映射、一律实读"的规矩一致:
+       * 换一台驱动器、或者现场调过加减速, 这里都跟得上。
+       */
+      ax->off_prof_acc = em__find_field(bus, ax->slave, ax->rx_pdo,
+                                        EM_OID_PROF_ACC, 0, 32);
+      ax->off_prof_dec = em__find_field(bus, ax->slave, ax->rx_pdo,
+                                        EM_OID_PROF_DEC, 0, 32);
+      if (ax->off_prof_acc >= 0 && (uint32_t)ax->off_prof_acc + 4 > ax->Obytes)
+      {
+         em__err("%s: 6083h 算出的偏移 +%d 超出本从站输出镜像 (%u 字节) -> 拒绝",
+                 ax->label, ax->off_prof_acc, (unsigned)ax->Obytes);
+         return EM_R_FAIL;
+      }
+      if (ax->off_prof_dec >= 0 && (uint32_t)ax->off_prof_dec + 4 > ax->Obytes)
+      {
+         em__err("%s: 6084h 算出的偏移 +%d 超出本从站输出镜像 (%u 字节) -> 拒绝",
+                 ax->label, ax->off_prof_dec, (unsigned)ax->Obytes);
+         return EM_R_FAIL;
+      }
+
+      ax->prof_acc = em__pick_ramp(bus, ax->slave, EM_OID_PROF_ACC,
+                                   EM_RAMP_ACC_DEF, "6083h 加速度");
+      ax->prof_dec = em__pick_ramp(bus, ax->slave, EM_OID_PROF_DEC,
+                                   EM_RAMP_DEC_DEF, "6084h 减速度");
+
+      if (ax->off_prof_acc < 0 && ax->off_prof_dec < 0)
+         printf("  %s: 6083h/6084h 都不在生效 RxPDO 里 -> 主站不覆盖它们, 驱动器自己"
+                "的值生效 (本接口记录的是 %u/%u pul/s²)\n", ax->label,
+                (unsigned)ax->prof_acc, (unsigned)ax->prof_dec);
+      else
+         printf("  %s: 6083h/6084h 在生效 RxPDO 的偏移 +%d/+%d, 主站每周期下发 "
+                "%u/%u pul/s² (-1 = 该项不在映射里, 不会被覆盖)\n", ax->label,
+                ax->off_prof_acc, ax->off_prof_dec,
+                (unsigned)ax->prof_acc, (unsigned)ax->prof_dec);
+
+      /* 进 OP 之前就要把这些常量写进镜像 —— 一进 OP 主站就开始发帧了 */
+      em__pin_ramp(ax);
    }
 
    /* ---- 5. 上 SAFE_OP ---- */
@@ -1749,6 +1850,30 @@ int em_modes_offset(const em_axis_t *ax)
 {
    return ax ? ax->off_modes : -1;
 }
+
+void em_set_ramp(em_axis_t *ax, uint32_t acc, uint32_t dec)
+{
+   if (ax == NULL)
+      return;
+
+   /*
+    * 0 不拒绝 —— 有些驱动器把 6083h = 0 解释成"瞬时", 拒绝会把那条路堵死。但本机不是:
+    * 0 正是"斜坡永远起不来"的那个值, 也就是本期修的那个 bug 的成因, 所以说清楚。
+    */
+   if (acc == 0 || dec == 0)
+      em__warn("%s: 把 6083h/6084h 设成 0 (acc=%u dec=%u) —— 本机驱动器在 PV 下会因此"
+               "停在 0 转速: 它会收下速度指令 (6041h bit12 清零) 但一步不走",
+               ax->label, (unsigned)acc, (unsigned)dec);
+
+   ax->prof_acc = acc;
+   ax->prof_dec = dec;
+   /* 立刻写进镜像: 它是主站每周期下发的一项, 光记在结构体里不会到达驱动器 */
+   em__pin_ramp(ax);
+}
+
+uint32_t em_ramp_acc(const em_axis_t *ax) { return ax ? ax->prof_acc : 0; }
+uint32_t em_ramp_dec(const em_axis_t *ax) { return ax ? ax->prof_dec : 0; }
+int      em_ramp_offset(const em_axis_t *ax) { return ax ? ax->off_prof_acc : -1; }
 
 int em_is_enabled(const em_axis_t *ax)
 {
@@ -2184,6 +2309,22 @@ static void em_dump_one_map(em_bus_t *bus, int slave, uint16_t assign_index,
    }
 }
 
+/*
+ * 打印生效 RxPDO 里某一项的处置: 在映射里的给出偏移与"驱动/不驱动"及理由,
+ * 不在映射里的说明主站不会覆盖它。见 em_dump_pdo 里那段说明这张表为什么要逐项交代。
+ */
+static void em_dump_disposition(em_bus_t *bus, int slave, uint16_t rx_pdo,
+                                uint16_t index, uint8_t sub, int bits,
+                                const char *name, const char *disposition)
+{
+   int off = em__find_field(bus, slave, rx_pdo, index, sub, bits);
+
+   if (off < 0)
+      printf("      %s 不在映射里 -> 主站不覆盖它, 驱动器自己的值生效\n", name);
+   else
+      printf("      %s +%-4d %s\n", name, off, disposition);
+}
+
 void em_dump_pdo(em_bus_t *bus, int slave)
 {
    struct ec_slave *s;
@@ -2237,6 +2378,67 @@ void em_dump_pdo(em_bus_t *bus, int slave)
          else
             printf("    6060h 运行模式: 不在生效 RxPDO %04Xh 里 -> 经 SDO 写\n",
                    (unsigned)rx);
+
+         /*
+          * 表里**每一项**的处置都列出来。
+          *
+          * 这张表的规矩是本工程用两次真机事故换来的: **生效 RxPDO 里的每一项都是主站
+          * 拥有的**, 每周期都在下发 —— 不驱动它就是下发 0, 而且不会有任何报错。
+          *   6060h: 曾经 SDO 写进去 8 而 6061h 一直读回 0;
+          *   6083h: 被下发成 0 之后 PV 的斜坡起不来, "全 PASS 但电机没转"。
+          * 所以这里逐项交代"驱动 / 不驱动", 不驱动的那项还要写出理由。
+          */
+         printf("    本接口对生效 RxPDO 每一项的处置:\n");
+         em_dump_disposition(bus, slave, rx, EM_OID_CONTROLWORD, 0, 16,
+                             "6040h 控制字    ", "驱动 (使能状态机)");
+         em_dump_disposition(bus, slave, rx, EM_OID_MODES, 0, 8,
+                             "6060h 运行模式  ", "驱动 (em_set_mode)");
+         em_dump_disposition(bus, slave, rx, EM_OID_TARGET_POS, 0, 32,
+                             "607Ah 目标位置  ", "驱动 (CSP)");
+         em_dump_disposition(bus, slave, rx, EM_OID_TARGET_VEL, 0, 32,
+                             "60FFh 目标速度  ", "驱动 (PV)");
+         em_dump_disposition(bus, slave, rx, EM_OID_PROF_VEL, 0, 32,
+                             "6081h 轮廓速度  ",
+                             "**不驱动** (本接口不做 PP) -> 主站下发 0, "
+                             "与驱动器基线一致");
+         {
+            /*
+             * 这两项的处置文字要带上**实际会下发的值** —— 它是不是 0, 正是
+             * "PV 到底会不会动"的分水岭。
+             */
+            em_axis_t *ax = em_axis_by_pos(bus, slave - 1);
+            char       b1[128], b2[128];
+
+            if (ax == NULL && bus->naxis == 0)
+            {
+               /*
+                * em_dump_pdo 在 S2 就会被调用, 而那时 em_setup() 还没跑、一根轴都还没建。
+                * 这里**不能**说成"不驱动" —— 那正好和本次修复相反 (setup 之后是会驱动的),
+                * 也别说成"要下发 0"。如实说"还不知道"。
+                */
+               snprintf(b1, sizeof(b1), "**未定** (em_setup 还没跑, 尚未建轴)");
+               snprintf(b2, sizeof(b2), "**未定** (em_setup 还没跑, 尚未建轴)");
+            }
+            else if (ax == NULL)
+            {
+               /* 这个从站确实不是本接口管的轴 —— 没人给它定过值, 别说成"要下发 0" */
+               snprintf(b1, sizeof(b1), "**不驱动** (本从站不是本接口的轴)");
+               snprintf(b2, sizeof(b2), "**不驱动** (本从站不是本接口的轴)");
+            }
+            else
+            {
+               snprintf(b1, sizeof(b1), "驱动 (em_set_ramp, 每周期下发 %u pul/s²)%s",
+                        (unsigned)em_ramp_acc(ax),
+                        em_ramp_acc(ax) == 0 ? "  <<< 0 会让 PV 的斜坡起不来!" : "");
+               snprintf(b2, sizeof(b2), "驱动 (em_set_ramp, 每周期下发 %u pul/s²)%s",
+                        (unsigned)em_ramp_dec(ax),
+                        em_ramp_dec(ax) == 0 ? "  <<< 0 会让 PV 的斜坡停不住!" : "");
+            }
+            em_dump_disposition(bus, slave, rx, EM_OID_PROF_ACC, 0, 32,
+                                "6083h 轮廓加速度", b1);
+            em_dump_disposition(bus, slave, rx, EM_OID_PROF_DEC, 0, 32,
+                                "6084h 轮廓减速度", b2);
+         }
       }
    }
 }

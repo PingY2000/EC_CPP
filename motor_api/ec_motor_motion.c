@@ -89,6 +89,14 @@ int em_arm(em_axis_t *ax)
    if (ax->off_modes >= 0)
       em__put_u8(ax->out, ax->off_modes, (uint8_t)mode);
 
+   /*
+    * 6083h / 6084h 也重钉一次。它们在生效 RxPDO 里时是主站拥有的, 不写就是下发 0 ——
+    * 而 6083h = 0 会让 PV 的斜坡起不来 (驱动器收下速度指令、bit12 清零、却一步不走)。
+    * setup 时已经钉过一次, 这里是使能前的第二次: 纯镜像写、不发帧、不做 SDO, 零成本,
+    * 而漏一次的代价是一次"全 PASS 但电机没转"。
+    */
+   em__pin_ramp(ax);
+
    switch (mode)
    {
       case EM_MODE_CSP:
@@ -797,6 +805,9 @@ int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_m
 {
    uint32_t t0;
    int      reads[EM_MAX_AXES];
+   int32_t  pos0[EM_MAX_AXES];   /* 起跑时的实际位置, 用来判"到底转没转" */
+   int32_t  pos1[EM_MAX_AXES];
+   int32_t  vpeak[EM_MAX_AXES];  /* 运行期间 606Ch 的峰值 */
    int      i;
 
    if (axes == NULL || vel == NULL || n <= 0 || n > EM_MAX_AXES)
@@ -833,7 +844,20 @@ int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_m
                  "em_set_mode(ax, EM_MODE_PV)", ax->label, em_get_mode(ax));
          return EM_R_FAIL;
       }
+      /*
+       * 取起跑位置 —— 这是"转没转"唯一的客观依据, 所以取不到就整体拒绝。
+       * 光断言 6041h bit12 (Speed=0) 是不够的: 那个位说的是**驱动器收下了速度指令**,
+       * 不是**电机动了**。真机上出现过 bit12 正常清零、606Ch 恒为 0、6064h 一个计数
+       * 不动的情形 (主站把 6083h 加速度下发成了 0, 斜坡起不来) —— 那一趟全阶段 PASS。
+       */
+      if (em__cur_pos(ax, &pos0[i]) != EM_R_OK)
+      {
+         em__err("%s: 取不到起跑时的实际位置 (6064h) -> 无法判断这趟到底转没转, "
+                 "拒绝下发速度", ax->label);
+         return EM_R_FAIL;
+      }
       reads[i] = 0;
+      vpeak[i] = 0;
    }
 
    printf("  ---- PV: %d 根轴各跑自己的速度, 同周期下发, 跑 %ums ----\n",
@@ -873,6 +897,14 @@ int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_m
          if (!ax->mirror_ok)
             continue;
          reads[i]++;
+
+         /* 606Ch 的峰值 —— "确实在转"的另一个客观证据 (取绝对值, 反向跑也算) */
+         {
+            int32_t av = ax->vel < 0 ? -ax->vel : ax->vel;
+
+            if (av > vpeak[i])
+               vpeak[i] = av;
+         }
 
          if ((ax->sw & EM_SW_FAULT) != 0)
          {
@@ -917,6 +949,48 @@ int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_m
    for (i = 0; i < n; i++)
       printf("  %s: 跑满 %ums (期间 %d 次读数, 6041h=%s)\n", axes[i]->label,
              (unsigned)hold_ms, reads[i], em_sw_describe(axes[i]->sw));
+
+   /*
+    * ---- 判"到底转没转" ----
+    * 这是本函数从上一趟真机运行里补上的一条断言。那一趟 6041h 全程正常 (bit12 该清的
+    * 清、该置的置)、退出码 0, 而 6064h 一个计数没动、606Ch 恒为 0 —— 断言齐了, 却把
+    * "没转"报成了 PASS。原因是所有检查都在问"驱动器收下指令了吗", 没有一条在问
+    * "电机动了吗"。
+    *
+    * 用**位置**判而不是用速度判: 606Ch 是驱动器按自己的斜坡算出来的瞬时值, 在
+    * "斜坡起不来"这种故障下它恒为 0, 但有些驱动器会直接回报指令值 —— 那样就用它
+    * 判不出问题。位置不会骗人: 走没走, 6064h 说了算。
+    */
+   for (i = 0; i < n; i++)
+   {
+      int32_t moved;
+
+      if (em__cur_pos(axes[i], &pos1[i]) != EM_R_OK)
+      {
+         em__err("%s: 取不到停后的实际位置 (6064h) -> 无法判断这趟到底转没转, "
+                 "拒绝把这次当成成功", axes[i]->label);
+         em__pv_stop_all(axes, n);
+         return EM_R_FAIL;
+      }
+      moved = pos1[i] - pos0[i];
+      if (moved < 0)
+         moved = -moved;
+
+      printf("      %s: 6064h %d -> %d (走了 %d pul), 期间 606Ch 峰值 %d pul/s\n",
+             axes[i]->label, pos0[i], pos1[i], moved, vpeak[i]);
+
+      if (moved == 0)
+      {
+         em__err("%s: 整段 %ums 里 6064h 一个计数都没变 —— 驱动器收下了速度指令 "
+                 "(6041h bit12 已清零), 但电机没动。\n"
+                 "        先查 6083h/6084h: 它们在生效 RxPDO 里, 主站每周期都在下发, "
+                 "被下发成 0 就会让斜坡永远起不来\n"
+                 "        (跑一次 em_dump_pdo 看这两项的处置; 或用 --ramp-acc 指定一个非 0 值)",
+                 axes[i]->label, (unsigned)hold_ms);
+         em__pv_stop_all(axes, n);
+         return EM_R_FAIL;
+      }
+   }
 
    /*
     * 停机: **先把所有轴的速度一起写 0, 再逐轴断言** bit12 (Speed = 0)。

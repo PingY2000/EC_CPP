@@ -111,6 +111,14 @@ extern "C" {
 
 #define EM_POS_TOL_DEF      50    /* CSP 到位容差默认值 (pul) */
 #define EM_MAX_DELTA_DEF  50000   /* 单次运动位移上限默认值 (pul) —— 见 ec_motor.h 的说明 */
+/*
+ * 轮廓加减速度的兜底值 (pul/s²)。本机 6083h/6084h 的实读值就是 500000, 也是
+ * slide_motion 用成功过的那个值 —— 但**只在读不到驱动器自己的值时才用它**,
+ * 正常路径是采信驱动器自己的配置。为什么必须有一个兜底: 见 em_setup 里那段
+ * "6083h 实读 0" 的说明 —— 0 是主站自己下发进去的, 拿它当"驱动器的值"会自己骗自己。
+ */
+#define EM_RAMP_ACC_DEF 500000u
+#define EM_RAMP_DEC_DEF 500000u
 #define EM_POLL_MS           2    /* 周期轮询节拍让步 */
 #define EM_STEP_TMO_MS    1000    /* 使能状态机单步超时 */
 #define EM_SDO_TMO_MOTION  200    /* 运动期的 SDO 超时 (非运动期用 EC_TIMEOUTRXM) */
@@ -133,6 +141,9 @@ extern "C" {
 #define EM_OID_TARGET_POS    0x607A
 #define EM_OID_HOMING_OFF    0x607C
 #define EM_OID_SOFTLIM       0x607D
+#define EM_OID_PROF_VEL      0x6081  /* 轮廓速度 (PP 用; 本接口不做 PP, 见 em_arm 的 PP 分支) */
+#define EM_OID_PROF_ACC      0x6083  /* 轮廓加速度 (PV 的斜坡靠它) */
+#define EM_OID_PROF_DEC      0x6084  /* 轮廓减速度 */
 #define EM_OID_GEAR_ENABLE   0x2201  /* 0 细分有效 / 1 电子齿轮有效 —— 决定行程当量 */
 #define EM_OID_SUBDIV        0x2400  /* 细分: 电机一圈脉冲数, 本机实测 50000 */
 #define EM_OID_HOMING_MODE   0x6098
@@ -425,6 +436,23 @@ int em_set_mode(em_axis_t *ax, int mode);
 /* 运行模式是不是经过程数据驱动的 (即 6060h 在生效的 RxPDO 里) */
 int em_modes_via_pdo(const em_axis_t *ax);
 int em_modes_offset(const em_axis_t *ax);   /* 6060h 的字节偏移, -1 = 不在映射里 */
+
+/*
+ * 轮廓加减速度 6083h / 6084h (pul/s²) —— PV 的斜坡由它们决定。
+ *
+ * **为什么接口必须管这两个对象**: 它们和 6060h 一样在生效的 RxPDO 里 (本机 1601h 的
+ * 第 6/7 项, 输出镜像 +15 / +19), 所以主站每周期都在下发它们。不写就是**下发 0**,
+ * 而 6083h = 0 意味着斜坡永远起不来 —— 现象极隐蔽: 驱动器收下了速度指令
+ * (6041h bit12 "Speed=0" 因此清零), 606Ch 却恒为 0, 6064h 一个计数不动。
+ * 断言"驱动器接受了指令"的那套检查全都会通过。
+ *
+ * 缺省取自驱动器自己的实读值 (读不到或读到 0 才落到 EM_RAMP_*_DEF, 并在 em_setup
+ * 里说明); 传 0 不拒绝, 但会打一条 WARN —— 有些驱动器把 0 解释成"瞬时", 本机不是。
+ */
+void     em_set_ramp(em_axis_t *ax, uint32_t acc, uint32_t dec);
+uint32_t em_ramp_acc(const em_axis_t *ax);
+uint32_t em_ramp_dec(const em_axis_t *ax);
+int      em_ramp_offset(const em_axis_t *ax);  /* 6083h 的字节偏移, -1 = 不在映射里 */
 
 /* 读 6061h 实际生效的模式 */
 int em_get_mode(em_axis_t *ax);

@@ -78,6 +78,7 @@
 /* 上限 (只能收紧, 放宽要 --force-caps) */
 #define CAP_DIST      50000u   /* pul */
 #define CAP_VEL       50000u   /* pul/s */
+#define CAP_RAMP    5000000u   /* pul/s² */
 #define CAP_PV_HOLD    3000u   /* ms */
 #define CAP_TMO       60000u   /* ms */
 
@@ -85,6 +86,7 @@
 #define DEF_DIST       5000    /* pul ≈ 0.1 圈 (按 2400h = 50000 pul/圈) */
 #define DEF_VEL        5000    /* pul/s */
 #define DEF_PV_VEL     1000    /* pul/s —— PV 没有我们控制的加减速, 所以比 CSP 更慢 */
+#define DEF_RAMP     500000    /* pul/s² —— 驱动器 6083h/6084h 的实读值, 见 em_ramp_acc */
 #define DEF_PV_HOLD    1000    /* ms */
 #define DEF_TMO       10000    /* ms */
 
@@ -122,6 +124,8 @@ typedef struct
    int  vel;
    int  pv_vel;
    int  pv_opposite;
+   int  ramp_acc;                 /* 6083h 轮廓加速度 (pul/s²) —— 0 会让 PV 的斜坡起不来 */
+   int  ramp_dec;                 /* 6084h 轮廓减速度 */
    int  pv_hold;
    int  tmo;
    int  mode;                     /* S6 跑哪种模式: EM_MODE_CSP / EM_MODE_PV */
@@ -150,6 +154,10 @@ static void usage(const char *prog)
       "  --dist N          CSP 位移, 缺省 %d, 上限 %u pul\n"
       "  --vel  N          CSP 速度, 缺省 %d, 上限 %u pul/s\n"
       "  --pv-vel N        PV 速度, 缺省 %d, 上限 %u pul/s\n"
+      "  --ramp-acc N      6083h 轮廓加速度, 缺省 %d, 上限 %u pul/s²\n"
+      "                      驱动器在 PV 下靠它爬坡; 它能收到 0, 但 0 意味着\n"
+      "                      「斜坡永远起不来」—— 会报速度指令已接受却一步不走\n"
+      "  --ramp-dec N      6084h 轮廓减速度, 同上\n"
       "  --pv-hold N       PV 保持时间, 缺省 %d, 上限 %u ms\n"
       "  --pv-opposite     PV 时让第 2 根轴反向跑 (缺省两轴同向)\n"
       "  --tmo N           单个运动超时, 缺省 %d ms\n"
@@ -166,6 +174,7 @@ static void usage(const char *prog)
       "注意: --axis 给子集时 em_setup 会拒绝 —— 留在 PRE_OP 的从站不参与过程数据\n"
       "      交换, 会让帧的 WKC 持续偏短, 与「过程数据没落地」分不开。\n",
       prog, DEF_DIST, CAP_DIST, DEF_VEL, CAP_VEL, DEF_PV_VEL, CAP_VEL,
+      DEF_RAMP, CAP_RAMP,
       DEF_PV_HOLD, CAP_PV_HOLD, DEF_TMO);
 }
 
@@ -178,6 +187,8 @@ static int parse_args(int argc, char *argv[], opts_t *o)
    o->dist      = DEF_DIST;
    o->vel       = DEF_VEL;
    o->pv_vel    = DEF_PV_VEL;
+   o->ramp_acc  = DEF_RAMP;
+   o->ramp_dec  = DEF_RAMP;
    o->pv_hold   = DEF_PV_HOLD;
    o->tmo       = DEF_TMO;
    o->cycle_us  = 2000;
@@ -291,6 +302,27 @@ static int parse_args(int argc, char *argv[], opts_t *o)
          }
          *dst = v;
       }
+      else if (strcmp(a, "--ramp-acc") == 0 || strcmp(a, "--ramp-dec") == 0)
+      {
+         /*
+          * 这一对**单独一条分支**, 因为它允许 0 —— 上面那条对速度/时间一律要求 v > 0。
+          * 0 不拒绝: 有些驱动器把 6083h = 0 解释成"瞬时", 本机不是, 所以放到 S6 里
+          * 针对本机打 WARN, 而不是在这里把参数判死。
+          */
+         int *dst = (strcmp(a, "--ramp-acc") == 0) ? &o->ramp_acc : &o->ramp_dec;
+
+         if (i + 1 >= argc)
+         {
+            printf("%s 后面要跟一个整数\n", a);
+            return EM_EXIT_USAGE;
+         }
+         *dst = atoi(argv[++i]);
+         if (*dst < 0)
+         {
+            printf("%s 不能是负数 (加减速度没有方向)\n", a);
+            return EM_EXIT_USAGE;
+         }
+      }
       else if (a[0] != '-')
       {
          o->ifname = a;
@@ -324,6 +356,13 @@ static int parse_args(int argc, char *argv[], opts_t *o)
       {
          printf("--pv-vel %d 超过上限 %u pul/s (加 --force-caps 可放宽)\n",
                 o->pv_vel, CAP_VEL);
+         return EM_EXIT_USAGE;
+      }
+      if ((o->ramp_acc > (int)CAP_RAMP || o->ramp_dec > (int)CAP_RAMP) &&
+          !o->force_caps)
+      {
+         printf("--ramp-acc/--ramp-dec 超过上限 %u pul/s² (加 --force-caps 可放宽)\n",
+                CAP_RAMP);
          return EM_EXIT_USAGE;
       }
       if (o->pv_hold > (int)CAP_PV_HOLD && !o->force_caps)
@@ -659,6 +698,27 @@ int main(int argc, char *argv[])
                 em_modes_offset(a));
       else
          printf("      6060h 运行模式: 不在生效 RxPDO 里 -> 经 SDO 写\n");
+
+      /*
+       * 6083h/6084h 同理 —— 这两项是"PV 收了指令却不转"的第一嫌疑。
+       * 在生效 RxPDO 里就意味着主站每周期都在下发, 下发 0 则斜坡永远起不来。
+       */
+      if (em_ramp_offset(a) >= 0)
+         printf("      6083h/6084h 加减速度: 在生效 RxPDO 的 +%d -> 主站每周期下发 "
+                "%u/%u pul/s²\n", em_ramp_offset(a),
+                (unsigned)em_ramp_acc(a), (unsigned)em_ramp_dec(a));
+      else
+         printf("      6083h/6084h 加减速度: 不在生效 RxPDO 里 -> 主站不覆盖, "
+                "用驱动器自己的值\n");
+
+      /*
+       * 6081h 是本接口**唯一有意不驱动**的一项过程数据: 它只在 PP 下当轮廓速度用,
+       * 而 PP 是 slide_motion 的活。写出来是为了让"表里每一项都有交代"这件事完整 ——
+       * 上一版正是因为没人问"还有哪些项没写", 才让 6060h 和 6083h 先后出的事。
+       * (它在不在映射里由 em_dump_pdo 的处置表逐项列出, 这里不重算。)
+       */
+      printf("      6081h 轮廓速度: 本接口不做 PP -> **不驱动**, 主站下发 0 "
+             "(驱动器基线本来就是 0)\n");
    }
 
    /* ==================================================================
@@ -886,6 +946,20 @@ int main(int argc, char *argv[])
             printf("  PV 方向: %s\n", opt.pv_opposite
                    ? "第 1 根正向 / 第 2 根反向 (--pv-opposite, 已确认机械上安全)"
                    : "两轴同向 (缺省; 不知道机械关系时不互相拉开)");
+
+            /*
+             * 6083h/6084h —— PV 的斜坡。它们在生效 RxPDO 里, 主站每周期都在下发,
+             * 不设就是下发 0, 而 0 让斜坡永远起不来 (症状: 驱动器收下速度指令、
+             * 606Ch 恒为 0、6064h 一步不走, 而所有断言都过)。所以这里是必做的一步,
+             * 不是可选的微调。
+             */
+            if (opt.ramp_acc == 0 || opt.ramp_dec == 0)
+               printf("  [WARN] --ramp-acc/--ramp-dec 传了 0: 本机驱动器在 PV 下会因此"
+                      "一步不走 (收下速度指令但斜坡起不来)\n");
+            for (i = 0; i < naxis; i++)
+               em_set_ramp(ax[i], (uint32_t)opt.ramp_acc, (uint32_t)opt.ramp_dec);
+            printf("  6083h/6084h 轮廓加减速度: %d/%d pul/s² (逐轴已写进输出镜像)\n",
+                   opt.ramp_acc, opt.ramp_dec);
 
             for (i = 0; i < naxis; i++)
                pv[i] = (i % 2 == 1 && opt.pv_opposite)

@@ -80,6 +80,18 @@ struct em_axis
     */
    int off_modes;
 
+   /*
+    * 6083h / 6084h 轮廓加减速度 (RxPDO)。**-1 = 不在生效映射里**。
+    *
+    * 和 6060h 同一个类: 在映射里就是主站拥有的, 每周期都在下发 —— 不写就是下发 0。
+    * 而 0 对 6083h 意味着"斜坡永远起不来"(见 em_ramp_acc 那段说明)。这两个是
+    * 本期新增的驱动项, 也是 em__pin_ramp() 存在的理由。
+    */
+   int      off_prof_acc;
+   int      off_prof_dec;
+   uint32_t prof_acc;   /* 每周期经过程数据下发的值 (pul/s²) */
+   uint32_t prof_dec;
+
    int off_act_pos;     /* 6064h 实际位置 (TxPDO) */
    int off_act_vel;     /* 606Ch 实际速度 (TxPDO) */
 
@@ -164,6 +176,7 @@ int em__cycle(em_bus_t *bus);
  */
 void     em__put_u8 (uint8_t *m, int off, uint8_t v);
 void     em__put_u16(uint8_t *m, int off, uint16_t v);
+void     em__put_u32(uint8_t *m, int off, uint32_t v);
 void     em__put_i32(uint8_t *m, int off, int32_t v);
 uint8_t  em__get_u8 (const uint8_t *m, int off);
 uint16_t em__get_u16(const uint8_t *m, int off);
@@ -171,6 +184,19 @@ int32_t  em__get_i32(const uint8_t *m, int off);
 
 /* 写 6040h 到输出镜像 (只写镜像, 下一帧才发出去) */
 void em__set_cw(em_axis_t *ax, uint16_t cw);
+
+/*
+ * 把"在生效 RxPDO 里、由主站拥有"的常量项重新写进本地输出镜像: 6083h / 6084h。
+ * (6060h 由 em_arm 自己钉, 因为它要用刚读到的 6061h 值。)
+ *
+ * **纯镜像写 —— 不发帧、不做 SDO。** 这一点是刻意的: 本函数会被放在使能之前,
+ * 而进 OP 之后的 SDO 往返正是上一期怀疑会让驱动器掉出 OP (WKC 3->1) 的诱因。
+ *
+ * 必须在**进 OP 之前**至少调用一次。主站一进 OP 就开始发帧, 而镜像里这两项在不写
+ * 的情况下是 0 (calloc 出来的) —— 也就是说, 连"只读观测"那次带 --allow-pdo 的运行
+ * 也在往驱动器下发 6083h = 0。
+ */
+void em__pin_ramp(em_axis_t *ax);
 
 /*
  * 写控制字 -> 每周期打过程数据 -> 等 6041h 满足 (sw & mask) == want。
