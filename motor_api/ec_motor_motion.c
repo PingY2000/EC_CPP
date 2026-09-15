@@ -79,6 +79,16 @@ int em_arm(em_axis_t *ax)
       return EM_R_FAIL;
    }
 
+   /*
+    * 6060h 在生效 RxPDO 里时, 把镜像那一字节**对齐到驱动器实际认的模式**。
+    *
+    * 这里读到的是驱动器自报的 6061h, 也就是"它现在按哪种模式解释 607Ah"。使能那一
+    * 帧如果镜像里的 6060h 与它不一致, 驱动器就会在我们刚刚钉好目标值之后换一种解释
+    * 方式 —— 钉目标值的意义就没了。重钉一次是零成本的, 而漂一次的代价是一次意外运动。
+    */
+   if (ax->off_modes >= 0)
+      em__put_u8(ax->out, ax->off_modes, (uint8_t)mode);
+
    switch (mode)
    {
       case EM_MODE_CSP:
@@ -658,25 +668,74 @@ int em_csp_move_abs(em_axis_t *ax, int32_t target, uint32_t vel, uint32_t tmo_ms
 
 int em_csp_move_rel(em_axis_t *ax, int32_t delta, uint32_t vel, uint32_t tmo_ms)
 {
-   int32_t cur;
-   int64_t tgt;
+   em_axis_t *one[1];
+   int32_t    d[1];
+   uint32_t   v[1];
 
    if (ax == NULL)
       return EM_R_FAIL;
-   if (em__cur_pos(ax, &cur) != EM_R_OK)
-   {
-      em__err("%s: 读不到当前实际位置 -> 相对运动没有起点, 拒绝", ax->label);
+
+   one[0] = ax;
+   d[0]   = delta;
+   v[0]   = vel;
+   return em_csp_move_rel_multi(one, d, v, 1, tmo_ms);
+}
+
+int em_csp_move_rel_multi(em_axis_t **axes, const int32_t *delta,
+                          const uint32_t *vel, int n, uint32_t tmo_ms)
+{
+   int32_t tgt[EM_MAX_AXES];
+   int32_t cur[EM_MAX_AXES];
+   int     i;
+
+   if (axes == NULL || delta == NULL || vel == NULL || n <= 0 || n > EM_MAX_AXES)
       return EM_R_FAIL;
+
+   /*
+    * 第一步: 把**所有**轴的起点取完, 一个字节都还没下发。
+    *
+    * 顺序很重要。如果取一根、下发一根, 各轴的起点就落在不同时刻、不同帧上 ——
+    * 而"两轴同时从各自此刻的位置出发"正是这个函数存在的理由。
+    * 先取完再算: 起点是**同一个决定时刻**的一组实际位置。
+    */
+   for (i = 0; i < n; i++)
+   {
+      if (axes[i] == NULL)
+         return EM_R_FAIL;
+      if (em__cur_pos(axes[i], &cur[i]) != EM_R_OK)
+      {
+         em__err("%s: 读不到当前实际位置 -> 相对运动没有起点, 拒绝 "
+                 "(一个轴取不到就不下发任何轴)",
+                 axes[i]->label);
+         return EM_R_FAIL;
+      }
    }
 
-   tgt = (int64_t)cur + (int64_t)delta;
-   if (tgt < -2147483647LL || tgt > 2147483647LL)
+   /* 第二步: 逐轴算绝对目标。越 32 位就整体拒绝 —— 不静默回绕。 */
+   for (i = 0; i < n; i++)
    {
-      em__err("%s: 当前位置 %d 加位移 %d 超出 32 位范围 -> 拒绝 (不静默回绕)",
-              ax->label, cur, delta);
-      return EM_R_FAIL;
+      int64_t t = (int64_t)cur[i] + (int64_t)delta[i];
+
+      if (t < -2147483647LL || t > 2147483647LL)
+      {
+         em__err("%s: 当前位置 %d 加位移 %d 超出 32 位范围 -> 拒绝 (不静默回绕)",
+                 axes[i]->label, cur[i], delta[i]);
+         return EM_R_FAIL;
+      }
+      tgt[i] = (int32_t)t;
    }
-   return em_csp_move_abs(ax, (int32_t)tgt, vel, tmo_ms);
+
+   /*
+    * 把基准显式打出来。用户要确认的就是"607Ah 相对于开始这一刻的实际位置",
+    * 那就让这句话出现在日志里, 而不是只存在于代码的意图中。
+    */
+   printf("  相对运动的起点 (调用这一刻各轴的实际位置):\n");
+   for (i = 0; i < n; i++)
+      printf("    %s: %d -> %d pul (位移 %d)\n", axes[i]->label, cur[i], tgt[i],
+             delta[i]);
+
+   /* 第三步: 一次下发 —— 所有轴共用同一个基准时刻、同一个周期帧 */
+   return em_csp_move_multi(axes, tgt, vel, n, tmo_ms);
 }
 
 /* ======================================================================
@@ -707,105 +766,192 @@ int em_pv_stop(em_axis_t *ax)
                       EM_STEP_TMO_MS, "PV 速度归零 (6041h bit12)");
 }
 
-int em_pv_run_for(em_axis_t *ax, int32_t vel, uint32_t hold_ms)
+/*
+ * 把所有轴的速度写 0 并打若干帧 —— 出事时的统一收尾。
+ *
+ * 多轴下这件事必须是"全部", 不是"出事那一根": 返回错误却留着别的轴在转, 比单轴时
+ * 更难收场。只写 0 不在这里断言 bit12 —— 断言留给调用方逐轴做, 因为一根没停住不该
+ * 让其余轴的停机流程走不完。
+ */
+static void em__pv_stop_all(em_axis_t **axes, int n)
+{
+   int i, k;
+
+   for (i = 0; i < n; i++)
+   {
+      if (axes[i] != NULL && axes[i]->off_target_vel >= 0)
+      {
+         em__set_cw(axes[i], EM_CW_ENABLE_OP);
+         em__put_i32(axes[i]->out, axes[i]->off_target_vel, 0);
+      }
+   }
+   for (k = 0; k < 20; k++)
+   {
+      if (axes[0] != NULL)
+         (void)em__cycle(axes[0]->bus);
+      em__sleep_ms(EM_POLL_MS);
+   }
+}
+
+int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_ms)
 {
    uint32_t t0;
-   int      reads = 0;
-   int      rc;
+   int      reads[EM_MAX_AXES];
+   int      i;
 
-   if (ax == NULL)
+   if (axes == NULL || vel == NULL || n <= 0 || n > EM_MAX_AXES)
       return EM_R_FAIL;
-   if (!em_pv_available(ax))
+
+   /*
+    * ---- 全部校验, 一根都不动 ----
+    * 多轴下"跑到一半才发现第 2 根不行"意味着一根在动、一根没动。所以这里全部查完
+    * 才写第一个字节。
+    */
+   for (i = 0; i < n; i++)
    {
-      em__err("%s: 60FFh (目标速度) 不在本轴实读的映射里 -> PV 做不了。"
-              "看 setup 时那条 [WARN] 与 em_dump_pdo 的输出", ax->label);
-      return EM_R_FAIL;
-   }
-   if (vel == 0)
-   {
-      em__err("%s: 目标速度是 0 -> 拒绝 (速度 0 是「不动」, 不是「尽快」)", ax->label);
-      return EM_R_FAIL;
-   }
-   if (em__check_motion_ready(ax, "PV") != EM_R_OK)
-      return EM_R_FAIL;
-   if (em_get_mode(ax) != EM_MODE_PV)
-   {
-      em__err("%s: 6061h 报当前模式 %d, 不是 PV(3)。先 em_disable() 再 "
-              "em_set_mode(ax, EM_MODE_PV)", ax->label, em_get_mode(ax));
-      return EM_R_FAIL;
+      em_axis_t *ax = axes[i];
+
+      if (ax == NULL)
+         return EM_R_FAIL;
+      if (!em_pv_available(ax))
+      {
+         em__err("%s: 60FFh (目标速度) 不在本轴实读的映射里 -> PV 做不了。"
+                 "看 setup 时那条 [WARN] 与 em_dump_pdo 的输出", ax->label);
+         return EM_R_FAIL;
+      }
+      if (vel[i] == 0)
+      {
+         em__err("%s: 目标速度是 0 -> 拒绝 (速度 0 是「不动」, 不是「尽快」)",
+                 ax->label);
+         return EM_R_FAIL;
+      }
+      if (em__check_motion_ready(ax, "PV") != EM_R_OK)
+         return EM_R_FAIL;
+      if (em_get_mode(ax) != EM_MODE_PV)
+      {
+         em__err("%s: 6061h 报当前模式 %d, 不是 PV(3)。先 em_disable() 再 "
+                 "em_set_mode(ax, EM_MODE_PV)", ax->label, em_get_mode(ax));
+         return EM_R_FAIL;
+      }
+      reads[i] = 0;
    }
 
-   printf("  ---- %s PV: 目标速度 %d pul/s, 跑 %ums ----\n", ax->label, vel,
-          (unsigned)hold_ms);
+   printf("  ---- PV: %d 根轴各跑自己的速度, 同周期下发, 跑 %ums ----\n",
+          n, (unsigned)hold_ms);
+   for (i = 0; i < n; i++)
+      printf("       %s: 目标速度 %d pul/s\n", axes[i]->label, vel[i]);
 
    t0 = em__now_ms();
    while ((int32_t)(em__now_ms() - t0) < (int32_t)hold_ms)
    {
       if (em_stop_requested())
       {
-         printf("  [中止] 停止请求 -> 速度写 0\n");
-         em__set_cw(ax, EM_CW_ENABLE_OP);
-         em__put_i32(ax->out, ax->off_target_vel, 0);
-         for (rc = 0; rc < 20; rc++)
-         {
-            (void)em__cycle(ax->bus);
-            em__sleep_ms(EM_POLL_MS);
-         }
+         printf("  [中止] 停止请求 -> 所有轴速度写 0\n");
+         em__pv_stop_all(axes, n);
          return EM_R_STOP;
       }
 
       /* 6040h 与 60FFh 都是过程数据, 每周期都得重发 */
-      em__set_cw(ax, EM_CW_ENABLE_OP);
-      em__put_i32(ax->out, ax->off_target_vel, vel);
-      (void)em__cycle(ax->bus);
-
-      if (ax->mirror_ok)
+      for (i = 0; i < n; i++)
       {
-         reads++;
+         em__set_cw(axes[i], EM_CW_ENABLE_OP);
+         em__put_i32(axes[i]->out, axes[i]->off_target_vel, vel[i]);
+      }
 
-         /*
-          * 跑的过程中也要盯着。PV 期间出故障或撞限位, 驱动器会自己停, 但主站若只顾
-          * 跑满 hold_ms 就会把"它已经停了"当成"跑完了" —— 那等于把一次异常说成正常。
-          */
+      /* >>> 一帧喂所有轴 —— "同时调用两个驱动器"就发生在这一行 <<< */
+      (void)em__cycle(axes[0]->bus);
+
+      /*
+       * 用**同一帧**的镜像逐轴检查。跑的过程中也要盯着: PV 期间出故障或撞限位,
+       * 驱动器会自己停, 但主站若只顾跑满 hold_ms 就会把"它已经停了"当成"跑完了" ——
+       * 那等于把一次异常说成正常。
+       */
+      for (i = 0; i < n; i++)
+      {
+         em_axis_t *ax = axes[i];
+
+         if (!ax->mirror_ok)
+            continue;
+         reads[i]++;
+
          if ((ax->sw & EM_SW_FAULT) != 0)
          {
-            printf("  [FAIL] 运行中 6041h bit3 = Fault (%s)\n",
-                   em_sw_describe(ax->sw));
-            em__set_cw(ax, EM_CW_ENABLE_OP);
-            em__put_i32(ax->out, ax->off_target_vel, 0);
+            printf("  [FAIL] %s: 运行中 6041h bit3 = Fault (%s)\n",
+                   ax->label, em_sw_describe(ax->sw));
+            em__pv_stop_all(axes, n);
             return EM_R_FAIL;
          }
          if ((ax->sw & EM_SW_OP_ENABLED) == 0)
          {
-            printf("  [FAIL] 运行中掉出 Operation enabled (%s)\n",
-                   em_sw_describe(ax->sw));
+            printf("  [FAIL] %s: 运行中掉出 Operation enabled (%s)\n",
+                   ax->label, em_sw_describe(ax->sw));
+            em__pv_stop_all(axes, n);
             return EM_R_FAIL;
          }
          if ((ax->sw & EM_SW_INTLIMIT) != 0)
          {
-            printf("  [FAIL] 运行中 6041h bit11 硬件限位有效 —— 撞到限位了, 速度写 0\n");
-            em__set_cw(ax, EM_CW_ENABLE_OP);
-            em__put_i32(ax->out, ax->off_target_vel, 0);
+            printf("  [FAIL] %s: 运行中 6041h bit11 硬件限位有效 —— 撞到限位了, "
+                   "所有轴速度写 0\n", ax->label);
+            em__pv_stop_all(axes, n);
             return EM_R_FAIL;
          }
       }
       em__sleep_ms(EM_POLL_MS);
    }
 
-   if (reads == 0)
+   /*
+    * 逐轴判"这趟读数到底有没有发生过"。整段 hold_ms 里一笔 6041h 都没取到, 上面那些
+    * "运行中检查"就是一次都没真正做过 —— 不能因为"没查到问题"就说这趟跑得正常。
+    */
+   for (i = 0; i < n; i++)
    {
-      /*
-       * 整段 hold_ms 里一笔 6041h 都没取到 —— 上面那些"运行中检查"一次都没真正做过。
-       * 不能因为"没查到问题"就说这趟跑得正常。
-       */
-      em__err("%s: 运行期间一笔完整的 6041h 都没取到, 那几条运行中检查一次都没生效 "
-              "-> 拒绝把这次当成成功", ax->label);
-      return EM_R_FAIL;
+      if (reads[i] == 0)
+      {
+         em__err("%s: 运行期间一笔完整的 6041h 都没取到, 那几条运行中检查一次都没生效 "
+                 "-> 拒绝把这次当成成功", axes[i]->label);
+         em__pv_stop_all(axes, n);
+         return EM_R_FAIL;
+      }
    }
 
-   printf("  跑满 %ums (期间 %d 次读数, 6041h=%s)\n", (unsigned)hold_ms, reads,
-          em_sw_describe(ax->sw));
-   return em_pv_stop(ax);
+   for (i = 0; i < n; i++)
+      printf("  %s: 跑满 %ums (期间 %d 次读数, 6041h=%s)\n", axes[i]->label,
+             (unsigned)hold_ms, reads[i], em_sw_describe(axes[i]->sw));
+
+   /*
+    * 停机: **先把所有轴的速度一起写 0, 再逐轴断言** bit12 (Speed = 0)。
+    *
+    * 不逐轴调 em_pv_stop(): 那个函数写完 0 就等在自己那根轴上, 于是第 2 根要等第 1 根
+    * 停稳了才开始减速 —— 多轴下这等于"先后停", 而我们要的是"一起停"。
+    * 写 0 是一次性的(下一帧就发出去), 断言才是要花时间的部分, 两者分开正好。
+    */
+   for (i = 0; i < n; i++)
+   {
+      em__set_cw(axes[i], EM_CW_ENABLE_OP);
+      em__put_i32(axes[i]->out, axes[i]->off_target_vel, 0);
+   }
+   for (i = 0; i < n; i++)
+   {
+      int rc = em__wait_sw(axes[i], EM_SW_PV_SPEED_ZERO, EM_SW_PV_SPEED_ZERO,
+                           EM_STEP_TMO_MS, "PV 速度归零 (6041h bit12)");
+
+      if (rc != EM_R_OK)
+         return rc;
+   }
+   return EM_R_OK;
+}
+
+int em_pv_run_for(em_axis_t *ax, int32_t vel, uint32_t hold_ms)
+{
+   em_axis_t *one[1];
+   int32_t    v[1];
+
+   if (ax == NULL)
+      return EM_R_FAIL;
+
+   one[0] = ax;
+   v[0]   = vel;
+   return em_pv_run_multi(one, v, 1, hold_ms);
 }
 
 /* ======================================================================

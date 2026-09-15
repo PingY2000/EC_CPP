@@ -288,6 +288,16 @@ int em_open(em_bus_t *bus, const char *ifname);
 void em_print_adapters(void);
 
 /*
+ * 把控制台输出代码页设成 UTF-8。**调用方应当在 main() 的第一句调它。**
+ *
+ * 本模块内部会在打日志时惰性调用一次, 但那只救得了**那之后**的输出。源码是 UTF-8,
+ * Windows 控制台默认是 GBK, 所以"在第一次打日志之前"打印的汉字会全是乱码 ——
+ * 实测把「多轴」打成「澶氳酱」。横幅恰好就在那个区间里, 所以别等它自己初始化。
+ * 幂等, 多调无妨。
+ */
+void em_console_init(void);
+
+/*
  * 毫秒睡眠。对外提供是因为**调用方写自己的过程数据循环时要用它**: 过程数据要持续
  * 打, 而"持续打"就得有个节拍 —— 光用空转会把一个核吃满, 而且那样打出去的帧间隔
  * 由 CPU 速度决定, 不是我们可以复现的。
@@ -401,10 +411,20 @@ int  em_axis_set_move_limit(em_axis_t *ax, uint32_t max_delta_pul);
 uint32_t em_axis_move_limit(const em_axis_t *ax);
 
 /*
- * 设定运行模式 (写 6060h, 再读 6061h 确认驱动器接受了)。
+ * 设定运行模式 (写 6060h, 再读 6061h 确认驱动器**认了**)。
  * **已使能时拒绝**: CiA402 规定模式只能在未使能时改。
+ *
+ * 传输方式由 setup 时实读决定 —— **6060h 在生效 RxPDO 里就走过程数据** (写输出镜像
+ * + 打帧等 6061h 跟上), 不在里面才走 SDO。理由是通用的: 对象只要在生效的 RxPDO 里,
+ * 它就是主站拥有的, 对它做 SDO 写会被下一帧撤销。真机上 6060h 正是这种情况 ——
+ * 曾经 SDO 写进去 6060h=8, 6061h 却一直读回 0, 因为主站每周期都在下发 6060h=0。
+ * 走哪条路可用 em_modes_via_pdo() 查。
  */
 int em_set_mode(em_axis_t *ax, int mode);
+
+/* 运行模式是不是经过程数据驱动的 (即 6060h 在生效的 RxPDO 里) */
+int em_modes_via_pdo(const em_axis_t *ax);
+int em_modes_offset(const em_axis_t *ax);   /* 6060h 的字节偏移, -1 = 不在映射里 */
 
 /* 读 6061h 实际生效的模式 */
 int em_get_mode(em_axis_t *ax);
@@ -486,6 +506,19 @@ int em_csp_move_abs(em_axis_t *ax, int32_t target, uint32_t vel, uint32_t tmo_ms
 int em_csp_move_rel(em_axis_t *ax, int32_t delta,  uint32_t vel, uint32_t tmo_ms);
 
 /*
+ * 多轴相对运动 (CSP) —— **起点由接口内部取**。
+ *
+ * 每根轴的 607Ah 目标 = "调用这一刻该轴的实际位置" + delta[i]。关键在"这一刻":
+ * 全部轴的起点在**同一个决定时刻、同一帧**上取, 然后一次下发。逐轴各调一次
+ * em_csp_move_rel() 的话, 各轴的起点落在不同时刻、不同帧上 —— 对"两轴同时"这种
+ * 用法, 那个差别正是要消除的东西。
+ *
+ * 取不到某根轴的实际位置就**整体拒绝**, 一个字节都不下发 (绝不拿 0 当当前位置)。
+ */
+int em_csp_move_rel_multi(em_axis_t **axes, const int32_t *delta,
+                          const uint32_t *vel, int n, uint32_t tmo_ms);
+
+/*
  * **多轴同周期下发。** 本接口的核心, 也是"同时调用两个驱动器"成立的地方:
  * 一个周期内给每根轴写各自的目标位置, 然后**发一帧喂所有轴**。
  * 各轴按自己的 vel 独立推进、独立判到位 —— 谁先到谁先停 (不是插补同起同停)。
@@ -497,6 +530,16 @@ int em_csp_move_multi(em_axis_t **axes, const int32_t *target, const uint32_t *v
 /* 速度模式: 写到 vel 跑 hold_ms, 再写 0 停, 并断言 6041h bit12 (Speed = 0) */
 int em_pv_run_for(em_axis_t *ax, int32_t vel, uint32_t hold_ms);
 int em_pv_stop(em_axis_t *ax);
+
+/*
+ * **多轴 PV 同周期下发。** 每根轴跑自己的 vel 跑满 hold_ms, 然后逐轴写 0 并断言
+ * 6041h bit12。
+ *
+ * 任一轴不合格 (缺 60FFh / vel 为 0 / 模式不是 PV / 有 Fault 或限位) 就**整体拒绝**,
+ * 一根都不动 —— 多轴下"跑到一半才发现第 2 根不行"意味着一根在动一根没动, 更难收场。
+ * 运行中任一根出故障或撞限位, **所有轴一起停**, 不留别的轴还在转。
+ */
+int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_ms);
 
 /*
  * 回零 (HM)。顺序: 未使能时写 6098h/6099h/609Ah/607Ch (写后回读) -> 6060h = 6

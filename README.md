@@ -60,13 +60,17 @@ cmake --build build-mingw --target slide_verify aliasinfo slide_motion sm_state 
 - `motor_api` / `motor_test` 是**多轴运动接口** (CSP 位置同步 / PV 速度 / HM 回零),
   与 `slide_motion` 的 SDO + PP 并列, 区别在于**目标值每周期经过程数据下发** ——
   CSP/PV 要求目标值每周期刷新, SDO 的 700 ms 往返追不上。同样**默认一个字节都不写**:
-  写 PDO 映射要 `--allow-pdo`, 使能/运动要 `--allow-motion` (+ 交互确认),
-  回零要 `--home` (它会撞限位、会找原点开关)。
+  写 PDO 映射要 `--allow-pdo`, 使能/运动要 `--allow-motion`, 回零要 `--home`
+  (它会撞限位、会找原点开关)。用 `--mode csp|pv` 选 S6 跑位置同步还是速度模式。
   **先不带任何 `--allow` 参数跑一次**: 它读完总线、打印实读的 PDO 映射与只读参数后
   就退出 0, 一个字节都不写。退出码 **10** 同理。
+  > **`--allow-motion` 本身就是那句确认, 运行时不再问一次 y/N** —— 别在脚本里顺手
+  > 加上它。(`slide_motion` 有交互确认, 这个工具没有。)
   > 它**不写死** `1600h`/`1A00h`, 而是先读 `1C12h`/`1C13h` 问"哪个 PDO 生效" ——
   > 本机 `1C12h` 指的是 **`1601h`**, `1600h` 是一张**没生效**的表。
-  > 详见 [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md) 的「PDO 映射」。
+  > 同理 `6060h`(运行模式) 就在 `1601h` 里, 所以它由过程数据驱动而不是 SDO ——
+  > 对它做 SDO 写会被下一帧撤销。详见
+  > [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md) 的「PDO 映射」。
 - 全部工具都依赖 **Npcap** 独占网卡 —— 与仓库的 python 链 (pysoem) 一样,
   **勿同时运行**。
 - 参数为网卡名 (Windows Npcap 形如 `\Device\NPF_{GUID}`),不带参数时列出可用网卡。

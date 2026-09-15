@@ -70,6 +70,16 @@ struct em_axis
    int off_target_pos;  /* 607Ah 目标位置 (RxPDO) —— CSP 要 */
    int off_target_vel;  /* 60FFh 目标速度 (RxPDO) —— PV 要 */
    int off_sw;          /* 6041h 状态字 (TxPDO) —— 硬要求 */
+
+   /*
+    * 6060h 运行模式 (RxPDO)。**-1 = 不在生效映射里**。
+    *
+    * 这一项必须和上面几个分开看: 那几项是"没有就拒绝"的硬要求, 而 6060h 是
+    * "在映射里就必须经过程数据驱动、不在映射里才能走 SDO" —— 两种事实两种走法,
+    * 由 setup 时实读决定。详见 em_set_mode() 里的注释。
+    */
+   int off_modes;
+
    int off_act_pos;     /* 6064h 实际位置 (TxPDO) */
    int off_act_vel;     /* 606Ch 实际速度 (TxPDO) */
 
@@ -152,8 +162,10 @@ int em__cycle(em_bus_t *bus);
  * 两者混起来看代码会误判"写成功"的含义 —— 一个是驱动器收下了, 一个只是我们改了
  * 自己的内存。
  */
+void     em__put_u8 (uint8_t *m, int off, uint8_t v);
 void     em__put_u16(uint8_t *m, int off, uint16_t v);
 void     em__put_i32(uint8_t *m, int off, int32_t v);
+uint8_t  em__get_u8 (const uint8_t *m, int off);
 uint16_t em__get_u16(const uint8_t *m, int off);
 int32_t  em__get_i32(const uint8_t *m, int off);
 

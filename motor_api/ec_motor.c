@@ -77,7 +77,16 @@ void em_clear_stop(void)     { g_stop = 0; }
 
 static int g_console_done = 0;
 
-static void em__console_init(void)
+/*
+ * 对外公开版。**调用方应当在 main() 的第一句调它** —— 理由见下。
+ *
+ * 本函数原来只被 em_bus_new()/em__err()/em__warn()/em__log() 惰性调用, 于是
+ * "在 em_bus_new() 之前打印的汉字"落在 GBK 代码页下, 全是乱码。这不是理论问题:
+ * motor_test 的横幅就在 em_bus_new() 之前, 实测把「多轴」打成「澶氳酱」
+ * (UTF-8 的 E5 A4 9A E8 BD B4 被按 GBK 解成 E5A4/9AE8/BDB4 三个字)。
+ * 卫兵只有这一份, 多调几次没关系。
+ */
+void em_console_init(void)
 {
    if (g_console_done)
       return;
@@ -90,6 +99,8 @@ static void em__console_init(void)
    SetConsoleOutputCP(CP_UTF8);
 #endif
 }
+
+static void em__console_init(void) { em_console_init(); }
 
 /* ======================================================================
  * 时钟与睡眠
@@ -171,6 +182,19 @@ void em_set_verbose(em_bus_t *bus, int on) { if (bus) bus->verbose = on ? 1 : 0;
  * memcpy 一个 uint16 就是小端表示。用 memcpy 而不是强制转换, 是为了不依赖
  * 偏移的对齐 (与 test2.c 的 set_cw 同一个理由)。
  * ====================================================================== */
+
+void em__put_u8(uint8_t *m, int off, uint8_t v)
+{
+   if (m != NULL && off >= 0)
+      m[off] = v;
+}
+
+uint8_t em__get_u8(const uint8_t *m, int off)
+{
+   if (m != NULL && off >= 0)
+      return m[off];
+   return 0;
+}
 
 void em__put_u16(uint8_t *m, int off, uint16_t v)
 {
@@ -422,9 +446,30 @@ typedef struct
 
 /*
  * RxPDO 必须含的三项。
- * 注意**没有 6060h**: 它是 8 bit, 往里塞一个非整字节项会给后面所有项的偏移带来
- * 对齐风险, 而运行模式本来就是"设一次"的配置量, 不是周期数据 —— 走 SDO, 在
- * 未使能时写一遍即可。少一类风险。
+ *
+ * ============================================================================
+ * 为什么**故意不把 6060h 列进来**
+ * ============================================================================
+ * 这张表是给 em_map_ensure() 用的: 列进来的项**缺失就补写 PDO 映射**。6060h 列进去
+ * 会带来两个后果: (1) 补写映射要 --allow-pdo, 于是"选一个运行模式"变成需要动映射的
+ * 操作; (2) 往表里插一项 8 bit 会**挪动它后面所有项的偏移**, 等于为了一个配置量去
+ * 改动整张表。
+ *
+ * 更要紧的是方向错了: 6060h 在不在生效 RxPDO 里**是个现场事实, 两种事实都能跑**,
+ * 各走各的传输 —— 在映射里就经过程数据驱动, 不在映射里才走 SDO。由 setup 时实读
+ * 得到的 ax->off_modes 决定(见 em_set_mode), 而不是靠"强制把它补进映射"来统一。
+ *
+ * ---------------------------------------------------------------------------
+ * 曾经写在这里的一条**错误结论**, 留个记号免得再犯:
+ *   原注释说"运行模式是设一次的量, 不是周期数据 —— 走 SDO, 未使能时写一遍即可"。
+ *   这句话在本机是**假的**。真机 1C12h 生效的是 1601h, 而 6060h 就是它的第 2 项,
+ *   位于输出镜像字节 +2。主站每周期把整块镜像原样发出去, 而这里从来不写 +2, 于是
+ *   主站一直在下发 6060h=0; 驱动器控制环连续采样 SM2, SDO 写进去的值下一帧就被
+ *   盖回去 —— 现象正是 6060h 对象回读 8、6061h 却读回 0。
+ *
+ * 通用教训: **对象只要在生效的 RxPDO 里, 它就是主站拥有的**, 必须经过程数据驱动;
+ * 对它做 SDO 写永远会被下一帧撤销。这一条与具体驱动器无关。
+ * ============================================================================
  */
 static const em_field_t EM_NEED_RX[] = {
    { EM_OID_CONTROLWORD, 0, 16, "6040h 控制字"        },
@@ -545,6 +590,29 @@ static int em_map_bits(const uint32_t *e, int n)
    for (i = 0; i < n; i++)
       bit += (int)(e[i] & 0xFFu);
    return bit;
+}
+
+/*
+ * 在**指定的**映射对象里查一个字段的字节偏移, 查不到返回 -1。
+ *
+ * 与 em_axis_bind() 的关系: 那个函数是"把一组需要的字段全查出来, 缺了硬的要拒绝";
+ * 本函数是"只问一个字段在不在、在哪"。查法完全一样(em_map_read + em_map_offset),
+ * 所以偏移一律是**实读**出来的, 没有一处写死。
+ *
+ * 用途是 6060h: 它属于"在映射里就得走过程数据"那一类, 不能塞进 EM_NEED_RX 的
+ * "缺了就补"语义里(理由见 EM_NEED_RX 上面那段)。
+ */
+static int em__find_field(em_bus_t *bus, int slave, uint16_t pdo_index,
+                          uint16_t index, uint8_t sub, int want_bits)
+{
+   uint32_t e[EM_MAP_MAX];
+   int      n = 0;
+
+   if (pdo_index == 0)
+      return -1;
+   if (em_map_read(bus, slave, pdo_index, 4, &n, e) != EM_R_OK)
+      return -1;
+   return em_map_offset(e, n, index, sub, want_bits);
 }
 
 /* 快照一个映射对象 (写之前取, 供收尾还原) */
@@ -1273,6 +1341,12 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
       ax->move_limit = EM_MAX_DELTA_DEF;
       ax->off_cw = ax->off_target_pos = ax->off_target_vel = -1;
       ax->off_sw = ax->off_act_pos = ax->off_act_vel = -1;
+      /*
+       * off_modes 必须显式置 -1。calloc 给它的是 0, 而 0 **是一个合法的偏移**
+       * (输出镜像的字节 0 正是 6040h 的低字节) —— 万一 setup 中途失败、后面又有谁
+       * 调 em_set_mode, 就会把运行模式写进控制字里。
+       */
+      ax->off_modes = -1;
       snprintf(ax->label, sizeof(ax->label), "轴%d(从站%d)", i, slave);
 
       bus->axis[i] = ax;
@@ -1398,6 +1472,28 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
          em__err("%s: 算出的偏移超出本从站的镜像区间 (Obytes=%u, Ibytes=%u) -> 拒绝",
                  ax->label, (unsigned)ax->Obytes, (unsigned)ax->Ibytes);
          return EM_R_FAIL;
+      }
+
+      /*
+       * 6060h 单独查 —— 它**不在** EM_NEED_RX 里, 所以不走上面那条 "缺了就补" 的路。
+       * 在生效映射里就必须经过程数据驱动, 不在里面才走 SDO。见 em_set_mode()。
+       */
+      ax->off_modes = em__find_field(bus, ax->slave, ax->rx_pdo,
+                                     EM_OID_MODES, 0, 8);
+      if (ax->off_modes >= 0)
+      {
+         if ((uint32_t)ax->off_modes + 1 > ax->Obytes)
+         {
+            em__err("%s: 6060h 算出的偏移 +%d 超出本从站输出镜像 (%u 字节) -> 拒绝",
+                    ax->label, ax->off_modes, (unsigned)ax->Obytes);
+            return EM_R_FAIL;
+         }
+         printf("  %s: 6060h 在生效 RxPDO 的 +%d -> 运行模式经过程数据驱动 "
+                "(SDO 写会被下一帧撤销)\n", ax->label, ax->off_modes);
+      }
+      else
+      {
+         printf("  %s: 6060h 不在生效 RxPDO 里 -> 运行模式走 SDO\n", ax->label);
       }
    }
 
@@ -1644,6 +1740,16 @@ uint32_t em_mirror_frames(const em_axis_t *ax) { return ax ? ax->frames : 0; }
 uint16_t em_rx_pdo(const em_axis_t *ax) { return ax ? ax->rx_pdo : 0; }
 uint16_t em_tx_pdo(const em_axis_t *ax) { return ax ? ax->tx_pdo : 0; }
 
+int em_modes_via_pdo(const em_axis_t *ax)
+{
+   return (ax != NULL && ax->off_modes >= 0);
+}
+
+int em_modes_offset(const em_axis_t *ax)
+{
+   return ax ? ax->off_modes : -1;
+}
+
 int em_is_enabled(const em_axis_t *ax)
 {
    if (ax == NULL || !ax->mirror_ok)
@@ -1719,17 +1825,87 @@ int em_set_mode(em_axis_t *ax, int mode)
    }
 
    want = (int8_t)mode;
-   if (em__wr_i8(ax, EM_OID_MODES, 0, want, "运行模式 6060h") != EM_R_OK)
-      return EM_R_FAIL;
 
-   /* 读 6061h 确认驱动器**接受了**: 6060h 写进去不等于它认这个模式 */
-   got = em_get_mode(ax);
-   if (got != mode)
+   /*
+    * ==================================================================
+    * 两条传输路径 —— 由 setup 时实读决定的 ax->off_modes 选
+    * ==================================================================
+    * 6060h 在生效的 RxPDO 里时, **它就是主站拥有的**: 主站每周期把整块输出镜像
+    * 原样发出去, 驱动器控制环连续采样 SM2, 所以 SDO 写进 6060h 的值下一帧就被
+    * 镜像里的值盖回去。真机现象正是 6060h 对象回读 8、6061h 却读回 0 ——
+    * SDO 那一侧"写成功"了, 驱动器认的却是过程数据里那个 0。
+    * 所以: 在映射里 -> 写镜像 + 打帧; 不在映射里 -> SDO 写。
+    */
+   if (ax->off_modes >= 0)
    {
-      em__err("%s: 写了 6060h=%d 但 6061h 读回 %d —— 驱动器没接受这个模式",
-              ax->label, mode, got);
-      return EM_R_FAIL;
+      uint32_t t0    = em__now_ms();
+      uint32_t got_f = 0;      /* 期间收到过多少完整帧 */
+
+      em__log(ax->bus, "%s: 6060h 在生效 RxPDO 的 +%d -> 经过程数据下发 %d",
+              ax->label, ax->off_modes, mode);
+
+      for (;;)
+      {
+         /*
+          * 每周期都重写这一字节。不是"多写一次": 确认期间只要它被任何路径改掉,
+          * 驱动器就会按别的模式理解 607Ah —— 重写是为了让它不可能漂。
+          */
+         em__put_u8(ax->out, ax->off_modes, (uint8_t)want);
+         (void)em__cycle(ax->bus);
+         got_f = ax->frames;
+
+         /*
+          * 读 6061h 确认驱动器**认了**。这是 SDO 读, 不是写 —— 读不会跟过程数据打架,
+          * 而 6061h (实际模式) 本来就不在 TxPDO 里。
+          */
+         got = em_get_mode(ax);
+         if (got == mode)
+            break;
+
+         if (em_stop_requested())
+         {
+            em__err("%s: 改运行模式期间收到停止请求 -> 中止", ax->label);
+            return EM_R_FAIL;
+         }
+         if ((int32_t)(em__now_ms() - t0) >= (int32_t)EM_STEP_TMO_MS)
+         {
+            /*
+             * 分清两种失败, 别都赖在"驱动器不接受"上: 一帧完整过程数据都没收到的
+             * 话, 6060h 根本没送到驱动器, 那是总线问题, 不是模式问题。
+             */
+            if (got_f == 0)
+            {
+               em__err("%s: %ums 内一帧完整过程数据都没收到 (short_frames=%u) "
+                       "-> 6060h 根本没送到驱动器, 这是总线问题不是模式问题",
+                       ax->label, (unsigned)EM_STEP_TMO_MS,
+                       (unsigned)ax->short_frames);
+            }
+            else
+            {
+               em__err("%s: 写了 6060h=%d (经过程数据 +%d, 期间收到 %u 帧) "
+                       "但 6061h 读回 %d —— 驱动器没接受这个模式",
+                       ax->label, mode, ax->off_modes, (unsigned)got_f, got);
+            }
+            return EM_R_FAIL;
+         }
+         em__sleep_ms(EM_POLL_MS);
+      }
    }
+   else
+   {
+      if (em__wr_i8(ax, EM_OID_MODES, 0, want, "运行模式 6060h") != EM_R_OK)
+         return EM_R_FAIL;
+
+      /* 读 6061h 确认驱动器**接受了**: 6060h 写进去不等于它认这个模式 */
+      got = em_get_mode(ax);
+      if (got != mode)
+      {
+         em__err("%s: 写了 6060h=%d (经 SDO) 但 6061h 读回 %d —— 驱动器没接受这个模式",
+                 ax->label, mode, got);
+         return EM_R_FAIL;
+      }
+   }
+
    em__log(ax->bus, "%s: 运行模式 = %d (%s)", ax->label, mode,
            (mode == EM_MODE_CSP) ? "CSP 位置同步" :
            (mode == EM_MODE_PV)  ? "PV 速度" :
@@ -2037,4 +2213,30 @@ void em_dump_pdo(em_bus_t *bus, int slave)
                    EM_NEED_RX, EM_NEED_RX_N, "RxPDO (主站 -> 驱动器, 输出镜像)");
    em_dump_one_map(bus, slave, EM_OID_TXPDO_ASSIGN, EM_OID_TXPDO0, EM_SM_TXPDO,
                    EM_NEED_TX, EM_NEED_TX_N, "TxPDO (驱动器 -> 主站, 输入镜像)");
+
+   /*
+    * 6060h 单独打印 —— 它**不在**上面那张"本接口需要的字段"表里(故意不列, 理由见
+    * EM_NEED_RX 上面那段), 但它恰恰是最容易出事的一项: 在生效 RxPDO 里就意味着
+    * 主站每周期都在下发它, SDO 写一律被下一帧撤销。所以它的偏移和传输方式必须看得见。
+    */
+   {
+      uint32_t ae[EM_MAP_MAX];
+      int      an = 0;
+
+      if (em_map_read(bus, slave, EM_OID_RXPDO_ASSIGN, 2, &an, ae) == EM_R_OK &&
+          an > 0)
+      {
+         uint16_t rx  = (uint16_t)(ae[0] & 0xFFFFu);
+         int      off = em__find_field(bus, slave, rx, EM_OID_MODES, 0, 8);
+
+         if (off >= 0)
+            printf("    6060h 运行模式: 在生效 RxPDO %04Xh 的 +%d 字节 "
+                   "-> **经过程数据驱动**\n"
+                   "        (对它做 SDO 写会被下一帧撤销: 主站每周期都在下发它)\n",
+                   (unsigned)rx, off);
+         else
+            printf("    6060h 运行模式: 不在生效 RxPDO %04Xh 里 -> 经 SDO 写\n",
+                   (unsigned)rx);
+      }
+   }
 }

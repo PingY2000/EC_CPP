@@ -17,11 +17,12 @@
  *   S2  **实读 PDO 映射 + 只读参数, 到此为止退出 0**  无需授权   <-- 先跑这一步!
  *   S3  补映射 (仅 RAM) + 建过程数据 + 证明偏移    需 --allow-pdo
  *   S4  (可选 DC +) 进 OP + 确认过程数据落地       需 --allow-pdo
- *   S5  两轴使能                                  需 --allow-motion (+ 交互确认)
- *   S6  CSP: 两轴各走不同距离, 同周期下发; 再走回    需 --allow-motion
- *   S7  PV:  两轴各跑一个速度, 到点停, 断言 bit12    需 --allow-motion
- *   S8  回零 (方式 24)                            需 --allow-motion --home
- *   S9  收尾 (无条件执行)                          总是跑
+ *   S5  两轴使能                                  需 --allow-motion
+ *   S6  CSP 或 PV (由 --mode 选): 同周期下发         需 --allow-motion
+ *         csp: 两轴各走不同距离 (相对各自的起点), 再走回
+ *         pv : 两轴各跑自己的速度, 到点停, 断言 bit12
+ *   S7  回零 (方式 24)                            需 --allow-motion --home
+ *   S8  收尾 (无条件执行)                          总是跑
  *
  * **强烈建议先只跑 S0~S2**(即不带任何 --allow 参数): 它一个字节都不写, 打印出的
  * 1600h/1A00h 实读值与推导偏移就是后面所有动作的事实依据。它会第一次回答"这台设备
@@ -30,8 +31,10 @@
  * ---- 安全边界 ----
  *   - 默认一个字节都不写。写 PDO 映射要 --allow-pdo, 使能/运动要 --allow-motion,
  *     回零要 --home (它会撞限位、会找原点开关)。
- *   - 给了 --allow-motion 之后**还会再问一次 y/N** —— 授权是启动时的意图, 确认是
- *     此刻的动作。
+ *   - **--allow-motion 本身就是那句确认, 运行时不会再问一次 y/N。** 命令行上的授权
+ *     是有意为之的动作, 不是提示符。所以别在脚本里顺手加上它 —— 加上就等于确认过了。
+ *     (这里曾经有一个交互确认, 后来去掉了: 在提示符那儿等的那几秒总线是静的, 驱动器
+ *     可能掉出 OP, 让"确认"本身变成一次故障源。)
  *   - 上限只能收紧不能放宽: --dist 默认 5000 / 上限 50000 pul; --vel 默认 5000 /
  *     上限 50000 pul/s。按 2400h 细分 = 50000 pul/圈 算, 默认值 ≈ 0.1 圈。放宽要
  *     --force-caps, 而且应当是有意的。
@@ -121,6 +124,7 @@ typedef struct
    int  pv_opposite;
    int  pv_hold;
    int  tmo;
+   int  mode;                     /* S6 跑哪种模式: EM_MODE_CSP / EM_MODE_PV */
    int  axis_given[EM_MAX_AXES];  /* 下标 = 总线位置, 1 = 显式选中 */
    int  naxis_given;
 } opts_t;
@@ -140,6 +144,9 @@ static void usage(const char *prog)
       "  --keep-mapping    收尾不还原 PDO 映射 (缺省还原)\n"
       "\n"
       "参数(只能收紧, 放宽要 --force-caps):\n"
+      "  --mode csp|pv     S6 跑哪种模式, 缺省 csp\n"
+      "                      csp = 位置同步 (6060h=8), 相对各自起点走 --dist\n"
+      "                      pv  = 速度模式 (6060h=3), 跑 --pv-hold\n"
       "  --dist N          CSP 位移, 缺省 %d, 上限 %u pul\n"
       "  --vel  N          CSP 速度, 缺省 %d, 上限 %u pul/s\n"
       "  --pv-vel N        PV 速度, 缺省 %d, 上限 %u pul/s\n"
@@ -174,6 +181,7 @@ static int parse_args(int argc, char *argv[], opts_t *o)
    o->pv_hold   = DEF_PV_HOLD;
    o->tmo       = DEF_TMO;
    o->cycle_us  = 2000;
+   o->mode      = EM_MODE_CSP;
 
    for (i = 1; i < argc; i++)
    {
@@ -190,6 +198,27 @@ static int parse_args(int argc, char *argv[], opts_t *o)
       else if (strcmp(a, "--keep-mapping") == 0) o->keep_mapping = 1;
       else if (strcmp(a, "--force-caps") == 0)   o->force_caps = 1;
       else if (strcmp(a, "--pv-opposite") == 0)  o->pv_opposite = 1;
+      else if (strcmp(a, "--mode") == 0)
+      {
+         if (i + 1 >= argc)
+         {
+            printf("--mode 后面要跟 csp 或 pv (试 --help)\n");
+            return EM_EXIT_USAGE;
+         }
+         {
+            const char *m = argv[++i];
+
+            if (strcmp(m, "csp") == 0)
+               o->mode = EM_MODE_CSP;
+            else if (strcmp(m, "pv") == 0)
+               o->mode = EM_MODE_PV;
+            else
+            {
+               printf("--mode 只认 csp 或 pv, 不认「%s」(试 --help)\n", m);
+               return EM_EXIT_USAGE;
+            }
+         }
+      }
       else if (strcmp(a, "--dc") == 0)
       {
          o->use_dc = 1;
@@ -328,30 +357,6 @@ static int parse_args(int argc, char *argv[], opts_t *o)
 }
 
 /* ======================================================================
- * 交互确认
- *
- * 授权 (--allow-motion) 是**启动时**表达的意图; 这一问是**此刻**的动作确认。
- * 两者不是一回事: 授权一次, 后面每一步都靠它; 而"现在要不要让电机转起来"值得再问一次。
- * ====================================================================== */
-/*
-static int confirm(const char *what)
-{
-   char line[32];
-
-   printf("\n  >>> 即将: %s\n", what);
-   printf("  >>> 人在设备旁吗? 手在物理急停上吗? 确认请输 y (其它任何输入都算取消): ");
-   fflush(stdout);
-
-   if (fgets(line, sizeof(line), stdin) == NULL)
-   {
-      printf("\n  (读不到输入 -> 视为取消)\n");
-      return 0;
-   }
-   return (line[0] == 'y' || line[0] == 'Y');
-}
-*/
-
-/* ======================================================================
  * 小工具
  * ====================================================================== */
 
@@ -425,12 +430,20 @@ int main(int argc, char *argv[])
    int          maybe_live = 0;
    int          rc, i;
 
+   /*
+    * 第一句就设控制台代码页。放在 parse_args 之前是刻意的: parse_args 自己会打印
+    * 中文错误信息 (未知参数 / --mode 值不对 / 超上限), 而那些都是在原来那句
+    * SetConsoleOutputCP 之前打的 —— 于是"报错的那几行"恰好是乱码的那几行, 最该
+    * 看清的时候看不清。放这儿两种都没有了。
+    */
+   em_console_init();
+
    signal(SIGINT, on_ctrl_c);
 
    rc = parse_args(argc, argv, &opt);
    if (rc != EM_EXIT_OK)
       return rc;
-   SetConsoleOutputCP(CP_UTF8);
+
    printf("test motor_test - 多轴 CiA402 接口验收 (%s)\n", em_version());
    printf("网卡: %s\n", opt.ifname);
    printf("授权: --allow-pdo=%s --allow-motion=%s --home=%s%s\n",
@@ -635,6 +648,17 @@ int main(int argc, char *argv[])
              (unsigned)em_rx_pdo(a), (unsigned)em_tx_pdo(a),
              em_csp_available(a) ? "可用" : "**不可用**",
              em_pv_available(a) ? "可用" : "**不可用**");
+
+      /*
+       * 6060h 走哪条路 —— 这一行是给"运行模式改不动"那种故障用的。
+       * 若它写着"经过程数据", 那么对 6060h 做 SDO 写一定不生效 (下一帧就被镜像盖回去),
+       * 别再往 SDO 那个方向查了。
+       */
+      if (em_modes_via_pdo(a))
+         printf("      6060h 运行模式: 在生效 RxPDO 的 +%d -> 经**过程数据**下发\n",
+                em_modes_offset(a));
+      else
+         printf("      6060h 运行模式: 不在生效 RxPDO 里 -> 经 SDO 写\n");
    }
 
    /* ==================================================================
@@ -707,26 +731,20 @@ int main(int argc, char *argv[])
       goto out;
    }
 
-   {
-      char what[512];
-
-      if (opt.allow_home)
-         snprintf(what, sizeof(what),
-                  "两轴使能(带电) -> CSP 各走 %d pul 再走回 -> PV 跑 %dms -> "
-                  "回零(方式 24, 会去找原点开关、可能撞限位)",
-                  opt.dist, opt.pv_hold);
-      else
-         snprintf(what, sizeof(what),
-                  "两轴使能(带电) -> CSP 各走 %d pul 再走回 -> PV 跑 %dms",
-                  opt.dist, opt.pv_hold);
-      /*
-      if (!confirm(what))
-      {
-         printf("  已取消 —— 电机不会带电\n");
-         exit_code = EM_EXIT_OK;
-         goto out;
-      }*/
-   }
+   /*
+    * 这里不再有 y/N 交互确认 —— **--allow-motion 本身就是那句确认**。
+    * 命令行上写下它是有意为之的动作。既然不再等输入, 就把"接下来会发生什么"先打出来,
+    * 让操作员在电机带电之前看到这趟要多远/多久。
+    */
+   printf("  即将(带电): %d 根轴 ", naxis);
+   if (opt.mode == EM_MODE_CSP)
+      printf("CSP 各走 %d pul 再走回", opt.dist);
+   else
+      printf("PV 各跑 %ums%s", opt.pv_hold,
+             opt.pv_opposite ? " (第 2 根反向)" : "");
+   if (opt.allow_home)
+      printf(" -> 回零(方式 24, 会去找原点开关、可能撞限位)");
+   printf("\n");
 
    rc = em_enable_all(bus);
    if (rc != EM_EXIT_OK)
@@ -751,26 +769,41 @@ int main(int argc, char *argv[])
       print_axis_live(em_axis(bus, i), "带电");
 
    /* ==================================================================
-    * S6 CSP: 两轴各走不同距离, 同周期下发; 再走回
+    * S6 CSP 或 PV —— 由 --mode 选
+    *
+    * 两者是同一件事的两种做法: 都是"多轴、同一个周期帧、各轴下发各自的目标值"。
+    * 所以共用一个阶段 —— 公共前置(失能 -> 切模式 -> 使能)完全一样, 只有下发什么
+    * 不一样。分成两段写会让那套前置重复一遍。
     * ================================================================== */
-   printf("\n==== S6 CSP (位置同步模式, 6060h=8) ====\n");
+   printf("\n==== S6 %s (6060h=%d) ====\n",
+          (opt.mode == EM_MODE_CSP) ? "CSP 位置同步模式" : "PV 速度模式",
+          opt.mode);
 
    {
-      int32_t  start[EM_MAX_AXES];
-      int32_t  tgt[EM_MAX_AXES];
-      uint32_t v[EM_MAX_AXES];
-      int      can_csp = 1;
+      int32_t  d[EM_MAX_AXES];    /* CSP: 相对位移 (去程正向 / 回程取负) */
+      uint32_t v[EM_MAX_AXES];    /* CSP: 各轴速度 */
+      int32_t  pv[EM_MAX_AXES];   /* PV:  各轴速度 (可负) */
+      int      can = 1;
 
       for (i = 0; i < naxis; i++)
       {
          ax[i] = em_axis(bus, i);
-         if (!em_csp_available(ax[i]))
-            can_csp = 0;
+         if (opt.mode == EM_MODE_CSP)
+         {
+            if (!em_csp_available(ax[i]))
+               can = 0;
+         }
+         else
+         {
+            if (!em_pv_available(ax[i]))
+               can = 0;
+         }
       }
 
-      if (!can_csp)
+      if (!can)
       {
-         printf("  有轴的 607Ah/6064h 不在映射里 -> 跳过 CSP (不影响后面的 PV/回零)\n");
+         printf("  有轴的 %s 不在映射里 -> 跳过 S6 (不影响后面的回零)\n",
+                (opt.mode == EM_MODE_CSP) ? "607Ah/6064h" : "60FFh");
       }
       else
       {
@@ -778,14 +811,15 @@ int main(int argc, char *argv[])
          rc = em_disable_all(bus);
          if (rc != EM_EXIT_OK)
          {
-            printf("  先失能以便切模式, 但失能失败 -> 不再继续 (不要在使能状态下改模式)\n");
+            printf("  先失能以便切模式, 但失能失败 -> 不再继续 "
+                   "(不要在使能状态下改模式)\n");
             exit_code = EM_EXIT_FAIL;
             goto out;
          }
 
          for (i = 0; i < naxis; i++)
          {
-            if (em_set_mode(ax[i], EM_MODE_CSP) != EM_EXIT_OK)
+            if (em_set_mode(ax[i], opt.mode) != EM_EXIT_OK)
             {
                exit_code = EM_EXIT_FAIL;
                goto out;
@@ -799,122 +833,82 @@ int main(int argc, char *argv[])
             goto out;
          }
 
-         /*
-          * 方向交替: 第 1 根 +dist, 第 2 根 -dist, 第 3 根 +dist ...
-          * 这样几根轴在**同一个周期帧**里下发的是**不同**的目标 —— "同时驱动多台"才
-          * 真的被测到。全都朝同一方向走同样的距离, 用一根轴的逻辑也能糊过去。
-          * 起点取镜像里的实际位置 (S4 已经确认过镜像可信)。
-          */
-         for (i = 0; i < naxis; i++)
+         if (opt.mode == EM_MODE_CSP)
          {
-            int32_t cur = em_pos(ax[i]);
-
-            start[i] = cur;
-            tgt[i]   = cur + ((i % 2 == 0) ? opt.dist : -opt.dist);
-            v[i]     = (uint32_t)opt.vel;
-         }
-
-         printf("  两轴各走各的, 同一个周期帧下发:\n");
-         for (i = 0; i < naxis; i++)
-            printf("    %s: %d -> %d pul\n", em_axis_label(ax[i]), start[i], tgt[i]);
-
-         rc = em_csp_move_multi(ax, tgt, v, naxis, (uint32_t)opt.tmo);
-         if (rc != EM_EXIT_OK)
-         {
-            printf("  CSP 去程%s\n", (rc == 1) ? "被中止" : "失败");
-            exit_code = (rc == 1) ? EM_EXIT_OK : EM_EXIT_FAIL;
-            goto out;
-         }
-
-         /* 再走回起点 —— 只去不回的话, 下一次跑就从别的地方开始了 */
-         printf("\n  再一起走回起点:\n");
-         for (i = 0; i < naxis; i++)
-            printf("    %s: %d -> %d pul\n", em_axis_label(ax[i]), tgt[i], start[i]);
-
-         rc = em_csp_move_multi(ax, start, v, naxis, (uint32_t)opt.tmo);
-         if (rc != EM_EXIT_OK)
-         {
-            printf("  CSP 回程%s\n", (rc == 1) ? "被中止" : "失败");
-            exit_code = (rc == 1) ? EM_EXIT_OK : EM_EXIT_FAIL;
-            goto out;
-         }
-      }
-   }
-
-   /* ==================================================================
-    * S7 PV: 两轴各跑一个速度
-    * ================================================================== */
-   printf("\n==== S7 PV (速度模式, 6060h=3) ====\n");
-
-   {
-      int can_pv = 1;
-
-      for (i = 0; i < naxis; i++)
-      {
-         if (!em_pv_available(em_axis(bus, i)))
-            can_pv = 0;
-      }
-
-      if (!can_pv)
-      {
-         printf("  有轴的 60FFh 不在映射里 -> 跳过 PV\n");
-      }
-      else
-      {
-         rc = em_disable_all(bus);
-         if (rc != EM_EXIT_OK)
-         {
-            printf("  先失能以便切模式, 但失能失败 -> 不再继续\n");
-            exit_code = EM_EXIT_FAIL;
-            goto out;
-         }
-
-         for (i = 0; i < naxis; i++)
-         {
-            if (em_set_mode(em_axis(bus, i), EM_MODE_PV) != EM_EXIT_OK)
+            /*
+             * 方向交替: 第 1 根 +dist, 第 2 根 -dist, 第 3 根 +dist ...
+             * 这样几根轴在**同一个周期帧**里下发的是**不同**的目标 —— "同时驱动多台"
+             * 才真的被测到。全都朝同一方向走同样的距离, 用一根轴的逻辑也能糊过去。
+             */
+            for (i = 0; i < naxis; i++)
             {
-               exit_code = EM_EXIT_FAIL;
-               goto out;
+               d[i] = (i % 2 == 0) ? opt.dist : -opt.dist;
+               v[i] = (uint32_t)opt.vel;
             }
-         }
 
-         /*
-          * 方向: **缺省两轴同向**。PV 期间没有任何位置约束, 两根轴反向跑就是让它们
-          * 在机械上互相拉开 —— 而本程序不知道这两根轴在机械上是什么关系 (是不是同一
-          * 个龙门的两侧)。知道安全的人可以加 --pv-opposite 把第 2 根轴反过来。
-          */
-         printf("  PV 方向: %s\n", opt.pv_opposite
-                ? "第 1 根正向 / 第 2 根反向 (--pv-opposite, 已确认机械上安全)"
-                : "两轴同向 (缺省; 不知道机械关系时不互相拉开)");
+            printf("  %d 根轴各走各的, 同一个周期帧下发 "
+                   "(目标位置以**调用这一刻各自的实际位置**为基准):\n", naxis);
 
-         rc = em_enable_all(bus);
-         if (rc != EM_EXIT_OK)
-         {
-            exit_code = EM_EXIT_FAIL;
-            goto out;
-         }
-
-         for (i = 0; i < naxis; i++)
-         {
-            int32_t pv = (i % 2 == 1 && opt.pv_opposite) ? -opt.pv_vel : opt.pv_vel;
-
-            rc = em_pv_run_for(em_axis(bus, i), pv, (uint32_t)opt.pv_hold);
+            /* 去程 —— 基准由接口内部取 (em_csp_move_rel_multi) */
+            rc = em_csp_move_rel_multi(ax, d, v, naxis, (uint32_t)opt.tmo);
             if (rc != EM_EXIT_OK)
             {
-               printf("  %s PV %s\n", em_axis_label(em_axis(bus, i)),
-                      (rc == 1) ? "被中止" : "失败");
+               printf("  CSP 去程%s\n", (rc == 1) ? "被中止" : "失败");
                exit_code = (rc == 1) ? EM_EXIT_OK : EM_EXIT_FAIL;
                goto out;
             }
-            print_axis_live(em_axis(bus, i), "PV 停后");
+
+            /*
+             * 回程用**取负的同一组位移**, 而不是"回到 start[] 那个绝对位置"。
+             * 去程结束时 em_csp_move_multi 已经断言过 |实际 - 终点| <= 容差, 位置是
+             * 确认到了的。回程再拿一个旧绝对值去追, 只会让"中间丢了步"这件事在日志里
+             * 更难看出来 —— 相对回来则把误差如实留在原地。
+             */
+            printf("\n  再一起走回 (位移取负, 相对此刻的实际位置):\n");
+            for (i = 0; i < naxis; i++)
+               d[i] = -d[i];
+
+            rc = em_csp_move_rel_multi(ax, d, v, naxis, (uint32_t)opt.tmo);
+            if (rc != EM_EXIT_OK)
+            {
+               printf("  CSP 回程%s\n", (rc == 1) ? "被中止" : "失败");
+               exit_code = (rc == 1) ? EM_EXIT_OK : EM_EXIT_FAIL;
+               goto out;
+            }
+         }
+         else
+         {
+            /*
+             * 方向: **缺省两轴同向**。PV 期间没有任何位置约束, 两根轴反向跑就是让它们
+             * 在机械上互相拉开 —— 而本程序不知道这两根轴在机械上是什么关系 (是不是同一
+             * 个龙门的两侧)。知道安全的人可以加 --pv-opposite 把第 2 根轴反过来。
+             */
+            printf("  PV 方向: %s\n", opt.pv_opposite
+                   ? "第 1 根正向 / 第 2 根反向 (--pv-opposite, 已确认机械上安全)"
+                   : "两轴同向 (缺省; 不知道机械关系时不互相拉开)");
+
+            for (i = 0; i < naxis; i++)
+               pv[i] = (i % 2 == 1 && opt.pv_opposite)
+                          ? -opt.pv_vel : opt.pv_vel;
+
+            /* 一次调用, 一帧喂所有轴 */
+            rc = em_pv_run_multi(ax, pv, naxis, (uint32_t)opt.pv_hold);
+            if (rc != EM_EXIT_OK)
+            {
+               printf("  PV %s\n", (rc == 1) ? "被中止" : "失败");
+               exit_code = (rc == 1) ? EM_EXIT_OK : EM_EXIT_FAIL;
+               goto out;
+            }
+            for (i = 0; i < naxis; i++)
+               print_axis_live(ax[i], "PV 停后");
          }
       }
    }
 
    /* ==================================================================
-    * S8 回零
+    * S7 回零
     * ================================================================== */
-   printf("\n==== S8 回零 (HM, 6060h=6) ====\n");
+   printf("\n==== S7 回零 (HM, 6060h=6) ====\n");
 
    if (!opt.allow_home)
    {
@@ -976,7 +970,7 @@ int main(int argc, char *argv[])
    exit_code = EM_EXIT_OK;
 
    /* ==================================================================
-    * S9 收尾 —— 无条件执行
+    * S8 收尾 —— 无条件执行
     * ================================================================== */
 out:
    /*
