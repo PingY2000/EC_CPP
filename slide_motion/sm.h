@@ -212,7 +212,7 @@ typedef struct
    uint8_t     sub;
    uint8_t     dt;         /* SM_DT_*, 仅决定符号性 */
    uint8_t     cmp;        /* SM_CMP_* */
-   uint8_t     dangerous;  /* 1 = 这一项漂移则禁止 S3/S4 (限位功能/电子齿轮等) */
+   uint8_t     dangerous;  /* 1 = 这一项漂移则禁止 S3/S4 (限位功能定义/行程当量) */
    uint32_t    tol_pct;    /* SM_CMP_PCT 用 */
    const char *label;      /* 中文名 */
 } sm_spec_t;

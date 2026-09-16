@@ -40,7 +40,8 @@
 **不能用 Qt 官方安装器那个 msvcrt 版 MinGW** —— 理由（工作线程 `printf` 崩在
 `msvcrt!_lock` 的完整链路）写在 [README.md](../README.md) 的「上位机 `hmi` (Qt)」一节
 和 [CMakePresets.json](../CMakePresets.json) 的 `hmi-qt-ucrt64` 里。
-下面 §12 之后若提到用 Qt 官方 MinGW 搭建，一律以这一条为准。
+**本文件里凡是提到构建工具链的地方（§11、§12…），一律以这一条为准** ——
+§11 原先写的"MSVC 2022 x64 / 别混 MinGW"是被实现推翻的旧设想，已就地标注。
 `scan/` 与 `hmi/` 用**同一个 preset**（`EC_BUILD_SCAN` 默认跟随 `EC_BUILD_HMI`），
 所以这条约束对它同样成立，且没有第二条 configure 命令需要维护。
 
@@ -80,7 +81,7 @@ Qt 上位机如果直接链 `sm_*.c` 的源文件，就是把这件事放大成�
 ```text
 EC_CPP/
 ├─ CMakeLists.txt              # project(EC_CPP LANGUAGES C CXX) + option(EC_BUILD_HMI OFF)
-├─ CMakePresets.json           # 新增 preset: hmi-msvc (与现有 build/ build-mingw 隔离)
+├─ CMakePresets.json           # 新增 preset (实际叫 hmi-qt-ucrt64; 与 build/ build-mingw 隔离)
 ├─ SOEM/                       # 不动
 │
 ├─ ecat_core/                  # ★新: 无 Qt 依赖的静态库 (C++17, 内部可继续用 C 风格)
@@ -125,7 +126,7 @@ EC_CPP/
 │   │   ├─ panel_pdo_mirror.cpp    # ★过程数据镜像 + 位级标注
 │   │   ├─ panel_state_machine.cpp # 6040h/6041h 位灯 + 切换 + 通道指示
 │   │   ├─ panel_od_browser.cpp    # 对象字典 (SDO 读; 写需解保险)
-│   │   ├─ panel_pdo_map.cpp       # 1C12h/1C13h/1600h/1A00h + 推导出的偏移
+│   │   ├─ panel_pdo_map.cpp       # 1C12h/1C13h + 它们指到的那张映射对象 + 推导偏移
 │   │   ├─ panel_baseline.cpp      # 基线 diff
 │   │   ├─ panel_motion.cpp        # 使能 / 微动 / 回零 (PP)
 │   │   ├─ panel_jitter.cpp        # DC 周期抖动 vs 2217h 阈值
@@ -338,9 +339,14 @@ Windows 上 DC 抖动超阈值会报同步帧错误（`test2 --dc` 那条 `WKC=-
 - 顶层改成 `project(EC_CPP LANGUAGES C CXX)`（加 `CXX` 才能引 Qt）。
 - **`option(EC_BUILD_HMI "构建 Qt 上位机" OFF)`，默认关** ——
   没装 Qt 的人仍然能构建 CLI，现有工作流与 CI 不受影响。
-- Qt 6 LTS + **MSVC 2022 x64**：`SOEM/oshw/win32/wpcap` 里是 MSVC 格式的 `.lib`，
-  别在 HMI 上混 MinGW。用 `qt_standard_project_setup()` + `qt_add_executable`。
-- 构建隔离：`CMakePresets.json` 加独立 preset `hmi-msvc`，
+- ~~Qt 6 LTS + **MSVC 2022 x64**：`SOEM/oshw/win32/wpcap` 里是 MSVC 格式的 `.lib`，
+  别在 HMI 上混 MinGW。~~
+  **这条已被实现推翻**：实际用的是 **MSYS2 UCRT64 的 MinGW + `hmi-qt-ucrt64`
+  preset（Ninja）**，`wpcap.lib`/`Packet.lib` 由 MinGW 直接链接，没有任何问题；
+  真正的约束不是"别混 MinGW"，而是**界面用的 Qt 必须与 SOEM 同一套 CRT**
+  （见 §0 末段与 [hmi_click_position.md](hmi_click_position.md) §6.1）。
+  仍然保留的一半：用 `qt_standard_project_setup()` + `qt_add_executable`。
+- 构建隔离：`CMakePresets.json` 加独立 preset（实际叫 **`hmi-qt-ucrt64`**），
   避免与现有 `build/`（VS）和 `build-mingw`（Ninja + MinGW）互相污染。
 - 打包：`windeployqt` + Npcap 运行时（`wpcap.dll` / `Packet.dll`）+ 需管理员说明。
   GUI 启动时**自检网卡能否打开**，失败要给出 CLI 退出码 1 那种明确原因
@@ -349,22 +355,21 @@ Windows 上 DC 抖动超阈值会报同步帧错误（`test2 --dc` 那条 `WKC=-
   QCustomPlot 也是 GPL。内部调试台无所谓；若将来要闭源交付，
   自己在 `QWidget::paintEvent` 里画趋势图（位置/速度 vs 时间）可完全绕开。
 
+> **下面这段骨架里的 `target_link_libraries(... PRIVATE ... soem)` 是不能照抄的**
+> —— SOEM 的 `target_compile_options(soem PUBLIC $<$<C_COMPILER_ID:GNU>:-std=c11>)`
+> 没按语言设限，会经 PUBLIC 漏进 C++ 编译。实际写法是只引 `$<TARGET_FILE:soem>`
+> 并自己抄一份 include 目录，理由见 [hmi_click_position.md](hmi_click_position.md) §6.2。
+
 ```cmake
-# hmi/CMakeLists.txt 骨架
+# hmi/CMakeLists.txt 骨架 (源文件清单就是 §2 那棵树的叶子, 不在这里重复)
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 qt_standard_project_setup()
-qt_add_executable(hmi
-  main.cpp
-  bus/bus_worker.cpp  bus/cmd_queue.cpp  bus/recorder.cpp
-  model/slave_tree_model.cpp  model/od_model.cpp  model/pdo_model.cpp
-  safety/arm_controller.cpp  safety/state_lamp.cpp
-  panels/panel_connect.cpp  panels/panel_pdo_mirror.cpp
-  panels/panel_state_machine.cpp  panels/panel_od_browser.cpp
-  panels/panel_pdo_map.cpp  panels/panel_baseline.cpp
-  panels/panel_motion.cpp  panels/panel_jitter.cpp  panels/panel_trace.cpp
-)
-target_link_libraries(hmi PRIVATE Qt6::Widgets ecat_core soem)
-target_compile_options(hmi PRIVATE $<$<C_COMPILER_ID:MSVC>:/utf-8 /W3>)
+set(CMAKE_AUTOUIC OFF)          # 无 .ui 文件 (AUTOMOC 必须留着)
+qt_add_executable(hmi main.cpp <§2 各目录下的 .cpp>)
+target_link_libraries(hmi PRIVATE Qt6::Widgets ecat_core $<TARGET_FILE:soem>)
+target_compile_options(hmi PRIVATE
+  $<$<C_COMPILER_ID:GNU>:-Wall -Wextra>
+  $<$<C_COMPILER_ID:MSVC>:/utf-8 /W3>)
 ```
 
 ---
@@ -382,6 +387,12 @@ grep -rln "soem/soem.h" hmi/ | grep -v "bus/bus_worker.cpp" && exit 1
 # 3. 不许绕过 cia402.h 的位判据
 grep -rn "0x000F\|0x000f" hmi/ panels/ 2>/dev/null && exit 1
 ```
+
+> 第 3 条**会误伤一类合法写法**:`ecx_statecheck()` 自己就按 `0x000F` 掩状态,
+> 所以"检查 AL 错误位"的正确写法必然要提到 `0x000F`
+> (见 [ec_motor.c:1097](../motor_api/ec_motor.c#L1097) 那条注释)。
+> 落地时要么把这条改成"至少有一个 `0x000C` 判据", 要么只对"拿 `0x000F` 去判
+> 未使能"这一种用法报错, 不要按字面 grep。
 
 ---
 
