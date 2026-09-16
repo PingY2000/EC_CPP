@@ -18,4 +18,11 @@ if(EC_BUILD_HMI)
   add_subdirectory(hmi)
 endif()
 
+# 扫描采集上位机 (scan/)。**默认跟着 HMI 一起开** —— 它用的是同一个 Qt、同一个 preset,
+# 不为它再来一条 configure 命令。只想编 hmi 的人 -DEC_BUILD_SCAN=OFF 就行。
+option(EC_BUILD_SCAN "构建扫描采集上位机 (需要 Qt6 + C++ 编译器)" ${EC_BUILD_HMI})
+if(EC_BUILD_SCAN)
+  add_subdirectory(scan)
+endif()
+
 

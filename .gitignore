@@ -38,3 +38,6 @@ install_manifest.txt
 *.log
 Thumbs.db
 .DS_Store
+
+# ==== 扫描采集产物 (scan/ 默认写这里) ====
+/scan_out/

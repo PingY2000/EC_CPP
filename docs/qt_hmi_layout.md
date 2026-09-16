@@ -27,12 +27,22 @@
    `ecatworker.cpp` 里那些 `em_*` 换成 core 的接口即可，目录名不用动；
    `axispanel`/`mainwindow` 这两层与总线无关，基本可以原样留用。
 
+**2026-09-17 补**：`hmi/` 旁边又多了一个 [scan/](../scan/) —— 控制滑台**蛇形扫描**一个
+矩形区域、逐点读功率计、写 CSV 并画二维热力图的上位机（[docs/scan_sweep.md](scan_sweep.md)）。
+它对本节这两处偏离的处理方式是**继续走同一条路，而不是把 P1 提前**：`scan`
+**把 `hmi/ecatworker.cpp` 原样编进自己的目标**（同一个 2ms CSP 循环、同一套坐标零点与
+收尾护栏，只有一份实现），界面侧同样一个 `ecx_*` 都不碰。所以现在"同一套总线工作线程"
+有了**两个**调用方，`ecatworker` 事实上已经承担了 core 的职责 —— 将来抽 `ecat_core`
+时它是唯一要动的地方，两个界面都只是它的调用方。
+
 另外本节记录的这条环境事实值得单独记住：**界面用的 Qt 必须与 SOEM 同一套 CRT**。
 本机取 **MSYS2 UCRT64 仓库的 Qt 6**（`mingw-w64-ucrt-x86_64-qt6-base`），
 **不能用 Qt 官方安装器那个 msvcrt 版 MinGW** —— 理由（工作线程 `printf` 崩在
 `msvcrt!_lock` 的完整链路）写在 [README.md](../README.md) 的「上位机 `hmi` (Qt)」一节
 和 [CMakePresets.json](../CMakePresets.json) 的 `hmi-qt-ucrt64` 里。
 下面 §12 之后若提到用 Qt 官方 MinGW 搭建，一律以这一条为准。
+`scan/` 与 `hmi/` 用**同一个 preset**（`EC_BUILD_SCAN` 默认跟随 `EC_BUILD_HMI`），
+所以这条约束对它同样成立，且没有第二条 configure 命令需要维护。
 
 ---
 

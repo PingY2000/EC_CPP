@@ -107,14 +107,22 @@ void EcatThread::postCenterAll()
    }
 }
 
+void EcatThread::postRange(int32_t range)
+{
+   QMutexLocker lk(&m_mtx);
+   Cmd c; c.type = CMD_RANGE; c.value = range;
+   m_cmds.enqueue(c);
+}
+
 void EcatThread::setTarget(int axis, int32_t want_disp)
 {
    if (axis < 0 || axis >= EM_MAX_AXES)
       return;
 
    /* 夹在工作范围内。界面也会夹一次, 这里是第二道 —— 越界的目标不该只靠界面拦 */
-   if (want_disp >  HMI_RANGE) want_disp =  HMI_RANGE;
-   if (want_disp < -HMI_RANGE) want_disp = -HMI_RANGE;
+   int32_t range = m_range.load();
+   if (want_disp >  range) want_disp =  range;
+   if (want_disp < -range) want_disp = -range;
 
    QMutexLocker lk(&m_mtx);
    m_want[axis] = want_disp;
@@ -239,6 +247,7 @@ void EcatThread::drainCommands()
          case CMD_STOP:       doStop(); break;
          case CMD_ZERO:       doZero(c.axis); break;
          case CMD_CENTER:     doCenter(c.axis); break;
+         case CMD_RANGE:      doRange(c.value); break;
       }
    }
 }
@@ -464,6 +473,48 @@ void EcatThread::doCenter(int axis)
    setTarget(axis, 0);      /* 显示坐标 0 = 界面上那个正中 */
 }
 
+/*
+ * 改量程。**这一步有个必须绕开的陷阱**:
+ *
+ * interpolate() 是"先夹 m_tgt、再用 m_tgt 算 CSP 目标"的。所以如果把量程**改小**、
+ * 而滑台此刻正停在旧量程的边缘外, 那一夹就会把 m_tgt 拽回来 —— 那等于**凭空产生一次
+ * 运动, 而且是没人按过任何按钮的运动**。
+ *
+ * 所以这里的规矩是: 放大无条件允许(放大夹不到东西); 缩小只在新范围装得下所有轴的
+ * 当前 m_tgt 时才允许, 装不下就拒绝。**绝不为了迁就新量程去改 want/tgt。**
+ */
+void EcatThread::doRange(int32_t range)
+{
+   const int32_t old = m_range.load();
+
+   if (range < 1000)
+      range = 1000;                     /* 比 1 圈(50000)还小的量程没有意义, 兜个底 */
+
+   if (range >= old)
+   {
+      m_range.store(range);
+      note(QStringLiteral("量程已从 ±%1 改为 ±%2 脉冲 (只放大, 不产生任何运动)")
+              .arg(old).arg(range));
+      return;
+   }
+
+   /* 缩小 —— 逐轴确认装得下。m_tgt 是工作线程独占的, 这里读它不需要锁 */
+   for (int i = 0; i < m_naxis; i++)
+   {
+      if (m_tgt[i] > range || m_tgt[i] < -range)
+      {
+         note(QStringLiteral("量程改小被**拒绝**: 轴%1 当前下发目标 %2 超出新量程 ±%3。"
+                             "先把滑台走回新量程内 (或点「回中」) —— "
+                             "为了迁就新量程去夹一下目标就等于凭空下发一次运动")
+                 .arg(i).arg(m_tgt[i]).arg(range));
+         return;
+      }
+   }
+
+   m_range.store(range);
+   note(QStringLiteral("量程已从 ±%1 改为 ±%2 脉冲").arg(old).arg(range));
+}
+
 void EcatThread::tryInitOrigin()
 {
    if (m_naxis < 1)
@@ -487,14 +538,16 @@ void EcatThread::tryInitOrigin()
 
    m_origin_ready = true;
    note(QStringLiteral("零点是**连接时读到的位置**: 界面正中 = 现在这里, 可点范围 ±%1 脉冲 "
-                       "(50000 pul/圈 => ±10 圈)。换个零点用「把当前位置设为 0」")
-           .arg(HMI_RANGE));
+                       "(50000 pul/圈 => ±%2 圈)。换个零点用「把当前位置设为 0」")
+           .arg(m_range.load())
+           .arg(m_range.load() / 50000.0, 0, 'f', 1));
 }
 
 void EcatThread::interpolate(uint32_t dt_ms)
 {
    int32_t  want[EM_MAX_AXES];
    uint32_t vel [EM_MAX_AXES];
+   const int32_t range = m_range.load();
 
    {
       QMutexLocker lk(&m_mtx);
@@ -536,8 +589,8 @@ void EcatThread::interpolate(uint32_t dt_ms)
       }
 
       /* 显示坐标夹在工作范围内 —— 越界的目标不该只靠点击时那道夹 */
-      if (m_tgt[i] >  HMI_RANGE) m_tgt[i] =  HMI_RANGE;
-      if (m_tgt[i] < -HMI_RANGE) m_tgt[i] = -HMI_RANGE;
+      if (m_tgt[i] >  range) m_tgt[i] =  range;
+      if (m_tgt[i] < -range) m_tgt[i] = -range;
 
       /* 这就是 CSP: 每周期一次, 发的是绝对位置 (驱动器坐标) */
       (void)em_csp_set_target(ax, m_origin[i] + m_tgt[i]);
@@ -565,6 +618,7 @@ void EcatThread::publish(int wkc)
    t.naxis        = m_naxis;
    t.wkc          = wkc;
    t.expected_wkc = (m_bus != nullptr) ? em_expected_wkc(m_bus) : 0;
+   t.range        = m_range.load();
 
    for (int i = 0; i < m_naxis; i++)
    {

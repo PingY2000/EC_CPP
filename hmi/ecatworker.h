@@ -28,7 +28,14 @@
 
 /* ---------------------------------------------------------------- 参数 */
 
-/* 工作范围: ±500000 脉冲。50000 pul/圈 => ±10 圈 (2400h 实测 = 50000)。 */
+/* 工作范围**默认值**: ±500000 脉冲。50000 pul/圈 => ±10 圈 (2400h 实测 = 50000)。
+ *
+ * 它只是缺省 —— 真正的量程是 EcatThread::m_range, 可以经 postRange() 改。
+ * 加这一层是为了 scan/ (蛇形扫描采集): 它的区域默认 27 单位 = ±675000 脉冲,
+ * 比这里大。而量程在 interpolate() 里是**夹取**用的, 差一点就会把区域边缘悄悄削掉 ——
+ * 那种 bug 不报错, 只是永远扫不到边, 所以必须让它跟着区域参数走。
+ *
+ * hmi 自己从不调 postRange, 于是它拿到的永远是下面这个值, 行为与从前完全一致。 */
 #define HMI_RANGE       500000
 
 #define HMI_VEL_MIN       1000   /* pul/s, 约 0.02 圈/秒 */
@@ -69,6 +76,9 @@ struct BusTelem
    int      naxis     = 0;
    int      wkc       = 0;
    int      expected_wkc = 0;
+   /* 当前生效的量程 (脉冲)。默认 HMI_RANGE; scan/ 会经 postRange() 改成跟它的区域匹配,
+    * 界面靠它画量程、也靠它判断"我要的目标会不会被夹" */
+   int32_t  range     = HMI_RANGE;
    QString  note;                /* 最后一条给操作员看的话 */
    AxisTelem ax[EM_MAX_AXES];
 };
@@ -93,6 +103,7 @@ public:
    void postZeroHere(int axis);        /* 把当前位置设为显示坐标 0 */
    void postCenter(int axis);          /* 走到显示坐标 0 */
    void postCenterAll();
+   void postRange(int32_t range);      /* 改量程 (脉冲)。见 ecatworker.cpp 的 doRange */
 
    /* ---- GUI 线程调用: 每周期都要用的两个量, 加锁直接写 ---- */
    void setTarget(int axis, int32_t want_disp);
@@ -122,12 +133,13 @@ private:
    enum CmdType
    {
       CMD_LIST, CMD_CONNECT, CMD_DISCONNECT, CMD_ENABLE, CMD_DISABLE,
-      CMD_STOP, CMD_ZERO, CMD_CENTER
+      CMD_STOP, CMD_ZERO, CMD_CENTER, CMD_RANGE
    };
    struct Cmd
    {
-      CmdType type = CMD_STOP;
-      int     axis = -1;
+      CmdType type  = CMD_STOP;
+      int     axis  = -1;
+      int32_t value = 0;      /* CMD_RANGE 用 */
       QString text;
    };
 
@@ -139,6 +151,7 @@ private:
    void doStop();
    void doZero(int axis);
    void doCenter(int axis);
+   void doRange(int32_t range);
    void tryInitOrigin();
    void interpolate(uint32_t dt_ms);
    void publish(int wkc);
@@ -163,6 +176,11 @@ private:
    int32_t    m_origin[EM_MAX_AXES] = {0};
    int32_t    m_tgt   [EM_MAX_AXES] = {0};
    bool       m_fault_latched = false;
+
+   /* 当前量程 (脉冲)。**不是普通成员**: postRange 在工作线程里改它, 而 setTarget 在
+    * GUI 线程里读它 (夹取用), interpolate 又在工作线程里读 —— 所以用原子量, 不另加锁。
+    * 默认 HMI_RANGE, 于是 hmi 自己的行为一个字都不变。 */
+   std::atomic<int32_t> m_range{HMI_RANGE};
 
    std::atomic<bool> m_quit{false};
    bool       m_maybe_live = false;

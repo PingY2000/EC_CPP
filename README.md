@@ -12,11 +12,13 @@
 | [slide_motion/](slide_motion/) | 自有工具:**带动作**验收验证 (参数基线 → 使能状态机 → 微动与反馈闭环),**默认不动** |
 | ↳ `sm_state` / `sm_pdo` | 同目录下的两个**独立**专项小程序: 只验证 CiA402 状态机切换。`sm_state` 用 **SDO + PRE_OP**, `sm_pdo` 用 **PDO + OP** (会写 PDO 映射, 见下) |
 | [motor_api/](motor_api/) | 自有工具:**多轴 CiA402 运动接口** (位置同步 CSP / 速度 PV / 回零 HM) + 验收程序 `motor_test`。**至少支持同时驱动两台**, 目标值每周期经过程数据下发 |
-| [hmi/](hmi/) | 自有工具:**Qt Widgets 上位机** —— 两台滑台 ±500000 脉冲的 **CSP 点击定位界面** (点哪里去哪里 / 开机位置即零点 / 速度可调)。**默认不编**, 见下 |
+| [hmi/](hmi/) | 自有工具:**Qt Widgets 上位机 (手动调试台)** —— 两台滑台 ±500000 脉冲的 **CSP 点击定位界面** (点哪里去哪里 / 开机位置即零点 / 速度可调)。**默认不编**, 见下 |
+| [scan/](scan/) | 自有工具:**Qt Widgets 上位机 (自动采集)** —— 控制滑台**蛇形扫描**一个矩形区域, 逐点停、逐点读功率计、写 CSV 并画二维热力图。**共用 `hmi/` 的总线工作线程** (原样编进来, 不复制)。默认跟随 `EC_BUILD_HMI`, 见下 |
 | [baseline_ykd2205pe.ini](baseline_ykd2205pe.ini) | 示例参数基线 (由 `slide_motion --dump-baseline` 现场导出后人工审定) |
 | [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md) | YKD2205PE 对象速查与各工具的用法/退出码文档 |
 | [docs/slide_motion_verify.md](docs/slide_motion_verify.md) | `slide_motion` 的完整设计/安全须知/微动判据/实测记录 |
 | [docs/hmi_click_position.md](docs/hmi_click_position.md) | `hmi` (Qt 上位机) 的完整设计: 线程模型 / 坐标与零点 / CSP 插补 / 护栏 / 构建部署的坑 / 验收状态 |
+| [docs/scan_sweep.md](docs/scan_sweep.md) | `scan` (扫描采集) 的完整设计: 网格与蛇形 / 到位判据 / 状态机 / 功率计接口 / CSV 与断点续扫 / 量程算法 / 护栏 / 验收状态 |
 | [YKD2205PE.pdf](YKD2205PE.pdf) | 厂商手册 (参考) |
 
 顶层 `CMakeLists.txt` 通过 `add_subdirectory(SOEM)` 引用 SOEM 库,
@@ -25,7 +27,9 @@
 
 `hmi/` 由一个开关控制: `-DEC_BUILD_HMI=ON` 才会被 `add_subdirectory`。**默认 OFF**,
 所以没装 Qt 的机器照旧能编上面那些 CLI (那几条构建连 C++ 编译器都不需要有)。
-界面侧**不 include SOEM**、不调 `ecx_*`: 所有总线操作都在工作线程里, 见
+`scan/` 由 `EC_BUILD_SCAN` 控制, **默认值就是 `${EC_BUILD_HMI}`** —— 于是现有那条
+`cmake --preset hmi-qt-ucrt64` 一次把两个都编出来, 只想编 hmi 的人 `-DEC_BUILD_SCAN=OFF`。
+两个界面侧都**不 include SOEM**、不调 `ecx_*`: 所有总线操作都在工作线程里, 见
 [hmi/ecatworker.h](hmi/ecatworker.h) 顶部。
 
 ## 构建
@@ -46,6 +50,7 @@ cmake --build build-mingw --target slide_verify aliasinfo slide_motion sm_state 
 - `bin/sm_pdo.exe`
 - `bin/motor_test.exe`
 - `bin/hmi.exe` (仅当 `EC_BUILD_HMI=ON`)
+- `bin/scan.exe` / `bin/scan_selftest.exe` (仅当 `EC_BUILD_SCAN=ON`, 默认跟随 `EC_BUILD_HMI`)
 
 ### 上位机 `hmi` (Qt)
 
@@ -113,6 +118,39 @@ C:/msys64/ucrt64/bin/windeployqt6.exe --release --compiler-runtime \
 > 补拷进 `bin/`。`--no-translations` 是必须的: 否则会多出几十个
 > `bin/translations/*.qm`, 而 `.gitignore` 只忽略 `*.dll`/`*.exe`。
 
+### 上位机 `scan` (扫描采集)
+
+完整设计、安全须知与**哪些验收做了 / 哪些还没做**见
+[docs/scan_sweep.md](docs/scan_sweep.md)。
+
+**前置条件、工具链与上面那条 `hmi` 完全相同** —— 同一个 `hmi-qt-ucrt64` preset、
+同一套 UCRT64 Qt、同一条 `windeployqt6`。**不需要第二条 configure 命令**, 因为
+`EC_BUILD_SCAN` 默认就等于 `EC_BUILD_HMI`:
+
+```bash
+cmake --preset hmi-qt-ucrt64
+cmake --build out/build/hmi-qt-ucrt64            # 两个界面 + 自检一起编
+cmake --build out/build/hmi-qt-ucrt64 --target scan
+```
+
+**自检不需要设备, 也不需要网卡** (它只链 `Qt6::Core`, 用 `FakeBus` + 模拟功率计把
+整轮扫描跑完) —— 改完扫描逻辑先跑它, 几秒钟出结果:
+
+```bash
+PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
+# ... 143 passed, 0 failed
+```
+
+它只链 `Qt6Core`, 所以上面那条 `windeployqt6` (照 `bin/hmi.exe` 跑) 搬来的 DLL 就够它用了。
+
+> **`bin/scan.exe` 跟 `bin/hmi.exe` 是并存的两个程序, 不是两种模式。**
+> `hmi` 是手动调试台 (点哪里走哪里, 自己不会动); `scan` 管自动采集 (会自己走完一个
+> 区域, 一两个小时)。两者**编的是同一份 `hmi/ecatworker.cpp`** —— 2ms 的 CSP 插补循环、
+> 坐标与零点、收尾那套安全代码只有一份实现。改 `ecatworker` 两边一起变。
+
+默认参数下扫描的区域是 **27×27 单位** (1 单位 = 1 圈 = 50000 脉冲) ⇒
+**55×55 = 3025 点**, 线性估计约 **100 分钟**。
+
 ## 运行注意
 
 - `aliasinfo` 与 `slide_verify` 是**只读**的 (不进 OP、不写 6040h 控制字、不动电机)。
@@ -168,8 +206,29 @@ C:/msys64/ucrt64/bin/windeployqt6.exe --release --compiler-runtime \
   - 速度每轴一个滑块, 1000~100000 pul/s, 默认 20000。界面侧自己按实测 `dt` 做梯形插补
     (进近段自动减速), 不写 `6081h`, 也不走 `em_csp_move_multi`。
   - 它**不写** `2102h` (EEPROM)、**不动** `607Dh` 软限位、**不改** `2400h/2408h/2409h/2201h`。
+- `scan` (Qt 上位机, 自动采集) 与 `hmi` **同一套护栏**, 但它是**一段没人看着的长动作**
+  (默认参数下一趟约 100 分钟 / 3025 点), 所以额外注意:
+  - **方向盘没动过之前, 先跑一行。** 默认区域 27×27 单位 = **±13.5 圈 = ±675000 脉冲**,
+    这个行程是**算出来的, 不是量出来的** —— hmi 那边的 ±500000 是一个**选定的软量程**,
+    不是实测的机械行程, 机器上到底有没有 ±13.5 圈没人验过。
+    **第一次请把区域改成 `27 × 0.5` (分辨率 0.5) = 55 点、约 2 分钟**, 看方向和两端到不到位,
+    再决定要不要放开整片。硬件限位是真实存在的 (`2310h`: X1 = 正限位 / X2 = 负限位) ——
+    区域算错就是一头撞上去。
+  - 屏幕上的二维面板点哪里走哪里, 但**扫描进行中一律吞掉点击**, 要先按「中止」。
+  - **自动中止** (红色横幅 + 模态框): 掉出 OP / `6041h` bit3 故障 / **bit11 撞硬件限位** /
+    WKC 连续掉帧 / 丢帧或掉使能 / 有人从旁路改了目标 / 走到位超时 / CSV 写失败。
+    bit11 这一条是**最可能真触发**的那一条, 不是凑数的。
+  - 「暂停」「中止」都把目标冻在当前位置并**保持保持力矩** (故意不写 `6040h=0x0000`,
+    那是卸力, 滑台会因自重下滑)。「继续」会**重新走完当前点并重新采样**, 不会写进半点数据。
+  - 断点续扫 = 打开一个已存在的 CSV 继续追加。**几何参数对不上会拒绝**(并指出哪个变了);
+    「连接」会重设零点, 所以 CSV 里带一个 `zero_epoch`, 世代对不上时会要求你确认一次。
+  - 真功率计协议未定, 这一版只有**模拟源** (手输值 / 随机 / 读脚本文件)。
+  - 其余同 `hmi`: 启动后一个字节都不写; 「连接」「使能」各弹模态确认; 收尾顺序是
+    「先中止扫描」→ 失能 → 还原 PDO 映射 → 降 `PRE_OP` → 关网卡; 收尾未能确认失能时
+    模态告警 (= 退出码 **10** 的语义) —— 见到请立即断掉驱动器动力电源。
 - 全部工具都依赖 **Npcap** 独占网卡 —— 与仓库的 python 链 (pysoem) 一样,
-  **勿同时运行**。界面开着时同样独占: 别在它连着的时候再跑 CLI。
+  **勿同时运行**。界面开着时同样独占: 别在它连着的时候再跑 CLI, 也**别同时开
+  `hmi` 和 `scan`** —— 两个界面各有一份 `ecatworker`, 谁先连上谁占住网卡。
 - 参数为网卡名 (Windows Npcap 形如 `\Device\NPF_{GUID}`),不带参数时列出可用网卡。
 - 详细用法、输出示例与退出码见 [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md)
   (含 `sm_state`/`sm_pdo` 的选项与退出码表);
