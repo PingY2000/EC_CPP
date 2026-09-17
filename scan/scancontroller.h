@@ -29,7 +29,7 @@
  *
  *   · 掉出 OP / 连接断了
  *   · 任一轴 6041h bit3 故障  (EcatThread 已经会冻结目标, 但扫描必须停下来)
- *   · 任一轴 6041h bit11 撞硬件限位 (2310h X1/X2) —— 这一条最可能真触发
+ *   · 任一轴 6041h bit11 撞硬件限位 —— 这一条最可能真触发
  *   · WKC 连续若干帧不足 (拔网线就是这个表现)
  *   · 任一轴丢帧 (mirror_ok 掉) 或掉使能
  *   · 有人从**旁路**改了目标 (画布点击 / 回中) —— 扫描期间不允许, 见 externalWantChanged()
@@ -51,9 +51,17 @@
 
 namespace scan {
 
-/* 6041h bit11 = Internal limit active。2310h 实测 X1 = 正限位 / X2 = 负限位,
- * 撞上就是这一位置起来。见 docs/ykd2205pe_ci402.md:366-393 */
-#define SCAN_LIMIT_BIT   0x0800u
+/*
+ * 撞限位**不在这里判定** —— 读 AxisTelem::limit_active 那一个字段就够了。
+ *
+ * 它是 EcatThread::publish() 里由 ecatcmd::limit_hit() **一处**算出来的 (6041h bit11),
+ * 理由写在 ecatworker.h 那个函数上面: 从前这个判断在控制器 / 参数栏 / 画布三处各写
+ * 一遍, 而"分开算就会有一天两边说的不一样"。要改判定 (比如把 60FDh 拉进来) 只动那一处。
+ *
+ * 开关本身压着没有是**另一个问题**, 看 AxisTelem::dig_home / dig_pos / dig_neg
+ * (60FDh, 见 2310h~2312h 的功能映射: X0=原点 / X1=正限位 / X2=负限位)。
+ * 两者可能不一致, 而**中止只由 limit_active 决定**。
+ */
 
 /* 下发一个目标之后, 最多等它出现在遥测里多久 (ms)。见 externalWantChanged() */
 #define WANT_CONFIRM_MS   200

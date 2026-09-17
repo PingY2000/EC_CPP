@@ -2,6 +2,7 @@
 
 #include "mapcanvas.h"
 
+#include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDateTime>
@@ -20,12 +21,14 @@
 #include <QScrollArea>
 #include <QSpinBox>
 #include <QSplitter>
+#include <QStringList>
 #include <QStatusBar>
 #include <QThread>
 #include <QTimer>
 #include <QVBoxLayout>
 
 #include <cmath>
+#include <cstdio>
 
 namespace scan {
 
@@ -61,6 +64,11 @@ static const char *kOutDir = "scan_out";
  * 四种样子**都画满**(不搞"只在出问题时才显示"): 没连接时它坐在灰上, 于是"看不见灯"
  * 本身不会跟"灯灭了"混淆 —— 那正是"一个只在出问题时才出现的指示器"会骗人的地方。
  */
+/* 每一盏灯都带上的那一句。**放在这里而不是参数栏那个函数里**, 因为状态栏那两盏也用它 ——
+ * 悬停任何一盏都能学到同一条规矩, 否则"为什么使能是绿的、限位却是红的"只能去翻文档。 */
+static const char *kLampRule =
+   "\n\n灯亮 = 这件事正在发生; 灭 = 没发生; 灰 = 不知道。";
+
 static void paintLamp(QLabel *l, ScanWindow::Lamp s)
 {
    static const char *kCss[] = {
@@ -222,7 +230,7 @@ void ScanWindow::buildUi()
    connect(m_canvas, &MapCanvas::cellPicked, this, [this](int, int) { refresh(); });
 
    /* 右侧一列: 扫描参数 / 扫描控制 / 功率计 / 色标。**装进 QScrollArea** ——
-    * 这一列比窗口高是常态 (四组框加起来约 1140px, 而窗口里给它的位置通常只有 670),
+    * 这一列比窗口高是常态 (六组框加起来约 1330px, 而窗口里给它的位置通常只有 670),
     * 从前窗口一矮, 最下面的「色标」就被挤得看不见了, 而那正是操作员要改的东西。 */
    QWidget *side = new QWidget;
    side->setMinimumWidth(340);
@@ -230,9 +238,10 @@ void ScanWindow::buildUi()
    QVBoxLayout *sv = new QVBoxLayout(side);
    sv->setContentsMargins(0, 0, 0, 0);
    sv->setSpacing(8);
-   /* 「轴信号」排在最上面。这一列比窗口高是常态, 而它是**状态** ——
-    * 要滚才能看到的状态指示器不算状态指示器。它也就三行, 挤不掉什么 */
+   /* 「轴信号」和「限位开关」排在最上面。这一列比窗口高是常态, 而它们是**状态** ——
+    * 要滚才能看到的状态指示器不算状态指示器。两个框加起来也就七行, 挤不掉什么 */
    sv->addWidget(buildAxisPanel());
+   sv->addWidget(buildLimitPanel());
    sv->addWidget(buildParamPanel());
    sv->addWidget(buildScanPanel());
    sv->addWidget(buildMeterPanel());
@@ -282,13 +291,16 @@ void ScanWindow::buildUi()
    /* 限位两根轴各一个, **灯 + 字一起常显**。常显的理由: 没连接时它写 "--"、灯是灰的,
     * 于是"看不到它"本身不会跟"限位正常"混淆 —— 一个只在出问题时才出现的指示器,
     * 出问题时也未必有人正看着它 */
-   /* 同一套语法, 参数栏那六盏灯也用它 (见 buildAxisPanel):
-    * **灯亮 = 这个名字代表的事正在发生**。所以"没压着开关"是**灭灯**, 不是绿灯 ——
-    * 绿灯留给"使能带电", 常亮的东西多了就等于墙纸, 真出事那一秒就没人看得见了 */
+   /* 参数栏那两组灯用的是同一套语法 (见 kLampRule 与 buildAxisPanel/buildLimitPanel)。
+    *
+    * **这一盏说的是 bit11, 不是开关本身** —— 两者是两个问题, 而这一盏回答的是
+    * "会不会中止扫描"那一个。tooltip 必须说清, 否则它跟参数栏那六盏会被读成同一件事。 */
    const QString limTip = QStringLiteral(
-      "硬件限位信号灯 (6041h bit11)。\n"
-      "灰 = 没连接, 不知道该说什么; 灭 = 开关没被压住; 红 = 正压在开关上。\n"
-      "红的这一条**扫描中会自动中止** —— 区域算错就是一头撞上去。");
+      "硬件限位信号灯 (6041h bit11) —— **这一盏说的是「会不会中止扫描」**。\n"
+      "红亮 = 驱动器认为正压在硬件限位上, 扫描中会自动中止 (区域算错就是一头撞上去)。\n\n"
+      "它**不**等同于参数栏「限位开关」那六盏: 那一组说的是**开关本身压着没有** (60FDh)。\n"
+      "两者可能不一致 —— 不一致时**以这一盏为准**。扫描经过原点开关不会中止。")
+      + QString::fromUtf8(kLampRule);
 
    m_lampX = makeLamp(this, limTip);
    m_lampY = makeLamp(this, limTip);
@@ -360,10 +372,21 @@ QWidget *ScanWindow::buildTopBar()
 }
 
 /*
- * 每根轴三个信号: 使能 / 故障 / 限位。一个信号一个灯, 旁边跟一行字。
+ * 参数栏两块信号网格的列号。**列号 = 本组实际用到的最后一列 (= 信号数)** ——
+ * 这个值同时要交给 setColumnStretch, 单独写错一次就会凭空多出一个空列, 把前面几列
+ * 挤成一个字宽 (这个坑已经付过一次学费, 见 docs/scan_sweep.md §15 的踩坑表)。
+ * 所以列数只在这里写一遍, 上面造列和末尾拉伸都读它。
+ */
+enum { AX_ENABLED = 0, AX_FAULT = 1, AX_NCOL = 2 };
+enum { LIM_HOME = 0, LIM_POS = 1, LIM_NEG = 2, LIM_NCOL = 3 };
+
+/* 两块网格共用的那一句 kLampRule 定义在本文件顶部 (状态栏那两盏也要用)。 */
+
+/*
+ * 「轴信号」: 每根两个信号 (使能 / 故障), 第三行是跨全部列的「故障复位」按钮。
  *
  * 判据一律是**同一个规矩**: 灯亮 = 这个名字代表的事正在发生; 灭 = 没发生; 灰 = 不知道。
- * 使能灯是绿亮 (带电), 故障灯和限位灯是红亮 (出事了) —— 每一格旁边都有字, 所以"绿"
+ * 使能灯是绿亮 (带电), 故障灯是红亮 (出事了) —— 每一格旁边都有字, 所以"绿"
  * 不必再单独背一套含义。
  *
  * **名字写在表头上**, 不是每格重复一遍: 两行三列都写"使能 故障 限位"的话,
@@ -377,23 +400,18 @@ QWidget *ScanWindow::buildAxisPanel()
    g->setHorizontalSpacing(12);
    g->setVerticalSpacing(5);
 
-   static const char *kHead[3] = { "使能", "故障", "限位" };
-   /* 六盏灯共用的那一句。**每盏都带上** —— 悬停哪一盏都能学到同一条规矩,
-    * 否则"为什么使能是绿的、故障却是红的"只能去翻文档 */
-   static const char *kLampRule =
-      "\n\n灯亮 = 这件事正在发生; 灭 = 没发生; 灰 = 不知道。";
-   static const char *kTip[3] = {
+   m_axGrid.ncol = AX_NCOL;
+
+   static const char *kHead[AX_NCOL] = { "使能", "故障" };
+   static const char *kTip[AX_NCOL] = {
       "6041h bit2 —— 电机带电。\n"
       "未使能时点画布不会动: 这是「这个轴现在能不能走」的答案。",
 
       "6041h bit3 —— 驱动器故障位。\n"
-      "**扫描中置起会自动中止**; 清掉故障之前不要启扫。",
-
-      "6041h bit11 —— 正压在硬件限位开关上 (2310h X1 = 正 / X2 = 负)。\n"
-      "**扫描中会自动中止** —— 区域算错就是一头撞上去。"
+      "**扫描中置起会自动中止**; 用下面的「故障复位」清掉它再启扫。"
    };
 
-   for (int s = 0; s < 3; s++)
+   for (int s = 0; s < AX_NCOL; s++)
    {
       QLabel *h = new QLabel(QString::fromUtf8(kHead[s]), box);
       h->setStyleSheet(QStringLiteral("color:#6b7480;"));
@@ -406,18 +424,131 @@ QWidget *ScanWindow::buildAxisPanel()
       nm->setStyleSheet(QStringLiteral("color:#9aa3ae;"));
       g->addWidget(nm, i + 1, 0);
 
-      for (int s = 0; s < 3; s++)
+      for (int s = 0; s < AX_NCOL; s++)
       {
-         m_axLamp[i][s] = makeLamp(box, QString::fromUtf8(kTip[s])
-                                        + QString::fromUtf8(kLampRule));
-         m_axText[i][s] = new QLabel(box);
-         g->addWidget(lampUnit(box, m_axLamp[i][s], m_axText[i][s], 0), i + 1, s + 1);
+         m_axGrid.lamp[i][s] = makeLamp(box, QString::fromUtf8(kTip[s])
+                                             + QString::fromUtf8(kLampRule));
+         m_axGrid.text[i][s] = new QLabel(box);
+         g->addWidget(lampUnit(box, m_axGrid.lamp[i][s], m_axGrid.text[i][s], 0),
+                      i + 1, s + 1);
       }
    }
 
-   /* 多出来的宽度全给最后一列, 让灯和字都靠左排成一条;
-    * **列号只能是 0..3** —— 写到 4 会凭空多出一个空列, 把前面三列挤成一个字宽 */
-   g->setColumnStretch(3, 1);
+   /*
+    * 第三行: 「故障复位」跨满全部列。
+    *
+    * 它**不按故障灯决定可用性** —— 那盏灯是 30Hz 遥测推的, 永远滞后于驱动器,
+    * 拿它去灰掉按钮正是"两个指示器互相矛盾"那一类。没故障时按下去是**可证无害**的:
+    * 工作线程那条闸 (ecatcmd::axis_needs_reset) 会拦住并说明"一个字节都没写"。
+    * 这里只拦界面自己才知道的两件事: 没连接、扫描在跑 (见 onFaultResetClicked)。
+    */
+   m_btnFaultRst = new QPushButton(QStringLiteral("故障复位"), box);
+   m_btnFaultRst->setToolTip(QStringLiteral(
+      "清驱动器的故障位 (6040h bit7 上升沿)。\n\n"
+      "· **只对报了故障的轴做** (判据是 6041h bit3, 不是操作员点了哪个按钮);\n"
+      "  一根轴都没报故障时**一个字节都不会写** —— 点下去也安全。\n"
+      "· 复位的动作是**先写 6040h = 0x0000 (卸力) 再抬 bit7** —— bit7 是上升沿触发,\n"
+      "  不先把 0 压下去就构不成沿。所以它**不能**对一根健康的保持轴做: 会松开保持力矩。\n"
+      "· 复位成功后该轴停在**未使能**, 要接着走请重新点「使能」。\n"
+      "· 扫描进行中不能复位 —— 复位后该轴失能, 而失能轴扫不动。先「中止」。\n"
+      "· 每根轴最多 1 秒, 期间按钮不可用; 这段时间**不可中断**。\n"
+      "· 每次点击都会弹一次确认, 不做持久勾选。"));
+   connect(m_btnFaultRst, &QPushButton::clicked, this, &ScanWindow::onFaultResetClicked);
+   g->addWidget(m_btnFaultRst, 3, 0, 1, AX_NCOL + 1);
+
+   /* 多出来的宽度全给**本组最后一列** (不是写死 3), 让灯和字都靠左排成一条。
+    * 写成 AX_NCOL + 1 就会凭空多一个空列 —— 那正是上面那张警告说的坑 */
+   g->setColumnStretch(AX_NCOL, 1);
+   return box;
+}
+
+/*
+ * 「限位开关」: 每根三个信号 (原点 / 正限位 / 负限位), 第三行是可选的 60FDh 重映射。
+ *
+ * 与上面那块**分开两个框**, 理由不只是宽度: 这一组问的是**开关本身压着没有**,
+ * 而「轴信号 → 故障」和状态栏的「限位」问的是**驱动器会不会为此中止扫描**。
+ * 两者可能不一致, 而把它们并排放在一行里, 就会看起来像同一个问题的两个答案。
+ *
+ * 三个灯**纯显示, 不新增任何中止判据** —— 扫描区域本来就可能正好停在一个开关上,
+ * 用监视量去触发中止会白中止一趟一小时的活。会中止的仍然只有 6041h bit11。
+ */
+QWidget *ScanWindow::buildLimitPanel()
+{
+   QGroupBox *box = new QGroupBox(QStringLiteral("限位开关"), this);
+   QGridLayout *g = new QGridLayout(box);
+   g->setContentsMargins(6, 4, 6, 6);
+   g->setHorizontalSpacing(12);
+   g->setVerticalSpacing(5);
+
+   m_limGrid.ncol = LIM_NCOL;
+
+   static const char *kHead[LIM_NCOL] = { "原点", "正限位", "负限位" };
+   static const char *kTip[LIM_NCOL] = {
+      /* 原点灯是**绿的**, 所以要说出声来 —— 见 docs/scan_sweep.md §9「原点为什么不是红的」 */
+      "60FDh bit2 —— 原点开关现在压着没有 (2310h X0 = 原点)。\n"
+      "**绿亮 = 正压着, 这是位置信息不是故障** —— 回零时压到原点是正常动作,\n"
+      "扫描经过原点开关**不会**中止。\n"
+      "这一格说的是**开关本身**, 与「会不会中止扫描」是两个问题: 后者看 6041h bit11。",
+
+      "60FDh bit1 —— 正限位开关现在压着没有 (2311h X1 = 正限位)。\n"
+      "**红亮 = 正压着, 要立刻处理** —— 先手动把滑台走离限位。\n"
+      "这一格说的是**开关本身**; 会不会中止扫描看 6041h bit11 (状态栏那盏)。\n"
+      "两者不一致时**以 bit11 为准**。",
+
+      "60FDh bit0 —— 负限位开关现在压着没有 (2312h X2 = 负限位)。\n"
+      "**红亮 = 正压着, 要立刻处理** —— 先手动把滑台走离限位。\n"
+      "这一格说的是**开关本身**; 会不会中止扫描看 6041h bit11 (状态栏那盏)。\n"
+      "两者不一致时**以 bit11 为准**。"
+   };
+
+   for (int s = 0; s < LIM_NCOL; s++)
+   {
+      QLabel *h = new QLabel(QString::fromUtf8(kHead[s]), box);
+      h->setStyleSheet(QStringLiteral("color:#6b7480;"));
+      g->addWidget(h, 0, s + 1);
+   }
+
+   for (int i = 0; i < 2; i++)
+   {
+      QLabel *nm = new QLabel(QStringLiteral("轴%1").arg(i == 0 ? 'X' : 'Y'), box);
+      nm->setStyleSheet(QStringLiteral("color:#9aa3ae;"));
+      g->addWidget(nm, i + 1, 0);
+
+      for (int s = 0; s < LIM_NCOL; s++)
+      {
+         m_limGrid.lamp[i][s] = makeLamp(box, QString::fromUtf8(kTip[s])
+                                              + QString::fromUtf8(kLampRule));
+         m_limGrid.text[i][s] = new QLabel(box);
+         g->addWidget(lampUnit(box, m_limGrid.lamp[i][s], m_limGrid.text[i][s], 0),
+                      i + 1, s + 1);
+      }
+   }
+
+   /*
+    * 第三行: 可选的 60FDh 重映射开关。**默认关**。
+    *
+    * 本机实测生效的 1A00h 只有 6041h/6064h/606Ch 三项 10 字节, 60FDh **不在里面**
+    * (docs/ykd2205pe_ci402.md) —— 也就是说默认情况下上面三个灯会一直是"灰 + --"。
+    * 两条出路, **优先走第一条**:
+    *   1. 用厂家上位机改一次驱动器的 1A00h (零代码、断电也还在);
+    *   2. 勾上这个框, 让主站在连接时补一次 (仅写 RAM, 收尾时还原; 崩在收尾前会留在
+    *      驱动器里直到断电 —— 与 motor_test --allow-pdo 同一风险等级)。
+    *
+    * 它是**连接期**参数: 改了不重连不生效, 所以只在未连接时可改 (见 refresh())。
+    */
+   m_cbWantDigIn = new QCheckBox(QStringLiteral("让 60FDh 进 TxPDO"), box);
+   m_cbWantDigIn->setToolTip(QStringLiteral(
+      "连接时把 60FDh (数字输入) 追加进 TxPDO —— 不勾这个, 上面三个灯就一直是灰的。\n\n"
+      "**改了不重连不生效**, 所以只能在未连接时改。\n\n"
+      "本机实测生效的映射里没有 60FDh。推荐先用**厂家上位机**改一次驱动器的 1A00h\n"
+      "(不用改代码, 而且断电也在), 那样这个框永远不必勾。\n\n"
+      "勾上之后的代价: 过程数据从 10 字节变 14 字节; 只写 RAM, 收尾 (断开/关窗) 时还原;\n"
+      "但**崩在收尾之前**那次改写会留在驱动器里, 直到断电为止。"));
+   connect(m_cbWantDigIn, &QCheckBox::toggled, this, &ScanWindow::onWantDigInToggled);
+   g->addWidget(m_cbWantDigIn, 3, 0, 1, LIM_NCOL + 1);
+
+   /* 最后一列 = 本组信号数。理由同上一块 */
+   g->setColumnStretch(LIM_NCOL, 1);
    return box;
 }
 
@@ -947,6 +1078,97 @@ void ScanWindow::onEnableClicked()
    m_thr->postEnable();
 }
 
+/*
+ * 清驱动器的故障位。
+ *
+ * 两处闸分工明确, 各管一件事, **不要合并**:
+ *   · 这里的闸 = 界面自己才知道的事 (扫描在不在跑 / 有没有连上);
+ *   · 工作线程的闸 (ecatcmd::axis_needs_reset) = **该不该对这根轴写字节**。
+ *     "该复位哪根"是驱动器的事实 (6041h bit3), 不是操作员的选择 —— 所以按钮不带轴参数。
+ */
+void ScanWindow::onFaultResetClicked()
+{
+   /* 复位后该轴**失能**, 而失能轴扫不动 —— 从 Paused 继续会在第一拍就以一个费解的
+    * 理由中止。所以是「先中止」, 不是「暂停再继续」。沿用既有先例 (设零点那道闸)。 */
+   if (m_ctl->running())
+   {
+      hint(QStringLiteral("扫描进行中 —— 先「中止」才能做故障复位 "
+                          "(复位后该轴失能, 失能轴扫不动)"), true);
+      return;
+   }
+
+   /*
+    * **每次点击都弹模态确认**, 不做持久勾选 —— 与「使能」「连接」同一个先例。
+    *
+    * 弹窗里写的是**它以为**哪根轴报了故障: 遥测最多滞后 ~33ms, 而真正的判据在工作
+    * 线程里 (它读的是**刚读到的** 6041h bit3)。所以措辞用"看起来", 并明确说出
+    * "一个字节都没写"那种情况 —— 操作员按下去之前该知道最坏也就是白按一下。
+    */
+   const BusTelem t = m_thr->telemetry();
+   int todo[EM_MAX_AXES];
+   const int ntodo = ecatcmd::pick_faulted_axes(t, todo, EM_MAX_AXES);
+
+   QString who;
+   if (ntodo == 0)
+   {
+      who = QStringLiteral("**现在看起来没有轴报故障 (6041h bit3 都是 0)** —— "
+                           "按下去大概率**一个字节都不会写**。\n"
+                           "(如果故障是刚刚起来的, 工作线程会看到它并照常复位。)");
+   }
+   else
+   {
+      QStringList names;
+      for (int k = 0; k < ntodo && k < EM_MAX_AXES; k++)
+         names << QStringLiteral("轴%1").arg(todo[k] == 0 ? 'X' : 'Y');
+      who = QStringLiteral("看起来报故障的是: %1。").arg(names.join(QStringLiteral("、")));
+   }
+
+   QMessageBox box(QMessageBox::Warning,
+                   QStringLiteral("故障复位"),
+                   QStringLiteral(
+                      "%1\n\n"
+                      "确认:\n"
+                      "  · 人已经在设备旁边\n"
+                      "  · 手放在物理急停上\n"
+                      "  · **竖直轴下面没有人**\n\n"
+                      "复位的动作是**先写 6040h = 0x0000 (卸力) 再抬 bit7** ——\n"
+                      "bit7 是上升沿触发, 不先把 0 压下去就构不成沿。\n"
+                      "所以只对报了故障的轴做; 对一根健康的保持轴做这件事会松开它的保持力矩。\n\n"
+                      "复位成功后该轴停在**未使能**, 要接着走请重新点「使能」。\n"
+                      "每根轴最多 1 秒, 这段时间不可中断。").arg(who),
+                   QMessageBox::Ok | QMessageBox::Cancel, this);
+   box.setDefaultButton(QMessageBox::Cancel);
+   if (box.exec() != QMessageBox::Ok)
+      return;
+
+   m_thr->postFaultReset();
+}
+
+void ScanWindow::onWantDigInToggled(bool on)
+{
+   m_thr->setWantDigIn(on);
+
+   /*
+    * 这个框**永远可以勾** —— 从前是 setEnabled(!onair), 那是错的: 人恰恰是在连上
+    * 之后、看见上面三个灯全是"灰 + --"的时候, 才知道要勾它, 而那时候框是灰的
+    * (而且 onair 里那个 busy 一旦被漏掉就永远为真, 见 EcatThread::doConnect 那段),
+    * 于是表现就是"勾不上"。
+    *
+    * 但它是**连接期**参数: em_require_dig_in() 只在 em_setup 里被读一次, 所以勾了
+    * 对当前这一次连接没有任何影响。这一件事界面上看不出来, 只能说出来 —— 已经连上了
+    * 就讲明白"下次连接才生效", 并指一下眼前这一路 (那三个灯现在是灰的, 但扫描、
+    * 中止判定、故障复位都不依赖它, 不必为它停下手上的活)。
+    */
+   if (m_connected)
+   {
+      hint(on ? QStringLiteral(
+                       "已记下: 下次「连接」时把 60FDh 追加进 TxPDO。"
+                       "**本次连接不受影响** —— 三个限位灯要等重新连接之后才会亮。")
+              : QStringLiteral("已记下: 下次「连接」不再动 TxPDO 映射。**本次连接不受影响**。"),
+           false);
+   }
+}
+
 void ScanWindow::onCenterAllClicked()
 {
    m_thr->postCenterAll();
@@ -1226,10 +1448,11 @@ void ScanWindow::pushManualSpeed(const BusTelem &t, bool running)
 }
 
 /*
- * 一根轴的三个信号。
+ * 一根轴的五盏灯 + 状态栏那对。
  *
- * **限位在参数栏和状态栏两处都有, 都从这里出** —— 分开算就会有一天两边说的不一样,
- * 而"两个指示器互相矛盾"比"少一个指示器"坏得多。
+ * **参数栏与状态栏都从这里出** —— 分开算就会有一天两边说的不一样, 而"两个指示器
+ * 互相矛盾"比"少一个指示器"坏得多。撞限位的判定本身更是**只有一处定义**:
+ * ecatcmd::limit_hit, 在 EcatThread::publish() 里算好, 这里只读 a.limit_active。
  */
 void ScanWindow::refreshAxisSignals(const BusTelem &t)
 {
@@ -1244,15 +1467,31 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
        * 那个"正常"根本不是现在的状态。
        */
       const bool known = m_connected && a.valid && a.mirror_ok;
-      const bool lim   = known && (a.sw & SCAN_LIMIT_BIT) != 0;
+      const bool lim   = known && a.limit_active;
 
-      /* ---- 参数栏那六个 ---- */
-      setSignalCell(i, 0, known, a.enabled, Lamp::Ok,
+      /* ---- 「轴信号」那四个 ---- */
+      setSignalCell(m_axGrid, i, AX_ENABLED, known, a.enabled, Lamp::Ok,
                     QStringLiteral("已使能"), QStringLiteral("未使能"));
-      setSignalCell(i, 1, known, a.fault, Lamp::Bad,
+      setSignalCell(m_axGrid, i, AX_FAULT, known, a.fault, Lamp::Bad,
                     QStringLiteral("有故障"), QStringLiteral("无故障"));
-      setSignalCell(i, 2, known, lim, Lamp::Bad,
-                    QStringLiteral("撞上"), QStringLiteral("正常"));
+
+      /*
+       * ---- 「限位开关」那六个: 三个开关**本身**压着没有 (60FDh) ----
+       *
+       * known 要**再与 a.dig_known**。少了它, 读不到 60FDh 时那三位是 0, 于是界面会
+       * 显示"三个都没压住" —— 而那是个**看起来完全正常**的结论。不知道和"都没压住"
+       * 必须分得开, 这就是 AxisTelem::dig_known 单独占一个字段的理由。
+       *
+       * 六个格子的颜色: 原点用 Ok (绿亮 = 正在压着, 位置信息), 正负限位用 Bad。
+       * **绿色在这里不是"没事"** —— 灯亮一律表示"这件事正在发生", 见 kLampRule。
+       */
+      const bool dk = known && a.dig_known;
+      setSignalCell(m_limGrid, i, LIM_HOME, dk, a.dig_home, Lamp::Ok,
+                    QStringLiteral("压住"), QStringLiteral("松开"));
+      setSignalCell(m_limGrid, i, LIM_POS, dk, a.dig_pos, Lamp::Bad,
+                    QStringLiteral("压住"), QStringLiteral("松开"));
+      setSignalCell(m_limGrid, i, LIM_NEG, dk, a.dig_neg, Lamp::Bad,
+                    QStringLiteral("压住"), QStringLiteral("松开"));
 
       /* ---- 状态栏那一对: 用的是上面同一个 lim ---- */
       QLabel *lb   = (i == 0) ? m_lLimX : m_lLimY;
@@ -1265,12 +1504,25 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
          lb->setStyleSheet(QStringLiteral("color:#5a6270; padding:2px 6px;"));
          paintLamp(lamp, Lamp::Unknown);
          m_limShown[i] = false;      /* 不知道了就重新上膛: 再知道时该说的话还得说一遍 */
+
+         /* 断线/丢帧也是"这一位现在怎么样我们不知道了" —— 挂着的那条横幅同理该走,
+          * 否则界面会在没有任何数据的情况下继续断言"正压着" */
+         if (!m_limBanner[i].isEmpty() && m_banner->isVisible()
+             && m_banner->text() == m_limBanner[i])
+         {
+            m_banner->setVisible(false);
+            m_bannerTimer->stop();
+         }
+         m_limBanner[i] = QString();
          continue;
       }
 
       if (lim)
       {
-         lb->setText(ax + QStringLiteral(" 撞上!"));
+         /* 「有效」而不是「撞上」—— 这一位是 CiA402 的 "internal limit active",
+          * 它**不等于**"物理上已经撞到限位开关" (见下面上升沿那条横幅的说明)。
+          * 状态栏这一格短, 只能放一个词, 那就放驱动器自己那句话。 */
+         lb->setText(ax + QStringLiteral(" 有效!"));
          lb->setStyleSheet(QStringLiteral(
             "background:#5a1f1f; color:#ffb3b3; padding:2px 6px;"
             "border-radius:3px; font-weight:bold;"));
@@ -1288,18 +1540,96 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
       if (lim && !m_limShown[i])
       {
          m_limShown[i] = true;
-         hint(QStringLiteral("轴%1 的 6041h bit11 置起 —— 正压在硬件限位开关上 "
-                             "(2310h X1 = 正 / X2 = 负)。先手动把它走离限位。")
-                 .arg(i), true);
+
+         /*
+          * **顺带把当时的 60FDh 打到 stdout。** 30Hz 的面板灯可能一闪而过, 而 stdout
+          * 会把证据留下 —— 这是真机上唯一能定"bit11 到底什么时候置起"的东西:
+          *
+          *   bit11 置起, 而三位全 0  -> 2310h~2312h 的功能码没配对, 或 bit11 另有来源;
+          *   bit11 置起, 只有原点位  -> 扫描经过原点就会误中止, 该打开
+          *                              kRefineLimitWithDigIn (见 ecatworker.h);
+          *   bit11 置起, 正/负限位位 -> 正常, 就是撞上了。
+          *
+          * 这里**不改判定**。判定的开关在 ecatworker.h, 而它必须是一次有证据的改动。
+          */
+         if (a.dig_known)
+            std::printf("[scan] 轴%d 6041h bit11 上升沿: sw=0x%04X  60FDh 位: "
+                        "原点(bit2)=%d 正限位(bit1)=%d 负限位(bit0)=%d\n",
+                        i, (unsigned)a.sw, a.dig_home ? 1 : 0,
+                        a.dig_pos ? 1 : 0, a.dig_neg ? 1 : 0);
+         else
+            std::printf("[scan] 轴%d 6041h bit11 上升沿: sw=0x%04X  "
+                        "60FDh 不在生效映射里 (三个开关的状态无从得知)\n",
+                        i, (unsigned)a.sw);
+         std::fflush(stdout);
+
+         /*
+          * 措辞里**不许出现"已撞上"这种话**。
+          *
+          * bit11 是 CiA402 的 "internal limit active", 而驱动器拿它表示什么**本机还没
+          * 实测过** —— 可能是限位开关真的压着, 也可能只是一片没配的 607Dh 软限位,
+          * 甚至可能"只有原点开关压着"时它就置起 (这三条都记在 docs/scan_sweep.md §13 的
+          * 待验证清单里)。我们**知道的**只有两件事: 6041h 报了这一位; 60FDh 说了什么。
+          * 那就只说这两件, 再说清现在能做什么 —— 把"可能"讲成"就是", 操作员会去处理一个
+          * 不存在的问题, 而这比少一条提示坏得多。
+          */
+         const QString ev = QString::fromUtf8(
+            ecatcmd::limit_switch_text(a.dig_known, a.dig_pos, a.dig_neg));
+
+         QString act;
+         if (!a.dig_known)
+            act = QStringLiteral(
+               "读不到 60FDh, 所以**分不清是原点还是限位**。让 60FDh 可读就能分清: "
+               "勾上「让 60FDh 进 TxPDO」再重新「连接」, 或用厂家上位机改一次 1A00h。");
+         else if (a.dig_pos || a.dig_neg)
+            act = QStringLiteral("先手动把它走离压着的那个开关。");
+         else if (a.dig_home)
+            act = QStringLiteral(
+               "**正/负限位都没压着, 压着的是原点开关。** 滑台要是正停在原点附近, "
+               "这一位多半就是这么来的 —— 但「任何开关压着就置起」这件事本机还没实测过, "
+               "所以先按「它真的会让扫描中止」对待。");
+         else
+            act = QStringLiteral(
+               "那就要往别处找原因了: 607Dh 软限位? 还是 2310h~2312h 功能码没配? "
+               "它照样会让扫描自动中止, 别当它是假的; `motor_test` 的只读诊断里会打印 "
+               "607Dh 的两个软限位值。");
+
+         const QString banner =
+            QStringLiteral("轴%1 的 6041h bit11 置起 —— 驱动器报「内部限位有效」。\n"
+                           "%2\n%3")
+               .arg(i)
+               .arg(ev, act);
+
+         hint(banner, true);
+         m_limBanner[i] = banner;
       }
       else if (!lim)
       {
          m_limShown[i] = false;
+
+         /*
+          * 这一位掉了, 那条红横幅就该跟着走。
+          *
+          * hint(s, true) 是**不自动消失**的 (理由见 hint() 那段: 无人值守的一趟扫下来,
+          * 一闪而过的提示等于没提示) —— 但"不自动消失"对一句**描述当前状态**的话就是
+          * 个陷阱: 它说的是"正压着", 而压着的东西可能早松开了, 于是屏幕上留着一句过期
+          * 的话。过期的话比没说过更坏 —— 操作员会去处理一个不存在的问题。
+          *
+          * 只清**还是我们自己那条**的 (比对原文): 中止之类的消息可能已经把它换掉了,
+          * 那些不该被抹掉。
+          */
+         if (!m_limBanner[i].isEmpty() && m_banner->isVisible()
+             && m_banner->text() == m_limBanner[i])
+         {
+            m_banner->setVisible(false);
+            m_bannerTimer->stop();
+         }
+         m_limBanner[i] = QString();
       }
    }
 }
 
-void ScanWindow::setSignalCell(int i, int s, bool known, bool on, Lamp lit,
+void ScanWindow::setSignalCell(LampGrid &g, int i, int s, bool known, bool on, Lamp lit,
                                const QString &litTxt, const QString &offTxt)
 {
    QString txt;
@@ -1326,16 +1656,16 @@ void ScanWindow::setSignalCell(int i, int s, bool known, bool on, Lamp lit,
 
    /* 只在真变了才动控件。**一个格子两样 (灯 + 字) 是一起变的** ——
     * 文字决定颜色, 所以字没变就说明颜色也没变, 不必再比一遍 */
-   if (m_axLampLast[i][s] != l)
+   if (g.lampLast[i][s] != l)
    {
-      m_axLampLast[i][s] = l;
-      paintLamp(m_axLamp[i][s], l);
+      g.lampLast[i][s] = l;
+      paintLamp(g.lamp[i][s], l);
    }
-   if (m_axTextLast[i][s] != txt)
+   if (g.textLast[i][s] != txt)
    {
-      m_axTextLast[i][s] = txt;
-      m_axText[i][s]->setText(txt);
-      m_axText[i][s]->setStyleSheet(QStringLiteral("color:") + col);
+      g.textLast[i][s] = txt;
+      g.text[i][s]->setText(txt);
+      g.text[i][s]->setStyleSheet(QStringLiteral("color:") + col);
    }
 }
 
@@ -1396,6 +1726,32 @@ void ScanWindow::refresh()
    m_btnDis->setEnabled(m_connected);
    m_btnCenter->setEnabled(can_move);
    m_btnZero->setEnabled(can_move);
+
+   /*
+    * 故障复位: 没连接 / 扫描中 / 正在复位 -> 不可用。
+    *
+    * **刻意不看故障灯**。那盏灯是 30Hz 遥测推的, 永远滞后于驱动器; 拿它去灰掉按钮
+    * 就是"两个指示器互相矛盾"那一类 —— 灯刚灭而故障还在, 按钮灰着, 操作员只能重启程序。
+    * 没故障时按下去是**可证无害**的 (工作线程那条闸会拦住并说明"一个字节都没写"),
+    * 所以让它永远可按比猜更安全。
+    */
+   m_btnFaultRst->setEnabled(m_connected && !running && !t.resetting);
+   m_btnFaultRst->setText(t.resetting ? QStringLiteral("正在复位…")
+                                      : QStringLiteral("故障复位"));
+
+   /*
+    * 「让 60FDh 进 TxPDO」**不跟着 onair 变灰**。
+    *
+    * 它确实是个连接期参数 (改了不重连不生效), 但从前的做法是 `setEnabled(!onair)` ——
+    * 那弄出了一个比"勾了没反应"更坏的困惑: 人正是**在连上之后**看到三个灯全灰, 才想到
+    * 要勾它, 而那时候它已经灰了。再加上 busy 那个漏 (见 EcatThread::doConnect 那段),
+    * 连接一旦失败过就永远为真, 于是这个框再也勾不上 —— 表现就是"勾不上"。
+    *
+    * 改成永远可勾, 用"说出来"代替"灰掉": 已经连上了就提示"下次连接才生效"
+    * (见 onWantDigInToggled)。勾错了的代价为零 —— em_require_dig_in 只在 em_setup
+    * 里被读一次, 当前这一次连接一个字都不会被它改动。
+    */
+   m_cbWantDigIn->setEnabled(true);
 
    const bool meter_ok = (m_meter != nullptr) && m_meter->isOpen();
    const bool params_ok = m_ctl->paramsError().isEmpty();

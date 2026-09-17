@@ -267,10 +267,14 @@ bool ScanController::armRun(QString *err)
          return fail(err, QStringLiteral("轴%1 没使能。「使能」是唯一让电机带电的按钮, 得先按它").arg(i));
       if (a.fault || t.fault)
          return fail(err, QStringLiteral("轴%1 有故障位 (6041h bit3) —— 先清故障再扫").arg(i));
-      if ((a.sw & SCAN_LIMIT_BIT) != 0)
+      if (a.limit_active)
          return fail(err, QStringLiteral(
-            "轴%1 的 6041h bit11 已经置起 —— 现在正压在硬件限位开关上 (2310h X1/X2)。\n"
-            "这个状态开始扫描, 一头撞上去是必然的。先手动把它走离限位。").arg(i));
+            "轴%1 的 6041h bit11 已经置起 —— 驱动器现在认为它撞在硬件限位上。\n"
+            "%2。\n"
+            "这个状态开始扫描, 一头撞上去是必然的。先手动把它走离限位。")
+               .arg(i)
+               .arg(QString::fromUtf8(ecatcmd::limit_switch_text(
+                       a.dig_known, a.dig_pos, a.dig_neg))));
    }
 
    if (t.expected_wkc > 0 && t.wkc < t.expected_wkc)
@@ -859,11 +863,17 @@ QString ScanController::healthProblem(const BusTelem &t)
       if (!a.enabled)
          return QStringLiteral("轴%1 掉使能 (6041h bit2) —— 扫描自动中止").arg(i);
 
-      /* 这一条是本轮最可能真触发的: 区域算错就会一头撞上去 */
-      if ((a.sw & SCAN_LIMIT_BIT) != 0)
+      /* 这一条是本轮最可能真触发的: 区域算错就会一头撞上去。
+       * 后一句是**现场诊断**: bit11 未必真有个开关压着 (见 ecatworker.h 那段说明),
+       * 而这行字是操作员事后唯一还能看到的东西 —— 面板灯早就过去了。 */
+      if (a.limit_active)
          return QStringLiteral(
-            "轴%1 的 6041h bit11 置起 —— 撞上硬件限位开关了 (2310h X1 = 正 / X2 = 负)。\n"
-            "扫描已自动中止。手动把它走离限位之后, 用「续扫」接着采。").arg(i);
+            "轴%1 的 6041h bit11 置起 —— 驱动器认为它撞在硬件限位上。\n"
+            "%2。\n"
+            "扫描已自动中止。手动把它走离限位之后, 用「续扫」接着采。")
+               .arg(i)
+               .arg(QString::fromUtf8(ecatcmd::limit_switch_text(
+                       a.dig_known, a.dig_pos, a.dig_neg)));
 
       int32_t seen = 0;
       if (externalWantChanged(t, i, &seen))

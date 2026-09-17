@@ -48,8 +48,31 @@ public:
    /* 信号灯的四种样子。**放在头里, 因为窗口要记住每一格上一次是什么** ——
     * 只在真变了才动控件 (见 refreshAxisSignals)。
     *   Unknown = 灰: 不知道       Off = 灭: 这件事没发生
-    *   Ok      = 绿亮: 使能带电    Bad = 红亮: 出事了 */
+    *   Ok      = 绿亮: 使能带电 / 原点开关压着    Bad = 红亮: 出事了 */
    enum class Lamp { Unknown, Off, Ok, Bad };
+
+   /*
+    * 一块"每根轴一行、每格一盏灯 + 一行字"的网格。参数栏有**两块**, 列数不同:
+    *
+    *   轴信号   (2 列) 使能 / 故障
+    *   限位开关 (3 列) 原点 / 正限位 / 负限位
+    *
+    * 为什么拆成两个结构体而不是共用一个 [2][3]: 共用一个的话 "第 2 列是什么" 在两组里
+    * 意思不同 (轴信号里第 2 列是故障, 限位里是负限位), 而它们会共用同一套
+    * refreshAxisSignals 循环变量 —— 那是写错了也能编译过去的类型。
+    *
+    * **灯与字的画法只有一份实现** (paintLamp / makeLamp / lampUnit / setSignalCell),
+    * 这里存的是"哪些控件"和"上一次画成什么"。ncol 就是本组实际用到的列数,
+    * 也正是 setColumnStretch 要用到的那个列号 (见 buildAxisPanel 末尾那条警告)。
+    */
+   struct LampGrid
+   {
+      int      ncol = 0;
+      QLabel  *lamp[2][3] = {};      /* [轴][信号] */
+      QLabel  *text[2][3] = {};
+      Lamp     lampLast[2][3] = {};  /* 上一次画的是什么 */
+      QString  textLast[2][3];
+   };
 
    explicit ScanWindow(QWidget *parent = nullptr);
    ~ScanWindow() override;
@@ -66,11 +89,19 @@ private:
    QWidget *buildScanPanel();
    QWidget *buildMeterPanel();
    QWidget *buildShadePanel();
-   QWidget *buildAxisPanel();         /* 每根轴三个信号: 使能 / 故障 / 限位 */
+   /* 两块: 「轴信号」(使能/故障 + 故障复位按钮) 与「限位开关」(原点/正限位/负限位)。
+    * 拆开的理由见 §9 与 LampGrid 上面那段 —— 一行五个"灯+字"在 370px 里会被挤扁。 */
+   QWidget *buildAxisPanel();
+   QWidget *buildLimitPanel();
 
    /* ---- 操作 ---- */
    void onConnectClicked();
    void onEnableClicked();
+   /* 清驱动器的故障位。**每次点击都弹模态确认**, 见 .cpp 里那个函数的注释 */
+   void onFaultResetClicked();
+   /* 「让 60FDh 进 TxPDO」。转发给工作线程之外, **已经连上了还要说明白它下次才生效** ——
+    * 这一条只能说出来, 界面上看不出来, 见 .cpp 里那个函数的注释 */
+   void onWantDigInToggled(bool on);
    void onRestoreDefaults();          /* 「恢复默认」: 扫描参数回 Params 缺省 */
    void onCenterAllClicked();
    void onZeroHereClicked();          /* 「设为区域中心」 */
@@ -90,7 +121,7 @@ private:
    void applyDefaults();              /* 控件 ← Params 缺省 (构造时一次 + 「恢复默认」) */
    void pushManualSpeed(const BusTelem &t, bool running);
    void refreshAxisSignals(const BusTelem &t);   /* 限位/使能/故障: 状态栏 + 参数栏, 一份遥测 */
-   void setSignalCell(int i, int s, bool known, bool on, Lamp lit,
+   void setSignalCell(LampGrid &g, int i, int s, bool known, bool on, Lamp lit,
                       const QString &litTxt, const QString &offTxt);
    Params currentParams() const;
    void refresh();                    /* 30Hz: tick 状态机 + 刷遥测 + 刷按钮可用性 */
@@ -167,13 +198,12 @@ private:
    QPushButton    *m_btnScript = nullptr;
    QLabel         *m_lMeter    = nullptr;
 
-   /* ---- 轴信号 (参数栏): [轴][信号], 信号 0=使能 1=故障 2=限位 ---- */
-   QLabel *m_axLamp[2][3] = {};
-   QLabel *m_axText[2][3] = {};
-   /* 上一次画的是什么。**只在真变了才写控件** —— 30Hz 每帧给 14 个控件重设样式表
-    * 会把重绘刷爆 (横幅那个上升沿判断是同一个理由) */
-   Lamp     m_axLampLast[2][3] = {};
-   QString  m_axTextLast[2][3];
+   /* ---- 参数栏的两块信号网格 (见 LampGrid) ---- */
+   LampGrid m_axGrid;    /* 0=使能 1=故障 */
+   LampGrid m_limGrid;   /* 0=原点 1=正限位 2=负限位 */
+
+   QPushButton *m_btnFaultRst = nullptr;   /* 「轴信号」第三行, 跨全部列 */
+   QCheckBox   *m_cbWantDigIn = nullptr;   /* 「限位开关」第三行, 连接期参数 */
 
    /* ---- 状态栏 ---- */
    QLabel *m_banner = nullptr;
@@ -199,6 +229,9 @@ private:
    bool m_connected = false;
    bool m_faultShown = false;
    bool m_limShown[2] = {false, false};   /* 限位横幅的上升沿防重入, 一根轴一个 */
+   /* 我们发出去的那条限位横幅**原文**。下降沿靠它认"现在挂着的是不是我们自己那条" ——
+    * 是才清, 不是就不能动 (中止之类的消息可能已经把它换掉了)。见 refreshAxisSignals() */
+   QString m_limBanner[2];
    bool m_warnedLive = false;
    int  m_autoStop   = 0;     /* 自动中止弹窗的防重入 */
    QString m_last_dir;

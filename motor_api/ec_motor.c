@@ -223,6 +223,15 @@ uint16_t em__get_u16(const uint8_t *m, int off)
    return v;
 }
 
+uint32_t em__get_u32(const uint8_t *m, int off)
+{
+   uint32_t v = 0;
+
+   if (m != NULL && off >= 0)
+      memcpy(&v, m + off, 4);
+   return v;
+}
+
 int32_t em__get_i32(const uint8_t *m, int off)
 {
    int32_t v = 0;
@@ -496,6 +505,20 @@ static const em_field_t EM_NEED_TX[] = {
    { EM_OID_STATUSWORD, 0, 16, "6041h 状态字"    },
    { EM_OID_ACT_POS,    0, 32, "6064h 实际位置"  },
    { EM_OID_ACT_VEL,    0, 32, "606Ch 实际速度"  },
+};
+
+/*
+ * 60FDh 数字输入 —— **刻意不放进 EM_NEED_TX**。
+ *
+ * 那张表的语义是"缺了就追加进 PDO 映射"。60FDh 只是个**只读监视量**(三个限位/原点
+ * 开关的位置), 为它去改写驱动器的 1A00h 是拿配置换便利: 改完还得在收尾时还原,
+ * 而崩在收尾前就把改动留在驱动器里了。
+ *
+ * 所以默认路径是 em__find_field(): 在生效映射里就绑, 不在就不绑 (-1), 界面显示"不知道"。
+ * 真需要它时由 em_require_dig_in() 显式打开 —— 那是一个**有人按下、有人看得见**的动作。
+ */
+static const em_field_t EM_FIELD_DIG_IN[] = {
+   { EM_OID_DIG_IN,     0, 32, "60FDh 数字输入"  },
 };
 #define EM_NEED_RX_N ((int)(sizeof(EM_NEED_RX) / sizeof(EM_NEED_RX[0])))
 #define EM_NEED_TX_N ((int)(sizeof(EM_NEED_TX) / sizeof(EM_NEED_TX[0])))
@@ -1147,6 +1170,11 @@ int em__cycle(em_bus_t *bus)
             ax->pos = em__get_i32(ax->in, ax->off_act_pos);
          if (ax->off_act_vel >= 0)
             ax->vel = em__get_i32(ax->in, ax->off_act_vel);
+         /* 60FDh: 本机多半不在映射里 (off_dig_in < 0), 那就一直是 0。
+          * **调用方必须先问 em_dig_in_known()** —— 0 在"三个开关都没压住"这个问题上
+          * 是个看起来完全正常的答案, 拿它冒充事实就是 sm_bus.c 里那条教训。 */
+         if (ax->off_dig_in >= 0)
+            ax->dig_in = em__get_u32(ax->in, ax->off_dig_in);
 
          ax->mirror_ok = 1;
          ax->frames++;
@@ -1429,6 +1457,10 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
       ax->move_limit = EM_MAX_DELTA_DEF;
       ax->off_cw = ax->off_target_pos = ax->off_target_vel = -1;
       ax->off_sw = ax->off_act_pos = ax->off_act_vel = -1;
+      /* 同样必须显式置 -1: calloc 给的是 0, 而 0 是输入镜像的字节 0 —— 那正是 6041h
+       * 状态字的位置, 会把状态字当成 60FDh 读, 然后一本正经地报"负限位压住了" */
+      ax->off_dig_in = -1;
+      ax->dig_in = 0;
       /*
        * off_modes 必须显式置 -1。calloc 给它的是 0, 而 0 **是一个合法的偏移**
        * (输出镜像的字节 0 正是 6040h 的低字节) —— 万一 setup 中途失败、后面又有谁
@@ -1470,8 +1502,22 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
                         "RxPDO") != EM_R_OK)
          return EM_R_FAIL;
 
+      /*
+       * TxPDO 的需项表在这一处拼: 常规三项,**只有 em_require_dig_in() 明确要求过**
+       * 才把 60FDh 拼进去。不拼就是"只绑不补"的默认路径 —— 见 EM_FIELD_DIG_IN 上面那段。
+       *
+       * 拼成局部数组而不是写死两张表: em_map_ensure 的语义是"这张表里的缺项全补上",
+       * 想表达"这一项可选"就只有"给不给它"这一种说法, 多一张表就多一处会走岔的分叉。
+       */
+      em_field_t need_tx[EM_NEED_TX_N + 1];
+      int        n_need_tx = EM_NEED_TX_N;
+
+      memcpy(need_tx, EM_NEED_TX, sizeof(EM_NEED_TX));
+      if (bus->want_dig_in)
+         need_tx[n_need_tx++] = EM_FIELD_DIG_IN[0];
+
       if (em_map_ensure(bus, ax->slave, EM_OID_TXPDO_ASSIGN, ax->tx_pdo,
-                        EM_NEED_TX, EM_NEED_TX_N, allow_remap,
+                        need_tx, n_need_tx, allow_remap,
                         &bus->snap_tx[i].assign, &bus->snap_tx[i].pdo,
                         "TxPDO") != EM_R_OK)
          return EM_R_FAIL;
@@ -1546,6 +1592,36 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
       ax->off_sw      = offs[0];
       ax->off_act_pos = offs[1];
       ax->off_act_vel = offs[2];
+
+      /*
+       * 60FDh 数字输入 (U32 RO) —— **只绑不补**, 与 6060h/6083h/6084h 同一类。
+       * 它不在 EM_NEED_TX 里, 所以默认不会为了它去改写驱动器的 1A00h。
+       *
+       * 排在这里而不是别处: 上面第 2 步的 em_map_ensure 已经跑完了, 所以这一查
+       * 既认"本来就在映射里"的, 也认"刚刚被 em_require_dig_in 追加进去"的 ——
+       * 两条路合成一条, 不需要第二处代码。
+       *
+       * **绑不上也不在这里拒绝**: 与下面那条"只有 6040h/6041h 缺了才拒绝"同一个取舍 ——
+       * 一个监视项绑不上, 不该把本来能跑的 CSP 连坐掉。绑不上就是 -1, 界面显示"不知道"。
+       */
+      ax->off_dig_in = em__find_field(bus, ax->slave, ax->tx_pdo,
+                                      EM_OID_DIG_IN, 0, 32);
+      if (ax->off_dig_in >= 0 && (uint32_t)ax->off_dig_in + 4 > ax->Ibytes)
+      {
+         /*
+          * 偏移落在本轴输入镜像之外 = 照它读下去会读到别的从站的数据。
+          * **降级, 不拒绝**: 这里宁可少一个监视量, 也不要一个"看着有值、其实读错了地方"的。
+          */
+         em__warn("%s: 60FDh 算出的偏移 +%d 超出本轴输入镜像 (%u 字节) -> "
+                  "当作不在映射里 (限位开关那三个灯会显示 --)",
+                  ax->label, ax->off_dig_in, (unsigned)ax->Ibytes);
+         ax->off_dig_in = -1;
+      }
+      printf("  %s: 60FDh 数字输入 %s\n", ax->label,
+             (ax->off_dig_in >= 0)
+                ? "在生效 TxPDO 里 (原点/正限位/负限位三个开关每周期可读)"
+                : "**不在生效 TxPDO 里** -> 三个开关的灯会显示灰/-- "
+                  "(本函数按设计不去补映射; 要补见 em_require_dig_in)");
 
       /*
        * 6040h 与 6041h 是硬要求: 没有它们连状态机都推不动, 谈不上运动。
@@ -1879,6 +1955,39 @@ uint32_t em_mirror_frames(const em_axis_t *ax) { return ax ? ax->frames : 0; }
 
 uint16_t em_rx_pdo(const em_axis_t *ax) { return ax ? ax->rx_pdo : 0; }
 uint16_t em_tx_pdo(const em_axis_t *ax) { return ax ? ax->tx_pdo : 0; }
+
+/*
+ * 60FDh 的三个开关。位运算集中在这里 —— 与"状态字判读集中在 ec_motor.c"同一条规矩:
+ * 让调用方各写一份 (x & 0x2), 就会出现某一天只有一处把 0x2 写成了 0x4。
+ */
+int em_dig_in_known(const em_axis_t *ax)
+{
+   return (ax != NULL && ax->off_dig_in >= 0 && ax->mirror_ok) ? 1 : 0;
+}
+
+int em_di_home  (const em_axis_t *ax)
+{
+   return (ax != NULL && (ax->dig_in & EM_DI_HOME) != 0) ? 1 : 0;
+}
+
+int em_di_poslim(const em_axis_t *ax)
+{
+   return (ax != NULL && (ax->dig_in & EM_DI_POS_LIMIT) != 0) ? 1 : 0;
+}
+
+int em_di_neglim(const em_axis_t *ax)
+{
+   return (ax != NULL && (ax->dig_in & EM_DI_NEG_LIMIT) != 0) ? 1 : 0;
+}
+
+uint32_t em_dig_in_raw   (const em_axis_t *ax) { return ax ? ax->dig_in : 0; }
+int      em_dig_in_offset(const em_axis_t *ax) { return ax ? ax->off_dig_in : -1; }
+
+void em_require_dig_in(em_bus_t *bus, int on)
+{
+   if (bus != NULL)
+      bus->want_dig_in = on ? 1 : 0;
+}
 
 int em_modes_via_pdo(const em_axis_t *ax)
 {

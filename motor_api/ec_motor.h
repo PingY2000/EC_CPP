@@ -166,6 +166,24 @@ extern "C" {
 #define EM_OID_TXPDO0        0x1A00
 
 /* ======================================================================
+ * 数字输入 60FDh —— 三个开关。位定义见 docs/ykd2205pe_ci402.md
+ * ======================================================================
+ *
+ * 本机接线 (端子功能 2310h~2312h 实测 = 1/2/3):
+ *   X0 = 原点   -> bit2
+ *   X1 = 正限位 -> bit1
+ *   X2 = 负限位 -> bit0
+ *
+ * **这三位是"经 2300h 电平反转 + 2310h 功能映射之后"的结果** (手册 V2.4 p84),
+ * 所以直接用, 调用方不需要再取反。反过来说: 2300h (输入有效电平逻辑) 配反了,
+ * 这三个灯**一起反相** —— 不是某一根的事, 而是一整排"看着挺正常"的假信号。
+ */
+#define EM_DI_NEG_LIMIT  0x00000001u  /* bit0 负限位 */
+#define EM_DI_POS_LIMIT  0x00000002u  /* bit1 正限位 */
+#define EM_DI_HOME       0x00000004u  /* bit2 原点开关 */
+#define EM_DI_X3         0x00000008u  /* bit3 X3 (本机未接线, 2313h = 0) */
+
+/* ======================================================================
  * 控制字 6040h —— 推送过的值只有下面这几个, 不试探厂商私有控制字
  * ====================================================================== */
 #define EM_CW_DISABLE_V  0x0000  /* Disable voltage */
@@ -512,6 +530,36 @@ int32_t  em_pos(const em_axis_t *ax);   /* 6064h */
 int32_t  em_vel(const em_axis_t *ax);   /* 606Ch */
 int      em_mirror_ok(const em_axis_t *ax);
 uint32_t em_mirror_frames(const em_axis_t *ax);  /* 收到过多少个完整帧 */
+
+/*
+ * ---- 60FDh 三个开关 (原点 / 正限位 / 负限位) ----
+ *
+ * **先问 em_dig_in_known(), 再问下面三个。** 这个顺序不是客套:
+ *   · 60FDh 多半**不在生效 TxPDO 里** (本机 1A00h 只有 6041h/6064h/606Ch 三项),
+ *     那时下面三个一律返回 0 —— 而 0 在"开关压着没有"这个问题上是一个
+ *     **看起来完全正常**的答案 (同样的教训见 sm_bus.c 里那段"无法解读"的说明);
+ *   · 短帧时镜像不更新, 读数同样是陈值。
+ * 也就是说: **不知道和"三个都没压住"必须分得开**, 而返回值本身分不开。
+ */
+int      em_dig_in_known(const em_axis_t *ax);  /* 映射里有**且**收到过完整帧 */
+int      em_di_home  (const em_axis_t *ax);     /* bit2 原点开关 */
+int      em_di_poslim(const em_axis_t *ax);     /* bit1 正限位 */
+int      em_di_neglim(const em_axis_t *ax);     /* bit0 负限位 */
+uint32_t em_dig_in_raw(const em_axis_t *ax);    /* 原始 60FDh (调试用) */
+int      em_dig_in_offset(const em_axis_t *ax); /* 字节偏移; -1 = 不在生效映射里 */
+
+/*
+ * 让**下一次** em_setup 把 60FDh 追加进 TxPDO (RAM only, 收尾时还原)。
+ *
+ * 默认不开。理由见 ec_motor.c 里 EM_FIELD_DIG_IN 上面那段: 一个只读监视量不该有
+ * 改写驱动器 1A00h 的副作用。真要用, 代价要一起认下来:
+ *   · SM3 从 10 字节变 14 字节;
+ *   · 只写 RAM —— 但**崩在收尾之前**就会把改动留在驱动器里, 直到断电重启;
+ *   · 需要 allow_remap 授权, 否则 em_map_ensure 会拒绝 (报错说得很清楚)。
+ *
+ * **连接期参数**: 必须在 em_setup 之前调。改了不重连不生效。
+ */
+void em_require_dig_in(em_bus_t *bus, int on);
 
 /*
  * 该轴**生效**的 PDO 映射对象索引 (setup 时实读 1C12h / 1C13h 得到), setup 之前为 0。

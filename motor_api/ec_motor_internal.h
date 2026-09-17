@@ -95,6 +95,20 @@ struct em_axis
    int off_act_pos;     /* 6064h 实际位置 (TxPDO) */
    int off_act_vel;     /* 606Ch 实际速度 (TxPDO) */
 
+   /*
+    * 60FDh 数字输入 (TxPDO)。**只绑不补** —— 在生效映射里就用, 不在就是 -1。
+    *
+    * 为什么不能列进 EM_NEED_TX: 那张表的语义是"缺了就追加进 PDO 映射", 而 QHMI 是带
+    * allow_remap=1 连上来的 (hmi/ecatworker.cpp 的 em_setup 调用) —— 一个只读的监视量
+    * 不该有改写驱动器 1A00h 的副作用, 改完还得在收尾时还原。
+    *
+    * 本机实测生效的 1A00h 只有 6041h/6064h/606Ch 三项 10 字节, **没有 60FDh**
+    * (docs/ykd2205pe_ci402.md 「不要相信任何一份出厂映射」那一节), 所以这里多半是 -1,
+    * 三个限位开关的界面显示"不知道"。要让它绑上见 em_require_dig_in()。
+    */
+   int      off_dig_in;
+   uint32_t dig_in;     /* 最新一帧完整过程数据里的 60FDh */
+
    /* 最新一帧完整过程数据里的采样 */
    uint16_t sw;
    int32_t  pos;
@@ -143,6 +157,11 @@ struct em_bus
    int verbose;
    int opened;
    int mapped;      /* 是否真的改写过 PDO 映射 */
+   /*
+    * 是否**主动**把 60FDh 追加进 TxPDO。默认 0 = 只在映射里已经有它时才绑。
+    * 连接期参数, 由 em_require_dig_in() 在 em_setup 之前设 —— 见那个函数的说明。
+    */
+   int want_dig_in;
    int in_op;
    int prev_manualstatechange;
 
@@ -180,6 +199,7 @@ void     em__put_u32(uint8_t *m, int off, uint32_t v);
 void     em__put_i32(uint8_t *m, int off, int32_t v);
 uint8_t  em__get_u8 (const uint8_t *m, int off);
 uint16_t em__get_u16(const uint8_t *m, int off);
+uint32_t em__get_u32(const uint8_t *m, int off);
 int32_t  em__get_i32(const uint8_t *m, int off);
 
 /* 写 6040h 到输出镜像 (只写镜像, 下一帧才发出去) */

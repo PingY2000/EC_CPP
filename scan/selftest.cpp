@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <vector>
@@ -174,10 +175,30 @@ public:
    /* ---- 注入 ---- */
    void setFault(int i)        { t_.ax[i].fault = true; t_.fault = true; }
    void setEnabled(int i, bool e) { t_.ax[i].enabled = e; }
+
+   /*
+    * 撞限位。**两样一起设**, 因为真实现里那样是同一个东西的两个来源:
+    * EcatThread::publish() 里 limit_active = ecatcmd::limit_hit(sw, dig...) ——
+    * 这一个假总线要跟着那一条走, 否则测试跑的是一个真实程序里不存在的组合状态。
+    */
    void setLimit(int i, bool on)
    {
-      if (on) t_.ax[i].sw |= SCAN_LIMIT_BIT;
-      else    t_.ax[i].sw &= (uint16_t)~SCAN_LIMIT_BIT;
+      if (on) { t_.ax[i].sw |= EM_SW_INTLIMIT;  t_.ax[i].limit_active = true;  }
+      else    { t_.ax[i].sw &= (uint16_t)~EM_SW_INTLIMIT; t_.ax[i].limit_active = false; }
+   }
+
+   /*
+    * 三个限位开关本身 (60FDh)。**dig_known 单独一个开关**, 不靠"三个都 false"推 ——
+    * 读不到 60FDh 时那三位也是 false, 而"三个都没压住"是个看起来完全正常的结论。
+    * 默认 unknown: 真机上生效的 1A00h 里没有 60FDh, 那才是常态。
+    */
+   void setDigKnown(int i, bool k) { t_.ax[i].dig_known = k; }
+   void setDig(int i, bool home, bool pos, bool neg)
+   {
+      t_.ax[i].dig_known = true;
+      t_.ax[i].dig_home  = home;
+      t_.ax[i].dig_pos   = pos;
+      t_.ax[i].dig_neg   = neg;
    }
    void setDropFrames(int i, bool d) { t_.ax[i].mirror_ok = !d; }
    void setWkc(int w)          { t_.wkc = w; }
@@ -998,6 +1019,230 @@ static void test_preflight()
    }
 }
 
+/* ------------------------------------------------- 故障复位 (6040h bit7 上升沿) */
+
+/*
+ * 这些判据全在 ecatcmd 里 (头文件, inline) —— **故意放在头文件**:
+ * scan_selftest 不编 ecatworker.cpp, 逻辑写在 .cpp 里就等于永远验不到,
+ * 而下面第一条恰好是这个程序里最不能错的一行。
+ */
+static void test_faultreset()
+{
+   using namespace ecatcmd;
+
+   /*
+    * 「该不该复位这根轴」= 全部安全性所在。
+    *
+    * em_fault_reset() 的动作顺序是"先写 6040h = 0x0000 (卸力) 打十帧, 再抬 bit7"
+    * (bit7 是上升沿触发, 不先压 0 构不成沿), 而它**到函数末尾**才报告"本来就没有故障"。
+    * 所以对一根健康的保持轴做这件事会真的松开保持力矩 —— 竖直滑台会掉下来。
+    * 这道闸必须在**调用之前**, 而它就是下面这四行。
+    */
+   caseBegin("faultreset: 只有「可信 + 有故障」才许碰");
+   check(!axis_needs_reset(false, true,  true),  "invalid axis is skipped");
+   check(!axis_needs_reset(false, false, true),  "invalid + unknown is skipped");
+   check(!axis_needs_reset(true,  false, true),  "**unknown (mirror_ok=false) is skipped, not guessed**");
+   check(!axis_needs_reset(true,  true,  false), "healthy axis is never written to");
+   check(!axis_needs_reset(true,  false, false), "unknown + healthy is skipped");
+   check( axis_needs_reset(true,  true,  true),  "trusted + faulted -> reset");
+
+   /* ---- 从一份遥测里挑出该复位的轴 ---- */
+   caseBegin("faultreset: 挑轴 — 挑不到就一个字节都不写");
+   {
+      BusTelem t;
+      t.naxis = 2;
+      for (int i = 0; i < 2; i++)
+      {
+         t.ax[i].valid     = true;
+         t.ax[i].mirror_ok = true;
+      }
+
+      int out[EM_MAX_AXES];
+
+      /* 一根都没故障 —— 这是最要紧的一种情况: 返回 0 = 一个字节都不该写 */
+      checkEq(pick_faulted_axes(t, out, EM_MAX_AXES), 0, "no fault -> nothing to do");
+
+      /* 两根都故障 */
+      t.ax[0].fault = t.ax[1].fault = true;
+      checkEq(pick_faulted_axes(t, out, EM_MAX_AXES), 2, "both faulted");
+      checkEq(out[0], 0, "first is axis 0");
+      checkEq(out[1], 1, "second is axis 1");
+
+      /* 轴0 有故障、轴1 状态未知 —— **未知的跳过, 不猜**。猜错 = 对它卸力 */
+      t.ax[1].fault     = true;
+      t.ax[1].mirror_ok = false;
+      checkEq(pick_faulted_axes(t, out, EM_MAX_AXES), 1, "an unknown axis is skipped");
+      checkEq(out[0], 0, "and only the trusted one is left");
+
+      /* 状态未知的轴线上一根都不碰 */
+      t.ax[0].mirror_ok = false;
+      checkEq(pick_faulted_axes(t, out, EM_MAX_AXES), 0, "all unknown -> nothing");
+
+      /* valid=false 同理 */
+      t.ax[0].mirror_ok = true;
+      t.ax[0].valid     = false;
+      checkEq(pick_faulted_axes(t, out, EM_MAX_AXES), 0, "invalid -> nothing");
+
+      /* 没有轴 */
+      BusTelem none;
+      none.naxis = 0;
+      checkEq(pick_faulted_axes(none, out, EM_MAX_AXES), 0, "no axes -> nothing");
+
+      /* out 装不下时**仍返回真实条数**: 调用方靠这个数决定该说什么 */
+      t.ax[0].valid = true;
+      t.ax[0].fault = t.ax[1].fault = true;
+      t.ax[1].mirror_ok = true; t.ax[1].valid = true;
+      checkEq(pick_faulted_axes(t, out, 1), 2, "max is respected but the count is honest");
+      checkEq(out[0], 0, "and the first one is still reported");
+
+      /* out = nullptr: 只要个数 */
+      checkEq(pick_faulted_axes(t, nullptr, 0), 2, "count only");
+   }
+}
+
+/* ------------------------------------------------- 三个限位开关 (60FDh) */
+
+/*
+ * 撞限位的判定**只有一处** (ecatcmd::limit_hit)。这里把两条规则都钉住 ——
+ * 包括还没打开的那一条。
+ *
+ * 「还没打开的那一条」为什么也要测: kRefineLimitWithDigIn 从 0 改成 1 是一次
+ * **有证据的改动** (见 ecatworker.h), 改的那一刻不该再补测试。所以规则写成带
+ * constexpr 参数的函数, 两条分支在同一次构建里都跑得到。
+ */
+static void test_limitsw()
+{
+   using namespace ecatcmd;
+
+   const uint16_t LIM = EM_SW_INTLIMIT;
+
+   caseBegin("limitsw: 今天的判定 = bit11 单独, 一个比特没变");
+   check( limit_hit(LIM, false, false, false), "bit11 + nothing known -> still hit");
+   check( limit_hit(LIM, true,  false, false), "bit11 + both switches released -> still hit");
+   check( limit_hit(LIM, true,  true,  false), "bit11 + positive switch");
+   check( limit_hit(LIM, true,  false, true),  "bit11 + negative switch");
+   check(!limit_hit(0,   true,  true,  true),  "no bit11 -> never a hit");
+   check(!limit_hit(0,   false, false, false), "no bit11, nothing known");
+
+   /*
+    * 「原点不算」这件事**在类型上就成立了**: limit_hit 的参数里根本没有原点那一位
+    * (dig_home 传不进来), 所以它不可能影响中止判定 —— 这不是靠一条 if 记得写对。
+    * 于是"只压住原点"在这里长的就是 (pos=false, neg=false) 这一组。
+    */
+   caseBegin("limitsw: 精判据 (开关关着的那条分支)");
+   check(!limit_hit_rule(LIM, true,  false, false, true),
+         "**bit11 + only the home switch pressed (pos/neg both released) -> NOT a hit**");
+   check( limit_hit_rule(LIM, true,  true,  false, true), "bit11 + positive switch -> hit");
+   check( limit_hit_rule(LIM, true,  false, true,  true), "bit11 + negative switch -> hit");
+   check( limit_hit_rule(LIM, true,  true,  true,  true), "bit11 + both -> hit");
+   /* **这一条是"不弱化"的保证**: 不知道 60FDh 就退回旧判据, 保护一点不减 */
+   check( limit_hit_rule(LIM, false, false, false, true),
+         "bit11 + unknown 60FDh -> falls back to bit11 alone");
+   check(!limit_hit_rule(0,   true,  false, false, true), "no bit11 -> still no hit");
+
+   caseBegin("limitsw: 现场诊断那句话不许把「不知道」说成「都没压着」");
+   {
+      const char *unk = limit_switch_text(false, false, false);
+      check(std::strstr(unk, "无从得知") != nullptr,
+            "unknown is reported as unknown, not as 'nothing pressed'", unk);
+
+      const char *none_p = limit_switch_text(true, false, false);
+      check(std::strstr(none_p, "都没压着") != nullptr, "known + released says so", none_p);
+      const char *pos = limit_switch_text(true, true, false);
+      check(std::strstr(pos, "正限位") != nullptr, "positive limit is named", pos);
+      const char *neg = limit_switch_text(true, false, true);
+      check(std::strstr(neg, "负限位") != nullptr, "negative limit is named", neg);
+   }
+
+   /*
+    * ---- 新灯**不参与任何中止判据** ----
+    *
+    * 这是本轮那个决定的回归护栏: 只有原点开关压着时, 扫描必须一路跑到 Done,
+    * autoAborted 一次都不能响。会中止的仍然只有 6041h bit11。
+    * (扫描区域本来就可能正好停在一个开关上; 用监视量去触发会白中止一趟一小时的活。)
+    */
+   caseBegin("limitsw: 只压住原点开关 -> 扫描照跑, 一次都不中止");
+   {
+      Rig r;
+      r.ctrl.setParams(Rig::smallParams());
+      r.ctrl.rebuildPlan();
+
+      r.bus.setDig(1, /*home=*/true, /*pos=*/false, /*neg=*/false);
+      r.bus.setDig(0, /*home=*/true, /*pos=*/false, /*neg=*/false);
+
+      QString err;
+      check(r.startScan(QDir::tempPath() + "/scan_home.csv", &err), "start", err.toStdString());
+
+      bool fired = false;
+      QString what;
+      QObject::connect(&r.ctrl, &ScanController::autoAborted,
+                       [&](const QString &s) { fired = true; what = s; });
+
+      check(r.runToIdle(120000), "runs to the end");
+      check(!fired, "**the home switch never aborts a scan**", what.toStdString());
+      checkEq(r.ctrl.completedPoints(), 25, "all 25 points collected");
+      check(r.ctrl.state() == ScanController::State::Done, "Done, not Aborted");
+   }
+
+   /*
+    * ---- 旧判据没退化 ----
+    *
+    * 60FDh 读不到的机器 (本机的常态: 生效的 1A00h 里没有它) 上, bit11 置起**照样中止**。
+    * 这一条与上面那条是一对: 把原点排除掉, 不等于把保护削弱。
+    */
+   caseBegin("limitsw: bit11 置起而 60FDh 未知 -> 照样中止 (旧判据没退化)");
+   {
+      Rig r;
+      r.ctrl.setParams(Rig::smallParams());
+      r.ctrl.rebuildPlan();
+      QString err;
+      check(r.startScan(QDir::tempPath() + "/scan_noDig.csv", &err), "start", err.toStdString());
+
+      bool fired = false;
+      QString what;
+      QObject::connect(&r.ctrl, &ScanController::autoAborted,
+                       [&](const QString &s) { fired = true; what = s; });
+
+      r.runUntil([&] { return r.ctrl.completedPoints() >= 1; });
+      r.bus.setDigKnown(1, false);
+      r.bus.setLimit(1, true);
+      r.runUntil([&] { return r.ctrl.state() == ScanController::State::Aborted; }, 5000);
+
+      check(fired, "still aborts");
+      check(what.contains(QStringLiteral("bit11")), "names bit11", what.toStdString());
+      check(what.contains(QStringLiteral("无从得知")),
+            "**and says the switch state is unknown instead of pretending it is known**",
+            what.toStdString());
+   }
+
+   /*
+    * ---- 文案与开关状态对得上 ----
+    *
+    * 中止那行字是操作员事后唯一还能看到的东西 (面板灯早就过去了), 所以它必须说出
+    * 到底是哪个开关压着 —— 那正是「bit11 什么时候置起」这个待验证问题的现场答案。
+    */
+   caseBegin("limitsw: 中止文案点名压住的那个开关");
+   {
+      Rig r;
+      r.ctrl.setParams(Rig::smallParams());
+      r.ctrl.rebuildPlan();
+      QString err;
+      check(r.startScan(QDir::tempPath() + "/scan_named.csv", &err), "start", err.toStdString());
+
+      r.runUntil([&] { return r.ctrl.completedPoints() >= 1; });
+
+      QString what;
+      QObject::connect(&r.ctrl, &ScanController::autoAborted,
+                       [&](const QString &s) { what = s; });
+
+      r.bus.setDig(1, /*home=*/false, /*pos=*/false, /*neg=*/true);
+      r.bus.setLimit(1, true);
+      r.runUntil([&] { return r.ctrl.state() == ScanController::State::Aborted; }, 5000);
+
+      check(what.contains(QStringLiteral("负限位")), "names the negative limit", what.toStdString());
+   }
+}
+
 int main(int argc, char **argv)
 {
    QCoreApplication app(argc, argv);
@@ -1011,6 +1256,8 @@ int main(int argc, char **argv)
    test_aborts();
    test_retest();
    test_preflight();
+   test_faultreset();
+   test_limitsw();
 
    std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
    return g_fail == 0 ? 0 : 1;

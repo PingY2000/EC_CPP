@@ -671,8 +671,10 @@ void MapCanvas::drawMarkers(QPainter &p)
        * 也有同样的显示, 这里是为了**眼睛在画布上时不用挪开去读状态栏** ——
        * 扫描中撞限位是会自动中止的那一类, 值得用两种方式说同一件事。
        */
-      const bool lim_x = (t.ax[0].sw & SCAN_LIMIT_BIT) != 0;
-      const bool lim_y = (t.ax[1].sw & SCAN_LIMIT_BIT) != 0;
+      /* 读的是**已经算好的那一个字段** (由 ecatcmd::limit_hit 一处算出), 不在这里
+       * 再判一次 bit11 —— 这里从前就是那"三处各算一遍"里的一处 */
+      const bool lim_x = t.ax[0].limit_active;
+      const bool lim_y = t.ax[1].limit_active;
       if (lim_x || lim_y)
       {
          p.setBrush(Qt::NoBrush);
