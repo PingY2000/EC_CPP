@@ -23,13 +23,17 @@ qt_standard_project_setup()
 set(CMAKE_AUTOUIC OFF)
 
 # ---------------------------------------------------------------- 共用的那部分源文件
-# 两个目标都要: 纯逻辑 + 状态机 + 模拟功率计 + CSV。列成一个变量, 免得两处对不上。
+# 两个目标都要: 纯逻辑 + 状态机 + 模拟功率计 + CSV + 参数记忆。列成一个变量, 免得两处对不上。
+#
+# scanprefs **只链 Qt6::Core** (QSettings 在 Core 里) —— 这是它能进这个列表的前提:
+# 自检那边能真跑一遍"存进去再读回来相等"。见 scanprefs.h 顶部那段。
 set(SCAN_COMMON_SRC
   scanplan.cpp      scanplan.h
   scanarrive.cpp    scanarrive.h
   scancontroller.cpp scancontroller.h
   powermeter.cpp    powermeter.h
   scanlog.cpp       scanlog.h
+  scanprefs.cpp     scanprefs.h
   busview.h
 )
 

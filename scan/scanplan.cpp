@@ -180,14 +180,15 @@ std::string validate(const Params &p)
    if (nx < 1 || ny < 1)
       return "网格为空 (区域或分辨率不合法)";
 
-   /* 点数上限: 30000 秒级的粗估已经够劝退偶然多打一个 0 了 */
+   /* 点数上限。**常量在 scanplan.h** (kMaxPlanPoints) —— rebuildPlan() 拿它做拦截,
+    * 这里只是同一件事说给操作员听。两处写两个数字迟早会不一样 */
    long long total = (long long)nx * (long long)ny;
-   if (total > 200000)
+   if (total > kMaxPlanPoints)
    {
       char buf[200];
       std::snprintf(buf, sizeof(buf),
-                    "点数 %lld 太多 (上限 200000) —— 先确认分辨率是不是少打了个零",
-                    total);
+                    "点数 %lld 太多 (上限 %lld) —— 先确认分辨率是不是少打了个零",
+                    total, kMaxPlanPoints);
       return buf;
    }
 

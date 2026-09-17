@@ -41,3 +41,7 @@ Thumbs.db
 
 # ==== 扫描采集产物 (scan/ 默认写这里) ====
 /scan_out/
+
+# scan 记的参数 (exe 旁边的 scan.ini)。里面存着**这台机器**上次用的网卡,
+# 换一台机器那份 GUID 就没有意义了 —— 不入库。
+/bin/scan.ini

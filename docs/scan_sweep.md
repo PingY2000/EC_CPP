@@ -31,7 +31,8 @@ scan/
   scancontroller.h/.cpp   扫描状态机 (QObject, GUI 线程, 30Hz 外部喂时钟)
   powermeter.h/.cpp       PowerMeter 抽象 + 三个模拟实现
   scanlog.h/.cpp          CSV 追加写 + 读回
-  selftest.cpp            **不需要硬件也不需要界面**的自检 (188 条断言)
+  scanprefs.h/.cpp        参数的记忆 (exe 旁边的 scan.ini)。**只链 Qt6::Core**, 见 §16
+  selftest.cpp            **不需要硬件也不需要界面**的自检 (237 条断言)
 ```
 
 `scanplan` **刻意不 include 任何 Qt**(`std::vector` + POD + `std::string`)——
@@ -653,7 +654,7 @@ cmake --build out/build/hmi-qt-ucrt64 --target scan
 
 ```bash
 PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
-# ... 188 passed, 0 failed
+# ... 237 passed, 0 failed
 ```
 
 > **`scan_selftest` 被钉在 `-O1`,这是绕开一个工具链 bug,不是偷懒。**
@@ -692,6 +693,11 @@ PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
   [ykd2205pe_ci402.md](ykd2205pe_ci402.md)。
 - `scan/CMakeLists.txt` **没动**(`scan_selftest` 仍不编 `ecatworker.cpp` ——
   所以新增的判据全部写成头文件里的 `inline`,见 §15 末节那个坑)。
+- **2026-09-18 三条现场反馈(§16)**:新增 `scan/scanprefs.h` / `.cpp`;
+  `scanwindow.h` / `.cpp`(滚轮过滤器 + 记忆读写 + 超限那一行)、`scanplan.h` / `.cpp`
+  (`kMaxPlanPoints`)、`scancontroller.cpp`(超限不建网格)、`selftest.cpp`(188 → 237)、
+  `scan/CMakeLists.txt`(加 `scanprefs`)、`.gitignore`(`/bin/scan.ini`)、
+  `README.md`、本文。**`hmi/` 一个字没动。**
 
 ---
 
@@ -702,7 +708,7 @@ PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
 - 构建 **0 warning 0 error**;三个产物都是有效 PE:
   `bin/scan.exe` (755105 B)、`bin/scan_selftest.exe` (357751 B)、`bin/hmi.exe` (485981 B)。
   (字节数是**当次构建的读数,不是契约** —— 换个工具链版本就变。它只是"产物是有效 PE"的证据。)
-- **`scan_selftest` 188 条断言全过**(`188 passed, 0 failed`),覆盖:
+- **`scan_selftest` 237 条断言全过**(`237 passed, 0 failed`),覆盖:
 
   | 组 | 内容 |
   |---|---|
@@ -715,6 +721,8 @@ PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
   | preflight | 缺一条都不许动、量程装不下区域就拒绝 |
   | faultreset | `axis_needs_reset` 真值表(6 条)、`pick_faulted_axes` 在 9 种输入下挑得对不对(**含"状态未知的轴跳过,不猜"**) |
   | limitsw | 今天的 bit11 判定没变、精判据两条分支、现场诊断那句话不把"不知道"说成"都没压着"、**只压原点照样跑完一轮**、`60FDh` 未知时 bit11 照样中止、中止文案点名压住的开关 |
+  | plancap | 上限 200000 点:超了**一个点都不建**且「开始扫描」拒绝(理由是"点数")、正好 200000(400×500)必须建得出来、退回去必须能恢复(见 §16) |
+  | prefs | 文件不存在时给缺省(第一次运行与读了个半截的 ini 是同一条路)、存进去读回来**逐项相等**(含 `\Device\NPF_{GUID}` 的反斜杠)、不能扫的参数**盖不掉**上一次能用的那份(见 §16) |
 
 - **`scan_selftest` 抓出了三个真缺陷**,都在写完之后、有硬件之前:
   1. `beginAppend()` 把新数据行**粘在半行后面**(见 §8)
@@ -727,7 +735,21 @@ PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
 - **`bin/hmi.exe` 回归通过**:窗口正常,控制台输出与改动前一致
   (**没有**那句"量程已从…",因为它从不调 `postRange`)。
 - 全部改动文件的 `git diff --stat` == `git diff --ignore-cr-at-eol --stat`(无 EOL 噪声);
-  `scan/` 与 `hmi/` 全部 CRLF。
+  仓库**没有 `.gitattributes`,`core.autocrlf=false`** —— `git ls-files --eol scan/ hmi/`
+  显示**所有源文件都是 `w/lf`**。(本文从前写"`scan/` 与 `hmi/` 全部 CRLF",那是**错的**;
+  编辑这些文件时按 LF 加行,否则 diff 会凭空多出一整文件的行。)
+- **本次三件事都验过**(用临时探针 + 自检,不需要设备):
+  - 参数记忆:第一次跑写 `bin/scan.ini` → 第二次跑起来 `area_x = 12.5`(不是缺省的 27);
+    把 ini 里的网卡改成**第 10 块**(`\Device\NPF_{809345E5-…}`,Intel I219-V)→
+    起来后下拉框停在 **index 9** 而不是 index 0(证明是读回来的,不是碰巧撞上缺省那一项);
+    再把那个 GUID 改成一个不存在的 → **退回 index 0,不崩**(状态栏给一句提示)。
+  - 滚轮:**照 Qt 真实投递路径**滚过全部 12 个输入框(先投给 `childAt()` 命中的那个,
+    再沿父链走),每个框三列:没人点过 / 点过之后 / 翻过页之后。结论是
+    **没人点却被改 0/12、点过之后能改 9/12(另 3 个是 Qt 自己不动的下拉框)、
+    翻页后又被改 0/12**。**第一版验法(直接把事件 `sendEvent` 给 spin box)是假验**,
+    它"过了"而用户那里照样被改 —— 原因是真实投递先落在内部那个 `QLineEdit` 上,
+    见 §16.2、§16.5。
+  - 上限:自检里 400×500 建得出来、400×501 拒绝。
 
 ### 尚未验证(需要人在设备旁、手放在物理急停上)
 
@@ -1098,3 +1120,244 @@ ESI 声明里那份 12 项 / 39 字节的清单(含 `60FDh:32`)**不是生效的
 `enabled=1 visible=1`、`local=(13,85 362x24)`、可见区域**与自身矩形完全重合**
 (说明没被任何祖先裁掉),父 `QGroupBox` 的可见区域也等于它的几何 —— 即:它不但能勾,
 而且尺寸是完整的 362×24。探针用完已删(`scan/main.cpp` 的 blob 回到 `14ce4be3`,与 HEAD 逐字节相同)。
+
+---
+
+## 16. 2026-09-18 三条现场反馈:记参数 / 滚轮 / 卡死
+
+三条都是从**真机用起来**的角度提的,不是功能缺失:
+
+1. 每次开程序都要在十条 `\Device\NPF_{GUID}` 里重新认出上次那张网卡;
+2. 参数框上滚一下滚轮就改了值 —— 参数栏本身就是要滚的,手一滑就改错;
+3. **参数调到某些值,程序直接卡死。**
+
+第 3 条是缺陷,前两条是可用性。分别记。
+
+### 16.1 记忆:exe 旁边的 `scan.ini`(`scanprefs.h/.cpp`)
+
+新文件 `scan/scanprefs.{h,cpp}`,**只链 `Qt6::Core`** —— 这一条是设计前提,不是顺手:
+`scan_selftest` 不链 Widgets,把 ini 的读写放进一个能用自检真跑一遍的文件里,
+"键名写错一个字母"这种**不报错、只是下次记不住**的错才有人抓。所以读写与
+`Prefs` 结构体单独一个文件,只有 `Prefs { Params params; QString nic; int manual_speed; }`。
+
+- **位置**:`QCoreApplication::applicationDirPath()/scan.ini` —— exe 旁边。跟着程序走,
+  一眼能找到;想清零就删了它。`QSettings` 用 `IniFormat`,**不用注册表**。
+- **记**:区域 X/Y、分辨率、1 单位 = ? 脉冲、速度、停留、稳定、采样、蛇形、起始方向、
+  **上次连的网卡**、手动点画布用的速度。
+- **不记**(每一条都是决定不记的,不是漏了):
+  - **CSV 路径** —— 文件名带时间戳,记住它等于把上趟的数据盖上或者把新数据写到别处;
+  - **色标上下限** —— 它是"这一张图"的显示参数,把上趟锁的小范围套到新数据上,
+    新图会**看着是空的**,那是最坏的一类"看着坏了、其实没坏";每次都从 0..1 起;
+  - **功率计选择** —— 三个模拟源是穷举流程用的,真机协议还没有;
+  - **「让 60FDh 进 TxPDO」** —— 它一勾,连接时会往驱动器的 PDO 映射里写字节(仅 RAM)。
+    那种事每次都要人**当面**决定,与界面里"没有持久勾选"的先例一致。
+- **什么时候写**:①按「连接」时(**连之前先记住这张卡** —— 否则连上了再改掉下拉框,
+  记下的是最后选的那条而不是真连上的那条);②关窗时。
+- **写不进去不算错**:目录只读、盘满、文件被占着,都只是"这一次没记住"。
+  为它弹框、或者拦住一次连接,都不值得 —— `prefsSave()` 里没有返回错误这一路。
+- **过不了 `validate()` 的当前参数不覆盖旧的**(`prefsMergeParams`)。一次手滑
+  (分辨率少打一位)关窗之后,下次打开就该是"网格没建、开始按不动"?
+  那份参数本来也不能扫。记忆的用处是省下重填的功夫,不是如实记录每一次手滑 ——
+  所以宁可在 **连接时** 和 **关窗时** 都只记"能用得起来的那份"。
+  判据用的就是界面「开始扫描」按不按得动的那一条(`validate`)。
+- **量程(`range_pul`)一律归零**:它是从区域算出来的(`autoRangePul`),
+  记一份下来就是**第二份真相** —— 改了区域而忘记改量程,是静默错。
+
+**网卡怎么选回来**:`buildUi()` 里那个 `adaptersListed` 读回 `m_savedNic`,
+在 `\Device\NPF_{GUID}` 里 `findData()`;找不到(换了机器、卡拔了)**退回第一项**,
+状态栏给一句"上次用的网卡 (…) 不在列表里 —— 请重新选一块。(记在 exe 旁边的 scan.ini 里)"。
+**不弹模态框**:网卡列表还没出来时弹框没有意义,而这条不需要人立刻回应。
+
+### 16.2 滚轮:先选中,再滚(`WheelNeedsFocus`)
+
+规矩:**只有选中的那个输入框才认滚轮**;选中的意思就是它拿着焦点(点一下就有)。
+没有选中时,滚轮**不吃这一滚**,让它继续往上传给参数栏滚动区 —— 于是同一个滚轮
+在参数栏上照旧是滚动条,而不是"什么都没发生"(一个什么都不做的滚轮会让人以为程序死了)。
+
+**这一条第一版做错了,值得完整记一笔 —— 错在"事件到底落在哪个控件上"。**
+
+第一版把过滤器只装在 `QDoubleSpinBox` 这些外层控件上,探针也"验过"了:
+`27 -> 27, accepted=0`。**但那是假验**:探针把事件直接 `sendEvent` 给了 spin box 自己,
+而真机上不是这么走的。装在 `qApp` 上的探针抓下来的真实投递顺序是:
+
+```
+QWidgetWindow  ->  QLineEdit 'qt_spinbox_lineedit'  ->  QDoubleSpinBox
+```
+
+也就是**先接到滚轮的是 spin box 内部那个 `QLineEdit`**,而 `QAbstractSpinBox` 正好
+在那个 line edit 上装了自己的事件过滤器(内部编辑框的按键与滚轮都走那一条),
+**值就是在那一条里被改掉的**。过滤器只装在 spin box 上,这一滚根本轮不到我们 ——
+现象就是"闸装了,参数照旧一格一格地变"。同理还有第二处:判"选中没有"必须从
+**收到事件的那个控件往上找**到被闸的输入框再比焦点(`guardedAncestor`),
+拿 line edit 自己去比是永远比不上的(焦点在 spin box 上)。
+
+所以现在:
+
+```cpp
+/* 装在输入框 + 它的每一个子控件上 */
+void guard(QWidget *w) {
+   m_guards.insert(w);
+   w->installEventFilter(this);
+   for (QWidget *k : w->findChildren<QWidget *>())
+      k->installEventFilter(this);
+}
+
+/* 收到事件的那个控件 -> 找到它属于哪个被闸的输入框 */
+QWidget *input = guardedAncestor(w);
+if (input == nullptr)      return false;   /* 这一滚不落在参数框上 */
+if (hasFocusInside(input)) return false;   /* 选中过了: 按 Qt 原来的规矩改值 */
+e->ignore();                               /* 没选中: 不吃, 交给父级去滚 */
+return true;
+```
+
+第三处:**名单是"找出来的",不是手写的**。第一版手写了一张十六个控件的表,
+而手写的表**漏了不报错** —— 只是那个框还在被滚轮改。现在改成遍历窗口里所有
+`QAbstractSpinBox` 与 `QComboBox`,能漏的唯一方式是"新加了一个既不是
+`QAbstractSpinBox` 也不是 `QComboBox` 的输入控件"(那种东西现在还没有)。
+
+**还有一条"翻页不作废选中"的坑。** 光有"点过才认"不够:点过之后焦点一直留在那个框上,
+而人要滚参数栏时**鼠标正是从参数框上划过去的** —— 路过刚点过的那个,它照样改值,
+那正是要防的那件事。所以 `buildUi()` 里还接了一条:
+
+```cpp
+connect(sideScroll->verticalScrollBar(), &QScrollBar::valueChanged, this, [sideScroll](int) {
+   QWidget *fw = QApplication::focusWidget();
+   if (fw != nullptr && sideScroll->isAncestorOf(fw))
+      fw->clearFocus();       /* 人在翻页, 不是在改参数 -> 选中作废 */
+});
+```
+
+**滚动条一动就说明人在翻页**,于是把参数框的选中清掉,想用滚轮改就重新点一下。
+只清**滚动区里面**那个焦点(顶栏那张网卡表在滚动区外面,不受影响)。
+加上这一条之后,"翻页"这个动作本身**永远改不了任何参数**。
+
+两个实现细节:
+
+- **`e->ignore()` 与 `return true` 要一起用**。Qt 的规矩是"滚轮事件沿着父链上传,
+  直到被接受";过滤器返回 `true` 就**吃掉了**这一次投递,父级 `QScrollArea` 再也收不到,
+  参数栏就**滚不动了**。先 `ignore()`(于是 `accepted=false`)再把 `true` 返回,
+  才是"我不改值,这一滚交给上面去滚页面"。
+- **不能用 `w->hasFocus()`**:见上,焦点在内部那个 `QLineEdit`/`QDoubleSpinBox` 上,
+  谁是焦点跟"哪个是我要闸的输入框"是两件事,只能沿父链找。
+
+**范围**:只闸 `QAbstractSpinBox` 与 `QComboBox`,不是全局。画布的滚轮该不该缩放/滚动
+是另一件事;`QLineEdit`(CSV 路径)不闸 —— 滚轮改不了它的文字,它那一滚照旧落给参数栏。
+
+### 16.3 卡死:点数上限 200000(`kMaxPlanPoints`)
+
+**根因**。`ScanController::rebuildPlan()` 从前是"参数一动就照着算",
+`nx*ny` 有多大就建多大(这是改之前的原文):
+
+```cpp
+m_nx   = axisCount(m_p.area_x_unit, m_p.res_unit);
+m_ny   = axisCount(m_p.area_y_unit, m_p.res_unit);
+m_plan = buildPlan(m_p);                      /* nx*ny 个 Point */
+m_plan_p = m_p;
+
+const size_t n = (size_t)std::max(0, m_nx) * (size_t)std::max(0, m_ny);
+m_done.assign(n, 0);                          /* 再加三份同样大的 */
+m_have.assign(n, 0);
+m_watts.assign(n, 0.0);
+```
+
+而 `validate()` 里那条"点数 200000 太多"的提示**只是一句话** —— 它挡「开始扫描」,
+但**不挡 `rebuildPlan()`**。区域上限 500、分辨率下限 0.001 ⇒ **2.5e11 个点**。
+
+数值小一点(比如 1e8 个点、约 4 GB)时 `assign` **会成功** —— 于是没有崩溃、没有报错,
+只有:填 `plan` 的那个循环一直在跑,加上 `MapCanvas::paintEvent` 每帧重建
+`QImage(nx, ny)` 再逐像素填。**界面从此不动了**,而且**也没崩**,所以看起来就是"卡死"。
+这就是"某些值会卡死"那条的全部真相。
+
+**修法**。上限提成**一处定义**(`scanplan.h`):
+
+```cpp
+constexpr long long kMaxPlanPoints = 200000;
+```
+
+`validate()` 与 `rebuildPlan()` **读同一个常量** —— 一处分界,两处执行。
+`rebuildPlan()` 现在先算 `nx/ny/total`,超限就**什么都不建**:
+
+```cpp
+if (nx <= 0 || ny <= 0 || total > kMaxPlanPoints)
+{
+   m_nx = m_ny = 0;                    /* ← 这两行不能省, 见下 */
+   m_plan.clear(); m_done.clear(); m_have.clear(); m_watts.clear();
+   m_plan_p = m_p;
+   return;
+}
+```
+
+- **`m_nx = m_ny = 0` 是必须的,不是洁癖**:`cellDone()` 里按下标访问 `m_done[iy*m_nx+ix]`,
+  留下 `m_nx/nx` 而把数组清空就是**越界读**。零化之后"没有网格"在全程序里只有一种表示。
+- **空网格在别处都安全**:`rebuildImage()` 见到 `nx<=0` 直接返回(画布空着)、
+  `start()` 判 `nx<=0` 就拒绝、参数栏用 `paramsError()` 把「开始扫描」按住。
+- **画的是"要的那张网格",不是"建出来的那张"**:参数栏与状态栏显示的是
+  **算出来的 `nx/ny/total`**(哪怕超限),因为操作员要的是
+  "我要的这一片到底有多少点" —— 显示 0×0 会让人以为分辨率没生效。
+  超限时那一行写清 `网格 400 × 501 = 200400 点 … 超过上限 200000 —— 网格没有建
+  (画布此刻是空的, 「开始扫描」按不动)`。
+
+**为什么是 200000 而不是别的数**:它不是"能不能扫"的功能边界(真按 0.5 单位扫,
+默认区域才 3025 点),而是**资源闸**:`plan` 是 `Point` 数组、`m_done/m_have/m_watts`
+各一份、热力图要一张同尺寸的 `QImage`、还有一条预览路径。两万个点以内怎么都轻松,
+二十万个点是一张 447×447 的图 + 几十 MB —— 到这儿就够拦住"少打一个零"这类手滑了
+(27 → 2.7 就是 11 万个点,5.5 → 0.055 是 5000 万个)。`validate()` 里那句话也照着它写:
+"先确认分辨率是不是少打了个零"。
+
+### 16.4 这一轮动到的文件
+
+- **新增** `scan/scanprefs.h/.cpp`(只链 `Qt6::Core`);
+- `scan/scanwindow.h/.cpp`:`WheelNeedsFocus`(头里一行前置声明 + 成员写成具体类型,
+  因为装闸时要调它的 `guard()`)+ `nicShort()` + `loadSettings()` / `saveSettings()` +
+  `buildUi()` 末尾 `guard()` 遍历装闸 + 接滚动条那条"一滚就作废" + `adaptersListed`
+  选回网卡 + `pushParams()` 里超限那一行;
+- `scan/scanplan.h`:`kMaxPlanPoints`;`scan/scanplan.cpp`:`validate()` 用它;
+- `scan/scancontroller.cpp`:`rebuildPlan()` 的超限分支;
+- `scan/selftest.cpp`:`plancap` / `prefs` 两组(188 → **237** 条);
+- `scan/CMakeLists.txt`:`scanprefs.cpp scanprefs.h` 进 `SCAN_COMMON_SRC`;
+- `.gitignore`:**`/bin/scan.ini`** —— 它记着**这台机器**的网卡,换台机器那份 GUID 就没意义了;
+- `README.md`(scan 一节的三条 + 自检条数)、本文。
+
+### 16.5 验证到什么程度
+
+**验了**(见 §13;全部不需要设备,用临时探针 + 自检):
+
+- 参数记忆跨进程:第一次跑 → 第二次跑 `area_x = 12.5`(缺省是 27);
+- 网卡:把 ini 指到**第 10 块**(Intel I219-V)→ 起来停在 **index 9**;
+  指到一个不存在的 GUID → **退回 index 0 不崩**;
+- **滚轮(重点,第一版验错了所以重验)**:探针**不再直接 `sendEvent` 给 spin box**,
+  改成照 Qt 真实路径投递(先给 `childAt()` 那个控件,再沿父链走),
+  12 个输入框逐个三列:
+
+  ```
+  共 12 个输入框: 没人点却被改 0 (要 0); 选中后能改 9 (要 12);
+                  翻页清掉焦点 11 (要 12); 翻页后又被改 12 (要 0)
+  ```
+
+  逐行看是 `区域 X 27 -> 没人点:27 没动 -> 选中:28 改了 -> 翻页后:28 没动` 这样的三列。
+  两个"没到 12"都查过、都不是漏:
+
+  - **选中后能改 9/12**:另外 3 个是**下拉框**。闸对它们是放行的(`闸放行·Qt没动`),
+    但 `QComboBox::wheelEvent` 在弹出列表还没被创建过时会直接不吃滚轮 —— 这是 Qt 自己的
+    行为,不是我们的闸挡的,而且挡的方向是"不改",没有风险;
+  - **翻页清掉焦点 11/12**:那 1 个是顶栏的网卡表,它**在滚动区外面**,
+    不该被清(清了反而会丢用户的选择),代码里本来就用 `sideScroll->isAncestorOf()` 圈定了范围。
+
+  这一轮之前先复现了第一版的错:把过滤器只装在 spin box 上、探针直投 spin box 时,
+  看到的是"闸生效";换成真实投递路径后,同一个闸**一次都没被调到** —— 这就是用户
+  反馈"滚轮的问题还是没有解决"的原因。§16.2 记了这件事。
+- 上限:400×500 建得出来、400×501 拒绝且「开始扫描」按不动。
+
+**没验**:
+
+- **真机上"连上那张卡之后确实能进 OP"** —— 本轮一次都没连过设备(没有设备)。
+  记忆这条链路只验到"下拉框选对了",**"选对了就是对的卡"这件事本身还是 §13 那条老账**。
+- **卡死的门槛手感**:200000 是不是合适(会不会有正当的扫描需要更多点),
+  要等真按区域、真按分辨率跑几次才知道。现在这个数是从资源上倒推的,不是从需求来的。
+- 参数栏那个滚动区里,**滚轮在参数框上从"改值"变成"滚页面"之后手感如何** ——
+  只能上机看(尤其是触控板:一次滑动会连发很多个 wheel 事件)。**"翻页就作废选中"
+  这条同样只有手感能评**:滚一格就把刚点过的框清掉,是安全还是嫌烦,要人来判断。
+- **"滚轮闸"这条规则没有任何自检覆盖**:`scan_selftest` 只链 `Qt6::Core`,
+  装不了控件也就测不了这条 —— 它的全部证据就是上面那次探针(探针本身也随 `main.cpp`
+  一起还原了,不在仓库里)。要长期守住,得有一个能链 Widgets 的测试目标,本轮没做。
+

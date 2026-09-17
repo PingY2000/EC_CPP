@@ -32,6 +32,7 @@
 #include "scancontroller.h"
 #include "scanlog.h"
 #include "scanplan.h"
+#include "scanprefs.h"
 #include "powermeter.h"
 
 using namespace scan;
@@ -1019,6 +1020,177 @@ static void test_preflight()
    }
 }
 
+/* ------------------------------------------------- 点数上限 (一道资源闸) */
+
+/*
+ * 用户报的那条"参数设到某些值程序就卡死", 根子在这里。
+ *
+ * **在修好之前, 这个文件里的一行 check 都写不出来** —— 因为"卡死"发生在 setParams 里:
+ * buildPlan 会给 floor(区域/分辨率)+1 的平方个 Point 开空间。区域 500 × 分辨率 0.001
+ * 是 2.5e11 个点 (几十 TB); 小一点的那些**分配得下来**, 然后填满它要几秒 ——
+ * 而界面在这期间一帧都刷不出来, 操作员看到的就是"卡死", 而且回不去 (下一次按键又要
+ * 在同一个坑里再走一遍)。
+ *
+ * 所以现在断言的是: **超上限时一个 Point 都不建** —— 网格按 0×0 报, 三个结果数组清空,
+ * 开始按钮那一关 (validate) 照样拦。而"正好卡在上限上"必须建得出来: 闸太紧会误伤
+ * 合法的大网格, 那比不闸更坏 (人会把参数改小到能跑为止, 而扫出来的是错的区域)。
+ */
+static void test_plancap()
+{
+   caseBegin("plan cap: 太大就不建网格 (卡死的根子)");
+   {
+      Rig r;
+      Params p = Rig::smallParams();
+      p.area_x_unit = 500.0;
+      p.area_y_unit = 500.0;
+      p.res_unit    = 0.001;
+
+      /* 先确认这份参数**真的**是超大的那份 —— 否则下面几条是空验 */
+      checkEq(axisCount(p.area_x_unit, p.res_unit), 500001, "the requested grid is huge");
+      checkEq((long long)500001 * 500001, 250001000001LL, "and its point count is astronomic");
+
+      r.ctrl.setParams(p);
+
+      check(!r.ctrl.paramsError().isEmpty(), "validate rejects it");
+      checkEq(r.ctrl.totalPoints(), 0, "no plan was built");
+      checkEq(r.ctrl.gridNx(), 0, "grid reported empty (nx)");
+      checkEq(r.ctrl.gridNy(), 0, "grid reported empty (ny)");
+      check(!r.ctrl.cellDone(0, 0), "cellDone on an empty grid answers false");
+      check(!r.ctrl.cellHasValue(0, 0), "cellHasValue on an empty grid answers false");
+      checkNear(r.ctrl.cellValue(0, 0), 0.0, "cellValue on an empty grid answers 0");
+      checkEq(r.ctrl.estimateTotalMs(), 0, "estimate is 0, not an overflow");
+
+      QString err;
+      check(!r.startScan(QDir::tempPath() + "/cap1.csv", &err), "start is refused");
+      check(err.contains(QStringLiteral("点数")), "the reason is the point count",
+            err.toStdString());
+   }
+
+   caseBegin("plan cap: 正好到上限必须建得出来, 退回去必须能恢复");
+   {
+      Rig r;
+
+      /* 400 × 500 = 200000, 正好是上限 */
+      Params p = Rig::smallParams();
+      p.res_unit    = 0.5;
+      p.area_x_unit = 199.5;                 /* floor(199.5/0.5)+1 = 400 */
+      p.area_y_unit = 249.5;                 /* floor(249.5/0.5)+1 = 500 */
+      checkEq(axisCount(p.area_x_unit, p.res_unit), 400, "nx at the limit");
+      checkEq(axisCount(p.area_y_unit, p.res_unit), 500, "ny at the limit");
+
+      r.ctrl.setParams(p);
+      check(r.ctrl.paramsError().isEmpty(), "exactly at the limit is legal");
+      checkEq(r.ctrl.gridNx(), 400, "grid built (nx)");
+      checkEq(r.ctrl.gridNy(), 500, "grid built (ny)");
+      checkEq(r.ctrl.totalPoints(), 200000, "grid built (points)");
+
+      /* 多一格就拒 */
+      Params q = p;
+      q.area_x_unit = 200.0;                 /* floor(200/0.5)+1 = 401 -> 200500 点 */
+      r.ctrl.setParams(q);
+      check(!r.ctrl.paramsError().isEmpty(), "one column over the limit is refused");
+      checkEq(r.ctrl.totalPoints(), 0, "and its plan is gone, not half-built");
+
+      /* 退回来必须重建 —— 否则"改坏了再改回来"就永远回不到能扫的状态 */
+      r.ctrl.setParams(Rig::smallParams());
+      checkEq(r.ctrl.totalPoints(), 25, "back to a small grid rebuilds the plan");
+      checkEq(r.ctrl.gridNx(), 5, "back to a small grid (nx)");
+
+      QString err;
+      check(r.startScan(QDir::tempPath() + "/cap2.csv", &err), "and it scans again",
+            err.toStdString());
+      r.ctrl.abort(QString());
+   }
+}
+
+/* ------------------------------------------------- 参数记忆 (scan.ini) */
+
+/*
+ * 这一层最容易**悄悄**错: 键名错一个字母不报错, 只是那一项永远记不住 ——
+ * 而"哪张网卡"这件事要等到下次开机才发现, 那时没人会想到是 ini 的锅。
+ *
+ * 网卡名 (Npcap 的 `\Device\NPF_{GUID}`) 是这条路上唯一的坑: **INI 是有转义字符的格式**,
+ * 反斜杠写进去再读回来会不会变成别的样子, 只有真跑一遍才知道。下面那一条断言就钉这个。
+ */
+static void test_prefs()
+{
+   caseBegin("prefs: 文件不存在时给缺省 (第一次运行与读了个半截的 ini 是同一条路)");
+   {
+      QTemporaryDir dir;
+      check(dir.isValid(), "temp dir");
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      const Prefs none = prefsLoad(ini);
+      checkNear(none.params.area_x_unit, 27.0, "default area_x");
+      checkNear(none.params.res_unit, 0.5, "default res");
+      checkEq((long long)none.params.speed_pul_s, 20000, "default speed");
+      checkEq(none.params.samples_per_point, 1, "default samples");
+      check(none.params.serpentine, "default serpentine");
+      checkEq(none.manual_speed, -1, "manual speed unset");
+      check(none.nic.isEmpty(), "no nic yet");
+      checkEq(none.params.range_pul, 0, "range is never remembered");
+   }
+
+   caseBegin("prefs: 存进去再读回来, 逐项相等");
+   {
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      Prefs p;
+      p.params.area_x_unit      = 12.5;
+      p.params.area_y_unit      = 7.25;
+      p.params.res_unit         = 0.125;
+      p.params.pulses_per_unit  = 4096.0;
+      p.params.speed_pul_s      = 33333;
+      p.params.dwell_ms         = 150;
+      p.params.settle_ms        = 80;
+      p.params.samples_per_point = 4;
+      p.params.serpentine       = false;
+      p.params.start_positive   = false;
+      p.nic = QStringLiteral("\\Device\\NPF_{9A3C1E7B-4D2F-4A18-9C55-6B0E2F7A1D43}");
+      p.manual_speed = 12345;
+
+      prefsSave(ini, p);
+      const Prefs b = prefsLoad(ini);
+
+      checkNear(b.params.area_x_unit, 12.5, "area_x");
+      checkNear(b.params.area_y_unit, 7.25, "area_y");
+      checkNear(b.params.res_unit, 0.125, "res");
+      checkNear(b.params.pulses_per_unit, 4096.0, "pulses_per_unit");
+      checkEq((long long)b.params.speed_pul_s, 33333, "speed");
+      checkEq(b.params.dwell_ms, 150, "dwell");
+      checkEq(b.params.settle_ms, 80, "settle");
+      checkEq(b.params.samples_per_point, 4, "samples");
+      check(!b.params.serpentine, "serpentine=false survives");
+      check(!b.params.start_positive, "start_positive=false survives");
+      checkEq(b.manual_speed, 12345, "manual speed");
+      check(b.nic == p.nic, "the Npcap device path survives INI escaping",
+            b.nic.toStdString());
+   }
+
+   caseBegin("prefs: 不能扫的参数盖不掉上一次能用的那份");
+   {
+      Prefs store;
+      const Params good = Rig::smallParams();
+      prefsMergeParams(&store, good);
+      checkNear(store.params.area_x_unit, 2.0, "a scannable set is remembered");
+
+      /* 手滑: 分辨率少打一位 —— 这份过不了 validate */
+      Params bad = Rig::smallParams();
+      bad.res_unit = 0.0001;
+      check(!validate(bad).empty(), "the slipped set really is illegal");
+      prefsMergeParams(&store, bad);
+      checkNear(store.params.res_unit, 0.5, "the illegal set did NOT overwrite the old one");
+      checkNear(store.params.area_x_unit, 2.0, "and the rest of the old set is intact");
+
+      /* 量程一律归零 —— 它是算出来的 */
+      Params withr = Rig::smallParams();
+      withr.range_pul = 725000;
+      prefsMergeParams(&store, withr);
+      checkEq(store.params.range_pul, 0, "range is dropped, not remembered");
+   }
+}
+
 /* ------------------------------------------------- 故障复位 (6040h bit7 上升沿) */
 
 /*
@@ -1256,6 +1428,8 @@ int main(int argc, char **argv)
    test_aborts();
    test_retest();
    test_preflight();
+   test_plancap();
+   test_prefs();
    test_faultreset();
    test_limitsw();
 

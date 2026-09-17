@@ -2,12 +2,15 @@
 
 #include "mapcanvas.h"
 
+#include <QAbstractSpinBox>
+#include <QApplication>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDateTime>
 #include <QDir>
 #include <QDoubleSpinBox>
+#include <QEvent>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
@@ -19,6 +22,8 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QScrollBar>
+#include <QSet>
 #include <QSpinBox>
 #include <QSplitter>
 #include <QStringList>
@@ -26,6 +31,7 @@
 #include <QThread>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QWheelEvent>
 
 #include <cmath>
 #include <cstdio>
@@ -117,6 +123,120 @@ static QString fmtDur(int64_t ms)
    return QStringLiteral("%1 h %2 min").arg(m / 60).arg(m % 60);
 }
 
+/* ---------------------------------------------------------------- 滚轮闸 */
+
+/*
+ * **只有已经选中的输入框才认滚轮。**
+ *
+ * 从前滚轮停在参数栏上就能改值 —— 而参数栏比窗口高是常态, 人**就是在滚它**。
+ * 于是一次翻页会把路过的那几个框各改一格 (区域 / 分辨率 / 速度 …), 而且改完**看不出来**:
+ * 控件里的数变了, 可没人会去逐个核对那十二个数字 —— 而扫描区域算错一格是要撞限位的。
+ *
+ * 规矩定成"**先点它 (拿焦点), 滚轮才改值**", 与 hmi / 画布那条"会动滑台的动作要多做一步"
+ * 是同一条纪律: 最顺手的那个动作永远不产生后果。
+ *
+ * 没焦点时**不吃这一滚** (ignore 之后事件继续往上传) —— 于是同一个滚轮在参数栏上照样
+ * 是滚动条, 而不是"什么都没发生"。这一点不能省: 一个什么都不做的滚轮会让人以为程序死了。
+ * 参数栏本来就在 QScrollArea 里, 所以"滚轮滚不动"恰恰是最坏的那种无反应。
+ *
+ * ── 事件真正落在哪个控件上 (这一段是**实测**出来的, 别再照直觉改) ──────────
+ *
+ * 光标停在 QDoubleSpinBox 上滚一格, 投递顺序 (用装在 qApp 上的探针抓下来的) 是:
+ *
+ *    QWidgetWindow  ->  QLineEdit 'qt_spinbox_lineedit'  ->  QDoubleSpinBox
+ *
+ * 也就是说**先接到滚轮的是 spin box 内部那个 QLineEdit**, 不是 spin box 自己 ——
+ * 而 QAbstractSpinBox 正好在那个 line edit 上装了自己的事件过滤器 (它内部编辑框的
+ * 按键与滚轮都走那一条), 值就是在那里被改掉的。过滤器只挂在外层 spin box 上的话,
+ * 这一滚**根本轮不到我们** (第一版就是这么错的: 探针把事件直接 sendEvent 给 spin box,
+ * 看着闸住了; 真机上事件先落在内部 line edit 上, 值照样一格一格地变)。
+ *
+ * 两条由此而来, 缺一条就白闸:
+ *   · 过滤器要挂在输入框**以及它的每一个子控件**上 (见 guard());
+ *   · 判"选中没有"要从**收到事件的那个控件往上找**到被闸的输入框, 再拿它去比焦点 ——
+ *     拿 line edit 自己去比焦点是永远比不上的 (焦点在 spin box 上), 那会变成一个
+ *     "点进去了也不许改"的坏锁。
+ *
+ * ── 为什么还要"一滚页面就作废" ────────────────────────────────────────────
+ *
+ * 光有"点过才认"还是不够: 点过之后焦点一直留在那个框上, 而人要滚参数栏时
+ * **鼠标正是从参数框上划过去的** —— 路过刚点过的那个框, 它照样改值。
+ * 所以还要接住滚动区: **参数栏一滚, 选中就作废** (见 buildUi 里那个 connect)。
+ * 于是"翻页"这个动作本身永远改不了任何参数, 想用滚轮改就重新点一下。
+ */
+class WheelNeedsFocus : public QObject
+{
+public:
+   explicit WheelNeedsFocus(QObject *parent = nullptr) : QObject(parent) {}
+
+   /* 把 w 以及它的每一个子控件都闸上 (子控件那一条见上面"事件真正落在哪个控件上") */
+   void guard(QWidget *w)
+   {
+      if (w == nullptr)
+         return;
+
+      m_guards.insert(w);
+      w->installEventFilter(this);
+      for (QWidget *k : w->findChildren<QWidget *>())
+         k->installEventFilter(this);
+   }
+
+protected:
+   bool eventFilter(QObject *obj, QEvent *e) override
+   {
+      if (e->type() != QEvent::Wheel)
+         return false;
+
+      QWidget *w = qobject_cast<QWidget *>(obj);
+      if (w == nullptr)
+         return false;
+
+      QWidget *input = guardedAncestor(w);
+      if (input == nullptr)
+         return false;                 /* 这一滚不落在参数框上 (画布 / 滚动区自己) */
+
+      if (hasFocusInside(input))
+         return false;                 /* 选中过了 —— 按 Qt 原来的规矩改值 */
+
+      e->ignore();                     /* 没选中: 不吃, 让父级 (参数栏滚动区) 去滚 */
+      return true;
+   }
+
+private:
+   QWidget *guardedAncestor(QWidget *w) const
+   {
+      for (QObject *o = w; o != nullptr; o = o->parent())
+      {
+         auto *qw = qobject_cast<QWidget *>(o);
+         if (qw != nullptr && m_guards.contains(qw))
+            return qw;
+      }
+      return nullptr;
+   }
+
+   static bool hasFocusInside(const QWidget *w)
+   {
+      for (const QObject *o = QApplication::focusWidget(); o != nullptr; o = o->parent())
+      {
+         if (o == w)
+            return true;
+      }
+      return false;
+   }
+
+   QSet<QWidget *> m_guards;
+};
+
+/* 网卡名 (\Device\NPF_{GUID}) 太长, 横幅里只说得出那截 GUID —— 那是唯一有信息量的部分 */
+static QString nicShort(const QString &n)
+{
+   const int i = n.lastIndexOf(QLatin1Char('\\'));
+   QString s = (i >= 0) ? n.mid(i + 1) : n;
+   s.remove(QLatin1Char('{'));
+   s.remove(QLatin1Char('}'));
+   return s;
+}
+
 /* ---------------------------------------------------------------- 构造 */
 
 ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
@@ -149,15 +269,31 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
            });
    connect(m_thr, &EcatThread::adaptersListed, this,
            [this](const QStringList &names, const QStringList &descs) {
-              const QString keep = m_nic->currentData().toString();
+              /* 当前选着的那条**优先保住** (点一次「刷新网卡」不该把选好的卡弄丢);
+               * 还没选过 (开机第一次) 才轮到 scan.ini 里记住的那条 */
+              const QString cur = m_nic->currentData().toString();
+              const QString want = cur.isEmpty() ? m_savedNic : cur;
+
               m_nic->clear();
               for (int i = 0; i < names.size(); i++)
                  m_nic->addItem(descs.value(i, names[i]), names[i]);
-              if (keep.isEmpty())
+
+              if (want.isEmpty())
                  return;
-              const int idx = m_nic->findData(keep);
+
+              const int idx = m_nic->findData(want);
               if (idx >= 0)
+              {
                  m_nic->setCurrentIndex(idx);
+                 return;
+              }
+
+              /* 上次那张卡不在了 (换了机器 / USB 网卡没插)。**必须说出来** ——
+               * 不说的话现象是"开机默认选了另一块卡", 而人以为程序记错了 */
+              if (cur.isEmpty())
+                 hint(QStringLiteral("上次用的网卡 (%1) 不在列表里 —— 请重新选一块。"
+                                     "(记在 exe 旁边的 scan.ini 里)").arg(nicShort(want)),
+                      false);
            });
 
    connect(m_ctl, &ScanController::autoAborted, this, &ScanWindow::showFault);
@@ -282,6 +418,39 @@ void ScanWindow::buildUi()
    v->addWidget(m_banner);
    v->addWidget(split, 1);
    setCentralWidget(central);
+
+   /*
+    * 滚轮闸 (见 WheelNeedsFocus)。**名单是"找出来的", 不是手写的** ——
+    * 手写一张"哪些算输入框"的表, 漏一个就是漏一个 (而且漏了不报错, 只是那个框
+    * 还在被滚轮改), 而这里能漏的唯一方式是"新加了一个既不是 QAbstractSpinBox
+    * 也不是 QComboBox 的输入控件" —— 那种东西现在还没有。
+    *
+    * 挂在最后: 这里才保证上面那六组框全都建出来了。
+    *
+    * QLineEdit (CSV 路径 / 脚本路径) 不闸 —— 滚轮**改不了**它的文字, 没有要闸的东西;
+    * 它的那一滚照旧落给参数栏滚动区, 页面该滚还是滚。
+    */
+   m_wheelGuard = new WheelNeedsFocus(this);
+   for (QAbstractSpinBox *x : findChildren<QAbstractSpinBox *>())
+      m_wheelGuard->guard(x);
+   for (QComboBox *x : findChildren<QComboBox *>())
+      m_wheelGuard->guard(x);
+
+   /*
+    * **参数栏一滚, "选中"就作废。**
+    *
+    * 这是"翻页永远不会改参数"的另一半 (另一半是 WheelNeedsFocus 那条"点过才认"):
+    * 点过某个框之后, 人接着滚参数栏 —— 鼠标正是从那些框上划过去的, 路过刚点过的
+    * 那个, 它照样改值。滚动区的滚动条一动就说明**人在翻页, 不是在改参数**,
+    * 于是把参数框的选中 (焦点) 清掉, 想用滚轮改就得重新点一下。
+    *
+    * 只清**滚动区里面**那个焦点: 焦点在画布或别处时不受影响。
+    */
+   connect(sideScroll->verticalScrollBar(), &QScrollBar::valueChanged, this, [sideScroll](int) {
+      QWidget *fw = QApplication::focusWidget();
+      if (fw != nullptr && sideScroll->isAncestorOf(fw))
+         fw->clearFocus();
+   });
 
    /* ---- 状态栏 ---- */
    m_lNote = new QLabel(this);
@@ -700,6 +869,10 @@ QWidget *ScanWindow::buildParamPanel()
     */
    applyDefaults();
 
+   /* 再拿记忆覆盖一遍 (顺序不能反, 见 scanwindow.h)。
+    * 也在这里、也在 connect 之前: 读回来的值走的是同一条"不要触发信号"的路 */
+   loadSettings();
+
    /* 参数一改就重算 —— 让操作员在**按开始之前**就看见这一趟多长 */
    const QList<QDoubleSpinBox *> dspins{m_edAreaX, m_edAreaY, m_edRes, m_edPpu};
    for (QDoubleSpinBox *s : dspins)
@@ -894,6 +1067,60 @@ void ScanWindow::applyDefaults()
    m_edManSpeed->setValue(HMI_VEL_DEF);
 }
 
+/*
+ * 记忆: 读回上次的参数 (见 scanprefs.h)。
+ *
+ * **它只覆盖 ini 里真有的项** —— prefsLoad 把缺的项留在缺省上, 而上面那句 applyDefaults
+ * 刚把缺省填进控件, 于是"没记过的项 = 缺省"是同一件事, 不必在这里再判一次。
+ *
+ * setValue / setCurrentIndex 都会**自动夹进控件的量程** —— 一个被手改坏的 ini
+ * (区域写成 1e9) 会变成 500 而不是让界面炸掉。夹掉了不吭声: 这是记忆, 不是配置校验,
+ * 一开机就为一句话弹框只会被条件反射地关掉。
+ */
+void ScanWindow::loadSettings()
+{
+   const Prefs pf = prefsLoad(prefsPath());
+
+   m_edAreaX ->setValue(pf.params.area_x_unit);
+   m_edAreaY ->setValue(pf.params.area_y_unit);
+   m_edRes   ->setValue(pf.params.res_unit);
+   m_edPpu   ->setValue(pf.params.pulses_per_unit);
+   m_edSpeed ->setValue((int)pf.params.speed_pul_s);
+   m_edDwell ->setValue(pf.params.dwell_ms);
+   m_edSettle->setValue(pf.params.settle_ms);
+   m_edSamples->setValue(pf.params.samples_per_point);
+   m_cbDir   ->setCurrentIndex(pf.params.start_positive ? 0 : 1);
+   m_cbMode  ->setCurrentIndex(pf.params.serpentine ? 0 : 1);
+
+   /* 手动速度: **-1 = ini 里没这一项** (或是个旧 ini), 那就留在 applyDefaults 填的缺省上 */
+   if (pf.manual_speed > 0)
+      m_edManSpeed->setValue(pf.manual_speed);
+
+   /* 网卡此刻还选不了 (适配器清单是异步到的), 先存着, 到了再选 */
+   m_savedNic = pf.nic;
+}
+
+/*
+ * 记忆: 把当前参数写回去。**「连接」时与关窗时各一次**。
+ *
+ * 连接那一次是关键: "上次用的是哪张卡"说的是**真连过的那张**, 而不是"下拉框最后停在
+ * 哪张"。关窗那一次则是补上"改了参数但没连接就关掉"这种情况。
+ */
+void ScanWindow::saveSettings()
+{
+   Prefs pf = prefsLoad(prefsPath());     /* 先读回上次那份: 下面两处都是"覆盖不了就留着" */
+
+   /* **过不了体检的参数不覆盖旧的** —— 规则本身在 scanprefs 里 (那里能被自检钉住) */
+   prefsMergeParams(&pf, currentParams());
+
+   const QString nic = m_nic->currentData().toString();
+   pf.nic = nic.isEmpty() ? m_savedNic : nic;   /* 清单还没到 / 卡被拔了: 别把记住的抹掉 */
+   pf.manual_speed = m_edManSpeed->value();
+
+   prefsSave(prefsPath(), pf);
+   m_savedNic = pf.nic;
+}
+
 void ScanWindow::onRestoreDefaults()
 {
    /* 扫描中锁着这些控件 (见 refresh 的 locked 列表), 但那是"控件变灰"这一层的拦 ——
@@ -953,12 +1180,29 @@ void ScanWindow::pushParams()
    m_ctl->setParams(p);
    m_ctl->rebuildPlan();
 
-   const int nx = m_ctl->gridNx();
-   const int ny = m_ctl->gridNy();
+   /*
+    * 网格那一行**自己按参数算 nx/ny, 不读 m_ctl->gridNx()**。
+    *
+    * 超上限时控制器那边是 0×0 (它一个 Point 都没建, 见 rebuildPlan 那段), 而这一行
+    * 恰恰是要把"你要的这个网格有多大"说清楚的 —— 读控制器就只会显示 "0 × 0 = 0 点",
+    * 一句正确但没用的话。同一件事算两遍在这里是**必要的**: 控制器答的是"建出来的网格",
+    * 这一行答的是"参数说的网格", 超上限时这两者本来就该不一样。
+    */
+   const int nx = axisCount(p.area_x_unit, p.res_unit);
+   const int ny = axisCount(p.area_y_unit, p.res_unit);
+   const qint64 total = (qint64)nx * (qint64)ny;
 
-   m_lGrid->setText(QStringLiteral("网格 %1 × %2 = **%3 点**   ±%4 单位")
-                       .arg(nx).arg(ny).arg((qint64)nx * ny)
-                       .arg(m_ctl->params().area_x_unit / 2.0, 0, 'f', 3));
+   if (total > kMaxPlanPoints)
+      m_lGrid->setText(QStringLiteral("网格 %1 × %2 = **%3 点**   ±%4 单位\n"
+                                      "**超过上限 %5 —— 网格没有建** (画布此刻是空的, "
+                                      "「开始扫描」按不动)")
+                          .arg(nx).arg(ny).arg(total)
+                          .arg(p.area_x_unit / 2.0, 0, 'f', 3)
+                          .arg(kMaxPlanPoints));
+   else
+      m_lGrid->setText(QStringLiteral("网格 %1 × %2 = **%3 点**   ±%4 单位")
+                          .arg(nx).arg(ny).arg(total)
+                          .arg(p.area_x_unit / 2.0, 0, 'f', 3));
 
    /* 预估是**线性**的, 实际一定更长 —— 每次移动的进近段都要减速。
     * 不写这一句的话, 跑起来比预计慢 20% 就会被当成"卡住了" */
@@ -1055,6 +1299,11 @@ void ScanWindow::onConnectClicked()
       return;
 
    hint(QStringLiteral("正在连接... (选轴 / 补映射 / 进 OP 都要做 SDO, 慢是正常的)"), false);
+
+   /* **连上之前先记住这张卡** —— "上次用的网卡"说的是真连过的这张。
+    * 放在这里而不是等连接成功: 连接失败也说明人选的就是它, 下次开机仍然该默认它 */
+   saveSettings();
+
    m_thr->postConnect(m_nic->currentData().toString());
 }
 
@@ -1954,6 +2203,12 @@ void ScanWindow::closeEvent(QCloseEvent *e)
          warnMaybeLive();
       }
    }
+
+   /* 参数与网卡写回 scan.ini。**收尾之后才写** —— 上面那几步 (终止扫描 / 失能 / 还原
+    * 映射) 万一要弹"可能仍带电"的模态, 那才是人要看的东西, 不该被一次写文件挡在前面。
+    * 顺序上也更保险: 写盘失败只是这次没记住, 不影响收尾 */
+   saveSettings();
+
    e->accept();
 }
 

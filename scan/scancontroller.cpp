@@ -105,12 +105,43 @@ void ScanController::rebuildPlan()
    if (m_nx > 0 && !m_plan.empty() && sameGeom(m_p, m_plan_p))
       return;
 
-   m_nx   = axisCount(m_p.area_x_unit, m_p.res_unit);
-   m_ny   = axisCount(m_p.area_y_unit, m_p.res_unit);
+   const int nx = axisCount(m_p.area_x_unit, m_p.res_unit);
+   const int ny = axisCount(m_p.area_y_unit, m_p.res_unit);
+   const long long total = (long long)std::max(0, nx) * (long long)std::max(0, ny);
+
+   /*
+    * 点数上限的**闸就在这里** —— 不是 validate() 里那句提示。
+    *
+    * 参数是边输边算的: 分辨率从 0.5 打到 0.001 的路上会先经过 0.05、0.01 这些值,
+    * 每一个都立刻走到这里来。而"太大"的那些值里, 小的还能勉强分配 (区域 500 ×
+    * 分辨率 0.05 = 1e8 个点 = 4 GB, 分配得下来, 然后填满它要几秒), 大的直接把
+    * 分配器打到 bad_alloc。**而界面在这期间一帧都刷不出来** —— 操作员看到的就是
+    * "参数设到某些值程序卡死", 而且再也回不去 (下一次按键又要在同一个坑里再走一遍)。
+    *
+    * 所以超过上限时**一个 Point 都不建**: 网格当成 0×0, 三个结果数组清空。
+    * 于是: 画布画空的 (rebuildImage 见到 nx<=0 直接给一张空图)、开始按钮被
+    * paramsError() 挡着 (它报的就是同一句话)、红字把原因写在参数栏里。
+    *
+    * **不能只把 m_plan 清掉而留着 m_nx/m_ny**: 那三个数组是按 nx*ny 索引的
+    * (cellDone 那条 `m_done[iy*m_nx+ix]`), 长度对不上就是越界读。
+    */
+   if (nx <= 0 || ny <= 0 || total > kMaxPlanPoints)
+   {
+      m_nx = m_ny = 0;
+      m_plan.clear();
+      m_plan_p = m_p;
+      m_done.clear();
+      m_have.clear();
+      m_watts.clear();
+      return;
+   }
+
+   m_nx   = nx;
+   m_ny   = ny;
    m_plan = buildPlan(m_p);
    m_plan_p = m_p;
 
-   const size_t n = (size_t)std::max(0, m_nx) * (size_t)std::max(0, m_ny);
+   const size_t n = (size_t)m_nx * (size_t)m_ny;
    m_done.assign(n, 0);
    m_have.assign(n, 0);
    m_watts.assign(n, 0.0);

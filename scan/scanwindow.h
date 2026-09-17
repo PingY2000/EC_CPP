@@ -26,6 +26,7 @@
 #include "powermeter.h"
 #include "scancontroller.h"
 #include "scanplan.h"
+#include "scanprefs.h"
 
 class QCheckBox;
 class QComboBox;
@@ -39,6 +40,9 @@ class QTimer;
 namespace scan {
 
 class MapCanvas;
+
+/* 滚轮闸, 定义在 .cpp 里 (它只跟窗口内部那几个输入框打交道, 别处用不着) */
+class WheelNeedsFocus;
 
 class ScanWindow : public QMainWindow
 {
@@ -119,6 +123,11 @@ private:
    /* ---- 内部 ---- */
    void pushParams();                 /* 控件 → Params → 控制器 + 量程 */
    void applyDefaults();              /* 控件 ← Params 缺省 (构造时一次 + 「恢复默认」) */
+   /* 记忆 (exe 旁边的 scan.ini, 见 scanprefs.h)。
+    * load 在 buildParamPanel 里 applyDefaults **之后**调一次 —— 顺序不能反:
+    * 反过来的话, 紧接着的 applyDefaults 会把刚读回来的值全按缺省值盖掉, 等于白读。 */
+   void loadSettings();
+   void saveSettings();
    void pushManualSpeed(const BusTelem &t, bool running);
    void refreshAxisSignals(const BusTelem &t);   /* 限位/使能/故障: 状态栏 + 参数栏, 一份遥测 */
    void setSignalCell(LampGrid &g, int i, int s, bool known, bool on, Lamp lit,
@@ -221,6 +230,15 @@ private:
    QTimer        *m_tick        = nullptr;
    QTimer        *m_bannerTimer = nullptr;
    QElapsedTimer  m_clock;
+
+   /* 滚轮闸 (见 .cpp 里的 WheelNeedsFocus)。它自己不画任何东西, 只是一个挂在
+    * 参数输入框 (以及它们的子控件) 上的事件过滤器 —— 挂在本窗口名下只是为了有人负责删它。
+    * 类型用具体类而不是 QObject*, 因为装闸时要调它的 guard(); 类体在 .cpp 里 */
+   WheelNeedsFocus *m_wheelGuard = nullptr;
+
+   /* 上次用的网卡 (从 scan.ini 读回来的, 可能已经不在机器上了)。**适配器清单是
+    * 异步到的**, 所以先存在这儿, 等 adaptersListed 到了再拿它去选 */
+   QString        m_savedNic;
 
    int  m_epoch     = 0;      /* 零点世代。每次连接 / 每次「设为区域中心」+1, 进 CSV 表头 */
    /* 上次递给工作线程的量程。**只在数值真的变了才 postRange** —— 每敲一个键都投一条
