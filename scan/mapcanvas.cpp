@@ -27,7 +27,10 @@ static const QColor C_WANT   ("#ffb020");   /* 点击目标 (与 hmi 同义) */
 static const QColor C_TGT    ("#33d17a");   /* 本周期下发的插值目标 (与 hmi 同义) */
 static const QColor C_CUR    ("#ffffff");   /* 实测位置: 见下 */
 static const QColor C_FAIL   ("#d03b3b");   /* 采失败的那一格 */
-static const QColor C_SEL    ("#c8ced8");   /* Shift 选中的格 */
+static const QColor C_SEL    ("#c8ced8");   /* 左键查看选中的格 */
+/* 撞限位。**故意不复用 C_FAIL** —— 那个红的意思是"这一格没采到数", 是数据的问题;
+ * 这个是机械压在开关上, 是要立刻去处理的事。同一块画布上两种红必须能分开。 */
+static const QColor C_LIMIT  ("#ff5f5f");
 
 /*
  * 实测位置在 hmi 里是蓝色的 (#4a9eff)。**这里刻意换成白色。**
@@ -111,7 +114,9 @@ static const int RAMP_N = (int)(sizeof(RAMP_HEX) / sizeof(RAMP_HEX[0]));
 
 MapCanvas::MapCanvas(QWidget *parent) : QWidget(parent)
 {
-   setMinimumSize(320, 320);
+   /* 下限压到 240: 这块画布是**跟着窗口长**的那一半, 而右边那列现在自己会滚。
+    * 320 那会儿窗口一缩小, 是右边先被挤没, 而不是画布先变小 */
+   setMinimumSize(240, 240);
    setMouseTracking(true);
    setAutoFillBackground(false);
    setFocusPolicy(Qt::StrongFocus);
@@ -202,29 +207,47 @@ void MapCanvas::clearSelection()
 
 /* ---------------------------------------------------------------- 坐标 */
 
+/*
+ * 画布视野**固定**成 30×30 单位 (每边 ±15), 再各留 1 单位余量。
+ *
+ * 以前这里是跟着区域参数缩放的 —— 那样子区域一小, 框还是铺满整块画布: 两次不同尺寸的
+ * 扫描, 画出来一模一样大, 颜色也看不出疏密, 图与图没法比。固定视野之后 1 单位恒等于
+ * 固定的一格, 区域框反而成了**图里的一个量**, 一眼就能读出它占多大。
+ *
+ * 区域框画在这个视野**里面**: 默认 27×27, 每边还剩 2.5 单位余量, 手点对位够用。
+ * 每 5 单位一条的网格线落在 ±5/±10/±15 上, 正好与 30×30 的边界对齐。
+ */
+static const double kViewHalfUnits = 16.0;
+
+/*
+ * 画图区四周的留白 (像素)。标尺 / 色标条 / 超量程红字各占一条, **四个数写在一处** ——
+ * 谁要往框外画东西 (比如标尺), 就得从这儿拿宽度。散在各处的话, 改了 plotRect 而标尺
+ * 还按旧宽度摆, 数字就画到框上去了。
+ */
+static const double kPadL = 38.0;   /* 左边: Y 标尺的刻度与数字 */
+static const double kPadR = 74.0;   /* 右边: 色标条 + 它的数字 */
+static const double kPadT = 20.0;   /* 上边: "区域超出量程" 那行红字 */
+static const double kPadB = 38.0;   /* 下边: X 标尺的刻度与数字, 再加那行"视野"说明 */
+
 double MapCanvas::viewHalfUnits() const
 {
-   double ax = 27.0, ay = 27.0;
-   if (m_ctl != nullptr)
-   {
-      ax = m_ctl->params().area_x_unit;
-      ay = m_ctl->params().area_y_unit;
-   }
-   /* 区域各留 12% 的边, 于是区域框不会贴着画布边 */
-   return std::max(ax, ay) * 0.5 * 1.12 + 0.5;
+   return kViewHalfUnits;
 }
 
 QRectF MapCanvas::plotRect() const
 {
-   /* 色标条占右边 74 px; 剩下的取正方形, 免得 x/y 比例不一样 (那会让距离骗人) */
-   const double strip = 74.0;
-   const double w = (double)width() - strip - 16.0;
-   const double h = (double)height() - 40.0;
+   /* 色标条占右边 kPadR; 剩下的取正方形, 免得 x/y 比例不一样 (那会让距离骗人) */
+   const double w = (double)width()  - kPadL - kPadR - 8.0;
+   const double h = (double)height() - kPadT - kPadB;
    const double side = std::min(w, h);
    if (side < 40.0)
       return QRectF(0, 0, 0, 0);
 
-   return QRectF(8.0, 8.0, side, side);
+   /* **居中**。以前是钉在左上角 8,8 —— 窗口一宽, 正方形画布右边就剩一大块空白,
+    * 而画布恰恰是这里唯一要看的东西。 */
+   const double x = kPadL + std::max(0.0, (w - side) / 2.0);
+   const double y = kPadT + std::max(0.0, (h - side) / 2.0);
+   return QRectF(x, y, side, side);
 }
 
 QPointF MapCanvas::pxOf(double xu, double yu) const
@@ -282,6 +305,15 @@ void MapCanvas::rebuildImage()
 
 void MapCanvas::rebuildPath()
 {
+   /*
+    * 存的是**单位, 不是像素**。像素由 drawPath 现算 —— 单位是扫描点的本来样子,
+    * 窗口多大跟它没关系。
+    *
+    * 以前这里存的是 pxOf(...) 的像素, 只在"网格数/点数变了"时才重建: 窗口一缩放,
+    * 热力图跟着走了 (它每帧现算), 蛇形线却还停在旧的像素位置上 —— 画布拉大了,
+    * 线只占左上角一小块。像素根本不是这份数据的属性, 存它就得靠一个容易忘的失效
+    * 标记去救。存单位, 这类 bug 就不存在了。
+    */
    m_path = QPainterPath();
    if (m_ctl == nullptr || m_ctl->totalPoints() <= 0)
       return;
@@ -290,12 +322,12 @@ void MapCanvas::rebuildPath()
    if (p0 == nullptr)
       return;
 
-   m_path.moveTo(pxOf(p0->x_unit, p0->y_unit));
+   m_path.moveTo(p0->x_unit, p0->y_unit);
    for (int k = 1; k < m_ctl->totalPoints(); k++)
    {
       const Point *p = m_ctl->pointAt(k);
       if (p != nullptr)
-         m_path.lineTo(pxOf(p->x_unit, p->y_unit));
+         m_path.lineTo(p->x_unit, p->y_unit);
    }
 }
 
@@ -336,6 +368,7 @@ void MapCanvas::paintEvent(QPaintEvent *)
       drawHeat(p);
    drawGrid(p);
    drawPath(p);
+   drawRulers(p);
    drawMarkers(p);
    drawScaleBar(p);
    drawHud(p);
@@ -410,14 +443,8 @@ void MapCanvas::drawGrid(QPainter &p)
    p.setPen(QPen(clipped ? C_FAIL : C_AREA, clipped ? 2 : 1));
    p.drawRect(area);
 
-   /* 刻度: 角上标单位数 */
-   p.setPen(C_MUTED);
-   QFont f = p.font();
-   f.setPointSizeF(7.5);
-   p.setFont(f);
-   const QString lab = QStringLiteral("±%1 单位").arg(half, 0, 'f', 1);
-   p.drawText(QRectF(r.left(), r.bottom() + 2, r.width(), 14),
-              Qt::AlignHCenter | Qt::AlignTop, lab);
+   /* 框下那行"视野 ±16 单位"归 drawRulers 管 —— 它得跟刻度数字排在同一条带子里,
+    * 两处各画各的就会叠上 */
 
    if (clipped)
    {
@@ -428,15 +455,117 @@ void MapCanvas::drawGrid(QPainter &p)
    }
 }
 
+/*
+ * 坐标标尺: 下边是 X, 左边是 Y。每 1 单位一个小刻度, 每 5 单位一个带数字的 ——
+ * **与网格线同一组位置**, 所以线和对得上的数永远是同一个。
+ *
+ * 以前框下面只有一行"视野 ±16 单位", 那是**说明**, 不是标尺: 图上任何一个点离零点
+ * 多远, 得自己拿手指头数格子。而这块画布的手动定位恰恰是按坐标下发的 (点一下 =
+ * 走到那个显示坐标), 读不出坐标就只能靠试 —— 标尺是给这件事用的。
+ */
+void MapCanvas::drawRulers(QPainter &p)
+{
+   static const double kTick     = 5.0;   /* 大刻度线长 */
+   static const double kTickFine = 3.0;   /* 小刻度线长 */
+   static const double kGap      = 2.0;   /* 刻度线到数字 */
+
+   const QRectF r = plotRect();
+   const double half = viewHalfUnits();
+   const double k = r.width() / (2.0 * half);      /* 一单位多少像素 */
+   if (!(k > 0.0))
+      return;
+
+   QFont f = p.font();
+   f.setPointSizeF(7.0);
+   p.setFont(f);
+
+   const int  n    = (int)std::floor(half / kTick);   /* 3 -> ±15 */
+   const bool fine = (k >= 7.0);   /* 1 单位的小刻度: 太挤就不画 (画布能被拖到 240px) */
+
+   /* 小刻度先画 —— 它是背景, 不该压在大刻度和数字上 */
+   if (fine)
+   {
+      p.setPen(C_GRID);
+      const int m = (int)std::floor(half);
+      for (int i = -m; i <= m; i++)
+      {
+         if (i % (int)kTick == 0)
+            continue;                    /* 5 的倍数归大刻度 */
+         const QPointF a = pxOf((double)i, 0.0);
+         const QPointF b = pxOf(0.0, (double)i);
+         p.drawLine(QPointF(a.x(), r.bottom()),
+                    QPointF(a.x(), r.bottom() + kTickFine));
+         p.drawLine(QPointF(r.left(), b.y()),
+                    QPointF(r.left() - kTickFine, b.y()));
+      }
+   }
+
+   for (int i = -n; i <= n; i++)
+   {
+      const double  u    = (double)i * kTick;
+      const bool    zero = (i == 0);           /* 零点跟别的刻度分开: 它是显示坐标的原点 */
+      const QPointF a = pxOf(u, 0.0);
+      const QPointF b = pxOf(0.0, u);
+
+      p.setPen(zero ? C_TEXT : C_AXIS);
+      p.drawLine(QPointF(a.x(), r.bottom()), QPointF(a.x(), r.bottom() + kTick));
+      p.drawLine(QPointF(r.left(), b.y()), QPointF(r.left() - kTick, b.y()));
+
+      /*
+       * 数字**隔一个画一个**当画布小到"5 单位还不到一个数字宽"的时候 (k < 8, 也就是
+       * 画布被拖到 300px 出头)。刻度线一根不少 —— 少的是数字, 线还得跟网格线对得上。
+       */
+      if (k >= 8.0 || i % 2 == 0)
+      {
+         const QString s = QString::number(u, 'f', 0);
+         p.setPen(zero ? C_TEXT : C_MUTED);
+         p.drawText(QRectF(a.x() - 22.0, r.bottom() + kTick + kGap, 44.0, 12.0),
+                    Qt::AlignHCenter | Qt::AlignTop, s);
+         p.drawText(QRectF(r.left() - kTick - 30.0, b.y() - 6.0, 30.0, 12.0),
+                    Qt::AlignRight | Qt::AlignVCenter, s);
+      }
+   }
+
+   /* 单位写在两根标尺交会的那个角上 —— 光有数字说不清是毫米还是脉冲 */
+   p.setPen(C_MUTED);
+   p.drawText(QRectF(r.left() - kTick - 30.0, r.bottom() + kTick + kGap, 30.0, 12.0),
+              Qt::AlignRight | Qt::AlignVCenter, QStringLiteral("单位"));
+
+   /* 视野是固定的, 所以这行写的永远是同一个数 —— 它现在是**刻度说明**,
+    * 不是"这块区域多大" (那写在图里那个框上, 以及左上角那三行里) */
+   p.drawText(QRectF(r.left(), r.bottom() + kTick + kGap + 14.0, r.width(), 14.0),
+              Qt::AlignHCenter | Qt::AlignTop,
+              QStringLiteral("视野 ±%1 单位 (固定)").arg(half, 0, 'f', 1));
+}
+
 void MapCanvas::drawPath(QPainter &p)
 {
    if (m_path.isEmpty() || m_ctl->totalPoints() < 2)
       return;
 
+   const QRectF r = plotRect();
+   const double k = r.width() / (2.0 * viewHalfUnits());
+   if (!(k > 0.0))
+      return;
+
+   /* 单位 -> 像素, 现算。跟 pxOf 是同一条式子, 只是包成了变换 */
+   QTransform t;
+   t.translate(r.center().x(), r.center().y());
+   t.scale(k, -k);                      /* Y 轴向上, 屏幕坐标向下 */
+
+   p.save();
+   p.setTransform(t, true);
+
    /* 预览线要很淡: 它的作用是"告诉你待会儿怎么走", 不该压过热力图 */
+   QPen pen(QColor(107, 116, 128, 150), 1);
+   /* **cosmetic 不能省**: 世界变换会把线宽一起放大 k 倍 (这里 k ≈ 20), 不写的话
+    * 那条 1px 的细线会变成一条 20px 的灰带, 把整张热力图盖掉 */
+   pen.setCosmetic(true);
    p.setBrush(Qt::NoBrush);
-   p.setPen(QPen(QColor(107, 116, 128, 150), 1));
+   p.setPen(pen);
    p.drawPath(m_path);
+
+   p.restore();
 }
 
 void MapCanvas::drawMarkers(QPainter &p)
@@ -454,7 +583,7 @@ void MapCanvas::drawMarkers(QPainter &p)
       p.drawRect(QRectF(q.x() - h, q.y() - h, 2 * h, 2 * h));
    }
 
-   /* Shift 选中的格 */
+   /* 左键查看选中的格 */
    if (m_sel_ix >= 0 && m_sel_iy >= 0)
    {
       const double res = m_ctl->params().res_unit;
@@ -469,15 +598,26 @@ void MapCanvas::drawMarkers(QPainter &p)
       p.setPen(QPen(C_SEL, 2));
       p.drawRect(QRectF(q.x() - h, q.y() - h, 2 * h, 2 * h));
 
-      if (m_ctl->cellHasValue(m_sel_ix, m_sel_iy))
-      {
-         p.setPen(C_TEXT);
-         QFont f = p.font();
-         f.setPointSizeF(8.0);
-         p.setFont(f);
-         p.drawText(QRectF(q.x() - 60, q.y() - h - 18, 120, 16), Qt::AlignCenter,
-                    QStringLiteral("%1").arg(m_ctl->cellValue(m_sel_ix, m_sel_iy), 0, 'g', 6));
-      }
+      QFont f = p.font();
+      f.setPointSizeF(8.0);
+      p.setFont(f);
+
+      /*
+       * 数值 —— **没采到也写出来, 写"未采集"**。空着的话跟"这里根本没选中"分不清,
+       * 而这两种情况的下一步动作完全不同 (一个去重测, 一个去检查是不是点歪了)。
+       */
+      const bool has = m_ctl->cellHasValue(m_sel_ix, m_sel_iy);
+      p.setPen(has ? C_TEXT : C_MUTED);
+      p.drawText(QRectF(q.x() - 70, q.y() - h - 18, 140, 16), Qt::AlignCenter,
+                 has ? QStringLiteral("%1").arg(m_ctl->cellValue(m_sel_ix, m_sel_iy), 0, 'g', 6)
+                     : QStringLiteral("未采集"));
+
+      /* 索引 + 坐标: 「重测选中点」按的是**索引**, 得让人看见自己选中的是第几格 */
+      p.setPen(C_MUTED);
+      p.drawText(QRectF(q.x() - 90, q.y() + h + 2, 180, 15), Qt::AlignCenter,
+                 QStringLiteral("[%1, %2]  (%3, %4) 单位")
+                    .arg(m_sel_ix).arg(m_sel_iy)
+                    .arg(xu, 0, 'f', 2).arg(yu, 0, 'f', 2));
    }
 
    if (m_bus == nullptr)
@@ -524,6 +664,32 @@ void MapCanvas::drawMarkers(QPainter &p)
       p.setPen(QPen(QColor(21, 24, 30, 220), 2));
       p.setBrush(C_POS);
       p.drawEllipse(q, R, R);
+
+      /*
+       * 硬件限位 (6041h bit11) —— 红圈套在位置点上 + 写清是哪根轴。
+       * 光一个红圈说不清是 X 还是 Y 撞了, 而这两件事的处理办法完全不同; 状态栏里
+       * 也有同样的显示, 这里是为了**眼睛在画布上时不用挪开去读状态栏** ——
+       * 扫描中撞限位是会自动中止的那一类, 值得用两种方式说同一件事。
+       */
+      const bool lim_x = (t.ax[0].sw & SCAN_LIMIT_BIT) != 0;
+      const bool lim_y = (t.ax[1].sw & SCAN_LIMIT_BIT) != 0;
+      if (lim_x || lim_y)
+      {
+         p.setBrush(Qt::NoBrush);
+         p.setPen(QPen(C_LIMIT, 2));
+         p.drawEllipse(q, R + 7, R + 7);
+
+         const QString s = (lim_x && lim_y) ? QStringLiteral("X / Y 轴撞限位")
+                         : lim_x           ? QStringLiteral("X 轴撞限位")
+                                           : QStringLiteral("Y 轴撞限位");
+         QFont f = p.font();
+         f.setPointSizeF(9.0);
+         f.setBold(true);
+         p.setFont(f);
+         p.setPen(C_LIMIT);
+         p.drawText(QRectF(q.x() - 90, q.y() + R + 8, 180, 16),
+                    Qt::AlignCenter, s);
+      }
    }
 }
 
@@ -570,6 +736,17 @@ void MapCanvas::drawScaleBar(QPainter &p)
 
 void MapCanvas::drawHud(QPainter &p)
 {
+   /*
+    * HUD 贴的是**画图区**, 不是窗口边 —— 窗口下沿那条带子现在是 X 标尺的,
+    * 还按 height() 摆的话这两行字会正好压在刻度数字上。
+    * 宽度也收到画图区内: 越过去就压到右边的色标条上了。
+    */
+   const QRectF r = plotRect();
+   const int    x = (int)r.left() + 8;
+   const int    w = (int)(r.right() - x - 6);
+   if (w < 40)
+      return;
+
    QFont f = p.font();
    f.setPointSizeF(8.0);
    p.setFont(f);
@@ -580,13 +757,25 @@ void MapCanvas::drawHud(QPainter &p)
                            .arg(m_ctl->completedPoints())
                            .arg(m_ctl->totalPoints())
                            .arg(m_ctl->pendingPoints());
-   p.drawText(QRect(10, 8, 260, 15), Qt::AlignLeft | Qt::AlignVCenter, prog);
+   p.drawText(QRect(x, (int)r.top() + 6, 260, 15), Qt::AlignLeft | Qt::AlignVCenter, prog);
 
    p.setPen(C_MUTED);
-   p.drawText(QRect(10, 23, 300, 15), Qt::AlignLeft | Qt::AlignVCenter,
+   p.drawText(QRect(x, (int)r.top() + 21, w, 15), Qt::AlignLeft | Qt::AlignVCenter,
               m_ctl->stateText());
 
-   /* 左下: 悬停读数 (单位 + 脉冲) */
+   /* 第三行: 区域尺寸。视野固定之后, 图里那个框多大就不再是"画布多大"了 ——
+    * 数字写出来, 免得把 27 的框当成铺满的 30 看。
+    * **接在状态那一行下面, 而不是钉在右上角**: 画布可以被拖到 240px 宽, 右对齐的话
+    * 那块文字会压到左边这行进度上去 */
+   p.setPen(C_MUTED);
+   const Params &q = m_ctl->params();
+   p.drawText(QRect(x, (int)r.top() + 36, w, 15), Qt::AlignLeft | Qt::AlignVCenter,
+              QStringLiteral("区域 %1 × %2 单位")
+                 .arg(q.area_x_unit, 0, 'f', 2)
+                 .arg(q.area_y_unit, 0, 'f', 2));
+
+   /* 下沿: 悬停读数 (单位 + 脉冲)。**有标尺之后这行更好用了** ——
+    * 标尺给到 5 单位, 这里是任意位置的精确值 */
    if (m_hover && m_ctl != nullptr)
    {
       const double ppu = m_ctl->params().pulses_per_unit;
@@ -595,20 +784,58 @@ void MapCanvas::drawHud(QPainter &p)
                            .arg((long long)std::llround(m_hover_xu * ppu))
                            .arg((long long)std::llround(m_hover_yu * ppu));
       p.setPen(C_TEXT);
-      p.drawText(QRect(10, height() - 40, width() - 20, 15),
+      p.drawText(QRect(x, (int)r.bottom() - 34, w, 15),
                  Qt::AlignLeft | Qt::AlignVCenter, s);
    }
 
-   /* 右下: 操作提示。Shift 重测这种不写出来就没人知道 */
+   /* 再下面一行: 操作提示。两个键各干什么不写出来就没人知道。
+    * 扫描中那一句也照实说 —— 查看还能用, 不能用的是手动定位 */
    p.setPen(m_manual_ok ? C_MUTED : C_WANT);
    const QString hint = m_manual_ok
-      ? QStringLiteral("左键 = 手动定位    Shift+左键 = 选中该格")
-      : QStringLiteral("扫描进行中 —— 先「中止」才能手动控制");
-   p.drawText(QRect(10, height() - 22, width() - 20, 15),
+      ? QStringLiteral("左键 = 查看该格    Shift+左键 = 手动定位")
+      : QStringLiteral("扫描中 —— 查看随便点; 手动定位要先「中止」");
+   p.drawText(QRect(x, (int)r.bottom() - 18, w, 15),
               Qt::AlignLeft | Qt::AlignVCenter, hint);
 }
 
 /* ---------------------------------------------------------------- 交互 */
+
+/*
+ * 查看那一格: 选中最近的网格点, 把它的数值 / 索引 / 坐标显示出来。
+ *
+ * **只读, 不动滑台** —— 所以扫描中照样能用 (盯着数据一格格长出来的时候, 正想问
+ * "这一点采到多少")。窗口那边也只把 `m_manual_ok` 用在手动定位那条路上。
+ */
+void MapCanvas::pickCell(double xu, double yu)
+{
+   const Params &q = m_ctl->params();
+   const double res = q.res_unit;
+   const int nx = m_ctl->gridNx();
+   const int ny = m_ctl->gridNy();
+   if (!(res > 0.0) || nx <= 0 || ny <= 0)
+      return;
+
+   const double span_x = ((double)nx - 1.0) * res;
+   const double span_y = ((double)ny - 1.0) * res;
+
+   /* lround 取的就是**最近**的那个格点, 所以下面不必再判"落在半格之内" ——
+    * 它按定义恒成立 (|round(t) - t| <= 0.5) */
+   const int ix = (int)std::lround((xu + span_x / 2.0) / res);
+   const int iy = (int)std::lround((yu + span_y / 2.0) / res);
+
+   if (ix < 0 || ix >= nx || iy < 0 || iy >= ny)
+   {
+      /* 点在网格外面 (区域框外那圈余量): **取消选中, 而不是什么都不做**。
+       * 不做的话, 选错了的那个框会一直赖在图上, 而人以为自己已经点掉了 */
+      clearSelection();
+      return;
+   }
+
+   m_sel_ix = ix;
+   m_sel_iy = iy;
+   update();
+   emit cellPicked(ix, iy);
+}
 
 void MapCanvas::mousePressEvent(QMouseEvent *e)
 {
@@ -617,10 +844,6 @@ void MapCanvas::mousePressEvent(QMouseEvent *e)
 
    const QPoint px = e->position().toPoint();
 
-   /* **扫描中一律吞掉。** 手动插一脚的话, 那一点的数据说不清是哪来的 */
-   if (!m_manual_ok)
-      return;
-
    double xu = 0.0, yu = 0.0;
    unitAt(px, &xu, &yu);
 
@@ -628,40 +851,37 @@ void MapCanvas::mousePressEvent(QMouseEvent *e)
    if (std::fabs(xu) > half || std::fabs(yu) > half)
       return;
 
-   if (e->modifiers() & Qt::ShiftModifier)
+   /* 左键 = 查看。**它排在扫描那道闸前面** —— 只读的动作没有理由被闸住 */
+   if (!(e->modifiers() & Qt::ShiftModifier))
    {
-      /* 就近吸附到网格点。落在半格之外就不选 —— 免得选中一个离得很远的格子 */
-      const Params &q = m_ctl->params();
-      const double res = q.res_unit;
-      const int nx = m_ctl->gridNx();
-      const int ny = m_ctl->gridNy();
-      if (res > 0.0 && nx > 0 && ny > 0)
-      {
-         const double span_x = ((double)nx - 1.0) * res;
-         const double span_y = ((double)ny - 1.0) * res;
-
-         const int ix = (int)std::lround((xu + span_x / 2.0) / res);
-         const int iy = (int)std::lround((yu + span_y / 2.0) / res);
-
-         if (ix >= 0 && ix < nx && iy >= 0 && iy < ny)
-         {
-            const double gx = -span_x / 2.0 + (double)ix * res;
-            const double gy = -span_y / 2.0 + (double)iy * res;
-            if (std::fabs(gx - xu) <= res * 0.5 && std::fabs(gy - yu) <= res * 0.5)
-            {
-               m_sel_ix = ix;
-               m_sel_iy = iy;
-               update();
-               emit cellPicked(ix, iy);
-            }
-         }
-      }
+      pickCell(xu, yu);
       return;
    }
+
+   /* from here: Shift + 左键 = 手动定位。**扫描中一律吞掉。**
+    * 手动插一脚的话, 那一点的数据说不清是哪来的 */
+   if (!m_manual_ok)
+      return;
 
    const double ppu = m_ctl->params().pulses_per_unit;
    if (!(ppu > 0.0))
       return;
+
+   /*
+    * 夹在**实际生效的量程**之内。视野固定成 ±16 单位之后, 画布上有一圈是扫描区外面、
+    * 也超出量程的地方 —— 在那一圈点一下就是一次走到量程尽头的长动作, 而界面上完全
+    * 看不出"我要的是 16 单位、实际只会走到 14.5"。夹掉之后橙色三角会停在量程边上,
+    * 那一停就是"到了这里就不动了"的说明。量程还没读到 (range <= 0) 时不夹。
+    */
+   double lim = half;
+   if (m_bus != nullptr)
+   {
+      const BusTelem t = m_bus->telemetry();
+      if (t.range > 0)
+         lim = std::min(lim, (double)t.range / ppu);
+   }
+   xu = std::max(-lim, std::min(lim, xu));
+   yu = std::max(-lim, std::min(lim, yu));
 
    emit manualMove((int32_t)std::llround(xu * ppu), (int32_t)std::llround(yu * ppu));
 }

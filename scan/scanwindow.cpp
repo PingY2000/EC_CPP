@@ -10,13 +10,16 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QSpinBox>
+#include <QSplitter>
 #include <QStatusBar>
 #include <QThread>
 #include <QTimer>
@@ -37,6 +40,58 @@ static const char *kBannerInfo =
  * 从仓库根目录敲 ./bin/scan.exe 是最常见的用法 —— 那样数据就落在仓库根的 scan_out/,
  * 正是 .gitignore 里那一条。 */
 static const char *kOutDir = "scan_out";
+
+/* ---------------------------------------------------------------- 信号灯 */
+
+/*
+ * 信号灯: 一个 12px 的圆点。四种样子 (ScanWindow::Lamp)。
+ *
+ *   Unknown 灰   —— 不知道 (没连接 / 轴上没遥测 / 丢过帧)
+ *   Off     灭   —— 这个名字代表的事**没发生**
+ *   Ok      绿亮 —— 使能带电
+ *   Bad     红亮 —— 出事了 (故障 / 撞限位)
+ *
+ * 判据只有一条: **灯亮 = 这个名字代表的事正在发生**。这是配电柜上的老规矩,
+ * 好处是每一格只需要读一个字就懂。
+ *
+ * 为什么不是"绿 = 没事": 那样的话正常时是**一片绿灯常亮**(没故障、没撞限位),
+ * 而真正要处理的那一秒也是绿的 —— 灯就成了墙纸。现在正常运行时只亮一盏 (使能),
+ * 那一盏恰恰是"电机带电, 动手之前先看清楚"的意思, 它是信息不是墙纸。
+ *
+ * 四种样子**都画满**(不搞"只在出问题时才显示"): 没连接时它坐在灰上, 于是"看不见灯"
+ * 本身不会跟"灯灭了"混淆 —— 那正是"一个只在出问题时才出现的指示器"会骗人的地方。
+ */
+static void paintLamp(QLabel *l, ScanWindow::Lamp s)
+{
+   static const char *kCss[] = {
+      "border:1px solid #6b7480; border-radius:6px; background:#4a5058;",  /* Unknown */
+      "border:1px solid #3c434e; border-radius:6px; background:#20242b;",  /* Off */
+      "border:1px solid #1f8a4c; border-radius:6px; background:#33d17a;",  /* Ok */
+      "border:1px solid #ffb3b3; border-radius:6px; background:#ff4d4d;"   /* Bad */
+   };
+   l->setStyleSheet(QString::fromLatin1(kCss[(int)s]));
+}
+
+static QLabel *makeLamp(QWidget *parent, const QString &tip)
+{
+   QLabel *l = new QLabel(parent);
+   l->setFixedSize(12, 12);
+   l->setToolTip(tip);
+   paintLamp(l, ScanWindow::Lamp::Unknown);
+   return l;
+}
+
+/* 灯 + 字 = 一条信息。装在一起, 免得布局把它们排散了 */
+static QWidget *lampUnit(QWidget *parent, QLabel *lamp, QLabel *text, int left = 10)
+{
+   QWidget *w = new QWidget(parent);
+   QHBoxLayout *h = new QHBoxLayout(w);
+   h->setContentsMargins(left, 0, 2, 0);   /* 状态栏里留一点: 两根轴的信息要能分开读 */
+   h->setSpacing(5);
+   h->addWidget(lamp);
+   h->addWidget(text);
+   return w;
+}
 
 static QString fmtDur(int64_t ms)
 {
@@ -166,37 +221,83 @@ void ScanWindow::buildUi()
    });
    connect(m_canvas, &MapCanvas::cellPicked, this, [this](int, int) { refresh(); });
 
-   /* 右侧一列: 扫描参数 / 扫描控制 / 功率计 / 色标。整列固定宽度, 免得拖窗口时
-    * 输入框跟着一起变形 */
-   QWidget *side = new QWidget(central);
-   side->setFixedWidth(370);
+   /* 右侧一列: 扫描参数 / 扫描控制 / 功率计 / 色标。**装进 QScrollArea** ——
+    * 这一列比窗口高是常态 (四组框加起来约 1140px, 而窗口里给它的位置通常只有 670),
+    * 从前窗口一矮, 最下面的「色标」就被挤得看不见了, 而那正是操作员要改的东西。 */
+   QWidget *side = new QWidget;
+   side->setMinimumWidth(340);
 
    QVBoxLayout *sv = new QVBoxLayout(side);
    sv->setContentsMargins(0, 0, 0, 0);
    sv->setSpacing(8);
+   /* 「轴信号」排在最上面。这一列比窗口高是常态, 而它是**状态** ——
+    * 要滚才能看到的状态指示器不算状态指示器。它也就三行, 挤不掉什么 */
+   sv->addWidget(buildAxisPanel());
    sv->addWidget(buildParamPanel());
    sv->addWidget(buildScanPanel());
    sv->addWidget(buildMeterPanel());
    sv->addWidget(buildShadePanel());
    sv->addStretch(1);
 
-   QHBoxLayout *mid = new QHBoxLayout;
-   mid->setContentsMargins(0, 0, 0, 0);
-   mid->setSpacing(8);
-   mid->addWidget(m_canvas, 1);
-   mid->addWidget(side);
+   QScrollArea *sideScroll = new QScrollArea(central);
+   sideScroll->setWidget(side);
+   sideScroll->setWidgetResizable(true);
+   sideScroll->setFrameShape(QFrame::NoFrame);
+   /* 两条滚动条都用默认的 AsNeeded: **内容不允许被悄悄裁掉**。横向的那条平时不出现,
+    * 只有把下面那根分隔条拖得太左、输入框真的放不下时才出来提醒一声 */
+   sideScroll->setMinimumWidth(320);
+   /* **下限压到 0**: 否则滚动区会拿里面那列的高度去顶窗口的最小高度,
+    * 窗口就再也缩不小了 —— 那正是加这个滚动区要解决的问题 */
+   sideScroll->setMinimumHeight(0);
+
+   /*
+    * 左画布 | 右参数栏, 中间一根**可以拖的分隔条**。
+    *
+    * 为什么不用"画布伸缩 + 参数栏固定宽度": 参数栏里那些输入框有自己的最小宽度,
+    * 固定宽度一旦压到它下面, QScrollArea 就**把右边裁掉** (横向滚动条关着的话连
+    * 拖都拖不回来)。交给 QSplitter 之后, 宽度分配由它算, 拖不动就是真的放不下了。
+    * 顺带还给了操作员一个旋钮: 嫌画布小就往左拖, 嫌参数栏窄就往右拖。
+    */
+   QSplitter *split = new QSplitter(Qt::Horizontal, central);
+   split->addWidget(m_canvas);
+   split->addWidget(sideScroll);
+   split->setStretchFactor(0, 1);        /* 窗口变大, 多出来的地方全给画布 */
+   split->setStretchFactor(1, 0);
+   split->setSizes({760, 400});
+   split->setCollapsible(0, false);      /* 别把哪一边拖没了 —— 两边都是要看的 */
+   split->setCollapsible(1, false);
+   split->setChildrenCollapsible(false);
 
    QVBoxLayout *v = new QVBoxLayout(central);
    v->addWidget(buildTopBar());
    v->addWidget(m_banner);
-   v->addLayout(mid, 1);
+   v->addWidget(split, 1);
    setCentralWidget(central);
 
    /* ---- 状态栏 ---- */
    m_lNote = new QLabel(this);
    m_lWkc  = new QLabel(this);
    m_lWkc->setFont(QFont(QStringLiteral("Consolas")));
+
+   /* 限位两根轴各一个, **灯 + 字一起常显**。常显的理由: 没连接时它写 "--"、灯是灰的,
+    * 于是"看不到它"本身不会跟"限位正常"混淆 —— 一个只在出问题时才出现的指示器,
+    * 出问题时也未必有人正看着它 */
+   /* 同一套语法, 参数栏那六盏灯也用它 (见 buildAxisPanel):
+    * **灯亮 = 这个名字代表的事正在发生**。所以"没压着开关"是**灭灯**, 不是绿灯 ——
+    * 绿灯留给"使能带电", 常亮的东西多了就等于墙纸, 真出事那一秒就没人看得见了 */
+   const QString limTip = QStringLiteral(
+      "硬件限位信号灯 (6041h bit11)。\n"
+      "灰 = 没连接, 不知道该说什么; 灭 = 开关没被压住; 红 = 正压在开关上。\n"
+      "红的这一条**扫描中会自动中止** —— 区域算错就是一头撞上去。");
+
+   m_lampX = makeLamp(this, limTip);
+   m_lampY = makeLamp(this, limTip);
+   m_lLimX = new QLabel(this);
+   m_lLimY = new QLabel(this);
+
    statusBar()->addWidget(m_lNote, 1);
+   statusBar()->addPermanentWidget(lampUnit(this, m_lampX, m_lLimX));
+   statusBar()->addPermanentWidget(lampUnit(this, m_lampY, m_lLimY));
    statusBar()->addPermanentWidget(m_lWkc);
 }
 
@@ -258,6 +359,68 @@ QWidget *ScanWindow::buildTopBar()
    return w;
 }
 
+/*
+ * 每根轴三个信号: 使能 / 故障 / 限位。一个信号一个灯, 旁边跟一行字。
+ *
+ * 判据一律是**同一个规矩**: 灯亮 = 这个名字代表的事正在发生; 灭 = 没发生; 灰 = 不知道。
+ * 使能灯是绿亮 (带电), 故障灯和限位灯是红亮 (出事了) —— 每一格旁边都有字, 所以"绿"
+ * 不必再单独背一套含义。
+ *
+ * **名字写在表头上**, 不是每格重复一遍: 两行三列都写"使能 故障 限位"的话,
+ * 这块地方会变成一片字, 而灯反而看不见了。
+ */
+QWidget *ScanWindow::buildAxisPanel()
+{
+   QGroupBox *box = new QGroupBox(QStringLiteral("轴信号"), this);
+   QGridLayout *g = new QGridLayout(box);
+   g->setContentsMargins(6, 4, 6, 6);
+   g->setHorizontalSpacing(12);
+   g->setVerticalSpacing(5);
+
+   static const char *kHead[3] = { "使能", "故障", "限位" };
+   /* 六盏灯共用的那一句。**每盏都带上** —— 悬停哪一盏都能学到同一条规矩,
+    * 否则"为什么使能是绿的、故障却是红的"只能去翻文档 */
+   static const char *kLampRule =
+      "\n\n灯亮 = 这件事正在发生; 灭 = 没发生; 灰 = 不知道。";
+   static const char *kTip[3] = {
+      "6041h bit2 —— 电机带电。\n"
+      "未使能时点画布不会动: 这是「这个轴现在能不能走」的答案。",
+
+      "6041h bit3 —— 驱动器故障位。\n"
+      "**扫描中置起会自动中止**; 清掉故障之前不要启扫。",
+
+      "6041h bit11 —— 正压在硬件限位开关上 (2310h X1 = 正 / X2 = 负)。\n"
+      "**扫描中会自动中止** —— 区域算错就是一头撞上去。"
+   };
+
+   for (int s = 0; s < 3; s++)
+   {
+      QLabel *h = new QLabel(QString::fromUtf8(kHead[s]), box);
+      h->setStyleSheet(QStringLiteral("color:#6b7480;"));
+      g->addWidget(h, 0, s + 1);
+   }
+
+   for (int i = 0; i < 2; i++)
+   {
+      QLabel *nm = new QLabel(QStringLiteral("轴%1").arg(i == 0 ? 'X' : 'Y'), box);
+      nm->setStyleSheet(QStringLiteral("color:#9aa3ae;"));
+      g->addWidget(nm, i + 1, 0);
+
+      for (int s = 0; s < 3; s++)
+      {
+         m_axLamp[i][s] = makeLamp(box, QString::fromUtf8(kTip[s])
+                                        + QString::fromUtf8(kLampRule));
+         m_axText[i][s] = new QLabel(box);
+         g->addWidget(lampUnit(box, m_axLamp[i][s], m_axText[i][s], 0), i + 1, s + 1);
+      }
+   }
+
+   /* 多出来的宽度全给最后一列, 让灯和字都靠左排成一条;
+    * **列号只能是 0..3** —— 写到 4 会凭空多出一个空列, 把前面三列挤成一个字宽 */
+   g->setColumnStretch(3, 1);
+   return box;
+}
+
 QWidget *ScanWindow::buildParamPanel()
 {
    QGroupBox *box = new QGroupBox(QStringLiteral("扫描参数"), this);
@@ -296,6 +459,22 @@ QWidget *ScanWindow::buildParamPanel()
    m_edSpeed->setRange(HMI_VEL_MIN, HMI_VEL_MAX);
    m_edSpeed->setSingleStep(1000);
    m_edSpeed->setSuffix(QStringLiteral(" pul/s"));
+   m_edSpeed->setToolTip(QStringLiteral("扫描时走多快。**一轮扫描从头到尾一个速度** ——\n"
+                                        "它在「开始扫描」那一刻下发一次, 中途改不了。"));
+
+   /* 手动速度: 点画布 /「全部回中」时用。
+    * **扫描中不生效** —— 那时候速度归 ScanController 管, 中途改会让"每点耗时"的
+    * 估算和状态机的超时判据都对不上。扫描一结束/中止, 这里会自己把手动速度推回去 */
+   m_edManSpeed = new QSpinBox(box);
+   m_edManSpeed->setRange(HMI_VEL_MIN, HMI_VEL_MAX);
+   m_edManSpeed->setSingleStep(1000);
+   m_edManSpeed->setSuffix(QStringLiteral(" pul/s"));
+   /* 提示里**不提「重测选中点」** —— 那一个走的是扫描状态机 (armRun), 用的是
+    * 「扫描速度」。写上就成了假话, 而操作员照着它会得出错的预期 */
+   m_edManSpeed->setToolTip(QStringLiteral(
+      "手动点画布走点、以及「全部回中」的速度。\n"
+      "**只在没扫描时生效**: 扫描 (含「重测选中点」) 用的是上面那个「扫描速度」。\n"
+      "嫌对位时走得太快就调小它, 不必动扫描速度。"));
 
    m_edDwell = new QSpinBox(box);
    m_edDwell->setRange(0, 60000);
@@ -340,12 +519,33 @@ QWidget *ScanWindow::buildParamPanel()
    f->addRow(QStringLiteral("分辨率"), m_edRes);
    f->addRow(QStringLiteral("1 单位 ="), m_edPpu);
    f->addRow(QStringLiteral("扫描速度"), m_edSpeed);
+   f->addRow(QStringLiteral("手动速度"), m_edManSpeed);
    f->addRow(QStringLiteral("单点停留"), m_edDwell);
    f->addRow(QStringLiteral("稳定窗口"), m_edSettle);
    f->addRow(QStringLiteral("每点采样"), m_edSamples);
    f->addRow(QStringLiteral("起始方向"), m_cbDir);
    f->addRow(QStringLiteral("扫描方式"), m_cbMode);
    f->addRow(QStringLiteral("CSV"), csvRow);
+
+   m_btnDef = new QPushButton(QStringLiteral("恢复默认"), box);
+   {
+      /* 提示里的数字从 Params 现算 —— 手抄一份的话, 缺省值一改这里就成了假话 */
+      const Params d0;
+      m_btnDef->setToolTip(QStringLiteral(
+         "这一组里的每一项都回到程序里的缺省值:\n"
+         "区域 %1 × %2 单位 / 分辨率 %3 / 1 单位 = %4 脉冲 / 速度 %5 pul/s / 停留 %6 ms …\n"
+         "**CSV 输出路径不动** —— 那是这一趟数据写哪儿, 不是扫描的参数。")
+         .arg(d0.area_x_unit, 0, 'f', 0).arg(d0.area_y_unit, 0, 'f', 0)
+         .arg(d0.res_unit, 0, 'f', 3).arg(d0.pulses_per_unit, 0, 'f', 0)
+         .arg(d0.speed_pul_s).arg(d0.dwell_ms));
+   }
+   connect(m_btnDef, &QPushButton::clicked, this, &ScanWindow::onRestoreDefaults);
+
+   QHBoxLayout *defRow = new QHBoxLayout;
+   defRow->setContentsMargins(0, 0, 0, 0);
+   defRow->addStretch(1);
+   defRow->addWidget(m_btnDef);
+   f->addRow(defRow);
 
    m_lGrid = new QLabel(box);
    m_lGrid->setStyleSheet(QStringLiteral("color:#c8ced8;"));
@@ -367,19 +567,7 @@ QWidget *ScanWindow::buildParamPanel()
     * 这一段必须在下面那些 connect **之前** —— 否则每 set 一个值都会触发一轮
     * pushParams() → refresh(), 而 refresh() 要用的按钮和标签此刻还没建出来。
     */
-   {
-      const Params d;                    /* scanplan.h 里那一份就是缺省 */
-      m_edAreaX->setValue(d.area_x_unit);
-      m_edAreaY->setValue(d.area_y_unit);
-      m_edRes  ->setValue(d.res_unit);
-      m_edPpu  ->setValue(d.pulses_per_unit);
-      m_edSpeed->setValue((int)d.speed_pul_s);
-      m_edDwell->setValue(d.dwell_ms);
-      m_edSettle->setValue(d.settle_ms);
-      m_edSamples->setValue(d.samples_per_point);
-      m_cbDir ->setCurrentIndex(d.start_positive ? 0 : 1);
-      m_cbMode->setCurrentIndex(d.serpentine ? 0 : 1);
-   }
+   applyDefaults();
 
    /* 参数一改就重算 —— 让操作员在**按开始之前**就看见这一趟多长 */
    const QList<QDoubleSpinBox *> dspins{m_edAreaX, m_edAreaY, m_edRes, m_edPpu};
@@ -388,6 +576,10 @@ QWidget *ScanWindow::buildParamPanel()
    const QList<QSpinBox *> ispins{m_edSpeed, m_edDwell, m_edSettle, m_edSamples};
    for (QSpinBox *s : ispins)
       connect(s, &QSpinBox::valueChanged, this, &ScanWindow::pushParams);
+
+   /* 手动速度不进 Params (它跟扫描几何无关, 也不该写进 CSV 表头), 所以不走 pushParams ——
+    * 直接叫 refresh(), 那里有"没扫描就把手动速度推给工作线程"那一段 */
+   connect(m_edManSpeed, &QSpinBox::valueChanged, this, &ScanWindow::refresh);
    connect(m_cbDir,  &QComboBox::currentIndexChanged, this, &ScanWindow::pushParams);
    connect(m_cbMode, &QComboBox::currentIndexChanged, this, &ScanWindow::pushParams);
 
@@ -417,7 +609,9 @@ QWidget *ScanWindow::buildScanPanel()
    connect(m_btnAbort, &QPushButton::clicked, this, &ScanWindow::onAbortClicked);
 
    m_btnRetest = new QPushButton(QStringLiteral("重测选中点"), box);
-   m_btnRetest->setToolTip(QStringLiteral("在画布上 **Shift + 左键** 选中一格, 再点这个"));
+   m_btnRetest->setToolTip(QStringLiteral("在画布上 **左键** 选中一格, 再点这个。\n"
+                                          "(选中是只读的, 扫描中也能选)"));
+
    connect(m_btnRetest, &QPushButton::clicked, this, &ScanWindow::onRetestClicked);
 
    m_btnOpen = new QPushButton(QStringLiteral("打开 CSV 续扫"), box);
@@ -548,6 +742,48 @@ QWidget *ScanWindow::buildShadePanel()
 }
 
 /* ---------------------------------------------------------------- 参数 */
+
+void ScanWindow::applyDefaults()
+{
+   /* scanplan.h 里的 Params 就是缺省值的唯一定义处 —— 这里不另抄一份数字 */
+   const Params d;
+
+   m_edAreaX->setValue(d.area_x_unit);
+   m_edAreaY->setValue(d.area_y_unit);
+   m_edRes  ->setValue(d.res_unit);
+   m_edPpu  ->setValue(d.pulses_per_unit);
+   m_edSpeed->setValue((int)d.speed_pul_s);
+   m_edDwell->setValue(d.dwell_ms);
+   m_edSettle->setValue(d.settle_ms);
+   m_edSamples->setValue(d.samples_per_point);
+   m_cbDir  ->setCurrentIndex(d.start_positive ? 0 : 1);
+   m_cbMode ->setCurrentIndex(d.serpentine ? 0 : 1);
+
+   /* 手动速度不在 Params 里 (它跟扫描几何无关), 缺省就是 HMI_VEL_DEF —— 与 hmi 一致 */
+   m_edManSpeed->setValue(HMI_VEL_DEF);
+}
+
+void ScanWindow::onRestoreDefaults()
+{
+   /* 扫描中锁着这些控件 (见 refresh 的 locked 列表), 但那是"控件变灰"这一层的拦 ——
+    * 这里再判一次, 是因为恢复默认会**重建网格**: 几何改到一半的扫描落进 CSV 的
+    * (ix,iy) 与实际位置就对不上了 */
+   if (m_ctl->running())
+   {
+      hint(QStringLiteral("扫描进行中 —— 先「中止」才能改参数"), true);
+      return;
+   }
+
+   applyDefaults();     /* 每一 setValue 都会经 pushParams 重算一遍, 幂等 */
+
+   const Params d;
+   hint(QStringLiteral("扫描参数已恢复默认 (区域 %1 × %2 单位, 分辨率 %3, "
+                       "1 单位 = %4 脉冲, 速度 %5 pul/s)。CSV 输出路径没动")
+           .arg(d.area_x_unit, 0, 'f', 0).arg(d.area_y_unit, 0, 'f', 0)
+           .arg(d.res_unit, 0, 'f', 3).arg(d.pulses_per_unit, 0, 'f', 0)
+           .arg(d.speed_pul_s), false);
+   refresh();
+}
 
 Params ScanWindow::currentParams() const
 {
@@ -950,7 +1186,7 @@ void ScanWindow::onRetestClicked()
    const int iy = m_canvas->selectedIy();
    if (ix < 0 || iy < 0)
    {
-      hint(QStringLiteral("先在画布上 **Shift + 左键** 选中一格"), false);
+      hint(QStringLiteral("先在画布上用 **左键** 选中一格"), false);
       return;
    }
 
@@ -967,6 +1203,141 @@ void ScanWindow::onRetestClicked()
 }
 
 /* ---------------------------------------------------------------- 刷新 */
+
+/*
+ * 手动速度只在**没在扫描**的时候推。
+ *
+ * 扫描中的速度是 ScanController::start() 设的那一个, 这里再推就是中途改速度 ——
+ * 而状态机的「每点耗时」估算与「走到位超时」判据都建立在那个速度上 (见
+ * scancontroller.cpp 的 startPoint)。扫描一结束/中止, running 变假, 这里就自己
+ * 把手动速度推回去 —— **不需要谁来记"该恢复了"**, 那种记账总有一条路径会漏掉。
+ *
+ * 只在数值真的不一样时才推: 这是 30Hz 调的, 每帧都 setSpeed 是白做功。
+ */
+void ScanWindow::pushManualSpeed(const BusTelem &t, bool running)
+{
+   if (!m_connected || running)
+      return;
+
+   const uint32_t v = (uint32_t)m_edManSpeed->value();
+   for (int i = 0; i < t.naxis && i < EM_MAX_AXES; i++)
+      if (t.ax[i].vel != v)
+         m_thr->setSpeed(i, v);
+}
+
+/*
+ * 一根轴的三个信号。
+ *
+ * **限位在参数栏和状态栏两处都有, 都从这里出** —— 分开算就会有一天两边说的不一样,
+ * 而"两个指示器互相矛盾"比"少一个指示器"坏得多。
+ */
+void ScanWindow::refreshAxisSignals(const BusTelem &t)
+{
+   for (int i = 0; i < 2; i++)
+   {
+      const AxisTelem &a = t.ax[i];
+
+      /*
+       * "不知道"的判据**跟状态机完全一致** (ScanController 自动中止那一段用的就是
+       * `!valid || !mirror_ok`)。判得比状态机宽的话, 会出现最坏的那种不一致:
+       * 灯说"正常", 而程序已经因为"丢了过程数据帧"中止了 —— 而且此时 sw 是陈值,
+       * 那个"正常"根本不是现在的状态。
+       */
+      const bool known = m_connected && a.valid && a.mirror_ok;
+      const bool lim   = known && (a.sw & SCAN_LIMIT_BIT) != 0;
+
+      /* ---- 参数栏那六个 ---- */
+      setSignalCell(i, 0, known, a.enabled, Lamp::Ok,
+                    QStringLiteral("已使能"), QStringLiteral("未使能"));
+      setSignalCell(i, 1, known, a.fault, Lamp::Bad,
+                    QStringLiteral("有故障"), QStringLiteral("无故障"));
+      setSignalCell(i, 2, known, lim, Lamp::Bad,
+                    QStringLiteral("撞上"), QStringLiteral("正常"));
+
+      /* ---- 状态栏那一对: 用的是上面同一个 lim ---- */
+      QLabel *lb   = (i == 0) ? m_lLimX : m_lLimY;
+      QLabel *lamp = (i == 0) ? m_lampX : m_lampY;
+      const QString ax = QStringLiteral("限位%1").arg(i == 0 ? 'X' : 'Y');
+
+      if (!known)
+      {
+         lb->setText(ax + QStringLiteral(" --"));
+         lb->setStyleSheet(QStringLiteral("color:#5a6270; padding:2px 6px;"));
+         paintLamp(lamp, Lamp::Unknown);
+         m_limShown[i] = false;      /* 不知道了就重新上膛: 再知道时该说的话还得说一遍 */
+         continue;
+      }
+
+      if (lim)
+      {
+         lb->setText(ax + QStringLiteral(" 撞上!"));
+         lb->setStyleSheet(QStringLiteral(
+            "background:#5a1f1f; color:#ffb3b3; padding:2px 6px;"
+            "border-radius:3px; font-weight:bold;"));
+         paintLamp(lamp, Lamp::Bad);
+      }
+      else
+      {
+         lb->setText(ax + QStringLiteral(" 正常"));
+         lb->setStyleSheet(QStringLiteral("color:#7b8391; padding:2px 6px;"));
+         paintLamp(lamp, Lamp::Off);   /* **灭, 不是绿** —— 见 paintLamp 上面那段 */
+      }
+
+      /* 上升沿弹一次横幅, 与上面故障那条同一个理由: 30Hz 每帧都设一遍会把重绘刷爆。
+       * 扫描中 bit11 置起会走自动中止 (那条有模态框), 这一条管的是**平时手动走的时候** */
+      if (lim && !m_limShown[i])
+      {
+         m_limShown[i] = true;
+         hint(QStringLiteral("轴%1 的 6041h bit11 置起 —— 正压在硬件限位开关上 "
+                             "(2310h X1 = 正 / X2 = 负)。先手动把它走离限位。")
+                 .arg(i), true);
+      }
+      else if (!lim)
+      {
+         m_limShown[i] = false;
+      }
+   }
+}
+
+void ScanWindow::setSignalCell(int i, int s, bool known, bool on, Lamp lit,
+                               const QString &litTxt, const QString &offTxt)
+{
+   QString txt;
+   QString col;
+   Lamp    l = Lamp::Unknown;
+
+   if (!known)
+   {
+      txt = QStringLiteral("--");
+      col = QStringLiteral("#5a6270");            /* 灰字: 连灯一起暗下去 */
+   }
+   else if (on)
+   {
+      txt = litTxt;
+      col = (lit == Lamp::Ok) ? QStringLiteral("#5fd693") : QStringLiteral("#ff8f8f");
+      l   = lit;
+   }
+   else
+   {
+      txt = offTxt;
+      col = QStringLiteral("#7b8391");
+      l   = Lamp::Off;
+   }
+
+   /* 只在真变了才动控件。**一个格子两样 (灯 + 字) 是一起变的** ——
+    * 文字决定颜色, 所以字没变就说明颜色也没变, 不必再比一遍 */
+   if (m_axLampLast[i][s] != l)
+   {
+      m_axLampLast[i][s] = l;
+      paintLamp(m_axLamp[i][s], l);
+   }
+   if (m_axTextLast[i][s] != txt)
+   {
+      m_axTextLast[i][s] = txt;
+      m_axText[i][s]->setText(txt);
+      m_axText[i][s]->setStyleSheet(QStringLiteral("color:") + col);
+   }
+}
 
 void ScanWindow::refresh()
 {
@@ -1000,20 +1371,24 @@ void ScanWindow::refresh()
 
    m_lNote->setText(t.note);
 
-   /* 画布: 扫描中一律吞掉点击。**只有画布一处决定吞不吞** —— 窗口再拦一道是兜底,
-    * 两处都判就会有一天只改了一处 */
+   /* 画布: 扫描中吞掉**手动定位** (查看是只读的, 不归这条管)。
+    * **只有画布一处决定吞不吞** —— 窗口再拦一道是兜底, 两处都判就会有一天只改了一处 */
    const bool running = m_ctl->running();
    m_canvas->setManualAllowed(!running);
+
+   pushManualSpeed(t, running);
 
    /* 扫描中锁住参数与取样源。几何改到一半的扫描是没有意义的 —— 落进 CSV 的
     * (ix,iy) 和实际位置就对不上了 */
    const QList<QWidget *> locked{
-      m_edAreaX, m_edAreaY, m_edRes, m_edPpu, m_edSpeed, m_edDwell,
+      m_edAreaX, m_edAreaY, m_edRes, m_edPpu, m_edSpeed, m_edManSpeed, m_edDwell,
       m_edSettle, m_edSamples, m_cbDir, m_cbMode, m_edCsv, m_cbMeter,
-      m_edManualV, m_edRandomN, m_edScript, m_btnScript, m_btnOpen
+      m_edManualV, m_edRandomN, m_edScript, m_btnScript, m_btnOpen, m_btnDef
    };
    for (QWidget *w : locked)
       w->setEnabled(!running);
+
+   refreshAxisSignals(t);
 
    const bool can_move = m_connected && !running;
    m_btnEnable->setEnabled(can_move && !t.ax[0].enabled);

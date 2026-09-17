@@ -27,11 +27,30 @@
  *   · 扫到了、读数失败 —— 红框 (crash 那种红), 因为那才是要人去处理的一格
  *   · 扫到了、有数 —— 顺序色标
  *
+ * ── 视野 ──────────────────────────────────────────────────────────────
+ *
+ * **固定 30×30 单位** (每边 ±15, 再各留 1 单位余量, 见 mapcanvas.cpp 的 kViewHalfUnits) ——
+ * 不跟着扫描区域缩放。缩放的话两次不同尺寸的扫描画出来一样大、颜色也看不出疏密,
+ * 图与图没法比; 固定之后 1 单位恒等于固定的一格, 区域框成了图里的一个量。
+ *
+ * 窗口变大变小, 变的是**这块方形的像素边长**, 不是它的量程 —— 量程是常数。
+ * 画出来的一切 (热力图 / 蛇形轨迹 / 滑台位置) 都是**按单位存、画的时候才换成像素**的,
+ * 所以拉伸窗口是整张图一起缩放, 不会出现"格子跟着长、线还停在原处"。
+ * 下边一条 X 标尺、左边一条 Y 标尺 (每 1 单位小刻度, 每 5 单位带数字, 与网格线同一组位置),
+ * 于是图上任何一个点离零点多远可以直接读出来 —— 手动定位是按坐标下发的, 这一条要够得着。
+ *
  * ── 交互 ──────────────────────────────────────────────────────────────
  *
- * 左键 = 手动定位到那一点 (与 hmi 的点击同义, 走显示坐标)
- * Shift + 左键 = 选中那一格 (供「重测这一点」用)
- * **扫描进行中一律吞掉**, 只留一行提示 —— 扫描期间手动插一脚, 采出来的数据就说不清了。
+ * 左键 = **查看那一格** (选中 + 读出数值 / 索引 / 坐标)。**只读**, 扫描中也能用 ——
+ *        它是"看一眼", 不动滑台, 所以没有任何理由在扫描时把它关掉。
+ * Shift + 左键 = 手动定位到那一点 (与 hmi 的点击同义, 走显示坐标), **夹在当前生效量程内**
+ *
+ * **要走滑台就得按住 Shift。** 这一条是刻意的: 画布上最常见的动作是"看看这一点采到多少",
+ * 而那一下如果同时会把滑台支出去, 就没人敢随便点了 —— 尤其扫描完一屏数据、想逐格读的时候。
+ * 动作分给两个键之后, 会动的一个永远要**多做一步**, 顺手点的那一个永远是空手。
+ *
+ * **扫描进行中手动定位一律吞掉**, 只留一行提示 —— 扫描期间手动插一脚, 采出来的数据就
+ * 说不清了。查看不受影响。
  */
 #pragma once
 
@@ -69,18 +88,18 @@ public:
    /* 按当前已采数据的最小/最大定标。**只在人按了按钮时调** */
    bool fitShadeToData();
 
-   /* Shift+左键选中的格; 没有选中时都是 -1 */
+   /* 左键查看时选中的格; 没有选中时都是 -1 */
    int selectedIx() const { return m_sel_ix; }
    int selectedIy() const { return m_sel_iy; }
    void clearSelection();
 
-   /* 扫描中/跨区域时由窗口置位, 用来决定吞不吞点击 */
+   /* 扫描中/跨区域时由窗口置位。**它只管手动定位那一条路** —— 查看是只读的, 不吞 */
    void setManualAllowed(bool on) { m_manual_ok = on; }
 
 signals:
-   /* 左键点了一下: 请把滑台移到这个显示坐标。窗口负责转成 setTarget */
+   /* Shift+左键点了一下: 请把滑台移到这个显示坐标。窗口负责转成 setTarget */
    void manualMove(int32_t x_pul, int32_t y_pul);
-   /* Shift+左键选中了某一格 */
+   /* 左键查看选中了某一格 */
    void cellPicked(int ix, int iy);
 
 protected:
@@ -95,6 +114,7 @@ private:
    QRectF plotRect() const;           /* 画图区 (已经是正方形) */
    QPointF pxOf(double xu, double yu) const;
    void    unitAt(const QPoint &p, double *xu, double *yu) const;
+   void    pickCell(double xu, double yu);   /* 左键: 选中最近的格 (只读) */
 
    /* ---- 画 ---- */
    void  rebuildColors();             /* OKLab 插值出 256 级查找表 */
@@ -103,6 +123,7 @@ private:
    void  drawGrid(QPainter &p);
    void  drawHeat(QPainter &p);
    void  drawPath(QPainter &p);
+   void  drawRulers(QPainter &p);     /* X/Y 坐标标尺 (每 1 单位小刻度, 每 5 单位带数字) */
    void  drawMarkers(QPainter &p);
    void  drawScaleBar(QPainter &p);
    void  drawHud(QPainter &p);

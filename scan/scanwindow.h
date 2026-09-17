@@ -45,6 +45,12 @@ class ScanWindow : public QMainWindow
    Q_OBJECT
 
 public:
+   /* 信号灯的四种样子。**放在头里, 因为窗口要记住每一格上一次是什么** ——
+    * 只在真变了才动控件 (见 refreshAxisSignals)。
+    *   Unknown = 灰: 不知道       Off = 灭: 这件事没发生
+    *   Ok      = 绿亮: 使能带电    Bad = 红亮: 出事了 */
+   enum class Lamp { Unknown, Off, Ok, Bad };
+
    explicit ScanWindow(QWidget *parent = nullptr);
    ~ScanWindow() override;
 
@@ -60,10 +66,12 @@ private:
    QWidget *buildScanPanel();
    QWidget *buildMeterPanel();
    QWidget *buildShadePanel();
+   QWidget *buildAxisPanel();         /* 每根轴三个信号: 使能 / 故障 / 限位 */
 
    /* ---- 操作 ---- */
    void onConnectClicked();
    void onEnableClicked();
+   void onRestoreDefaults();          /* 「恢复默认」: 扫描参数回 Params 缺省 */
    void onCenterAllClicked();
    void onZeroHereClicked();          /* 「设为区域中心」 */
    void onBrowseCsv();
@@ -79,6 +87,11 @@ private:
 
    /* ---- 内部 ---- */
    void pushParams();                 /* 控件 → Params → 控制器 + 量程 */
+   void applyDefaults();              /* 控件 ← Params 缺省 (构造时一次 + 「恢复默认」) */
+   void pushManualSpeed(const BusTelem &t, bool running);
+   void refreshAxisSignals(const BusTelem &t);   /* 限位/使能/故障: 状态栏 + 参数栏, 一份遥测 */
+   void setSignalCell(int i, int s, bool known, bool on, Lamp lit,
+                      const QString &litTxt, const QString &offTxt);
    Params currentParams() const;
    void refresh();                    /* 30Hz: tick 状态机 + 刷遥测 + 刷按钮可用性 */
    void setConnected(bool on);
@@ -117,13 +130,15 @@ private:
    QDoubleSpinBox *m_edAreaY = nullptr;
    QDoubleSpinBox *m_edRes   = nullptr;
    QDoubleSpinBox *m_edPpu   = nullptr;
-   QSpinBox       *m_edSpeed = nullptr;
+   QSpinBox       *m_edSpeed = nullptr;   /* 扫描速度: 由 ScanController::start 下发 */
+   QSpinBox       *m_edManSpeed = nullptr;/* 手动速度: 点画布 / 全部回中用 */
    QSpinBox       *m_edDwell = nullptr;
    QSpinBox       *m_edSettle = nullptr;
    QSpinBox       *m_edSamples = nullptr;
    QComboBox      *m_cbDir   = nullptr;
    QComboBox      *m_cbMode  = nullptr;
    QLineEdit      *m_edCsv   = nullptr;
+   QPushButton    *m_btnDef  = nullptr;   /* 恢复默认 */
 
    QLabel *m_lGrid = nullptr;
    QLabel *m_lEst  = nullptr;
@@ -152,10 +167,25 @@ private:
    QPushButton    *m_btnScript = nullptr;
    QLabel         *m_lMeter    = nullptr;
 
+   /* ---- 轴信号 (参数栏): [轴][信号], 信号 0=使能 1=故障 2=限位 ---- */
+   QLabel *m_axLamp[2][3] = {};
+   QLabel *m_axText[2][3] = {};
+   /* 上一次画的是什么。**只在真变了才写控件** —— 30Hz 每帧给 14 个控件重设样式表
+    * 会把重绘刷爆 (横幅那个上升沿判断是同一个理由) */
+   Lamp     m_axLampLast[2][3] = {};
+   QString  m_axTextLast[2][3];
+
    /* ---- 状态栏 ---- */
    QLabel *m_banner = nullptr;
    QLabel *m_lNote  = nullptr;
    QLabel *m_lWkc   = nullptr;
+   /* 硬件限位 (6041h bit11), 一根轴一个。**扫描中撞限位会自动中止** ——
+    * 这条必须常显, 不是"点开某个面板才看得到"的东西。
+    * 信号灯在左、文字在右, **两个一起读**才算一条信息 */
+   QLabel *m_lampX  = nullptr;
+   QLabel *m_lampY  = nullptr;
+   QLabel *m_lLimX  = nullptr;
+   QLabel *m_lLimY  = nullptr;
 
    /* ---- 状态 ---- */
    QTimer        *m_tick        = nullptr;
@@ -168,6 +198,7 @@ private:
    int32_t m_last_range = 0;
    bool m_connected = false;
    bool m_faultShown = false;
+   bool m_limShown[2] = {false, false};   /* 限位横幅的上升沿防重入, 一根轴一个 */
    bool m_warnedLive = false;
    int  m_autoStop   = 0;     /* 自动中止弹窗的防重入 */
    QString m_last_dir;
