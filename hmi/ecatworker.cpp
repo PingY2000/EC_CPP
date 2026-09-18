@@ -91,6 +91,32 @@ void EcatThread::postFaultReset()
    m_cmds.enqueue(c);
 }
 
+void EcatThread::postHome(int axis, int method, uint32_t vel_fast)
+{
+   QMutexLocker lk(&m_mtx);
+   Cmd c; c.type = CMD_HOME; c.axis = axis; c.method = method;
+   c.value = (int32_t)vel_fast;
+   m_cmds.enqueue(c);
+}
+
+/*
+ * 「停止」在回零期间走这一个。**这是全程序唯一一处 GUI 线程直呼 motor_api**
+ * (见头文件顶部那条边界的第二个例外)。
+ *
+ * 它为什么安全, 是**结构性**的, 不是"小心一点就行": em_request_stop() 只往一个
+ * `static volatile sig_atomic_t` 里存 1 —— 不碰 em_bus_t、不碰网卡、不做任何 I/O。
+ * motor_api 自己就是按"信号处理器里也能调"设计它的 (它唯一的生产调用方是
+ * motor_test 的 SIGINT 处理器)。
+ *
+ * 它为什么非直呼不可, 也是结构性的: 回零阻塞在工作线程里, 而命令队列是那个线程在
+ * run() 顶部排空的 —— 一条 CMD_STOP 要等回零自己退出来才轮到, 那时 30 秒超时早就
+ * 过去了。**"按停止键直接停"这条需求, 靠队列实现不了。**
+ */
+void EcatThread::requestMotionStop()
+{
+   em_request_stop();
+}
+
 void EcatThread::setWantDigIn(bool on)
 {
    QMutexLocker lk(&m_mtx);
@@ -248,6 +274,31 @@ void EcatThread::drainCommands()
          c = m_cmds.dequeue();
       }
 
+      /*
+       * ---- 每一条命令都从"干净"开始 ------------------------------------
+       *
+       * g_stop 是**进程级**的 (motor_api 为了能在信号处理器里调, 只能这么做),
+       * 而且它**不会自己清**。上一条命令留下的那个 1 会让下一条命令在它的第一次
+       * 检查处当场中止 —— em__cw_step / em__wait_sw / em_set_mode / em_home /
+       * em_fault_reset 全都读它。那是一种最难查的失败: "点了使能没反应, 控制台说
+       * 被中止了"。故障复位那条更糟 —— 它是在写完 6040h = 0x0000 (**已经卸力**)
+       * 之后才中止的。
+       *
+       * 所以在这里清, 一条命令清一次。会话只有两种, 都正确:
+       *   · 空闲时被置起   -> 下一条命令开始前就清掉了, 它一个字都不受影响;
+       *   · 命令运行中被置起 -> 由**正在跑的那一条**理会, 跑完即清。
+       *
+       * 「停止」在回零期间正是靠第二条生效的 (见 requestMotionStop)。
+       *
+       * ⚠️ 但这留下一个洞, 由 doHome() 的收尾自己补: 回零被中止之后, **收尾**那几步
+       * 会立刻被这个还没清的标志打断 (它的第一步 em_disable 内部就有 em__cw_step),
+       * 于是轴就停在"使能 + HM + bit4 可能还举着"—— 正是我们要防的那个状态。
+       *
+       * interpolate() / em_service() 不读这个标志, 所以从"置起"到"下一条命令出队"
+       * 之间它们照跑, 无害。hmi 那边没有任何人置它, 所以这一句对它是空操作。
+       */
+      em_clear_stop();
+
       switch (c.type)
       {
          case CMD_LIST:       doListAdapters(); break;
@@ -284,6 +335,7 @@ void EcatThread::drainCommands()
          case CMD_CENTER:     doCenter(c.axis); break;
          case CMD_RANGE:      doRange(c.value); break;
          case CMD_FAULT_RESET: doFaultReset(); break;
+         case CMD_HOME:       doHome(c.axis, c.method, (uint32_t)c.value); break;
       }
    }
 }
@@ -619,6 +671,220 @@ void EcatThread::doFaultReset()
    note(s);
 }
 
+/*
+ * 回零 —— 驱动器自带的 HM 模式 (6060h = 6)。正/反向就是方式 24 / 29。
+ *
+ * 结构是三段, 顺序不能动: **闸 (一个字节都不写) -> 宣告 -> 动作 + 无条件收尾**。
+ *
+ * 收尾那段才是本函数的主体, 因为 em_home() 的五条返回路径**没有一条**留下的状态是
+ * 调用方可以不管的:
+ *   · 到位        (ec_motor_motion.c:1265) -> 使能 + HM + bit4 已放下
+ *   · 被中止      (:1192)                 -> 使能 + HM + bit4 已撤 (它**特意**保持使能:
+ *                                            回零中途位置不明, 卸力会让滑台自由下滑)
+ *   · bit3 故障   (:1208)                 -> 使能 + HM + **bit4 还举着**
+ *   · bit13 回零错(:1217)                 -> 同上
+ *   · 超时        (:1239)                 -> 同上, 而且那一刻**驱动器还在找**
+ * 所以这里只有一个出口, 没有"成功就早返回"这种写法。
+ */
+void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
+{
+   if (axis < 0 || axis >= EM_MAX_AXES)
+      return;                    /* 编程错误, 不是操作员的事 */
+
+   const bool bus_ready = (m_bus != nullptr) && m_in_op;
+   em_axis_t *ax = bus_ready ? m_ax[axis] : nullptr;
+
+   /*
+    * 「还有轴在走」用工作线程**自己的真相** (m_want 对 m_tgt), 不用遥测 —— 遥测是
+    * 界面那个 30Hz 轮询的快照, 有一个周期的滞后。同 doZero 的先例。
+    *
+    * 这条判据不是装饰: 回零期间 interpolate() 整个不跑, 所以若另一根轴正在走, 它的
+    * 目标会**停在半途**。
+    */
+   bool any_moving = false;
+   {
+      QMutexLocker lk(&m_mtx);
+      for (int i = 0; i < m_naxis; i++)
+         if (m_ax[i] != nullptr && m_want[i] != m_tgt[i])
+            any_moving = true;
+   }
+
+   /* 用**刚读到的** 6041h, 不用上一轮发布的快照 —— 同 doFaultReset。
+    * 这一条尤其要紧: 本函数的第一件事是 em_disable(), 它**真的会撤掉保持力矩**。
+    * 等 em_home() 自己去发现"不该做", 力矩已经撤了。 */
+   const bool mirror_ok = (ax != nullptr) && em_mirror_ok(ax) != 0;
+   const bool fault     = (ax != nullptr) && (em_sw(ax) & EM_SW_FAULT) != 0;
+
+   /* 只放行 24/29。em_home() 自己只查 [1,35] —— 那个范围里其它方式的方向语义在这台
+    * 机器上一次都没验过, 放进来就是拿滑台去试。 */
+   const bool negative = (method == ecatcmd::home_method_for(true));
+   if (method != ecatcmd::home_method_for(false) && !negative)
+   {
+      note(QStringLiteral("回零方式 %1 不在允许的范围内 (只用 24/29) -> **一个字节都没写**")
+              .arg(method));
+      return;
+   }
+
+   const char *why = ecatcmd::home_refusal(bus_ready && ax != nullptr, m_origin_ready,
+                                           mirror_ok, fault, any_moving);
+   if (why != nullptr)
+   {
+      note(QStringLiteral("%1 回零没有发起: %2 -> **一个字节都没写**")
+              .arg(QString::fromUtf8(ecatcmd::axis_label(axis)),
+                   QString::fromUtf8(why)));
+      return;
+   }
+
+   const QString nm = QString::fromUtf8(ecatcmd::axis_label(axis));
+
+   /* ---- 宣告"正在回零"。**必须在第一个阻塞调用之前** ----
+    *
+    * 界面靠它把四个回零按钮按住、把「停止」换成立即中止。下面那两次加锁直写是
+    * "阻塞期间界面还看得见"的唯一原因 —— 与 doFaultReset 那一对一字不差, 理由见
+    * publish() 里 t.resetting 那段。 */
+   m_homing = true;
+   m_homing_axis = axis;
+   m_homing_method = method;
+   {
+      QMutexLocker lk(&m_mtx);
+      m_telem.homing = true;
+      m_telem.homing_axis = axis;
+      m_telem.homing_method = method;
+   }
+
+   em_home_cfg_t cfg;
+   em_home_cfg_default(&cfg);
+   cfg.method   = method;
+   cfg.vel_fast = ecatcmd::home_vel_clamp((int32_t)vel_fast);
+   cfg.vel_slow = ecatcmd::home_vel_slow(cfg.vel_fast);
+   /* **acc 必须跟着速度一起算**, 不能留 em_home_cfg_default 那个 5000 —— 它配 2000 pul/s
+    * 是 0.4 秒斜坡, 配放开的 100000 就是 20 秒斜坡 (一次回零全在加速)。见
+    * ecatcmd::home_accel_for 那段。offset 保持 0: 界面上没有它的控件, 确认弹窗把
+    * 这两个数念给操作员听。 */
+   cfg.acc      = ecatcmd::home_accel_for(cfg.vel_fast);
+
+   /*
+    * ★ 先失能。6098h/6099h/609Ah/607Ch **只在未使能时可写**, em_home() 的第一句检查
+    * 就是 em_is_enabled (ec_motor_motion.c:1096)。也就是说这一刻该轴失去保持力矩,
+    * 竖直轴可能下滑 —— 这件事躲不掉, 只能每次都写在确认弹窗里。
+    */
+   int rc_disable = 0;
+   if (em_is_enabled(ax))
+      rc_disable = em_disable(ax);
+
+   /* 0 = 到位 / 1 = 被停止请求中止 / 负 = 失败 (ec_motor.h:661 那一段给 em_home 定的)。
+    * 比字面量, 不比 EM_R_OK —— 那是 ec_motor_internal.h 里的宏, 而界面这一侧刻意
+    * 不 include 内部头 (同 doFaultReset 里那段注释)。 */
+   const int rc_home = em_home(ax, &cfg, HMI_HOME_TMO_MS);
+
+   /* ==================================================================
+    * 收尾。**无条件, 顺序不能动。**
+    * ================================================================== */
+
+   /*
+    * ---- 0. 再清一次停止标志 ----
+    *
+    * 这是补 drainCommands() 留下的那个洞。那个停止请求瞄的是**运动**, 而收尾的全部
+    * 职责是抵达一个确定状态 —— 半途而废严格地比做完更糟。不补这一句, 一个被中止的
+    * 回零会停在第 1 步的中间 (em_disable 内部就有 em__cw_step, 它读这个标志), 于是
+    * 轴落在"使能 + HM + bit4 可能还举着" —— 而那正是本函数存在的意义。
+    */
+   em_clear_stop();
+
+   /*
+    * ---- 1. 失能 ----
+    *
+    * ★ 这一步**不是冗余**。em_home() 在 bit3 / bit13 / 超时那三条路上是**举着 bit4
+    * 返回**的 (它一次都没写回 0x000F), 也就是说驱动器那一刻**还在找**。让它停下来的
+    * 正是这里: 0x0007 / 0x0006 / 0x0000 都没有 bit4。
+    * 将来别以"回零都结束了"为理由把它省掉 —— 省掉就是让它一直找下去。
+    */
+   if (em_is_enabled(ax))
+   {
+      const int rc = em_disable(ax);
+      if (rc_disable == 0)
+         rc_disable = rc;
+   }
+
+   /* ---- 2. 切回 CSP ----
+    * em_set_mode 在已使能时会被拒, 所以它必须排在 1 之后。此刻轴停在 HM 模式里, 而
+    * interpolate() 只会按 CSP 解释 607Ah —— 不切回来, 插补写的目标就是一串噪音。 */
+   const int rc_mode = em_set_mode(ax, EM_MODE_CSP);
+
+   /* ---- 3. 重新使能到 CSP ----
+    * em_arm 会把 607Ah 钉在**此刻的** 6064h (ec_motor_motion.c:115), 所以使能那一帧
+    * 本身就是"原地不动"。 */
+   int rc_enable = -1;
+   if (rc_mode == 0)
+      rc_enable = em_enable(ax);
+
+   /*
+    * ---- 4. 重新锚定显示原点 ----
+    *
+    * ★ **这一行漏掉, 就是一次没人按过按钮的全速运动。**
+    *
+    * 回零之后驱动器自报的 6064h 会跳到它的回零坐标系里 (等不等于 0 由 2214h 与 607Ch
+    * 共同决定, em_home 刻意不断言这件事)。而界面上每一个显示坐标都是 6064h - m_origin。
+    * 若 m_origin 还是回零之前那个值, 下一次 interpolate() 就会算出 m_origin + m_tgt,
+    * 并把**回零之前的那个物理位置**当成 CSP 目标发出去。
+    *
+    * **必须在 3 之后**: em_arm 钉 607Ah 用的是"使能那一刻的 6064h"。先锚定再使能的话,
+    * 失能窗口里自重下滑的那一段会让 m_origin 停在**下滑之前**的位置, 而 607Ah 钉在
+    * **下滑之后**的位置 —— 同样是一次回跳。放在后面, origin + m_tgt / 607Ah / 6064h
+    * 三者自洽, 一帧都不动。
+    */
+   m_origin[axis] = em_pos(ax);
+   m_tgt[axis]    = 0;
+   {
+      QMutexLocker lk(&m_mtx);
+      m_want[axis] = 0;
+   }
+
+   /* ---- 5. 判定 + 复位旗标 + 一次说完 ---- */
+
+   /* 判据是**收尾结束这一刻的实测状态**, 不是上面那几个返回码的排列组合 ——
+    * 理由见 ecatcmd::home_end_state 的注释。 */
+   const bool end_enabled = em_is_enabled(ax) != 0;
+   const bool fault_now   = (em_sw(ax) & EM_SW_FAULT) != 0;
+   const ecatcmd::HomeEnd end =
+      ecatcmd::home_end_state(true, fault_now, end_enabled, rc_mode);
+
+   m_homing = false;
+   m_homing_axis = -1;
+   m_homing_method = 0;
+   {
+      QMutexLocker lk(&m_mtx);
+      m_telem.homing = false;
+      m_telem.homing_axis = -1;
+      m_telem.homing_method = 0;
+   }
+
+   /* 收尾没能确认到"已卸力" -> 走既有的动力电源告警那条路 (ec_shutdown 也是它)。
+    * 这是**复用**: ScanWindow::refresh() 看到 maybeLive() 就会弹那个"立即断开驱动器
+    * 的动力电源, 不要只依赖软件"的模态 —— 正是"失能未确认"该说的一句话。 */
+   if (end == ecatcmd::HOME_END_STRANDED)
+      m_maybe_live = true;
+
+   /* note() 是**覆盖写**, 所以这里一次说完 (同 doFaultReset 最后那段)。 */
+   QString s = QStringLiteral("%1 %2找原点 (方式 %3): %4。\n%5")
+                  .arg(nm, QString::fromUtf8(ecatcmd::home_dir_text(negative)),
+                       QString::number(method),
+                       QString::fromUtf8(ecatcmd::home_cause_text(rc_home)),
+                       QString::fromUtf8(ecatcmd::home_end_text(end)));
+
+   if (end == ecatcmd::HOME_END_HOLDING)
+      s += QStringLiteral(" (显示坐标已把这里定为 0)");
+
+   if (end != ecatcmd::HOME_END_HOLDING)
+      s += QStringLiteral(" [收尾: 失能 %1 / 切 CSP %2 / 使能 %3]")
+              .arg(rc_disable).arg(rc_mode).arg(rc_enable);
+
+   s += QStringLiteral(" [6099h:01 = %1, :02 = %2 pul/s, 609Ah = %3, 上限 %4 秒]")
+           .arg(cfg.vel_fast).arg(cfg.vel_slow).arg(cfg.acc).arg(HMI_HOME_TMO_MS / 1000);
+
+   note(s);
+}
+
 void EcatThread::doStop()
 {
    /*
@@ -831,6 +1097,11 @@ void EcatThread::publish(int wkc)
     * (也是万一以后把复位改成跨周期状态机时唯一还需要的那半)。
     */
    t.resetting    = m_resetting;
+   /* 回零同一套, 理由与上面那段一字不差 —— 而且它更长 (回零能跑满 30 秒): 真正让
+    * 界面看到"正在回零…"的是 doHome() 里那两次加锁直写, 这一句负责循环恢复后自洽。 */
+   t.homing        = m_homing;
+   t.homing_axis   = m_homing_axis;
+   t.homing_method = m_homing_method;
    t.naxis        = m_naxis;
    t.wkc          = wkc;
    t.expected_wkc = (m_bus != nullptr) ? em_expected_wkc(m_bus) : 0;
@@ -931,6 +1202,9 @@ void EcatThread::teardown()
    m_origin_ready = false;
    m_fault_latched = false;
    m_resetting     = false;   /* 连接断了, "正在复位"这个状态跟着一起没了 */
+   m_homing        = false;   /* 同上。真在回零时走到这里, 调用方应当先 requestMotionStop() */
+   m_homing_axis   = -1;
+   m_homing_method = 0;
    for (int i = 0; i < EM_MAX_AXES; i++)
    {
       m_ax[i]     = nullptr;

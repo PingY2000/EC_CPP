@@ -55,6 +55,49 @@ static const char *kBannerInfo =
  * 正是 .gitignore 里那一条。 */
 static const char *kOutDir = "scan_out";
 
+/*
+ * 「读一次」等回话的上限。
+ *
+ * **必须比真机那条腿自己的报错阈值长**: ophirmeter 在工作线程里等不到新数时是
+ * 1800ms 先报一次错 (一句比"超时"更有用的原因, 见 ophirmeter.h)。这里要是设得比它短,
+ * 那句诊断就永远来不及发出来, 界面上只剩一句"没有回应" —— 把源想说的话盖掉是最坏的一种
+ * 兜底。模拟源的延迟是几十毫秒, 用不到这么长。
+ */
+static const int kReadOnceTimeoutMs = 6000;
+
+/*
+ * 功率的显示格式。**不固定小数位**: 光电探头的量级从 nW 到 W 都可能 ——
+ * 用 'f' 固定 6 位的话 1.2e-9 会显示成 0.000000 (看着像坏了), 而这个量级本来就是
+ * 科学计数才读得出来。所以按量级挑一套:
+ *
+ *   |v| >= 1e-3   -> 'g' 6 位有效数字 ("1", "0.00123457", "12.3456")
+ *   否则 / 0      -> 'e' 4 位有效数字 ("1.2000e-09")
+ *
+ * 'g' 会自己去掉尾零, 不用手写剥零。这一格是给操作员**核对**用的, 不是入 CSV 的那份数
+ * —— 入盘的是 double, 一位没少 (所以这里少显示几位不影响数据)。
+ */
+static QString fmtWatts(double v)
+{
+   if (std::fabs(v) >= 1e-3)
+      return QString::number(v, 'g', 6);
+   return QString::number(v, 'e', 4);
+}
+
+/* 「读一次」那条固定说明。**只有一份** —— buildMeterPanel 第一次装上去, refresh()
+ * 在按不了的时候把原因拼在它前面。两处各写一遍的话, 迟早只剩一处被改 */
+static const QString &readOnceTip()
+{
+   static const QString s = QStringLiteral(
+      "向**当前取样源**要一个数并显示出来 —— 不用跑整趟扫描就能确认功率计接上了、"
+      "读数合理。\n\n"
+      "它走的是扫描用的同一条路 (请求 → 读数信号), 所以这里通了, 采集那条路也就通了。\n\n"
+      "**扫描进行中它是禁用的**: 接口约定同一时刻只允许一个未决请求, 而那个请求归"
+      "扫描状态机。扫描停下来 (空闲/跑完/已中止) 才能手动读。\n\n"
+      "显示的时延是**一次往返的实测值** —— 它必须远小于扫描参数里的读数超时, "
+      "否则真机上会每点都超时。");
+   return s;
+}
+
 /* ---------------------------------------------------------------- 信号灯 */
 
 /*
@@ -261,6 +304,18 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
    connect(m_ophir, &OphirMeter::configFailed, this,
            [this](const QString &e) { hint(QStringLiteral("改功率计配置失败: ") + e, true); });
 
+   /* 「读一次」要能听见**任何一个**源的回话 —— m_meter 是会换的, 每换一次重接一遍
+    * 就是漏接的机会。干脆四个都接上, 靠 m_readPending 认出"这一份是不是我的":
+    * 控制器在跑的时候它是 false, 那时所有回话都归状态机, 这边一句都不插嘴。 */
+   for (PowerMeter *m : { static_cast<PowerMeter *>(m_manual),
+                          static_cast<PowerMeter *>(m_random),
+                          static_cast<PowerMeter *>(m_script),
+                          static_cast<PowerMeter *>(m_ophir) })
+   {
+      connect(m, &PowerMeter::readingReady,  this, &ScanWindow::onReadOnceReady);
+      connect(m, &PowerMeter::readingFailed, this, &ScanWindow::onReadOnceFailed);
+   }
+
    m_meter  = m_random;                 /* 默认随机源: 一按开始就有数据可看 */
    m_meter->open(nullptr);
 
@@ -390,6 +445,9 @@ void ScanWindow::buildUi()
     * 要滚才能看到的状态指示器不算状态指示器。两个框加起来也就七行, 挤不掉什么 */
    sv->addWidget(buildAxisPanel());
    sv->addWidget(buildLimitPanel());
+   /* 第三块:「回零」。它是**动作**不是参数, 但它与「限位开关」上面那两块有直接的
+    * 依赖 —— 回零找的就是那三盏灯说的那几个开关。紧挨着摆, 点之前眼睛能扫到它们 */
+   sv->addWidget(buildHomePanel());
    sv->addWidget(buildParamPanel());
    sv->addWidget(buildScanPanel());
    sv->addWidget(buildMeterPanel());
@@ -517,13 +575,19 @@ QWidget *ScanWindow::buildTopBar()
 
    m_btnEnable = new QPushButton(QStringLiteral("使能"), w);
    m_btnEnable->setObjectName(QStringLiteral("danger"));
-   m_btnEnable->setToolTip(QStringLiteral("切 CSP 模式并使能 —— **这是唯一让电机带电的按钮**"));
+   m_btnEnable->setToolTip(QStringLiteral(
+      "切 CSP 模式并使能 —— 让电机持续带电的按钮之一\n"
+      "(另一个是「回零」: 它自己也要带电才能找开关)"));
    connect(m_btnEnable, &QPushButton::clicked, this, &ScanWindow::onEnableClicked);
 
    m_btnStop = new QPushButton(QStringLiteral("停止"), w);
-   m_btnStop->setToolTip(QStringLiteral("目标冻在当前位置, **保持保持力矩**(不卸力)。"
-                                        "扫描中请用「中止」, 它除了冻住还会把进度留在 CSV 里"));
-   connect(m_btnStop, &QPushButton::clicked, m_thr, &EcatThread::postStop);
+   m_btnStop->setToolTip(QStringLiteral(
+      "目标冻在当前位置, **保持保持力矩**(不卸力)。"
+      "扫描中请用「中止」, 它除了冻住还会把进度留在 CSV 里。\n"
+      "**回零进行中按它 = 立即中止回零** (不用等 30 秒超时)"));
+   /* 走槽而不是直连 postStop: 回零期间这个按钮必须换成立即中止。
+    * 非回零时那个槽做的事与直连 postStop 一字不差 —— 见 onStopClicked */
+   connect(m_btnStop, &QPushButton::clicked, this, &ScanWindow::onStopClicked);
 
    m_btnDis = new QPushButton(QStringLiteral("失能"), w);
    m_btnDis->setToolTip(QStringLiteral("回失能态, 电机释放 (滑台可能因自重下滑)"));
@@ -767,6 +831,96 @@ QWidget *ScanWindow::buildLimitPanel()
 
    /* 最后一列 = 本组信号数。理由同上一块 */
    g->setColumnStretch(LIM_NCOL, 1);
+   return box;
+}
+
+/*
+ * 「回零」—— 驱动器自带的正/反向找原点 (6060h = 6)。
+ *
+ * 为什么单开一个框、还摆在第二块之后: 它是**动作**不是参数, 而且是本程序里唯一一个
+ * "按下之后滑台会带电自己走"的按钮。塞进扫描参数栏会和「区域」「分辨率」那些一起
+ * 被当成一行设置; 混进顶栏又会和「全部回中」挨在一起 —— 而那一个是走到软件零点,
+ * 完全不带电。分开摆, 名字、颜色、灰法才能各自正确。
+ *
+ * 四个按钮而不是一对: 一根轴一个方向一个。理由是回零**会失能**再走 (6098h 只能在
+ * 未使能时写), 竖直轴会在这期间失去保持力矩 —— 所以"只回我这一根"必须点得出来。
+ */
+QWidget *ScanWindow::buildHomePanel()
+{
+   QGroupBox *box = new QGroupBox(QStringLiteral("回零 (驱动器自己找原点)"), this);
+   QGridLayout *g = new QGridLayout(box);
+   g->setContentsMargins(6, 4, 6, 6);
+   g->setHorizontalSpacing(8);
+   g->setVerticalSpacing(5);
+
+   m_edHomeVel = new QSpinBox(box);
+   m_edHomeVel->setRange(HMI_HOME_VEL_MIN, HMI_HOME_VEL_MAX);
+   m_edHomeVel->setSingleStep(1000);   /* 与「扫描速度」「手动速度」同一个步长 */
+   m_edHomeVel->setSuffix(QStringLiteral(" pul/s"));
+   /*
+    * 缺省**必须显式设**: 新建的 QSpinBox 是 0, 而 setRange 会把它夹到**下限**
+    * HMI_HOME_VEL_MIN (100) —— 不写这一句, 界面上显示的就不是 HMI_HOME_VEL_DEF,
+    * 而是 100。那个值本身不危险, 只是与 em_home 的缺省悄悄不一致。
+    *
+    * 放这里而不是 applyDefaults(): 后者会被「恢复默认」再跑一遍, 那个按钮是给扫描
+    * 几何用的 —— 顺手点一下就把为试回零特意改过的速度抬回去, 是那种最难查的改动。
+    */
+   m_edHomeVel->setValue(HMI_HOME_VEL_DEF);
+   m_edHomeVel->setToolTip(QStringLiteral(
+      "6099h:01 找原点速度 (返回速度 6099h:02 是它的 1/4, 加减速 609Ah 由它派生,\n"
+      "都是自动算的 —— 见 hmi/ecatworker.h 里 home_vel_slow / home_accel_for)。\n"
+      "上限与「扫描速度」一样 (100000 pul/s ≈ 2 圈/秒), 缺省是驱动器自己 6099h:01 的\n"
+      "实测值 50000 (≈ 1 圈/秒)。\n\n"
+      "**它同时是一条「能找多远」的上限**: 速度 × 30 秒 = 一次回零最多走过的距离。\n"
+      "缺省 50000 时是 30 圈 (够走完缺省区域的一头到另一头); 调低会跟着缩小 ——\n"
+      "2000 pul/s 只有 1.2 圈, 那时碰不到开关该做的是**先把滑台手动挪到开关附近**。\n"
+      "第一次在陌生的机器上试方向, 把它压到下限 100。\n\n"
+      "它不会被记住 —— 每次回零的确认弹窗都会把当次数值念一遍。"));
+
+   g->addWidget(new QLabel(QStringLiteral("回零速度"), box), 0, 0);
+   g->addWidget(m_edHomeVel, 0, 1, 1, 2);
+
+   /*
+    * 按钮文字自带轴与方向 ("X 正向回零"), 不做"一个表头 + 四个短标签"——
+    * 布局一挤, 短标签就归错了列, 而错点这个按钮的代价是滑台朝**反方向**去找开关。
+    * 模态里还会把轴、方向、方式号再念一遍, 但那不该是唯一一道防线。
+    */
+   for (int i = 0; i < 2; i++)
+      for (int d = 0; d < 2; d++)
+      {
+         const bool neg  = (d == 1);
+         const int  meth = ecatcmd::home_method_for(neg);
+
+         m_btnHome[i][d] = new QPushButton(
+            QStringLiteral("%1 %2回零")
+               .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"),
+                    QString::fromUtf8(ecatcmd::home_dir_text(neg))), box);
+         m_btnHome[i][d]->setObjectName(QStringLiteral("danger"));
+         m_btnHome[i][d]->setToolTip(
+            QStringLiteral("6098h = %1 —— 原点开关 (X0) 为原点, **%2**高速先找。\n\n"
+                           "驱动器会自己带电去找: 朝哪走、什么时候停、撞不撞开关, "
+                           "全由它按这个方式决定。本程序只发一条「开始回零」。\n"
+                           "**软件拦不住它撞开关** —— 能做的只有「停止」立即中止。\n\n"
+                           "该轴会**先失能** (6098h 只能在未使能时写), 竖直轴会在这时\n"
+                           "失去保持力矩。回零结束后自动切回 CSP 并保持使能。\n\n"
+                           "「%2」说的是**电机轴**的正反向, 与画布上 +X/+Y 是不是同一个\n"
+                           "方向, 只有现场试一次才知道 —— 所以第一次务必把速度设到最低、\n"
+                           "人在物理急停旁。方向不对就换另一个按钮, 别硬顶。")
+               .arg(meth).arg(QString::fromUtf8(ecatcmd::home_dir_text(neg))));
+
+         connect(m_btnHome[i][d], &QPushButton::clicked, this,
+                 [this, i, d] { onHomeClicked(i, d); });
+
+         g->addWidget(m_btnHome[i][d], 1 + i, d);
+      }
+
+   QLabel *note = new QLabel(QStringLiteral(
+      "回零 = 让驱动器自己带电朝开关走。方向与开关位置只有现场知道。"), box);
+   note->setWordWrap(true);
+   note->setStyleSheet(QStringLiteral("color:#6b7480;"));
+   g->addWidget(note, 3, 0, 1, 2);
+
+   g->setColumnStretch(1, 1);
    return box;
 }
 
@@ -1082,9 +1236,51 @@ QWidget *ScanWindow::buildMeterPanel()
    f->addRow(m_devRowRange);
    f->addRow(m_devRowMode);
 
+   /*
+    * 「读一次」—— 接上之后第一件想做的事就是点一下看个数, 而不是先开一趟一小时的扫描。
+    *
+    * 它是**当前取样源**的一次普通请求, 走的正是扫描用的那条路 (requestReading →
+    * readingReady/readingFailed), 所以这一下通了, 采集那条路也就通了 —— 四个源都能点,
+    * 拿模拟源先对流程也行。
+    *
+    * 它**不是**第二个采集器: 接口约定"同一时刻只允许一个未决请求", 所以控制器不在
+    * Idle 时这个按钮是禁用的 (见 refresh() 里那条闸), 抢数的事不会发生。
+    */
+   m_btnRead = new QPushButton(QStringLiteral("读一次"), box);
+   m_btnRead->setToolTip(readOnceTip());
+   connect(m_btnRead, &QPushButton::clicked, this, &ScanWindow::onReadOnceClicked);
+
+   m_lReadout = new QLabel(box);
+   m_lReadout->setWordWrap(true);
+   m_lReadout->setStyleSheet(QStringLiteral("color:#7b8391;"));
+   /* 这一格会显示**设备来的字** (探头报的过量程原因之类)。QLabel 默认 AutoText,
+    * 那串字里只要有个 `<` 就会被当 HTML 解析 —— 于是要么显示不全, 要么被当成标签吃掉。
+    * 明写 PlainText: 这里只显示, 不排版 */
+   m_lReadout->setTextFormat(Qt::PlainText);
+   m_lReadout->setText(QStringLiteral("—"));
+
+   m_readTimer = new QTimer(this);
+   m_readTimer->setSingleShot(true);
+   connect(m_readTimer, &QTimer::timeout, this, [this] {
+      if (!m_readPending)
+         return;
+      m_readPending = false;
+      const double took = (double)(m_clock.elapsed() - m_readSentMs);
+      m_lReadout->setText(QStringLiteral("读一次: 没有回应 (等了 %1 秒) —— "
+                                         "取样源答应了却一个数都没回, 那是源自己的 bug")
+                             .arg(took / 1000.0, 0, 'f', 1));
+      refresh();
+   });
+
+   f->addRow(m_btnRead);
+   f->addRow(m_lReadout);
+
    m_lMeter = new QLabel(box);
    m_lMeter->setWordWrap(true);
    m_lMeter->setStyleSheet(QStringLiteral("color:#7b8391;"));
+   /* 同样: 这句里全是**设备给的字** (表头/探头型号、序列号)。AutoText 会试着按 HTML
+    * 解析它 —— 明写 PlainText, 免得某个序列号里的尖括号把这一行吃掉 */
+   m_lMeter->setTextFormat(Qt::PlainText);
    f->addRow(m_lMeter);
 
    onMeterInfoChanged();      /* 一开始选的是模拟源 -> 把真机那三行藏起来 */
@@ -1159,6 +1355,10 @@ void ScanWindow::applyDefaults()
 
    /* 手动速度不在 Params 里 (它跟扫描几何无关), 缺省就是 HMI_VEL_DEF —— 与 hmi 一致 */
    m_edManSpeed->setValue(HMI_VEL_DEF);
+
+   /* **回零速度刻意不在这里**: 它也不在 Params 里, 但「恢复默认」会把 applyDefaults
+    * 再跑一遍 —— 于是操作员为了第一次试回零特意压到 100, 却因为顺手点了「恢复默认」
+    * (那是给扫描几何用的) 被悄悄抬回 500。它的缺省设在 buildHomePanel 里, 只走一次。 */
 }
 
 /*
@@ -1579,6 +1779,160 @@ void ScanWindow::onCenterAllClicked()
    hint(QStringLiteral("两根轴都去显示坐标 0 (= 区域中心)"), false);
 }
 
+/*
+ * 「停止」。
+ *
+ * 两副面孔, 而这不是"顺手加的功能": 回零是**阻塞在工作线程里**的 (em_home 自己泵帧、
+ * 自己轮询), 而命令队列是那个线程在 run() 顶部排空的 —— 一条 CMD_STOP 要等回零自己
+ * 退出来才轮到, 那时 30 秒超时早就过去了。**靠队列实现不了"按停止键直接停"。**
+ *
+ * 所以回零期间走 requestMotionStop(): GUI 线程直呼 em_request_stop(), 只往一个
+ * volatile 标志里存 1, em_home 的 2ms 轮询下一个周期就看见并撤掉 6040h bit4。
+ * 这是全程序唯一一处 GUI 直呼 motor_api —— 理由与安全性的论证见 ecatworker.h 顶部。
+ */
+void ScanWindow::onStopClicked()
+{
+   if (m_thr->telemetry().homing)
+   {
+      m_thr->requestMotionStop();
+
+      /* **不追加 postStop()**: 回零的收尾自己会把目标冻在落点 (重新锚定零点 + 目标归零),
+       * 再投一条只会让 doStop() 的 note 把回零结果那一句从状态栏盖掉 (note 是覆盖写),
+       * 而"回零是被中止的还是到位了"正是此刻要看的那句话。 */
+      hint(QStringLiteral("正在中止回零… 「停止」已发出 (收尾要 失能 → 切回 CSP → 重新使能, "
+                          "最多几秒)"), false);
+      return;
+   }
+
+   /* 非回零时与从前一字不差 —— hmi 那边这个按钮仍然直连 postStop, 共用的是同一份
+    * ecatworker.cpp, 行为不变 */
+   m_thr->postStop();
+}
+
+/*
+ * 「X/Y 正/反向回零」。
+ *
+ * ⚠️ 这是全程序**最危险的一个按钮**: 按下之后滑台会自己带电朝开关走, 朝哪走、什么时候
+ * 停、撞不撞开关, 全由驱动器按 6098h 决定。本程序只发一条"开始回零", 软件**拦不住它
+ * 撞开关** —— 能做的只有: 慢速缺省、每次点击都要人当面确认方向与速度、以及一个真能
+ * 生效的中止。这三条就是下面这个模态的全部内容。
+ *
+ * 与 onEnableClicked / onFaultResetClicked 同一套写法: **每次都问**, 不做持久勾选,
+ * 默认按钮是 Cancel, 不抽公共 helper (三处的清单各说各的, 抽出去反而看不清少了哪一条)。
+ */
+void ScanWindow::onHomeClicked(int axis, int dir)
+{
+   if (axis < 0 || axis > 1 || dir < 0 || dir > 1)
+      return;
+
+   /* 扫描中一律拦住。这一条其实是**第二道** —— 按钮本身在扫描期间就是灰的
+    * (见 refresh 里的 can_home), 但模态前面这道闸留着, 因为"灰掉的按钮"不是
+    * 一个能读的理由 */
+   if (m_ctl->running())
+   {
+      hint(QStringLiteral("扫描进行中 —— 先「中止」才能回零"), true);
+      return;
+   }
+
+   const bool        neg  = (dir == 1);
+   const int         meth = ecatcmd::home_method_for(neg);
+   const uint32_t    vel  = ecatcmd::home_vel_clamp(m_edHomeVel->value());
+   const uint32_t    slow = ecatcmd::home_vel_slow(vel);
+   const uint32_t    acc  = ecatcmd::home_accel_for(vel);
+   const QString     ax   = (axis == 0) ? QStringLiteral("X") : QStringLiteral("Y");
+   const QString     dtxt = QString::fromUtf8(ecatcmd::home_dir_text(neg));
+
+   /*
+    * "能找多远"。**必须用工作线程那三个函数算, 不能在这里另写一遍** —— 抄一遍的话,
+    * 哪天 home_accel_for 改了斜坡时间或超时改了, 弹窗还在念旧的数, 而操作员正是照
+    * 这三个数决定按不按下去。
+    *
+    * 一圈多少脉冲取界面上那个「分辨率」框 (它本来就是 2400h 的实测值, 默认 50000);
+    * 框里是 0 的时候退回 50000, 免得除出 inf。
+    */
+   const double ppu   = (m_edPpu->value() > 0.0) ? m_edPpu->value() : 50000.0;
+   const double reach = (double)vel * (HMI_HOME_TMO_MS / 1000.0) / ppu;
+
+   /* 遥测只用来**读一遍现场**, 用来把该说的话说全 —— 它不参与"能不能做"的判断,
+    * 那一条在工作线程的那道闸里 (doHome), 用的是刚读到的值。 */
+   const BusTelem t = m_thr->telemetry();
+
+   QString warn;
+   if (t.ax[axis].valid && t.ax[axis].limit_active)
+   {
+      /* 复用限位那三句**唯一的定义** (它们放在头文件里正是为了这个): 此刻判据成立,
+       * 而回零是朝开关走 —— 操作员必须知道现在这一路已经是"有效"的。
+       * 顺带把 NPN 极性那件事摆出来: 极性配反时 bit11 恒为 1, 回零会找不到跳变。 */
+      const AxisTelem &a = t.ax[axis];
+      warn = QStringLiteral("\n"
+         "⚠️ **这一根现在的限位判据就是成立的** —— 回零是朝开关走, 这一点要看清楚:\n"
+         "  %1\n"
+         "  %2\n"
+         "  %3\n")
+         .arg(QString::fromUtf8(ecatcmd::limit_hit_headline(t.di_invert)),
+              QString::fromUtf8(ecatcmd::limit_switch_text(a.dig_known, a.dig_pos,
+                                                           a.dig_neg, t.di_invert)),
+              QString::fromUtf8(ecatcmd::limit_hit_advice(a.dig_known, a.dig_pos,
+                                                           a.dig_neg, a.dig_home,
+                                                           t.di_invert)));
+   }
+
+   QMessageBox box(QMessageBox::Warning,
+                   QStringLiteral("回零 —— 滑台会自己带电去找开关"),
+                   QStringLiteral(
+                      "轴 %1, **%2**找原点 (6098h = %3)。\n\n"
+                      "确认:\n"
+                      "  · 人已经在设备旁边\n"
+                      "  · 手放在物理急停上\n"
+                      "  · 滑台行程里没有手、工具、线\n"
+                      "  · **竖直轴下面没有人**\n\n"
+                      "**驱动器会自己带电并移动。** 本程序只发一条「开始回零」—— 之后朝哪个\n"
+                      "方向走、什么时候停、撞不撞开关, 全由驱动器按上面那个方式自己决定。\n"
+                      "**软件拦不住它撞开关**, 能做的只有「停止」立即中止。\n\n"
+                      "该轴会**先失能** (6098h/6099h/609Ah/607Ch 只能在未使能时写) ——\n"
+                      "竖直轴会在这时候失去保持力矩, 可能下滑。\n\n"
+                      "%4\n"
+                      "回零结束后会自动切回 CSP 并**保持使能** (停在落点带保持力矩),\n"
+                      "显示坐标会把回零点当做 0 (**零点世代 +1**)。\n\n"
+                      "**按「停止」可立即中止** (不用等那 %5 秒)。\n\n"
+                      "**「%2」说的是电机轴的正反向** —— 与画布上 +%6 是不是同一个方向,\n"
+                      "只有现场试一次才知道。方向不对就换另一个按钮, 别硬顶。%7")
+                      .arg(ax, dtxt).arg(meth)
+                      .arg(QStringLiteral(
+                         "本次: 找原点速度 %1 pul/s (6099h:01), 返回速度 %2 pul/s (6099h:02),\n"
+                         "加减速 %3 pul/s² (609Ah), 原点偏移 0 (607Ch), 上限 %4 秒后判超时。\n"
+                         "速度 × %4 秒 = 一次回零最多走过的距离 (%5 圈) —— 碰不到开关时请\n"
+                         "先把滑台手动挪近, **不要**为了够得着去调高速度。\n")
+                         .arg(vel).arg(slow).arg(acc)
+                         .arg(HMI_HOME_TMO_MS / 1000)
+                         .arg(QString::number(reach, 'f', 1)))
+                      .arg(HMI_HOME_TMO_MS / 1000).arg(ax, warn),
+                   QMessageBox::Ok | QMessageBox::Cancel, this);
+   box.setDefaultButton(QMessageBox::Cancel);
+   if (box.exec() != QMessageBox::Ok)
+      return;
+
+   /*
+    * 零点世代 +1。**在 postHome 之前**, 而且**无条件**。
+    *
+    * 为什么在 GUI 而不是在工作线程 (真正重新锚定 m_origin 的地方): GUI 无法知道工作
+    * 线程那道闸是拦还是放, 而两个方向的代价**不对称** ——
+    *   · 多发一代: 最多让续扫在开工前多问一次 (它本来就会问), 无害;
+    *   · 漏发一代: 续扫把回零前后的两半坐标**静默拼在一起** —— 而那正是这套机制
+    *     存在的全部理由。
+    * 所以往保守那边偏: **工作线程在所有它真动过的路径上重新锚定, GUI 每次派发都 +1**。
+    * 于是"锚定而不 +1"这个危险方向在结构上不可能出现。
+    */
+   m_epoch++;
+   m_ctl->setZeroEpoch(m_epoch);
+
+   m_thr->postHome(axis, meth, vel);
+
+   hint(QStringLiteral("轴 %1 的 %2回零已发出 (方式 %3, 速度 %4 pul/s)。"
+                       "**按「停止」可立即中止** —— 收尾要几秒, 请等状态栏里那句结果")
+           .arg(ax, dtxt).arg(meth).arg(vel), false);
+}
+
 void ScanWindow::onZeroHereClicked()
 {
    if (m_ctl->running())
@@ -1626,6 +1980,15 @@ void ScanWindow::onMeterChanged(int idx)
    default: pick = m_random; break;
    }
    m_meter = pick;
+
+   /* 换了源, 上一格那个数就**不再属于任何东西**了 —— 留着它, 操作员会把它读成新源
+    * 的读数 (一个从没读过的源旁边挂着一个数, 是最坏的一种残留)。未决的那个请求同理
+    * 要作废: 回话即使来了也不该再往这一格写。 */
+   if (m_readTimer != nullptr)
+      m_readTimer->stop();
+   m_readPending = false;
+   if (m_lReadout != nullptr)
+      m_lReadout->setText(QStringLiteral("—"));
 
    /* open() 对真机是**阻塞**的 (枚举 USB → 开设备 → 读探头 → 开流), 上限 12s。
     * 换源本来就不该在扫描中做, 所以这一下卡住不会拖慢任何采集。 */
@@ -1713,6 +2076,87 @@ void ScanWindow::onMeterCfgChanged()
 void ScanWindow::onManualValueChanged(double v)
 {
    m_manual->setValue(v);
+}
+
+/*
+ * ---------------------------------------------------------------- 读一次
+ *
+ * 「接上了」这件事在界面上原来只有一句状态行 (表头/探头型号 + 序列号), 想看到
+ * **一个数**必须先开一趟扫描 —— 而一趟扫描是一小时。刚插上表头的时候没人愿意先赌上
+ * 一小时才知道探头是不是坏的。
+ *
+ * 这里就发一次普通请求, 走的是扫描用的同一条路, 所以它通了 = 采集那条路也通了。
+ *
+ * ── 那条硬闸 ─────────────────────────────────────────────────────────────
+ *
+ * PowerMeter 的约定 (powermeter.h): **调用方负责保证同一时刻只有一个未决请求**。
+ * 扫描跑着的时候"调用方"是 ScanController, 所以这时候按下去就是两个请求撞在同一个源上:
+ * 真机那条 (每个采样只认严格更新的时间戳) 会让其中一边白等到超时, 模拟源则会把两个
+ * 数分给两边 —— 于是扫描的 CSV 里会**悄悄少一个点或者错一个点**。这种错不会报任何错,
+ * 所以只能靠闸门挡。refresh() 里那条 setEnabled 就是闸门, 这里再兜一次底。
+ *
+ * ── 为什么两个槽里还要比一次 sender() ─────────────────────────────────────
+ *
+ * 换取样源时那个未决请求会作废 (见 onMeterChanged), 但**旧源的回话可能已经排在事件
+ * 队列里**了。正常情况下它先被处理, 那时 m_readPending 还是 false, 于是丢掉 ——
+ * 可这靠的是队列的先后顺序。多比一次 `sender() != m_meter` 就把这个赌注去掉了:
+ * 只有**当前源**的回话算数。四个源都是本窗口的子对象、一样长寿, 所以 sender() 在这
+ * 里是安全的 (不是那种"发送者可能已经死了"的用法)。
+ */
+void ScanWindow::onReadOnceClicked()
+{
+   if (m_meter == nullptr || !m_meter->isOpen() || m_ctl->running() || m_readPending)
+      return;
+
+   /*
+    * 顺序是**有讲究的**: 先把 m_readPending / 起始时刻 / 兜底定时器全都摆好, **最后**才发
+    * 请求。
+    *
+    * 因为源有一个**同步回话**的口子: 没打开时三个模拟实现都是直接 `emit readingFailed`
+    * (在 requestReading() 的调用栈里就回来了, 见 powermeter.cpp)。虽然上面那道闸已经
+    * 挡掉了"没打开"这一种, 但把顺序倒过来就是**在别人的调用栈里改自己的状态** ——
+    * 那类 bug 只有在某个源改成同步回话的那天才炸, 而且炸在别处的代码上。
+    */
+   m_readPending = true;
+   m_readSentMs  = m_clock.elapsed();
+   m_lReadout->setText(QStringLiteral("读一次: 读取中…"));
+   m_readTimer->start(kReadOnceTimeoutMs);
+   refresh();                       /* 立刻把按钮灰掉, 免得连点出两个请求 */
+
+   m_meter->requestReading();
+}
+
+void ScanWindow::onReadOnceReady(double watts)
+{
+   /* 不是我们的那一份 —— 那就是扫描的读数, 一个字都别动 */
+   if (!m_readPending || sender() != m_meter)
+      return;
+
+   m_readPending = false;
+   m_readTimer->stop();
+
+   const double took = (double)(m_clock.elapsed() - m_readSentMs);
+   m_lReadout->setText(QStringLiteral("读一次 [%1]: %2 W   (往返 %3 ms)")
+                          .arg(m_meter->kind(), fmtWatts(watts))
+                          .arg(took, 0, 'f', 0));
+   refresh();
+}
+
+void ScanWindow::onReadOnceFailed(const QString &err)
+{
+   if (!m_readPending || sender() != m_meter)
+      return;
+
+   m_readPending = false;
+   m_readTimer->stop();
+
+   const double took = (double)(m_clock.elapsed() - m_readSentMs);
+   /* 失败原文照贴。**这一行是排查时最有用的一句** —— 没插表头 / 过量程 / 流没起来
+    * 是三种完全不同的错, 而它们各自的原话只有源那边知道 */
+   m_lReadout->setText(QStringLiteral("读一次 [%1]: 失败 —— %2   (往返 %3 ms)")
+                          .arg(m_meter->kind(), err)
+                          .arg(took, 0, 'f', 0));
+   refresh();
 }
 
 void ScanWindow::onBrowseScript()
@@ -2207,11 +2651,89 @@ void ScanWindow::refresh()
    refreshAxisSignals(t);
 
    const bool can_move = m_connected && !running;
-   m_btnEnable->setEnabled(can_move && !t.ax[0].enabled);
+   /* 回零期间一切"给目标 / 改坐标 / 改状态"的动作都要停: 总线线程正阻塞在 doHome 里,
+    * interpolate() 一帧都不跑, 而且轴此刻按 HM 解释, 607Ah 根本不是目标位置。
+    * 投进去的命令也不会丢 —— 它们排着队, 等回零退出来才执行, 那正是"点了没反应" */
+   const bool can_home = can_move && t.in_op && !t.homing && !t.resetting;
+
+   m_btnEnable->setEnabled(can_move && !t.homing && !t.ax[0].enabled);
+   /* 「停止」在回零中也**必须可按** —— 它现在兼任"立即中止回零" (见 onStopClicked)。
+    * 这一条刻意不加 !t.homing: 加了就等于把唯一那根救命绳藏起来 */
    m_btnStop->setEnabled(m_connected);
-   m_btnDis->setEnabled(m_connected);
+   /* 失能排在回零后面执行的话, 收尾会**再使能一次** —— 一次"失能"最后以带电告终,
+    * 比灰着更坏 */
+   m_btnDis->setEnabled(m_connected && !t.homing);
    m_btnCenter->setEnabled(can_move);
-   m_btnZero->setEnabled(can_move);
+   m_btnZero->setEnabled(can_move && !t.homing);
+
+   /*
+    * 四个回零按钮: **逐轴**判, 只看这一根。
+    * 另一根带不带电、有没有故障, 与"我这一根能不能回零"是两件事 —— 不该为它灰掉。
+    *
+    * 刻意**不看 t.ax[i].enabled**: 未使能也能回零 (em_home 自己会先失能再使能,
+    * 而且它**要求**未使能才能写 6098h)。把"已使能"当成不许回零, 会挡住最常见的那条路。
+    *
+    * fault / mirror_ok 这两条要在这里再判一次 —— 工作线程那道闸才是权威, 但让按钮
+    * 先按不动, 比让人点开模态、读完一屏清单、按了确认才被告知"有故障"要好。
+    */
+   for (int i = 0; i < 2; i++)
+   {
+      const bool ok = can_home && t.ax[i].valid && t.ax[i].mirror_ok && !t.ax[i].fault;
+
+      for (int d = 0; d < 2; d++)
+      {
+         m_btnHome[i][d]->setEnabled(ok);
+         /* 回零中把那**正在动的那一根**的按钮改名。不看轴就改名的话, 回 X 的时候
+          * Y 的两个按钮也写着"回零中…", 而它们其实只是被灰掉了 */
+         const bool mine = t.homing && (t.homing_axis == i);
+         m_btnHome[i][d]->setText(
+            mine ? QStringLiteral("%1 回零中…")
+                      .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"))
+                 : QStringLiteral("%1 %2回零")
+                      .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"),
+                           QString::fromUtf8(ecatcmd::home_dir_text(d == 1))));
+      }
+   }
+
+   /*
+    * 「回零速度」**不进上面那张 locked 表**, 所以这里不用管它: 它在扫描期间也可改。
+    * 它是个**值**不是动作, 灰掉只会让人以为"现在改它有用" —— 同「让 60FDh 进 TxPDO」
+    * 与「输入电平反转」那两条的先例。
+    */
+
+   /*
+    * 回零的横幅: 上升沿起一条, 下降沿**只清我们自己写的那条** (原文比对, 同
+    * m_limBanner 那一套) —— 期间工作线程可能已经把 note 换成了别的话, 那不能动。
+    * 只在真变了才动控件, 同 refreshAxisSignals 的习惯。
+    */
+   if (t.homing)
+   {
+      const QString s = QStringLiteral("轴%1 正在回零 (方式 %2, %3高速先找) —— "
+                                       "**按「停止」可立即中止**")
+                           .arg(t.homing_axis == 0 ? QStringLiteral("X")
+                                                   : QStringLiteral("Y"))
+                           .arg(t.homing_method)
+                           .arg(QString::fromUtf8(
+                                   ecatcmd::home_dir_text(t.homing_method == 29)));
+      if (m_homeBanner != s)
+      {
+         m_homeBanner = s;
+         hint(s, false);
+         /* hint() 会给非故障的提示挂上 8 秒自尽。**回零不是"事件"是"进行中的状态"** ——
+          * 而这句横幅上挂着"按「停止」可立即中止", 是这30秒里唯一写着出路的地方。
+          * 让它自己消失, 就等于在最长的那条路(超时)上把话说了一半。 */
+         m_bannerTimer->stop();
+      }
+   }
+   else if (!m_homeBanner.isEmpty())
+   {
+      if (m_banner->text() == m_homeBanner)
+      {
+         m_banner->setVisible(false);
+         m_bannerTimer->stop();
+      }
+      m_homeBanner.clear();
+   }
 
    /*
     * 故障复位: 没连接 / 扫描中 / 正在复位 -> 不可用。
@@ -2253,7 +2775,11 @@ void ScanWindow::refresh()
 
    const bool meter_ok = (m_meter != nullptr) && m_meter->isOpen();
    const bool params_ok = m_ctl->paramsError().isEmpty();
-   m_btnStart->setEnabled(!running && m_connected && meter_ok && params_ok);
+   /* **回零中不能起扫。** 回零把轴留在**使能**, 所以扫描要是半路撞上它, 既不会像
+    * "掉使能"那样自动中止, 也等不到插补 —— 状态机会以为到了点, 其实一格没动。
+    * 这一条是纵深防御: scancontroller 的 armRun() 里还有一道 (那道才是权威, 因为
+    * 「打开 CSV 续扫」那条路也能起扫) */
+   m_btnStart->setEnabled(!running && m_connected && meter_ok && params_ok && !t.homing);
 
    const ScanController::State st = m_ctl->state();
    m_btnPause->setEnabled(running && st != ScanController::State::Paused);
@@ -2313,6 +2839,39 @@ void ScanWindow::refresh()
             s += QStringLiteral(" · ") + i.summary;
       }
       m_lMeter->setText(s);
+   }
+
+   /*
+    * 「读一次」那条**硬闸** (理由见 onReadOnceClicked 上面那段):
+    * 控制器只要不在 Idle, 未决请求就归它, 这时候一个手动请求都不能发。
+    *
+    * 顺带把两个"按下去也没用"的情形一起挡了: 源没打开 (请求发出去必然失败, 而失败
+    * 原文会盖掉上一次那个好读数)、以及已经有一个手动请求在飞。
+    *
+    * **不去比对 isEnabled() 再决定要不要设** —— 每帧照设。30Hz 重设同一个值是廉价的,
+    * 而"只在变化时设"要为它多存一份影子状态, 那种状态正是忘记同步的来源。
+    */
+   if (m_btnRead != nullptr)
+   {
+      const bool can = (m_meter != nullptr) && m_meter->isOpen()
+                    && !m_ctl->running() && !m_readPending;
+      m_btnRead->setEnabled(can);
+
+      /* 为什么按不了, 说清楚 —— 一个灰按钮加一句原因, 比一个能点但注定失败的按钮好。
+       * 基础说明始终在下面 (readOnceTip), 按不了的时候把原因摆在前面 */
+      QString why;
+      if (m_meter == nullptr)
+         why = QStringLiteral("没有取样源");
+      else if (!m_meter->isOpen())
+         why = QStringLiteral("取样源没打开 (先在上面「取样源」里选一个)");
+      else if (m_readPending)
+         why = QStringLiteral("已经有一个读数在等回话");
+      else if (m_ctl->running())
+         why = QStringLiteral("扫描进行中: 未决请求归扫描状态机, 手动读会和它抢同一个数");
+
+      m_btnRead->setToolTip(why.isEmpty()
+         ? readOnceTip()
+         : QStringLiteral("现在读不了 —— ") + why + QStringLiteral("\n\n") + readOnceTip());
    }
 
    /* 故障横幅只在**上升沿**弹一次: 30Hz 每帧都设一遍会把重绘刷爆,
@@ -2400,6 +2959,22 @@ void ScanWindow::warnMaybeLive()
 
 void ScanWindow::disconnectAndStop()
 {
+   /*
+    * **回零进行中: 先掐掉它。**
+    *
+    * 这条断开路径是**同步等**的 (下面那个循环, 12 秒), 而回零是这个程序里唯一一个
+    * 单次能阻塞到 30 秒的动作 —— 不掐的话, 12 秒一轮空转到底, 回零还在跑,
+    * 最后 `QThread` 会在它的 `em_home` 还在泵帧的时候被拆掉。
+    *
+    * 这一句是**「停止」按钮那条直呼的近亲**, 但不需要另开先例: 走的是同一个
+    * requestMotionStop() (它只往一个标志里存 1, 见 ecatworker.h 里那段)。
+    *
+    * 注意它**必须先于**下面的 postDisconnect: 命令是排队的, 而队列要等回零退出来
+    * 才轮到 —— 先投那条命令再掐, 时序上其实一样, 但先掐能少等一个 33ms 的遥测轮询。
+    */
+   if (m_thr->isRunning() && m_thr->telemetry().homing)
+      m_thr->requestMotionStop();
+
    /* **先中止扫描再断总线。** 反过来的话状态机会看到"掉出 OP", 然后作为一个
     * "异常"去自动中止 —— 一条本来正常的收尾路径会变成红色告警 */
    if (m_ctl->running())

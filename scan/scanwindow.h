@@ -98,6 +98,9 @@ private:
     * 拆开的理由见 §9 与 LampGrid 上面那段 —— 一行五个"灯+字"在 370px 里会被挤扁。 */
    QWidget *buildAxisPanel();
    QWidget *buildLimitPanel();
+   /* 「回零」(驱动器自带的 HM 模式)。**独立的第三个框**, 不塞进扫描参数栏 ——
+    * 它是"让滑台自己去找开关"这类危险动作, 与几何参数不是一回事 */
+   QWidget *buildHomePanel();
 
    /* ---- 操作 ---- */
    void onConnectClicked();
@@ -125,6 +128,19 @@ private:
    void onMeterCfgChanged();          /* 那三项下拉框 → 设备 */
    void onBrowseScript();
    void onManualValueChanged(double v);
+   /* 「读一次」。它**会跟 ScanController 抢同一个未决请求**, 所以有一条硬闸:
+    * 控制器不在 Idle 时按钮是禁用的 (见 .cpp 里 onReadOnceClicked 那段)。
+    * 三个槽挂在四个取样源上, 靠 m_readPending 认出"这是不是我那一份"。 */
+   void onReadOnceClicked();
+   void onReadOnceReady(double watts);
+   void onReadOnceFailed(const QString &err);
+
+   /* 「X/Y 正/反向回零」。dir: 0 = 正向 (6098h = 24), 1 = 反向 (29)。
+    * **每次点击都弹模态** —— 这个动作会让滑台带电自己朝开关走, 见 .cpp 里那段。
+    * 它同时 +1 零点世代: 回零会把物理位置整个搬走, 与「设为区域中心」同一个理由。 */
+   void onHomeClicked(int axis, int dir);
+   /* 「停止」。回零期间它必须变成**立即中止** —— 见 .cpp 里那段 (队列救不了回零) */
+   void onStopClicked();
 
    /* ---- 内部 ---- */
    void pushParams();                 /* 控件 → Params → 控制器 + 量程 */
@@ -198,6 +214,16 @@ private:
    QLabel *m_lEst  = nullptr;
    QLabel *m_lWarn = nullptr;      /* 参数不合法 / 超量程 的那行红字 */
 
+   /* ---- 回零 ---- */
+   /* 6099h:01 找原点速度。上限夹在 HMI_HOME_VEL_MAX (2000) —— 与工作线程那道夹取
+    * **同一个宏**, 所以界面上显示的数就是线上发的数。
+    * **不进 scan.ini**: 它是运动参数, 而每次点击的模态都会把当次数值念一遍 */
+   QSpinBox    *m_edHomeVel = nullptr;
+   QPushButton *m_btnHome[2][2] = {};   /* [轴][方向] 0 = 正向, 1 = 反向 */
+   /* 我们发出去的那条"正在回零"横幅的原文。下降沿靠它认"现在挂着的是不是我们自己
+    * 那条" —— 同 m_limBanner 那套 */
+   QString      m_homeBanner;
+
    /* ---- 扫描控制 ---- */
    QPushButton *m_btnStart  = nullptr;
    QPushButton *m_btnPause  = nullptr;
@@ -220,6 +246,15 @@ private:
    QLineEdit      *m_edScript  = nullptr;
    QPushButton    *m_btnScript = nullptr;
    QLabel         *m_lMeter    = nullptr;
+   /* 接上之后第一件想做的事: **点一下, 出一个数**, 不用跑整趟扫描就能确认链路通了、
+    * 探头出的数合理。硬件没插时按接口约定干净报错 (见 onReadOnceFailed) */
+   QPushButton    *m_btnRead   = nullptr;
+   QLabel         *m_lReadout  = nullptr;
+   /* 未决请求的兜底。接口约定是"恰好回一次", 但那句话是**源那边的义务** ——
+    * 真机那条腿要是有 bug 就一个都不回, 界面会永远停在"读取中…" */
+   QTimer         *m_readTimer = nullptr;
+   bool            m_readPending = false;
+   qint64          m_readSentMs  = 0;   /* m_clock 的读数, 单调钟 */
 
    /* 真机那三项。**选项表由设备给**, 不是这里写死的 —— 手册明确说了不要按型号
     * 推断规格。选中模拟源时整行藏起来, 免得看着像能用 */

@@ -273,6 +273,13 @@ bool ScanController::armRun(QString *err)
    if (!t.in_op)
       return fail(err, QStringLiteral("总线不在 OP 状态"));
 
+   /* 回零**把轴留在使能 + HM**, 所以扫描半路撞上它, 既不会像"掉使能"那样被下面那条
+    * 自动中止判据抓到, 也等不到插补 (总线线程整段阻塞在 em_home 里, 一帧不泵)。
+    * 表现是状态机以为一个点"到了", 其实滑台纹丝没动 —— 采到的是上一站的光。
+    * 界面上「开始扫描」也灰着, 但那条路不唯一 (「打开 CSV 续扫」也走 armRun)。 */
+   if (t.homing)
+      return fail(err, QStringLiteral("总线正在回零 —— 等它做完再启扫"));
+
    if (m_meter == nullptr || !m_meter->isOpen())
       return fail(err, QStringLiteral("功率计没打开 —— 扫描要采数, 不能没有源"));
 
@@ -295,7 +302,8 @@ bool ScanController::armRun(QString *err)
       if (!a.valid || !a.mirror_ok)
          return fail(err, QStringLiteral("轴%1 还没收到完整的过程数据帧 —— 位置不可信").arg(i));
       if (!a.enabled)
-         return fail(err, QStringLiteral("轴%1 没使能。「使能」是唯一让电机带电的按钮, 得先按它").arg(i));
+         return fail(err, QStringLiteral(
+            "轴%1 没使能。「使能」或「回零」都会让电机带电, 得先按其中一个").arg(i));
       if (a.fault || t.fault)
          return fail(err, QStringLiteral("轴%1 有故障位 (6041h bit3) —— 先清故障再扫").arg(i));
       if (a.limit_active)
@@ -476,9 +484,10 @@ bool ScanController::resume(const QString &csv_path, bool accept_zero_epoch_chan
       return fail(why != nullptr ? why : err,
          QStringLiteral(
             "这个 CSV 是在**另一次零点**下采的 (文件里是第 %1 次, 现在是第 %2 次)。\n\n"
-            "连接时零点会被重设为「当时所在的位置」, 所以断线重连之后同一个坐标\n"
-            "指的**可能已经是另一个物理位置**。就这么接着扫, 下半场会和上半场拼在\n"
-            "一张图上, 而图上不会有任何异常的样子。\n\n"
+            "连接时零点会被重设为「当时所在的位置」, 回零也会把零点整个搬到驱动器\n"
+            "自报的那个原点 —— 这两种事之后, 同一个坐标指的**可能已经是另一个物理\n"
+            "位置**了。就这么接着扫, 下半场会和上半场拼在一张图上, 而图上不会有\n"
+            "任何异常的样子。\n\n"
             "请先确认: 滑台现在的位置和「上一次零点确立时」是同一个物理位置\n"
             "(比如都停在同一个机械靠块 / 同一个对位标记上)。确认了再选「继续」。\n\n"
             "文件: %3 (开始于 %4)")

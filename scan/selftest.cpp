@@ -19,6 +19,8 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QFile>
+#include <QIODevice>
 #include <QString>
 #include <QTemporaryDir>
 #include <QTimer>
@@ -253,6 +255,9 @@ public:
    void setDropFrames(int i, bool d) { t_.ax[i].mirror_ok = !d; }
    void setWkc(int w)          { t_.wkc = w; }
    void setInOp(bool v)        { t_.in_op = v; }
+   /* 总线正在回零。**只影响 armRun 那道闸** —— 真回零是工作线程在跑, 这个假总线
+    * 不假装能复现它, 只复现"控制器看得到的那一位" */
+   void setHoming(bool v)      { t_.homing = v; }
    void freezeMotion(bool f)   { freeze_ = f; }
    void setPosLag(int ms)      { pos_lag_ms_ = ms; }
    void setRange(int32_t r)    { t_.range = r; }
@@ -1704,6 +1709,412 @@ static void test_limitsw()
 }
 
 /*
+ * ---------------------------------------------------------------- 回零 (HM)
+ *
+ * 回零是**唯一一个软件兜不住的动作**: 一旦发起, 朝哪走、什么时候停、撞不撞开关, 全由
+ * 驱动器按 6098h 自己决定。所以这里钉的不是"回零能不能成功" (那要插上机器才知道),
+ * 而是**发起之前那道闸**与**收尾之后那句话** —— 这两样是纯判据, 也正是操作员唯一能
+ * 依赖的东西。
+ *
+ * 尤其是措辞: 「被停止中止」和「失败」是两件事 (前者是人让它停的), 「故障」和
+ * 「状态未知」也是两件事 (后者要人去做的是完全不同的一件事)。这些话都由这里钉住。
+ *
+ * 真正的 em_home() 调用链 (doHome / 收尾顺序 / g_stop 纪律) **一条都没法在这里验** ——
+ * 它们要 em_bus_t 和网卡。那些条目记在 docs/scan_sweep.md §13 的硬件清单里。
+ */
+static void test_homing()
+{
+   /* 本地小工具: 判"这句话里有这个词"。判据是**给人看的话**, 所以措辞也是被测的东西 */
+   auto has = [](const char *p, const char *w) {
+      return p != nullptr && std::string(p).find(w) != std::string::npos;
+   };
+
+   /* ---- 方向 ---------------------------------------------------- */
+   caseBegin("回零: 正/反向 -> 6098h（24 / 29）");
+   {
+      checkEq(ecatcmd::home_method_for(false), 24, "正向 = 方式 24");
+      checkEq(ecatcmd::home_method_for(true),  29, "反向 = 方式 29");
+
+      check(std::string(ecatcmd::home_dir_text(false)) == "正向", "正向的叫法");
+      check(std::string(ecatcmd::home_dir_text(true))  == "反向", "反向的叫法");
+
+      /* 范围守卫。上面两条只钉住"这个数没变", 钉不住"这个数是对的" —— 将来有人把
+       * 29 打成 30 或者 4, 那两条照样过。35 是"以当前位置为机械原点", 它**不去找**,
+       * 不是这两个按钮的意思 (见 docs/ykd2205pe_ci402.md 那张表) */
+      for (int neg = 0; neg < 2; neg++)
+      {
+         const int m = ecatcmd::home_method_for(neg != 0);
+         check(m >= 4 && m <= 30 && m != 35, "方式号落在手册的 HM 表里, 且不是 35");
+      }
+   }
+
+   /* ---- 返回速度派生 -------------------------------------------- */
+   caseBegin("回零: 6099h:02 = 6099h:01 / 4（下限 1）");
+   {
+      checkEq(ecatcmd::home_vel_slow(2000), 500, "2000 -> 500");
+      checkEq(ecatcmd::home_vel_slow(1000), 250, "1000 -> 250");
+      checkEq(ecatcmd::home_vel_slow(4),      1, "4 -> 1");
+      checkEq(ecatcmd::home_vel_slow(3),      1, "3 -> 整除到 0, 由下限救回 1");
+      checkEq(ecatcmd::home_vel_slow(0),      1, "0 -> 1（写 0 是什么语义手册没写, 而"
+                                                "「返回速度是 0」绝不该是它的意思）");
+
+      /* 全域不变式, 比逐个例子管用: 返回速度永远 >= 1 (绝不许发 0 出去), 且 <= 找原点
+       * 速度 (返回段是"慢慢回到那个点", 比找段还快没有道理) */
+      bool inv = true;
+      for (uint32_t v = 1; v <= 4000 && inv; v++)
+      {
+         const uint32_t s = ecatcmd::home_vel_slow(v);
+         if (s < 1u || s > v)
+            inv = false;
+      }
+      check(inv, "1..4000 全域: 1 <= 返回速度 <= 找原点速度");
+   }
+
+   /* ---- 夹取 ---------------------------------------------------- */
+   caseBegin("回零: 速度夹取与输入框的上下限是同一个宏");
+   {
+      checkEq(ecatcmd::home_vel_clamp(0),         HMI_HOME_VEL_MIN, "0 -> 下限");
+      checkEq(ecatcmd::home_vel_clamp(99),        HMI_HOME_VEL_MIN, "99 -> 下限");
+      /* **比上限高一点点**, 不写一个具体的数 —— 上一个版本这里写的是 2001, 而 2001
+       * 在上限从 2000 提到 100000 之后就成了一个**合法值**, 这条断言会从"验夹取"
+       * 变成"验上限还是 2000"。夹取测的是边界关系, 不是某一个数 */
+      checkEq(ecatcmd::home_vel_clamp((int32_t)HMI_HOME_VEL_MAX + 1), HMI_HOME_VEL_MAX,
+              "MAX + 1 -> 上限");
+      checkEq(ecatcmd::home_vel_clamp(2147483647), HMI_HOME_VEL_MAX, "INT32_MAX -> 上限");
+      checkEq(ecatcmd::home_vel_clamp(HMI_HOME_VEL_DEF), HMI_HOME_VEL_DEF, "缺省值原样通过");
+
+      /* 这一条锁的是"**界面上显示的数就是线上发的数**": 输入框的 range 与这道夹取读的
+       * 是同一对宏。哪天有人只放宽一边 (比如把 range 开到 5000 好"跑快点"), 这条会响 */
+      checkEq(ecatcmd::home_vel_clamp(HMI_HOME_VEL_MAX), HMI_HOME_VEL_MAX,
+              "clamp(MAX) == MAX —— range 与夹取没有漂移");
+      checkEq(ecatcmd::home_vel_clamp(HMI_HOME_VEL_MIN), HMI_HOME_VEL_MIN, "clamp(MIN) == MIN");
+
+      /* 回零速度的头上**不许高于程序里别的运动** —— 「手动速度」+ 点画布本来就能以
+       * HMI_VEL_MAX 朝同一个开关走, 回零比它快没有任何理由, 而慢是白慢 (见 §18) */
+      check(HMI_HOME_VEL_MAX <= HMI_VEL_MAX, "回零速度的上限不超过 HMI_VEL_MAX");
+      check(HMI_HOME_VEL_DEF >= HMI_HOME_VEL_MIN && HMI_HOME_VEL_DEF <= HMI_HOME_VEL_MAX,
+            "缺省值落在上下限之内");
+   }
+
+   /* ---- 加减速 -------------------------------------------------- */
+   caseBegin("回零: 609Ah 由速度派生 —— 斜坡时间 0.1 秒, 加速度封顶");
+   {
+      /* 驱动器自己那一对实测值: 6099h:01 = 50000, 609Ah = 500000。这一条钉的是
+       * "斜坡时间 = 0.1 秒"这个约定的源头 —— 它一变, 这行就该响 */
+      checkEq(ecatcmd::home_accel_for(50000), HMI_HOME_ACC_MAX,
+              "驱动器自己那一对 (50000 / 500000) 原样复现");
+
+      /* 在 50000 及以下: 斜坡时间恒为 0.1 秒 (acc == v * 10)。
+       * **这是这组测试里最要紧的一条** —— 没有它, 一个"加速度写死"的回归
+       * (比如又改回 5000) 会让低速那几条断言照样全过 */
+      bool ramp = true;
+      for (uint32_t v = HMI_HOME_VEL_MIN; v <= HMI_HOME_ACC_MAX / 10u; v++)
+         if (ecatcmd::home_accel_for(v) != v * 10u)
+            ramp = false;
+      check(ramp, "下限..50000 全域: 斜坡时间恒为 0.1 秒 (acc == v * 10)");
+
+      /* 封顶: 一个很高的速度**不许**换来一个比机器自己配的还硬的加速度 */
+      checkEq(ecatcmd::home_accel_for(50001), HMI_HOME_ACC_MAX, "刚过 50000 -> 封顶");
+      checkEq(ecatcmd::home_accel_for(HMI_HOME_VEL_MAX), HMI_HOME_ACC_MAX,
+              "上限速度 -> 还是封顶 (斜坡变长到 0.2 秒, 而不是加速度翻倍)");
+      /* 没有那个除法守卫的话 v * 10 会回绕, 于是"很大的速度"算出"很小的加速度" */
+      checkEq(ecatcmd::home_accel_for(4294967295u), HMI_HOME_ACC_MAX,
+              "UINT32_MAX -> 封顶, 不回绕");
+
+      bool mono = true, cap = true;
+      for (uint32_t v = HMI_HOME_VEL_MIN; v <= HMI_HOME_VEL_MAX; v++)
+      {
+         if (ecatcmd::home_accel_for(v) > HMI_HOME_ACC_MAX)
+            cap = false;
+         if (v > HMI_HOME_VEL_MIN && ecatcmd::home_accel_for(v) < ecatcmd::home_accel_for(v - 1))
+            mono = false;
+      }
+      check(cap,  "下限..上限 全域: 加速度不超过 HMI_HOME_ACC_MAX");
+      check(mono, "下限..上限 全域: 加速度随速度单调不减");
+   }
+
+   /* ---- 闸 ------------------------------------------------------ */
+   caseBegin("回零闸: 分支, 以及分支的**顺序**");
+   {
+      check(ecatcmd::home_refusal(true, true, true, false, false) == nullptr,
+            "全清 -> 放行 (nullptr)");
+
+      check(has(ecatcmd::home_refusal(false, true, true, false, false), "总线"),
+            "没连上 -> 说总线");
+      check(has(ecatcmd::home_refusal(false, true, true, true, false), "总线"),
+            "没连上 + 有故障 -> 还是先说总线: 那时连状态字都没有, 说故障是在猜");
+
+      check(has(ecatcmd::home_refusal(true, false, true, false, false), "位置"),
+            "一笔 6064h 都没取到 -> 说位置未知");
+
+      /* **顺序的要害**: 一个从没收到过的状态字里的 bit3 不是信息。这一条与
+       * axis_needs_reset 编码的是同一条规矩 */
+      const char *r = ecatcmd::home_refusal(true, true, false, true, false);
+      check(has(r, "未知"), "丢帧 + 有故障 -> 说「状态未知」");
+      check(!has(r, "bit3"), "丢帧时不许拿一个没收到过的状态字里的 bit3 说事");
+
+      r = ecatcmd::home_refusal(true, true, true, true, false);
+      check(has(r, "bit3") && has(r, "故障复位"), "有故障 -> 点名 bit3, 并指到「故障复位」");
+
+      r = ecatcmd::home_refusal(true, true, true, false, true);
+      check(has(r, "停止"), "还有轴在走 -> 让人先按「停止」");
+      check(has(r, "回零期间插补器是停的") || has(r, "停在半途"),
+            "还要说明白**为什么** —— 不然那句话看着像没道理的门槛");
+   }
+
+   /* ---- 收尾结局 ------------------------------------------------ */
+   caseBegin("回零收尾: 结局由**实测状态**定, 不由返回码排列组合");
+   {
+      check(ecatcmd::home_end_state(false, false, true,  0) == ecatcmd::HOME_END_NEVER_STARTED,
+            "没发起过就是没发起过");
+      check(ecatcmd::home_end_state(false, true,  true, -1) == ecatcmd::HOME_END_NEVER_STARTED,
+            "闸拦下时哪怕现场有故障, 也不是「这次回零把它搞坏了」");
+
+      check(ecatcmd::home_end_state(true, true, false, 0) == ecatcmd::HOME_END_FAULTED,
+            "bit3 还在 -> 故障");
+      /* 按 CiA402 这两条不该同时成立; 万一真同时读到, 该报的是**故障** —— 那才是要人
+       * 动手的那一件事。反过来说成"保持中"就是漏掉一个真故障 */
+      check(ecatcmd::home_end_state(true, true, true, 0) == ecatcmd::HOME_END_FAULTED,
+            "故障与使能同时读到 -> 报故障");
+
+      check(ecatcmd::home_end_state(true, false, false, 0) == ecatcmd::HOME_END_STRANDED,
+            "没使能也没故障 -> 状态不明");
+      /* 这一格是这道函数存在的**主要理由**: 轴可能确实带电, 但驱动器不按 CSP 解释
+       * 607Ah, 而 interpolate() 每周期都在往 607Ah 里写 —— "带力矩停着"和
+       * "带电但模式不对"是两件事, 说成 HOLDING 就是撒谎 */
+      check(ecatcmd::home_end_state(true, false, true, -1) == ecatcmd::HOME_END_STRANDED,
+            "已使能但没切回 CSP -> 不能说 HOLDING");
+      check(ecatcmd::home_end_state(true, false, false, -1) == ecatcmd::HOME_END_STRANDED,
+            "两样都不成立");
+
+      check(ecatcmd::home_end_state(true, false, true, 0) == ecatcmd::HOME_END_HOLDING,
+            "已使能 + 已是 CSP -> 保持中 (用户要的那一档)");
+   }
+
+   /* ---- 措辞 ---------------------------------------------------- */
+   caseBegin("回零措辞: 每一种结局说的话都对得上");
+   {
+      check(has(ecatcmd::home_end_text(ecatcmd::HOME_END_STRANDED), "可能仍带电"),
+            "STRANDED 必须把「可能仍带电」说出来");
+      check(has(ecatcmd::home_end_text(ecatcmd::HOME_END_FAULTED), "故障复位"),
+            "FAULTED 要指到「故障复位」 —— 而不是让人去拉总闸");
+      check(!has(ecatcmd::home_end_text(ecatcmd::HOME_END_HOLDING), "可能仍带电"),
+            "HOLDING 不许说带电不明: 那会让人白跑一趟动力电源");
+      check(has(ecatcmd::home_end_text(ecatcmd::HOME_END_HOLDING), "保持"),
+            "HOLDING 要明说「带保持力矩」 —— 用户就是照这句决定敢不敢松手");
+
+      check(has(ecatcmd::home_cause_text(0), "到位"), "rc = 0 -> 到位");
+      check(has(ecatcmd::home_cause_text(1), "停止"), "rc = 1 点名「停止」");
+      /* **被「停止」中止不是失败。** 那是人让它停的, 说成失败会让人去找一个不存在
+       * 的毛病 (这条路径本来就是本功能的半个需求) */
+      check(!has(ecatcmd::home_cause_text(1), "失败"), "被「停止」中止不许说成失败");
+      check(has(ecatcmd::home_cause_text(-1), "方向"), "真失败时给换方向的建议");
+      check(has(ecatcmd::home_cause_text(-1), "硬顶"),
+            "失败建议里要写明**别硬顶** —— 撞着开关还硬回, 才是真会伤机器的做法");
+   }
+
+   /* ---- 控制器那道闸 -------------------------------------------- */
+   caseBegin("回零中不起扫 (armRun), 回零结束立刻能起扫");
+   {
+      Rig r;
+      r.ctrl.setParams(Rig::smallParams());
+      QString err;
+
+      r.bus.setHoming(true);
+      check(!r.startScan(QDir::tempPath() + "/hm1.csv", &err), "回零中 -> 拒绝起扫");
+      check(err.contains(QStringLiteral("回零")), "理由说的是回零", err.toStdString());
+
+      /* 这道闸是"等一下", 不是"这份数据坏了" —— 回零做完必须马上能接着扫。
+       * 只会拒绝的闸跟没写一样 (同 preflight 那条的规矩) */
+      r.bus.setHoming(false);
+      check(r.startScan(QDir::tempPath() + "/hm2.csv", &err), "回零结束 -> 放行",
+            err.toStdString());
+      r.ctrl.abort(QString());
+   }
+}
+
+/*
+ * ---------------------------------------------------------------- 三个模拟源
+ *
+ * 它们从前没有一条测试 —— 而界面上那个「读一次」按钮**四个源都能点**, 于是它们的
+ * 行为第一次直接摆在操作员面前。这里钉的就一件事, 而且正是那条按钮的闸门所依赖的:
+ *
+ *   **一次请求恰好回一次** (readingReady 或 readingFailed, 不多不少), 且值对得上。
+ *
+ * 为什么这条值得单独钉: PowerMeter 的约定把"同一时刻只允许一个未决请求"交给了
+ * **调用方** (powermeter.h), 而"回话分得清是哪一次的"就靠"一请求一回话"这个配对关系。
+ * 哪天某个源改成回两次 (或一次都不回), 出错的不是它自己, 而是**扫描的 CSV 里悄悄
+ * 少一个点或者错一个点** —— 不报任何错。所以配对关系要有测试守着。
+ *
+ * 全是 QTimer::singleShot 投递的, 所以要真转一次事件循环才收得到回话。
+ * 每个请求**自己起一个 QEventLoop**: 复用同一个的话, 上一次那个超时定时器会在
+ * 下一次 exec() 里提前把它按停, 收到的东西就说不清是哪一次的了。
+ */
+
+/* 一次请求的回话 */
+struct Reply
+{
+   int     ready  = 0;
+   int     failed = 0;
+   double  watts  = 0.0;
+   QString err;
+};
+
+/*
+ * 发一个请求, 把事件循环转到有回话 (或超时) 为止。
+ *
+ * **连接挂在这个 loop 上** —— connect 的第三个参数 (context) 传 &loop, 于是 loop 一析构
+ * 连接就跟着断。这一步不是装饰: 不传 context 的话连接的宿主是**信号发送方** (那个源的
+ * 生存期), 而 lambda 里按引用捕获的 loop 早就析构了 —— 下一次请求回话时, 上一次留下的
+ * 那个 lambda 也会被叫起来, 碰的正是那个已经没了的 QEventLoop。**本文件踩过这个坑**
+ * (自检直接段错误, 而且因为 stdout 是块缓冲, 连一行输出都没留下), 所以收进一个函数,
+ * 只写一遍、只对一次。
+ */
+static Reply ask(PowerMeter *m, int timeout_ms = 2000)
+{
+   Reply r;
+   QEventLoop loop;
+   QObject::connect(m, &PowerMeter::readingReady, &loop, [&](double w) {
+      r.ready++; r.watts = w; loop.quit();
+   });
+   QObject::connect(m, &PowerMeter::readingFailed, &loop, [&](const QString &e) {
+      r.failed++; r.err = e; loop.quit();
+   });
+   m->requestReading();
+
+   /*
+    * 已经回了就不再进循环。**有的源是同步回话的** —— 没打开时那几个实现都是直接
+    * `emit readingFailed(...)` (见 powermeter.cpp), 那时上面两个 lambda 已经跑过了。
+    * 而 loop.quit() 在 exec() 之前调是**没有用**的 (Qt: 循环没在跑, 这个调用什么也不做),
+    * 所以照样进 exec() 的话会白等到超时 —— 不报错, 只是每一次都白花两秒。
+    */
+   if (r.ready == 0 && r.failed == 0)
+   {
+      QTimer::singleShot(timeout_ms, &loop, &QEventLoop::quit);
+      loop.exec();
+   }
+   return r;
+}
+
+static void test_meter_sources()
+{
+   caseBegin("meter: 手动源 —— 一次请求一个数, 没打开就恰好回一次失败");
+   {
+      ManualMeter man;
+      man.setValue(0.25);
+
+      /* 没打开: 请求必须得到**恰好一次** readingFailed (不是 0 次, 也不是 2 次) */
+      const Reply shut = ask(&man);
+      check(shut.ready == 0 && shut.failed == 1,
+            "closed -> exactly one failure, no reading", shut.err.toStdString());
+      check(!man.isOpen(), "and it stays closed");
+
+      QString e;
+      check(man.open(&e), "open()", e.toStdString());
+
+      const Reply r = ask(&man);
+      checkEq(r.ready, 1, "open -> exactly one reading");
+      checkNear(r.watts, 0.25, "and it is the value that was set");
+   }
+
+   caseBegin("meter: 随机源 —— 回话在 基值±噪声 之内");
+   {
+      RandomMeter rnd;
+      rnd.setBase(2.0);
+      rnd.setNoise(0.1);
+      rnd.setDelayMs(1);
+
+      QString e;
+      check(rnd.open(&e), "open()", e.toStdString());
+
+      /* 跑十次: 每一次都只许回一个数, 而且必须落在 ±噪声 的范围内。
+       * 这里不用 checkNear —— 它是随机的, 该验的是**界**, 不是某个具体值 */
+      int    bad_n = 0, out_of_band = 0;
+      double lo = 1e9, hi = -1e9;
+      for (int k = 0; k < 10; k++)
+      {
+         const Reply r = ask(&rnd);
+         if (r.ready != 1)
+            bad_n++;
+         if (r.watts < 2.0 - 0.1 - 1e-9 || r.watts > 2.0 + 0.1 + 1e-9)
+            out_of_band++;
+         lo = std::min(lo, r.watts);
+         hi = std::max(hi, r.watts);
+      }
+
+      char buf[160];
+      std::snprintf(buf, sizeof(buf), "10 次里 %d 次回话数不对, %d 次出了 [1.9,2.1]",
+                    bad_n, out_of_band);
+      check(bad_n == 0, "every request answers exactly once", buf);
+      check(out_of_band == 0, "every reading is inside base±noise", buf);
+      /* 十次全都撞在同一个数上 = 噪声坏了 (setNoise 没接上), 那热力图就没得看了 */
+      check(hi - lo > 0.0, "the noise actually varies between readings", buf);
+   }
+
+   caseBegin("meter: 脚本源 —— 按行取, 取完一轮从头, 游标对得上");
+   {
+      QTemporaryDir dir;
+      const QString f = dir.filePath(QStringLiteral("vals.txt"));
+      {
+         QFile w(f);
+         check(w.open(QIODevice::WriteOnly | QIODevice::Text), "write the script file");
+         /* 夹一行 # 注释和一个空行 —— 两种都该被跳过 (见 setPath) */
+         w.write("# 注释行\n1.5\n\n2.5\n3.5\n");
+      }
+
+      ScriptMeter scr;
+      scr.setDelayMs(1);
+      QString e;
+      check(scr.setPath(f, &e), "setPath reads the file", e.toStdString());
+      checkEq(scr.count(), 3, "three values, comment and blank line skipped");
+      check(scr.open(&e), "open()", e.toStdString());
+
+      const double want[4] = {1.5, 2.5, 3.5, 1.5};   /* 第 4 次绕回第一行 */
+      for (int k = 0; k < 4; k++)
+      {
+         const Reply r = ask(&scr);
+         char buf[96];
+         std::snprintf(buf, sizeof(buf), "第 %d 次: got %.9g, want %.9g",
+                       k + 1, r.watts, want[k]);
+         check(r.ready == 1 && std::fabs(r.watts - want[k]) < 1e-9,
+               "reads the next line, then wraps around", buf);
+      }
+      checkEq(scr.cursor(), 1, "cursor is one past the wrap-around value");
+   }
+
+   /*
+    * 这条**不是**在验某个源的行为, 是在验那条约定本身 —— 也就是界面上那个按钮为什么
+    * 必须在扫描期间禁用: 一次请求回一次, 配的是"同一时刻只有一个未决请求"。
+    * 两个请求撞在一起时, 源会**老老实实回两次**, 谁也不知道哪个数属于哪一次 ——
+    * 而真机那条 (Ophir) 更狠: 它按时间戳只认严格更新的采样, 于是其中一边白等到超时。
+    */
+   caseBegin("meter: 两个未决请求撞在一起 -> 源回两次, 所以闸门必须由调用方把");
+   {
+      ManualMeter man;
+      man.setValue(1.0);
+      QString e;
+      man.open(&e);
+
+      int n = 0;
+      QObject::connect(&man, &PowerMeter::readingReady, [&](double) { n++; });
+
+      man.requestReading();
+      man.requestReading();          /* 调用方违约 —— 这里就是要看它会发生什么 */
+      {
+         QEventLoop loop;
+         QTimer::singleShot(200, &loop, &QEventLoop::quit);
+         loop.exec();
+      }
+
+      checkEq(n, 2, "two overlapping requests -> two readings, unresolvable by the caller");
+   }
+
+   /* 这就是那个闸门要挡的东西 —— 而闸门在界面上 (ScanWindow::refresh 里那条
+    * setEnabled), 那层要 Qt Widgets, 本文件按约定不链。所以这条约定是**靠上面这条
+    * 测试说明为什么必须挡**, 而不是靠断言。 */
+}
+
+/*
  * ---------------------------------------------------------------- 真机功率计
  *
  * PD300R + Juno+ 这条路 (见 ophircom.h 顶部)。**这条腿不需要插表头** —— 它验的是
@@ -1894,6 +2305,8 @@ int main(int argc, char **argv)
    test_prefs();
    test_faultreset();
    test_limitsw();
+   test_homing();
+   test_meter_sources();
    test_ophir();
 
    std::printf("\n%d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
