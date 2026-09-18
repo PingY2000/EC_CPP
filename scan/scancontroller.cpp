@@ -300,12 +300,19 @@ bool ScanController::armRun(QString *err)
          return fail(err, QStringLiteral("轴%1 有故障位 (6041h bit3) —— 先清故障再扫").arg(i));
       if (a.limit_active)
          return fail(err, QStringLiteral(
-            "轴%1 的 6041h bit11 已经置起 —— 驱动器现在认为它撞在硬件限位上。\n"
+            "%1。\n"
             "%2。\n"
-            "这个状态开始扫描, 一头撞上去是必然的。先手动把它走离限位。")
-               .arg(i)
+            "%3。\n"
+            /* 收尾这句**不许说"会撞上去"** —— 上面 %3 里有一种成因正是"那个限位根本
+             * 不存在"(极性配反), 两句话并排给人看就会自相矛盾。这里只讲**后果**:
+             * 它在扫描期间成立就会自动中止, 所以现在拒绝。原因由 %1~%3 去说。 */
+            "扫描期间它是每 tick 都查、成立就自动中止的那一类, "
+            "与其采到一半停在同一格, 不如这一趟现在就不开始。")
+               .arg(QString::fromUtf8(ecatcmd::limit_hit_headline(t.di_invert)).arg(i))
                .arg(QString::fromUtf8(ecatcmd::limit_switch_text(
-                       a.dig_known, a.dig_pos, a.dig_neg))));
+                       a.dig_known, a.dig_pos, a.dig_neg, t.di_invert)))
+               .arg(QString::fromUtf8(ecatcmd::limit_hit_advice(
+                       a.dig_known, a.dig_pos, a.dig_neg, a.dig_home, t.di_invert))));
    }
 
    if (t.expected_wkc > 0 && t.wkc < t.expected_wkc)
@@ -894,17 +901,21 @@ QString ScanController::healthProblem(const BusTelem &t)
       if (!a.enabled)
          return QStringLiteral("轴%1 掉使能 (6041h bit2) —— 扫描自动中止").arg(i);
 
-      /* 这一条是本轮最可能真触发的: 区域算错就会一头撞上去。
-       * 后一句是**现场诊断**: bit11 未必真有个开关压着 (见 ecatworker.h 那段说明),
-       * 而这行字是操作员事后唯一还能看到的东西 —— 面板灯早就过去了。 */
+      /* 这一条是本轮最可能真触发的: 区域算错会真的压上去, 极性配反则会让它**一直**
+       * 亮着 (2026-09-18 那台机器就是后半种)。后两句是**现场诊断** —— bit11 报的是
+       * 硬件限位**信号有效**, 未必真有个开关压着 (见 ecatworker.h 那段说明),
+       * 而这行字是操作员事后唯一还能看到的东西: 面板灯早就过去了。 */
       if (a.limit_active)
          return QStringLiteral(
-            "轴%1 的 6041h bit11 置起 —— 驱动器认为它撞在硬件限位上。\n"
+            "%1。\n"
             "%2。\n"
-            "扫描已自动中止。手动把它走离限位之后, 用「续扫」接着采。")
-               .arg(i)
+            "%3。\n"
+            "扫描已自动中止。处理完之后用「续扫」接着采, 已经采过的点不会重采。")
+               .arg(QString::fromUtf8(ecatcmd::limit_hit_headline(t.di_invert)).arg(i))
                .arg(QString::fromUtf8(ecatcmd::limit_switch_text(
-                       a.dig_known, a.dig_pos, a.dig_neg)));
+                       a.dig_known, a.dig_pos, a.dig_neg, t.di_invert)))
+               .arg(QString::fromUtf8(ecatcmd::limit_hit_advice(
+                       a.dig_known, a.dig_pos, a.dig_neg, a.dig_home, t.di_invert)));
 
       int32_t seen = 0;
       if (externalWantChanged(t, i, &seen))

@@ -23,6 +23,7 @@
 #include <QString>
 
 #include "busview.h"
+#include "ophirmeter.h"
 #include "powermeter.h"
 #include "scancontroller.h"
 #include "scanplan.h"
@@ -106,6 +107,9 @@ private:
    /* 「让 60FDh 进 TxPDO」。转发给工作线程之外, **已经连上了还要说明白它下次才生效** ——
     * 这一条只能说出来, 界面上看不出来, 见 .cpp 里那个函数的注释 */
    void onWantDigInToggled(bool on);
+   /* 「输入电平反转 (NPN)」。**运行期参数** —— 勾一下就生效 (下一帧 publish), 不重连,
+    * 不写驱动器, 也不进 ini。但它是**安全相关**的: 见 .cpp 里那个函数的注释 */
+   void onDiInvertToggled(bool on);
    void onRestoreDefaults();          /* 「恢复默认」: 扫描参数回 Params 缺省 */
    void onCenterAllClicked();
    void onZeroHereClicked();          /* 「设为区域中心」 */
@@ -117,6 +121,8 @@ private:
    void onAbortClicked();
    void onRetestClicked();
    void onMeterChanged(int idx);
+   void onMeterInfoChanged();         /* 真机那三项下拉框 ← OphirMeter::info() */
+   void onMeterCfgChanged();          /* 那三项下拉框 → 设备 */
    void onBrowseScript();
    void onManualValueChanged(double v);
 
@@ -148,12 +154,20 @@ private:
    ScanController   *m_ctl  = nullptr;
    MapCanvas        *m_canvas = nullptr;
 
-   /* 三个模拟功率计都留着, m_meter 指向当前选中的那个。**不做工厂/注册表** ——
-    * 一个下拉框 + 三个成员就是终态, 加真机时这里多一个成员、多一个 case。 */
+   /* 四个功率计都留着, m_meter 指向当前选中的那个。**不做工厂/注册表** ——
+    * 一个下拉框 + 四个成员就是终态。
+    *
+    * m_ophir 是**真机**那一个 (PD300R + Juno+), 跟三个模拟源的区别不只是"真":
+    * 它有自己的工作线程 (见 ophirmeter.h), 还会主动报 infoChanged/configFailed。 */
    ManualMeter *m_manual = nullptr;
    RandomMeter *m_random = nullptr;
    ScriptMeter *m_script = nullptr;
+   OphirMeter  *m_ophir  = nullptr;
    PowerMeter  *m_meter  = nullptr;
+
+   /* 下拉框正在被程序填 (从设备回来的信息), 不是操作员在点 —— 那三项的
+    * currentIndexChanged 要吞掉, 否则会把刚读回来的值又写回设备一遍, 无限来回 */
+   bool m_meterCfgQuiet = false;
 
    /* ---- 顶栏 ---- */
    QComboBox   *m_nic       = nullptr;
@@ -207,20 +221,40 @@ private:
    QPushButton    *m_btnScript = nullptr;
    QLabel         *m_lMeter    = nullptr;
 
+   /* 真机那三项。**选项表由设备给**, 不是这里写死的 —— 手册明确说了不要按型号
+    * 推断规格。选中模拟源时整行藏起来, 免得看着像能用 */
+   QComboBox *m_cbWl       = nullptr;
+   QComboBox *m_cbRange    = nullptr;
+   /* **不叫 m_cbMode** —— 那个名字已经是上面「扫描模式」(方向/蛇形那个) 的了,
+    * 两个都要在, 名字撞了会很难看 */
+   QComboBox *m_cbMeasMode = nullptr;
+   QLabel    *m_lWl        = nullptr;
+   QLabel    *m_lRange     = nullptr;
+   QLabel    *m_lMeasMode  = nullptr;
+   /* 每一行(标签+下拉)的容器, 整行藏起来用 */
+   QWidget   *m_devRowWl    = nullptr;
+   QWidget   *m_devRowRange = nullptr;
+   QWidget   *m_devRowMode  = nullptr;
+
    /* ---- 参数栏的两块信号网格 (见 LampGrid) ---- */
    LampGrid m_axGrid;    /* 0=使能 1=故障 */
    LampGrid m_limGrid;   /* 0=原点 1=正限位 2=负限位 */
 
    QPushButton *m_btnFaultRst = nullptr;   /* 「轴信号」第三行, 跨全部列 */
    QCheckBox   *m_cbWantDigIn = nullptr;   /* 「限位开关」第三行, 连接期参数 */
+   /* 「限位开关」第四行。**安全相关** —— 开着的时候限位判据整个换掉 (见
+    * ecatcmd::limit_rule_for), 所以它必须一直显眼: 不随 onair 变灰, 也不持久化 */
+   QCheckBox   *m_cbDiInvert = nullptr;
 
    /* ---- 状态栏 ---- */
    QLabel *m_banner = nullptr;
    QLabel *m_lNote  = nullptr;
    QLabel *m_lWkc   = nullptr;
-   /* 硬件限位 (6041h bit11), 一根轴一个。**扫描中撞限位会自动中止** ——
-    * 这条必须常显, 不是"点开某个面板才看得到"的东西。
-    * 信号灯在左、文字在右, **两个一起读**才算一条信息 */
+   /* 限位判据 (默认 = 6041h bit11「**硬件限位信号有效**」), 一根轴一个。
+    * **扫描中它成立就会自动中止** —— 这条必须常显, 不是"点开某个面板才看得到"的东西。
+    * 信号灯在左、文字在右, **两个一起读**才算一条信息。
+    * 注意状态栏那一格的措辞是「有效!」而不是「撞上」: 手册对这一位的定义就是
+    * 限位信号的电平, 回零时它本来就该是 1 (见 ecatworker.h 顶部那段) */
    QLabel *m_lampX  = nullptr;
    QLabel *m_lampY  = nullptr;
    QLabel *m_lLimX  = nullptr;

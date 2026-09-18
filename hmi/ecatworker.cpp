@@ -103,6 +103,21 @@ bool EcatThread::wantDigIn() const
    return m_want_dig_in;
 }
 
+/*
+ * 「输入电平反转 (NPN)」—— 运行期参数, 所以**不加锁、不进命令队列** (见头文件那段):
+ * 界面勾一下, 下一帧 publish() 就用上了。语义 (同时换掉限位判据) 在
+ * ecatcmd::limit_rule_for 里, 不在调用点。
+ */
+void EcatThread::setDiInvert(bool on)
+{
+   m_di_invert.store(on);
+}
+
+bool EcatThread::diInvert() const
+{
+   return m_di_invert.load();
+}
+
 void EcatThread::postZeroHere(int axis)
 {
    QMutexLocker lk(&m_mtx);
@@ -820,6 +835,13 @@ void EcatThread::publish(int wkc)
    t.wkc          = wkc;
    t.expected_wkc = (m_bus != nullptr) ? em_expected_wkc(m_bus) : 0;
    t.range        = m_range.load();
+   /* 界面靠它知道"现在生效的是哪一条判据" —— 措辞与灯都随它变 (见 BusTelem::di_invert)。
+    *
+    * **一次 load 出一个局部量**, 下面每根轴都用这一个。不能在循环里一轴 load 一次:
+    * 界面正好在两次 load 之间勾了那个框的话, 同一次 publish 里会一半轴按老值算、
+    * 一半按新值算 —— 一份自相矛盾的电文, 而它看起来和正常电文一模一样。 */
+   const bool di_invert = m_di_invert.load();
+   t.di_invert = di_invert;
 
    for (int i = 0; i < m_naxis; i++)
    {
@@ -849,8 +871,26 @@ void EcatThread::publish(int wkc)
       a.dig_pos   = em_di_poslim(ax) != 0;
       a.dig_neg   = em_di_neglim(ax) != 0;
 
-      /* 撞限位: **只此一处算**, 控制器 / 参数栏 / 画布都读这个字段 */
-      a.limit_active = ecatcmd::limit_hit(a.sw, a.dig_known, a.dig_pos, a.dig_neg);
+      /*
+       * 「输入电平反转 (NPN)」。**三个一起翻, 不能只翻一个** —— 2300h 配反了是整排
+       * 一起反相 (手册 V2.4 p84 那句话反过来读就是这个意思), 分开翻反而会造出一个
+       * "看着对"的错状态, 而那种状态比全错更难发现。
+       *
+       * 读不到 60FDh 时那三个都是 0, 翻完变成"三个都压着"。**这个方向是故意的**:
+       * dig_known 那条规矩本来就是"不知道 ≠ 没压着", 翻成"压着"与它同一个方向 ——
+       * 万一有人在别处漏判了 dig_known, 看到的是"压着"(会拦下来), 而不是"松开"(会放过去)。
+       */
+      if (di_invert)
+      {
+         a.dig_home = !a.dig_home;
+         a.dig_pos  = !a.dig_pos;
+         a.dig_neg  = !a.dig_neg;
+      }
+
+      /* 撞限位: **只此一处算**, 控制器 / 参数栏 / 画布都读这个字段。
+       * 判据由 limit_rule_for(di_invert) 选, 见 ecatworker.h。 */
+      a.limit_active = ecatcmd::limit_hit(a.sw, a.dig_known, a.dig_pos, a.dig_neg,
+                                          di_invert);
 
       if (a.fault)
          t.fault = true;

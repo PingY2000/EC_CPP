@@ -27,11 +27,17 @@ set(CMAKE_AUTOUIC OFF)
 #
 # scanprefs **只链 Qt6::Core** (QSettings 在 Core 里) —— 这是它能进这个列表的前提:
 # 自检那边能真跑一遍"存进去再读回来相等"。见 scanprefs.h 顶部那段。
+#
+# ophircom/ophirmeter 是 PD300R + Juno+ 那条真机路 (见 ophircom.h 顶部)。它们也在这里,
+# 是因为自检要能回答"这台机器上 COM 对象注册了没有、能不能建出来、没插表头时能不能
+# 干净地报错" —— 那正是**不需要硬件**的那部分。两个目标因此都要链 ole32/oleaut32。
 set(SCAN_COMMON_SRC
   scanplan.cpp      scanplan.h
   scanarrive.cpp    scanarrive.h
   scancontroller.cpp scancontroller.h
   powermeter.cpp    powermeter.h
+  ophircom.cpp      ophircom.h
+  ophirmeter.cpp    ophirmeter.h
   scanlog.cpp       scanlog.h
   scanprefs.cpp     scanprefs.h
   busview.h
@@ -65,6 +71,7 @@ target_link_libraries(scan PRIVATE
   Qt6::Widgets
   $<TARGET_FILE:soem>            # 带依赖: soem 会先编出来
   ucrt ws2_32 winmm
+  ole32 oleaut32                 # ophircom.cpp 走 IDispatch: CoCreateInstance / SysAllocString ...
   ${CMAKE_SOURCE_DIR}/SOEM/oshw/win32/wpcap/Lib/x64/wpcap.lib
   ${CMAKE_SOURCE_DIR}/SOEM/oshw/win32/wpcap/Lib/x64/Packet.lib
 )
@@ -102,7 +109,9 @@ target_include_directories(scan_selftest PRIVATE
   ${CMAKE_SOURCE_DIR}/motor_api
 )
 
-target_link_libraries(scan_selftest PRIVATE Qt6::Core)
+# ole32/oleaut32 是 ophircom.cpp 要的。自检里那条腿 (test_ophir) 会真去建一次 COM 对象 ——
+# 没装 StarLab 的机器上它会 SKIP, 不是 FAIL。见 selftest.cpp 里的 skipCase()。
+target_link_libraries(scan_selftest PRIVATE Qt6::Core ole32 oleaut32)
 
 target_compile_options(scan_selftest PRIVATE
   $<$<CXX_COMPILER_ID:GNU>:-Wall -Wextra>

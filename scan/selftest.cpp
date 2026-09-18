@@ -17,8 +17,11 @@
  */
 #include <QCoreApplication>
 #include <QDir>
+#include <QElapsedTimer>
+#include <QEventLoop>
 #include <QString>
 #include <QTemporaryDir>
+#include <QTimer>
 
 #include <algorithm>
 #include <cmath>
@@ -35,13 +38,41 @@
 #include "scanprefs.h"
 #include "powermeter.h"
 
+/* test_ophir 那条腿要用 COM。这只是个头文件, 没有把 SOEM/Widgets 拖进来 ——
+ * 本文件"不链 SOEM 也不链 Qt Widgets"那条不变量没破 */
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
+#include <windows.h>
+#include <objbase.h>
+
+#include "ophircom.h"
+#include "ophirmeter.h"
+
 using namespace scan;
 
 /* ---------------------------------------------------------------- 断言 */
 
 static int g_fail = 0;
 static int g_pass = 0;
+static int g_skip = 0;
 static const char *g_case = "";
+
+/*
+ * 「这条**没验**」和「这条验失败了」是两回事, 报出来的数必须分开数。
+ *
+ * 用在需要外部东西的那几条上 —— 目前只有真机功率计那条 (要这台机器装了 Ophir 的
+ * StarLab)。没装就把这条标成 SKIP: 它不是失败的, 但**也不能算通过** ——
+ * 把没跑的当跑过了, 是自检最容易骗到自己的地方。
+ */
+static void skipCase(const char *why)
+{
+   g_skip++;
+   std::printf("  SKIP [%s] %s\n", g_case, why);
+}
 
 static void check(bool ok, const char *what, const std::string &extra = std::string())
 {
@@ -178,28 +209,46 @@ public:
    void setEnabled(int i, bool e) { t_.ax[i].enabled = e; }
 
    /*
-    * 撞限位。**两样一起设**, 因为真实现里那样是同一个东西的两个来源:
-    * EcatThread::publish() 里 limit_active = ecatcmd::limit_hit(sw, dig...) ——
-    * 这一个假总线要跟着那一条走, 否则测试跑的是一个真实程序里不存在的组合状态。
+    * 撞限位。**sw 摆好之后, limit_active 是用真判据算出来的**, 不是照抄一个 true ——
+    * EcatThread::publish() 里就是 `limit_active = ecatcmd::limit_hit(sw, dig..., di_invert)`。
+    * 这个假总线必须跟着**同一条函数**走: 照抄的话, 反转那一档 (sw 与 dig 谁说了算正好
+    * 相反) 就会在测试里退化成一个"两样总是一致"的假世界, 而那种不一致恰恰是最该测的。
     */
    void setLimit(int i, bool on)
    {
-      if (on) { t_.ax[i].sw |= EM_SW_INTLIMIT;  t_.ax[i].limit_active = true;  }
-      else    { t_.ax[i].sw &= (uint16_t)~EM_SW_INTLIMIT; t_.ax[i].limit_active = false; }
+      if (on) t_.ax[i].sw |= EM_SW_INTLIMIT;
+      else    t_.ax[i].sw &= (uint16_t)~EM_SW_INTLIMIT;
+      recomputeLimit(i);
+   }
+
+   /*
+    * 「输入电平反转 (NPN)」。**总线级** —— 一次改全部轴, 与 publish() 里"一次 load 出
+    * 一个局部量、所有轴共用"是同一件事。
+    */
+   void setDiInvert(bool on)
+   {
+      t_.di_invert = on;
+      for (int i = 0; i < EM_MAX_AXES; i++)
+         recomputeLimit(i);
    }
 
    /*
     * 三个限位开关本身 (60FDh)。**dig_known 单独一个开关**, 不靠"三个都 false"推 ——
     * 读不到 60FDh 时那三位也是 false, 而"三个都没压住"是个看起来完全正常的结论。
     * 默认 unknown: 真机上生效的 1A00h 里没有 60FDh, 那才是常态。
+    *
+    * **写进来的值要先反相**, 与 publish() 里那三行 `a.dig_x = !a.dig_x` 对着 ——
+    * 这个注入口给的是**驱动器 60FDh 的原始读数**, 不是反转之后的值。反相放在这一层,
+    * 测试就能写"60FDh 说两个限位都压着, 而反转开着 -> 实际一个都没压着"这种句子。
     */
-   void setDigKnown(int i, bool k) { t_.ax[i].dig_known = k; }
+   void setDigKnown(int i, bool k) { t_.ax[i].dig_known = k; recomputeLimit(i); }
    void setDig(int i, bool home, bool pos, bool neg)
    {
       t_.ax[i].dig_known = true;
-      t_.ax[i].dig_home  = home;
-      t_.ax[i].dig_pos   = pos;
-      t_.ax[i].dig_neg   = neg;
+      t_.ax[i].dig_home  = t_.di_invert ? !home : home;
+      t_.ax[i].dig_pos   = t_.di_invert ? !pos  : pos;
+      t_.ax[i].dig_neg   = t_.di_invert ? !neg  : neg;
+      recomputeLimit(i);
    }
    void setDropFrames(int i, bool d) { t_.ax[i].mirror_ok = !d; }
    void setWkc(int w)          { t_.wkc = w; }
@@ -212,6 +261,14 @@ public:
    int32_t pos(int i) const    { return t_.ax[i].pos; }
 
 private:
+   /* 唯一一处把 sw / dig / 反转合成 limit_active 的地方 —— 与 publish() 同一个函数 */
+   void recomputeLimit(int i)
+   {
+      const AxisTelem &a = t_.ax[i];
+      t_.ax[i].limit_active = ecatcmd::limit_hit(a.sw, a.dig_known, a.dig_pos,
+                                                 a.dig_neg, t_.di_invert);
+   }
+
    BusTelem t_;
    bool     freeze_ = false;
    int      pos_lag_ms_ = 0;
@@ -1275,12 +1332,13 @@ static void test_faultreset()
 /* ------------------------------------------------- 三个限位开关 (60FDh) */
 
 /*
- * 撞限位的判定**只有一处** (ecatcmd::limit_hit)。这里把两条规则都钉住 ——
- * 包括还没打开的那一条。
+ * 撞限位的判定**只有一处** (ecatcmd::limit_hit)。这里把**三条**规则都钉住 ——
+ * 包括还没打开的那一条, 和 2026-09-18 才加的反转那一条。
  *
  * 「还没打开的那一条」为什么也要测: kRefineLimitWithDigIn 从 0 改成 1 是一次
  * **有证据的改动** (见 ecatworker.h), 改的那一刻不该再补测试。所以规则写成带
- * constexpr 参数的函数, 两条分支在同一次构建里都跑得到。
+ * 参数的函数, 三条分支在同一次构建里都跑得到 —— 否则"要改一个 #define 重编一次
+ * 才能验另一条", 而安全关键的逻辑不能那样测。
  */
 static void test_limitsw()
 {
@@ -1289,12 +1347,12 @@ static void test_limitsw()
    const uint16_t LIM = EM_SW_INTLIMIT;
 
    caseBegin("limitsw: 今天的判定 = bit11 单独, 一个比特没变");
-   check( limit_hit(LIM, false, false, false), "bit11 + nothing known -> still hit");
-   check( limit_hit(LIM, true,  false, false), "bit11 + both switches released -> still hit");
-   check( limit_hit(LIM, true,  true,  false), "bit11 + positive switch");
-   check( limit_hit(LIM, true,  false, true),  "bit11 + negative switch");
-   check(!limit_hit(0,   true,  true,  true),  "no bit11 -> never a hit");
-   check(!limit_hit(0,   false, false, false), "no bit11, nothing known");
+   check( limit_hit(LIM, false, false, false, false), "bit11 + nothing known -> still hit");
+   check( limit_hit(LIM, true,  false, false, false), "bit11 + both switches released -> still hit");
+   check( limit_hit(LIM, true,  true,  false, false), "bit11 + positive switch");
+   check( limit_hit(LIM, true,  false, true,  false), "bit11 + negative switch");
+   check(!limit_hit(0,   true,  true,  true,  false), "no bit11 -> never a hit");
+   check(!limit_hit(0,   false, false, false, false), "no bit11, nothing known");
 
    /*
     * 「原点不算」这件事**在类型上就成立了**: limit_hit 的参数里根本没有原点那一位
@@ -1302,28 +1360,212 @@ static void test_limitsw()
     * 于是"只压住原点"在这里长的就是 (pos=false, neg=false) 这一组。
     */
    caseBegin("limitsw: 精判据 (开关关着的那条分支)");
-   check(!limit_hit_rule(LIM, true,  false, false, true),
+   check(!limit_hit_rule(LIM, true,  false, false, LIMIT_RULE_REFINED),
          "**bit11 + only the home switch pressed (pos/neg both released) -> NOT a hit**");
-   check( limit_hit_rule(LIM, true,  true,  false, true), "bit11 + positive switch -> hit");
-   check( limit_hit_rule(LIM, true,  false, true,  true), "bit11 + negative switch -> hit");
-   check( limit_hit_rule(LIM, true,  true,  true,  true), "bit11 + both -> hit");
+   check( limit_hit_rule(LIM, true,  true,  false, LIMIT_RULE_REFINED), "bit11 + positive switch -> hit");
+   check( limit_hit_rule(LIM, true,  false, true,  LIMIT_RULE_REFINED), "bit11 + negative switch -> hit");
+   check( limit_hit_rule(LIM, true,  true,  true,  LIMIT_RULE_REFINED), "bit11 + both -> hit");
    /* **这一条是"不弱化"的保证**: 不知道 60FDh 就退回旧判据, 保护一点不减 */
-   check( limit_hit_rule(LIM, false, false, false, true),
+   check( limit_hit_rule(LIM, false, false, false, LIMIT_RULE_REFINED),
          "bit11 + unknown 60FDh -> falls back to bit11 alone");
-   check(!limit_hit_rule(0,   true,  false, false, true), "no bit11 -> still no hit");
+   check(!limit_hit_rule(0,   true,  false, false, LIMIT_RULE_REFINED), "no bit11 -> still no hit");
+
+   /*
+    * ---- 第三条判据: 输入反转 (NPN)。2026-09-18 真机那条 ----
+    *
+    * 那台机器上 2300h 配反了, bit11 **恒为 1** —— 它不是判据了, 是个常数。
+    * 所以这一条判据的全部意义就在下面第一组断言里: **bit11 置起而开关都松开 -> 不中止**。
+    * 这与 REFINED 那条方向正好相反, 也是这台机器唯一能跑起来的走法。
+    *
+    * 反转的语义是"把限位判定从**驱动器的意见**换成**开关的真实状态**", 那 bit11 就必须
+    * 整个退场。写成本条判据而不是复用 REFINED (`bit11 && (...)`), 是为了不留下那个耦合:
+    * bit11 恒 1 时两者等价, 而哪天 2300h 被改对、反转忘了关, bit11 一变 0 就会把
+    * `bit11 && ...` 整条**恒置为 false** —— 保护静悄悄地全没, 而这个分支不会。
+    */
+   caseBegin("limitsw: 反转那条判据 —— bit11 不参与, 保护压在开关上");
+   check(!limit_hit_rule(LIM, true,  false, false, LIMIT_RULE_INVERT),
+         "**bit11 set but both switches released -> NOT a hit** (bit11 is stuck-1 here)");
+   check( limit_hit_rule(LIM, true,  true,  false, LIMIT_RULE_INVERT),
+         "inverted: positive switch pressed -> hit");
+   check( limit_hit_rule(LIM, true,  false, true,  LIMIT_RULE_INVERT),
+         "inverted: negative switch pressed -> hit");
+   /* 反转开着时 bit11 连"多一层保险"都算不上 —— 它不参与, 置不置起结果一样 */
+   check( limit_hit_rule(0,   true,  true,  false, LIMIT_RULE_INVERT)
+       == limit_hit_rule(LIM, true,  true,  false, LIMIT_RULE_INVERT),
+         "inverted: bit11 makes no difference at all");
+   /*
+    * **三条判据里只有这一条把「未知」判成中止。** 因为此时退无可退: bit11 已经不用了,
+    * 开关又读不到。REFINED 那条能退回 bit11, 这条没有可退的东西 —— 那就不动。
+    */
+   check( limit_hit_rule(0,   false, false, false, LIMIT_RULE_INVERT),
+         "inverted + unknown 60FDh -> abort, because there is no judge left");
+
+   caseBegin("limitsw: 哪个开关选哪条判据 —— 只此一处 (limit_rule_for)");
+   checkEq((int)limit_rule_for(false),
+           (int)(kRefineLimitWithDigIn != 0 ? LIMIT_RULE_REFINED : LIMIT_RULE_BIT11),
+           "反转关着 -> 由 kRefineLimitWithDigIn 那个编译期开关决定");
+   checkEq((int)limit_rule_for(true), (int)LIMIT_RULE_INVERT,
+           "反转开着 -> 一定是 INVERT, 与那个编译期开关无关");
+   /* 端到端那一条: 同一份输入, 反转一开一关必须得到**相反**的结论 —— 否则这个开关没接上 */
+   check( limit_hit(LIM, true, false, false, false)
+       && !limit_hit(LIM, true, false, false, true),
+         "bit11 + switches released: hit without invert, NOT a hit with invert");
 
    caseBegin("limitsw: 现场诊断那句话不许把「不知道」说成「都没压着」");
    {
-      const char *unk = limit_switch_text(false, false, false);
+      const char *unk = limit_switch_text(false, false, false, false);
       check(std::strstr(unk, "无从得知") != nullptr,
             "unknown is reported as unknown, not as 'nothing pressed'", unk);
+      /* 反转开着而读不到 60FDh: 比"不知道"还严重一层, 那句话得说出来 */
+      const char *unk_inv = limit_switch_text(false, false, false, true);
+      check(std::strstr(unk_inv, "反转") != nullptr,
+            "unknown + invert is called out as one judge short", unk_inv);
+      check(std::strcmp(unk, unk_inv) != 0, "...and it is not the same sentence");
 
-      const char *none_p = limit_switch_text(true, false, false);
+      const char *none_p = limit_switch_text(true, false, false, false);
       check(std::strstr(none_p, "都没压着") != nullptr, "known + released says so", none_p);
-      const char *pos = limit_switch_text(true, true, false);
+      const char *pos = limit_switch_text(true, true, false, false);
       check(std::strstr(pos, "正限位") != nullptr, "positive limit is named", pos);
-      const char *neg = limit_switch_text(true, false, true);
+      const char *neg = limit_switch_text(true, false, true, false);
       check(std::strstr(neg, "负限位") != nullptr, "negative limit is named", neg);
+
+      /* 反转开着时每一条都要说明"这是反相之后的值" —— 不然那个值没有来处 */
+      check(std::strstr(limit_switch_text(true, true, false, true), "反相") != nullptr,
+            "inverted: the value is labelled as post-inversion",
+            limit_switch_text(true, true, false, true));
+   }
+
+   /*
+    * 2026-09-18 真机那条: X0~X3 接的是 **NPN** 传感器 (高电平 = 未触发), 而 2300h
+    * (输入有效电平逻辑) 按常开配着 —— 于是两个限位输入常年读成"压着", bit11 恒置起,
+    * **扫描一次都开不起来**, 而现场的文案只说"两个都压着, 先手动走离限位" ——
+    * 那句话把人支去追一个不存在的限位。
+    *
+    * 这一条钉的是**措辞**, 不是逻辑: 正负限位同时压着物理上不成立, 所以那句话说出口
+    * 时必须带上"这多半不是真的"和"往 2300h 查"。逻辑一个字没改 —— bit11 照样挡住启扫,
+    * 该挡就得挡。
+    */
+   caseBegin("limitsw: 正负限位同时压着 = 不可能, 文案必须点破并指向 2300h");
+   {
+      const char *both = limit_switch_text(true, true, true, false);
+      check(std::strstr(both, "2300h") != nullptr,
+            "the impossible combination points at the polarity parameter", both);
+      check(std::strstr(both, "同时") != nullptr, "it says the two are simultaneous", both);
+
+      const char *adv = limit_hit_advice(true, true, true, false, false);
+      check(std::strstr(adv, "2300h") != nullptr, "the advice names 2300h too", adv);
+      /* 这一句是这次要根治的东西: 不许再叫人去走离一个不存在的限位 */
+      check(std::strstr(adv, "先手动把它走离") == nullptr,
+            "and it does NOT tell the operator to walk off a limit that is not there", adv);
+      /* 反转这个新出路也要点一下, 但必须连带说清它只治软件那一侧 */
+      check(std::strstr(adv, "输入电平反转") != nullptr, "the advice mentions the new way out",
+            adv);
+      check(std::strstr(adv, "只治软件") != nullptr,
+            "...and says plainly that it only fixes this side", adv);
+
+      /* 真正的单边压着 —— 那句"走离限位"在**这一支**上仍然是对的 */
+      const char *one = limit_hit_advice(true, true, false, false, false);
+      check(std::strstr(one, "走离") != nullptr, "a real single limit still says walk off it",
+            one);
+
+      /* 三种情形的建议必须彼此不同 —— 同一条建议套在四种成因上就是原来那个毛病 */
+      const char *a1 = limit_hit_advice(false, false, false, false, false);
+      const char *a2 = limit_hit_advice(true, false, false, false, false);
+      const char *a3 = limit_hit_advice(true, false, false, true, false);
+      check(std::strcmp(a1, a2) != 0 && std::strcmp(a2, a3) != 0 && std::strcmp(a1, a3) != 0,
+            "unknown / neither-pressed / home-only each get their own advice");
+      check(std::strstr(a2, "607Dh") != nullptr, "neither pressed -> look at the soft limits",
+            a2);
+      check(std::strstr(a3, "原点") != nullptr, "home only -> says it is the home switch", a3);
+   }
+
+   /*
+    * ---- 反转开着时, 上面那几句的**意思全变了**, 所以必须是另外几句话 ----
+    *
+    * 「正负限位同时压着」在两种语境下是两个病:
+    *   反转关着 -> 极性配反 (两边一起反相), 该去查 2300h;
+    *   反转开着 -> dig_* 已经是反相之后的值, 两路还同时为真就意味着 60FDh 的 bit1/bit0
+    *               同时为 0, 也就是两个输入端**真的**都被读成低电平。往 2300h 上找
+    *               是找不到的 —— 极性错只会让两边一起反相, 反相完就该松开了。
+    * 同一条建议套在两种成因上, 就是这次要根治的那个毛病本身, 只是换了个方向。
+    */
+   caseBegin("limitsw: 反转开着时「同时压着」换了个意思, 文案必须跟着换");
+   {
+      const char *t_off = limit_switch_text(true, true, true, false);
+      const char *t_on  = limit_switch_text(true, true, true, true);
+      check(std::strcmp(t_off, t_on) != 0, "same input, two different sentences");
+      check(std::strstr(t_on, "2300h") == nullptr,
+            "**with invert on it must NOT send you to 2300h** — polarity is already handled",
+            t_on);
+      check(std::strstr(t_on, "反相") != nullptr, "it says the values are post-inversion", t_on);
+
+      const char *a_on = limit_hit_advice(true, true, true, false, true);
+      check(std::strstr(a_on, "2300h") == nullptr,
+            "nor does the advice: that lever is already pulled", a_on);
+      check(std::strstr(a_on, "供电") != nullptr,
+            "it points at wiring / sensor power instead", a_on);
+
+      /*
+       * 反转开着时**单边压着反而是可信的** —— 判定用的就是它。这一句比反转关着时更强,
+       * 因为它不再是"多半是", 而是"就是这个"。措辞不同 = 两种语境分得开。
+       */
+      const char *one_on  = limit_hit_advice(true, true, false, false, true);
+      const char *one_off = limit_hit_advice(true, true, false, false, false);
+      check(std::strcmp(one_on, one_off) != 0, "single limit: invert changes the wording");
+      check(std::strstr(one_on, "可信") != nullptr,
+            "with invert on the reading is stated as trustworthy, not as a guess", one_on);
+
+      /*
+       * 反转开着而读不到 60FDh: 这是**必然开不了扫描**, 不是"可能有问题" ——
+       * 措辞里必须有那两条出路, 而且不能跟"反转关着时的未知"用同一句话。
+       */
+      const char *u_on  = limit_hit_advice(false, false, false, false, true);
+      const char *u_off = limit_hit_advice(false, false, false, false, false);
+      check(std::strcmp(u_on, u_off) != 0, "unknown 60FDh: invert changes the advice");
+      check(std::strstr(u_on, "永远开不了") != nullptr,
+            "**with invert on, unknown 60FDh means the scan can never start**", u_on);
+      check(std::strstr(u_on, "关掉") != nullptr, "and one way out is to turn the invert off",
+            u_on);
+
+      /*
+       * 开场白也要跟着判据换: 反转开着时 limit_active 与 bit11 毫无关系,
+       * 还说"bit11 置起"就是把人支去查一个决定不了任何事的位。
+       *
+       * 注意它**仍然提到** bit11 —— 但说的是"无关"。这是故意的: 操作员前面看到的
+       * 每一句横幅、文档里每一条待验证问题都在讲 bit11, 不主动回答"那 bit11 呢"
+       * 反而是把疑问留在那儿。所以这里钉的不是"不许出现这个词", 而是**不许说它置起**。
+       */
+      const char *h_off = limit_hit_headline(false);
+      const char *h_on  = limit_hit_headline(true);
+      check(std::strstr(h_off, "bit11") != nullptr
+            && std::strstr(h_off, "置起") != nullptr,
+            "invert off: the headline says bit11 is set", h_off);
+      check(std::strstr(h_on, "置起") == nullptr,
+            "**invert on: the headline must NOT claim bit11 is set** — it is not the judge",
+            h_on);
+
+      /*
+       * 措辞必须落在**信号**上, 不能落到"撞上了"。
+       *
+       * ykd 手册 V2.4 对 6041h bit11 的定义是「硬件限位信号有效时置 1」—— 它是那路
+       * 信号**此刻的电平**, 既不是驱动器的判断, 也不是一次已经发生的碰撞。回零时它
+       * 本来就该是 1 (motor_api/ec_motor_motion.c 的回零分支里就写着"bit11 硬件限位
+       * 有效, 仍在找原点")。把这个区别说丢, 现场就会去"清故障 / 重新使能", 或者
+       * 干脆不敢回零。
+       *
+       * 这个仓库里从前每一句旧文案都是"撞上了", 所以必须有东西钉住 —— 不然下一次
+       * 改文案的人(是未来的我, 也是别人)一定会飘回去。
+       */
+      check(std::strstr(h_off, "硬件限位信号有效") != nullptr,
+            "the headline uses the manual's own wording for bit11", h_off);
+      check(std::strstr(h_off, "撞") == nullptr,
+            "**and it does not say the axis crashed into a limit** — bit11 is a level, "
+            "not a collision", h_off);
+      check(std::strstr(h_off, "驱动器认为") == nullptr,
+            "...nor that the drive 'thinks' anything: nothing here is a verdict", h_off);
+      check(std::strstr(h_on, "无关") != nullptr,
+            "...and it answers the obvious question by saying bit11 is unrelated", h_on);
+      check(std::strcmp(h_off, h_on) != 0, "two headlines, not one");
    }
 
    /*
@@ -1354,6 +1596,52 @@ static void test_limitsw()
       check(!fired, "**the home switch never aborts a scan**", what.toStdString());
       checkEq(r.ctrl.completedPoints(), 25, "all 25 points collected");
       check(r.ctrl.state() == ScanController::State::Done, "Done, not Aborted");
+   }
+
+   /*
+    * ---- 2026-09-18 那台机器: 反转打开之后, 扫描必须真的能开起来 ----
+    *
+    * 现场原样搬进来: 2300h (输入有效电平逻辑) 配反了 —— 60FDh 说正限位与负限位
+    * **同时**压着, 而 6041h bit11 **恒为 1**。反转关着时上面前后每一条都拦着,
+    * 那是对的; 打开反转之后, 那两路读到的其实是"两个都松开着", 扫描就该照常跑。
+    *
+    * 这一条是**用户报的那个 bug 的回归护栏**: 它同时钉住三件事 ——
+    *   · 反转关着时拦得住 (拦不住才是真出事);
+    *   · 拦的时候话里指向 2300h (不然人不知道该动哪儿);
+    *   · 反转打开后放得行 (这个功能的**全部意义**就在这一条上)。
+    * 少了第三条, 上面那些纯判据的断言全过, 而功能仍然没用。
+    */
+   caseBegin("limitsw: NPN 那台机器 —— 反转打开后, bit11 恒置起也不再挡启扫");
+   {
+      Rig r;
+      r.ctrl.setParams(Rig::smallParams());
+      r.ctrl.rebuildPlan();
+
+      /* 驱动器原样: bit11 置起; 60FDh 原始读数说两个限位都压着 (高电平被当成触发) */
+      r.bus.setLimit(0, true); r.bus.setDig(0, false, true, true);
+      r.bus.setLimit(1, true); r.bus.setDig(1, false, true, true);
+
+      QString err;
+      check(!r.startScan(QDir::tempPath() + "/scan_npn_off.csv", &err),
+            "反转关着 -> 拒绝启扫 (拦得住, 这是对的)", err.toStdString());
+      {
+         const QByteArray eb = err.toUtf8();
+         check(std::strstr(eb.constData(), "2300h") != nullptr,
+               "拒绝的话里指向 2300h", err.toStdString());
+      }
+
+      /*
+       * 打开反转。**setDig 要再叫一次**: 它注入的是 60FDh 的**原始**读数, 而
+       * setDiInvert 只重算 limit_active, 不会回头去翻已经摆好的那三位
+       * (和 publish() 里"先读原始值、再统一反相"是同一个顺序)。
+       */
+      r.bus.setDiInvert(true);
+      r.bus.setDig(0, false, true, true);
+      r.bus.setDig(1, false, true, true);
+
+      err.clear();
+      check(r.startScan(QDir::tempPath() + "/scan_npn_on.csv", &err),
+            "**反转打开 -> 能启扫** (这才是这台机器要的)", err.toStdString());
    }
 
    /*
@@ -1415,6 +1703,180 @@ static void test_limitsw()
    }
 }
 
+/*
+ * ---------------------------------------------------------------- 真机功率计
+ *
+ * PD300R + Juno+ 这条路 (见 ophircom.h 顶部)。**这条腿不需要插表头** —— 它验的是
+ * 上半截: COM 对象在这台机器上注册了没有、那套绕开注册表的 typelib 加载走不走得通、
+ * 没插设备时会不会**干净地**报错 (不是崩, 也不是卡住)。
+ *
+ * 下半截 (真读到功率) 只在表头真插着的时候跑 —— 而那时它跑的是**外圈那套**
+ * (OphirMeter 的线程 + 异步请求), 正是最终要用的那一套。所以插上表头再跑一次这个
+ * 程序, 它就从"验没坏"变成"验能用"。
+ *
+ * 这台机器没装 StarLab -> SKIP, 不是 FAIL。理由见 skipCase()。
+ */
+static void test_ophir()
+{
+   caseBegin("ophir: COM object, no device attached");
+
+   if (!OphirCom::isRegistered())
+   {
+      skipCase("StarLab COM object not registered on this machine "
+               "(install Ophir StarLab to run this case)");
+      return;
+   }
+
+   /* 主线自己的 COM 环境。**跟 OphirMeter 的工作线程无关** —— 那边是它自己在
+    * runSession() 里起的 (服务端是 Apartment, 谁用谁初始化) */
+   if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)))
+   {
+      skipCase("CoInitializeEx(APARTMENTTHREADED) failed on this thread");
+      return;
+   }
+
+   OphirCom com;
+   QString  err;
+
+   const bool created = com.create(&err);
+   check(created, "create the COM object", err.toStdString());
+   if (!created)
+   {
+      CoUninitialize();
+      return;
+   }
+
+   /*
+    * GetVersion 这一条是**整条路的关键证据**。
+    *
+    * 这台机器上 IDispatch::GetIDsOfNames / GetTypeInfo / Invoke 全返回
+    * 0x8002801D, 因为注册表里 typelib 的版本号是字面量 "a.a"。oPhirCom 绕开注册表,
+    * 直接从 dll 资源里 LoadTypeLibEx 再走 ITypeInfo::Invoke。所以"GetVersion 能
+    * 拿到数"证明的不是"设备在", 而是"那套绕法成立、名字解析和派发都通"。
+    */
+   long ver = 0;
+   check(com.getVersion(&ver, &err) && ver != 0, "GetVersion via the DLL-resource typelib",
+         err.toStdString());
+
+   /* 枚举 USB: **成功**是硬性的, 设备个数不是 */
+   QStringList serials;
+   const bool scanned = com.scanUsb(&serials, &err);
+   check(scanned, "ScanUSB returns without error", err.toStdString());
+
+   if (!scanned)
+   {
+      com.destroy();
+      CoUninitialize();
+      return;
+   }
+
+   std::printf("  INFO [%s] ScanUSB found %d device(s)\n", g_case, (int)serials.size());
+
+   if (!serials.isEmpty())
+   {
+      /* 表头真插着 —— 但外圈那套要自成一趟, 别在这儿把设备先占住 */
+      std::printf("  INFO [%s] a head is attached; the real read path is exercised below\n",
+                  g_case);
+      com.destroy();
+      CoUninitialize();
+
+      caseBegin("ophir: live reading through OphirMeter");
+      {
+         OphirMeter meter;
+         check(meter.kind().contains(QStringLiteral("Ophir")), "kind() names the device");
+
+         QString e;
+         check(meter.open(&e), "open() with a head attached", e.toStdString());
+         if (meter.isOpen())
+         {
+            const OphirInfo i = meter.info();
+            check(i.valid, "info() is valid after open");
+            check(!i.sensor_name.isEmpty() || !i.device_name.isEmpty(),
+                  "info() names the head and the sensor", i.summary.toStdString());
+
+            /* 异步请求 -> 事件循环里等它回来 (跨线程是排队投递的) */
+            double        got = -1.0;
+            QString       fail;
+            int           ready = 0, failed = 0;
+            QEventLoop    loop;
+            QObject::connect(&meter, &PowerMeter::readingReady, [&](double w) {
+               ready++; got = w; loop.quit();
+            });
+            QObject::connect(&meter, &PowerMeter::readingFailed, [&](const QString &m) {
+               failed++; fail = m; loop.quit();
+            });
+            QTimer::singleShot(5000, &loop, &QEventLoop::quit);
+
+            meter.requestReading();
+            loop.exec();
+
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), "%d ready, %d failed, %s", ready, failed,
+                          fail.isEmpty() ? "-" : fail.toUtf8().constData());
+            check(ready == 1, "exactly one reading came back", buf);
+            check(!std::isnan(got) && got >= -1e-12, "the reading is a plausible wattage", buf);
+
+            meter.close();
+            check(!meter.isOpen(), "close() leaves it closed");
+         }
+      }
+      return;
+   }
+
+   /* ---- 没插表头: 该报错的地方必须报错, 而且必须快 ---- */
+   com.destroy();
+   CoUninitialize();
+
+   caseBegin("ophir: no device attached -- fails cleanly, does not hang");
+   {
+      OphirMeter meter;
+      check(meter.kind().contains(QStringLiteral("Ophir")), "kind() names the device");
+      check(!meter.isOpen(), "not open before open()");
+
+      /* 没打开就请求读数: 接口约定是**恰好回一次**, 不能一个都不回 */
+      int     failed = 0;
+      QString fail;
+      QObject::connect(&meter, &PowerMeter::readingFailed, [&](const QString &m) {
+         failed++; fail = m;
+      });
+      meter.requestReading();
+      check(failed == 1, "requestReading() while closed answers exactly once",
+            fail.toStdString());
+
+      QElapsedTimer t;
+      t.start();
+      QString err2;
+      const bool opened = meter.open(&err2);
+      const qint64 ms = t.elapsed();
+
+      if (opened)
+      {
+         /* 跑到这儿说明表头其实插着 (上面那趟和这趟之间插上的), 不算失败 */
+         std::printf("  INFO [%s] a head appeared mid-run; skipping the absent-device checks\n",
+                     g_case);
+         meter.close();
+         return;
+      }
+
+      check(!err2.isEmpty(), "open() said why it failed");
+      check(!meter.isOpen(), "isOpen() stays false after a failed open");
+
+      /* 12s 是 open() 自己的天花板。没设备时它是**立刻**失败的, 不该真等那么久 ——
+       * 这一条挡的是"没设备变成了等超时", 那样每次都白搭 12 秒 */
+      char buf[128];
+      std::snprintf(buf, sizeof(buf), "took %lld ms", (long long)ms);
+      check(ms < 4000, "the failure came back promptly, not on the 12s cap", buf);
+
+      /* 失败之后线程有没有收干净 —— 收不干净的话第二次就起不来了 */
+      QString err3;
+      const bool again = meter.open(&err3);
+      check(!again && !meter.isOpen(), "a second open() also fails cleanly (thread reaped)",
+            err3.toStdString());
+
+      meter.close();      /* 没收干净的话这里会卡 5 秒再走那条"放手"的路 */
+   }
+}
+
 int main(int argc, char **argv)
 {
    QCoreApplication app(argc, argv);
@@ -1432,7 +1894,8 @@ int main(int argc, char **argv)
    test_prefs();
    test_faultreset();
    test_limitsw();
+   test_ophir();
 
-   std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
+   std::printf("\n%d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
    return g_fail == 0 ? 0 : 1;
 }

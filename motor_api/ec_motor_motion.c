@@ -648,9 +648,11 @@ int em_csp_move_multi(em_axis_t **axes, const int32_t *target, const uint32_t *v
          }
          for (i = 0; i < n; i++)
          {
+            /* 「信号有效」, 不是「撞到限位了」: 手册对这一位的定义就是
+             * 硬件限位信号有效时置 1 —— 它是电平不是闩锁, 回零时本来就该置起 */
             if ((axes[i]->sw & EM_SW_INTLIMIT) != 0)
-               printf("    >>> %s 6041h bit11 硬件限位有效 —— 撞到限位了\n",
-                      axes[i]->label);
+               printf("    >>> %s 6041h bit11 硬件限位信号有效 (未必真压着 —— "
+                      "极性配反会让它一直亮着)\n", axes[i]->label);
          }
          return EM_R_FAIL;
       }
@@ -945,7 +947,7 @@ int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_m
          }
          if ((ax->sw & EM_SW_INTLIMIT) != 0)
          {
-            printf("  [FAIL] %s: 运行中 6041h bit11 硬件限位有效 —— 撞到限位了, "
+            printf("  [FAIL] %s: 运行中 6041h bit11 硬件限位信号有效, "
                    "所有轴速度写 0\n", ax->label);
             em__pv_stop_all(axes, n);
             return EM_R_FAIL;
@@ -1210,7 +1212,8 @@ int em_home(em_axis_t *ax, const em_home_cfg_t *cfg, uint32_t tmo_ms)
             printf(" [FAIL]\n");
             em__err("%s: 6041h bit13 = Homing error —— 回零失败 (%s)。"
                     "常见原因: 该方向找不到原点开关 / 方式与接线不符 (试 29 或 35) / "
-                    "撞到限位", ax->label, em_sw_describe(ax->sw));
+                    "限位信号一直是有效的 (极性配反时 X1/X2 恒报压着, 回零找不到跳变) / "
+                    "真的压上了限位", ax->label, em_sw_describe(ax->sw));
             return EM_R_FAIL;
          }
          if ((ax->sw & EM_SW_HM_ATTAINED) != 0)

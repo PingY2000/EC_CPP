@@ -666,10 +666,11 @@ void MapCanvas::drawMarkers(QPainter &p)
       p.drawEllipse(q, R, R);
 
       /*
-       * 硬件限位 (6041h bit11) —— 红圈套在位置点上 + 写清是哪根轴。
-       * 光一个红圈说不清是 X 还是 Y 撞了, 而这两件事的处理办法完全不同; 状态栏里
+       * 限位判据成立 (默认 = 6041h bit11「硬件限位信号有效」) —— 红圈套在位置点上 +
+       * 写清是哪根轴。
+       * 光一个红圈说不清是 X 还是 Y, 而这两件事的处理办法完全不同; 状态栏里
        * 也有同样的显示, 这里是为了**眼睛在画布上时不用挪开去读状态栏** ——
-       * 扫描中撞限位是会自动中止的那一类, 值得用两种方式说同一件事。
+       * 它是扫描中会自动中止的那一类, 值得用两种方式说同一件事。
        */
       /* 读的是**已经算好的那一个字段** (由 ecatcmd::limit_hit 一处算出), 不在这里
        * 再判一次 bit11 —— 这里从前就是那"三处各算一遍"里的一处 */
@@ -681,9 +682,11 @@ void MapCanvas::drawMarkers(QPainter &p)
          p.setPen(QPen(C_LIMIT, 2));
          p.drawEllipse(q, R + 7, R + 7);
 
-         const QString s = (lim_x && lim_y) ? QStringLiteral("X / Y 轴撞限位")
-                         : lim_x           ? QStringLiteral("X 轴撞限位")
-                                           : QStringLiteral("Y 轴撞限位");
+         /* 措辞与状态栏一致: 「有效」而不是「撞」—— bit11 是那路信号的电平, 不是
+          * 一次已经发生的碰撞 (见 ecatworker.h 里 limit_hit_headline 上面那段) */
+         const QString s = (lim_x && lim_y) ? QStringLiteral("X / Y 轴限位有效")
+                         : lim_x           ? QStringLiteral("X 轴限位有效")
+                                           : QStringLiteral("Y 轴限位有效");
          QFont f = p.font();
          f.setPointSizeF(9.0);
          f.setBold(true);

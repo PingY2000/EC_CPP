@@ -1,5 +1,7 @@
 #include "scanwindow.h"
 
+#include "ophircom.h"
+
 #include "mapcanvas.h"
 
 #include <QAbstractSpinBox>
@@ -24,7 +26,10 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSet>
+#include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QSpinBox>
+#include <QStandardItemModel>
 #include <QSplitter>
 #include <QStringList>
 #include <QStatusBar>
@@ -249,6 +254,13 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
    m_manual = new ManualMeter(this);
    m_random = new RandomMeter(this);
    m_script = new ScriptMeter(this);
+   m_ophir  = new OphirMeter(this);
+
+   /* 信息是工作线程攒好之后发过来的 (跨线程 → 自动排队, 落回 GUI 线程执行) */
+   connect(m_ophir, &OphirMeter::infoChanged, this, &ScanWindow::onMeterInfoChanged);
+   connect(m_ophir, &OphirMeter::configFailed, this,
+           [this](const QString &e) { hint(QStringLiteral("改功率计配置失败: ") + e, true); });
+
    m_meter  = m_random;                 /* 默认随机源: 一按开始就有数据可看 */
    m_meter->open(nullptr);
 
@@ -462,13 +474,18 @@ void ScanWindow::buildUi()
     * 出问题时也未必有人正看着它 */
    /* 参数栏那两组灯用的是同一套语法 (见 kLampRule 与 buildAxisPanel/buildLimitPanel)。
     *
-    * **这一盏说的是 bit11, 不是开关本身** —— 两者是两个问题, 而这一盏回答的是
-    * "会不会中止扫描"那一个。tooltip 必须说清, 否则它跟参数栏那六盏会被读成同一件事。 */
+    * **这一盏说的是判据, 不是开关本身** —— 默认判据是 6041h bit11 (勾了输入反转就换成
+    * 反相后的那两个限位开关)。两者是两个问题, 而这一盏回答的是 "会不会中止扫描"那一个。
+    * tooltip 必须说清, 否则它跟参数栏那六盏会被读成同一件事。 */
    const QString limTip = QStringLiteral(
       "硬件限位信号灯 (6041h bit11) —— **这一盏说的是「会不会中止扫描」**。\n"
-      "红亮 = 驱动器认为正压在硬件限位上, 扫描中会自动中止 (区域算错就是一头撞上去)。\n\n"
+      "红亮 = 手册对这一位的定义「**硬件限位信号有效**」成立了, 扫描中会自动中止。\n"
+      "它报的是那路信号**此刻的电平**, 不是「撞过了」—— 所以它未必真有个开关压着: "
+      "极性配反 (NPN 传感器 + 2300h 按常开配) 会让它一直亮着。\n\n"
       "它**不**等同于参数栏「限位开关」那六盏: 那一组说的是**开关本身压着没有** (60FDh)。\n"
-      "两者可能不一致 —— 不一致时**以这一盏为准**。扫描经过原点开关不会中止。")
+      "两者可能不一致 —— 不一致时**以这一盏为准**。扫描经过原点开关不会中止。\n\n"
+      "勾上「输入电平反转」之后这一盏换了判据: 那时它看的是**反相之后的**两个限位开关, "
+      "与 6041h bit11 无关 (「以这一盏为准」仍然成立 —— 只是它背后的来源换了)。")
       + QString::fromUtf8(kLampRule);
 
    m_lampX = makeLamp(this, limTip);
@@ -661,13 +678,15 @@ QWidget *ScanWindow::buildLimitPanel()
 
       "60FDh bit1 —— 正限位开关现在压着没有 (2311h X1 = 正限位)。\n"
       "**红亮 = 正压着, 要立刻处理** —— 先手动把滑台走离限位。\n"
-      "这一格说的是**开关本身**; 会不会中止扫描看 6041h bit11 (状态栏那盏)。\n"
-      "两者不一致时**以 bit11 为准**。",
+      "这一格说的是**开关本身**; 会不会中止扫描看状态栏那盏 (6041h bit11)。\n"
+      "两者本该同源 (都经 2300h + 2310h 出来), 不一致时**默认以 bit11 为准**;\n"
+      "但勾了「输入电平反转 (NPN)」之后改以反相后的开关为准 (见那个框的说明)。",
 
       "60FDh bit0 —— 负限位开关现在压着没有 (2312h X2 = 负限位)。\n"
       "**红亮 = 正压着, 要立刻处理** —— 先手动把滑台走离限位。\n"
-      "这一格说的是**开关本身**; 会不会中止扫描看 6041h bit11 (状态栏那盏)。\n"
-      "两者不一致时**以 bit11 为准**。"
+      "这一格说的是**开关本身**; 会不会中止扫描看状态栏那盏 (6041h bit11)。\n"
+      "两者本该同源 (都经 2300h + 2310h 出来), 不一致时**默认以 bit11 为准**;\n"
+      "但勾了「输入电平反转 (NPN)」之后改以反相后的开关为准 (见那个框的说明)。"
    };
 
    for (int s = 0; s < LIM_NCOL; s++)
@@ -715,6 +734,36 @@ QWidget *ScanWindow::buildLimitPanel()
       "但**崩在收尾之前**那次改写会留在驱动器里, 直到断电为止。"));
    connect(m_cbWantDigIn, &QCheckBox::toggled, this, &ScanWindow::onWantDigInToggled);
    g->addWidget(m_cbWantDigIn, 3, 0, 1, LIM_NCOL + 1);
+
+   /*
+    * 第四行: 「输入电平反转 (NPN)」。**默认关**。
+    *
+    * 治的是 2026-09-18 真机上那个病: X0~X3 接的是 NPN 传感器 (高电平 = 未触发),
+    * 而驱动器的 2300h (输入有效电平逻辑) 按常开配着 —— 于是 60FDh 那三位**整排反相**,
+    * 两个限位常年都报"压着", 6041h bit11 恒为 1, 扫描一步都开不了。
+    *
+    * tooltip 第一段就是那句最要紧的话: **它只治上位机这一侧**。不把这一句放最前面,
+    * 人会以为勾了就"修好了", 而驱动器自己的限位保护还按那套错的极性算着 ——
+    * 那是个比原来更坏的状态, 因为原来它至少是拦住的。
+    *
+    * 与上一行那个框的两处不同, 都在 tooltip 里说清了: 它**立即生效**(不用重连),
+    * 而且**不持久化**。理由见 onDiInvertToggled 上面那段。
+    */
+   m_cbDiInvert = new QCheckBox(QStringLiteral("输入电平反转 (NPN)"), box);
+   m_cbDiInvert->setToolTip(QStringLiteral(
+      "X0~X3 接的是 NPN 传感器 (高电平 = **未**触发), 而驱动器的 2300h (输入有效电平\n"
+      "逻辑) 按常开配着 —— 此时 60FDh 的原点/正限位/负限位三位**整排反相**, 两个限位\n"
+      "常年都报「压着」。勾上这个, 把三个一起翻回来。\n\n"
+      "**它只治本程序这一侧。** 60FDh 与 6041h bit11 都是驱动器给的, 勾这个框不会让\n"
+      "驱动器改变主意 —— 它自己的限位保护仍然按那套错的极性算。**能改 2300h 就去改它**\n"
+      "(那个才是修根, 改完这个框就不必勾了)。\n\n"
+      "勾上之后限位判据**整个换掉**: 不再看 bit11 (那台机器上它恒为 1, 已经不携带\n"
+      "信息了), 改看反相之后的正/负限位开关; 读不到 60FDh 时一律中止。\n\n"
+      "它**立即生效**, 不用重新连接, 不写驱动器一个字节, 也**不会被记住** ——\n"
+      "反转是「这台机器的线就是这么接的」的一条断言, 而断言错了的后果不是灯显示不对,\n"
+      "是**保护反过来** (真压着限位时它说没压着)。所以每次都要人当面确认。"));
+   connect(m_cbDiInvert, &QCheckBox::toggled, this, &ScanWindow::onDiInvertToggled);
+   g->addWidget(m_cbDiInvert, 4, 0, 1, LIM_NCOL + 1);
 
    /* 最后一列 = 本组信号数。理由同上一块 */
    g->setColumnStretch(LIM_NCOL, 1);
@@ -957,8 +1006,25 @@ QWidget *ScanWindow::buildMeterPanel()
    m_cbMeter->addItem(m_manual->kind());
    m_cbMeter->addItem(m_random->kind());
    m_cbMeter->addItem(m_script->kind());
+   m_cbMeter->addItem(m_ophir->kind());
    m_cbMeter->setCurrentIndex(1);
    connect(m_cbMeter, &QComboBox::currentIndexChanged, this, &ScanWindow::onMeterChanged);
+
+   /* **没装 StarLab 的那一项照样列出来, 但灰掉** —— 直接不列的话, 操作员会以为
+    * 这个程序没有真机这条路; 列出来灰着, 至少看得出"这一项存在, 但这台机器上
+    * 缺东西"。缺的是什么由 statusTip 说清楚。 */
+   if (!OphirCom::isRegistered())
+   {
+      const QString why = QStringLiteral(
+         "这台机器上没找到 OphirLMMeasurement 这个 COM 对象 —— "
+         "要先装 Ophir 的 StarLab (PD300R + Juno+ 的驱动就在里面)");
+      auto *m = qobject_cast<QStandardItemModel *>(m_cbMeter->model());
+      if (m != nullptr && m->item(3) != nullptr)
+      {
+         m->item(3)->setEnabled(false);
+         m->item(3)->setToolTip(why);
+      }
+   }
 
    m_edManualV = new QDoubleSpinBox(box);
    m_edManualV->setRange(-1e9, 1e9);
@@ -984,16 +1050,44 @@ QWidget *ScanWindow::buildMeterPanel()
    scriptRow->addWidget(m_edScript, 1);
    scriptRow->addWidget(m_btnScript);
 
+   /* 真机的三项。选项表**由设备给**, 这里一个都没写死 —— 探头不同, 能选的波长和
+    * 量程就不同, 按型号推断规格正是手册不让做的事 (见 ophirmeter.h)。
+    *
+    * 三行连着小标签一起收进一个容器里, 切到模拟源时整块 setVisible(false) ——
+    * 只灰着不藏起来的话, 那块空地会让人以为"这几个就是给模拟源调的" */
+   auto makeDevRow = [&](const QString &name, QComboBox **cb, QLabel **lb) {
+      QWidget *w = new QWidget(box);
+      QHBoxLayout *h = new QHBoxLayout(w);
+      h->setContentsMargins(0, 0, 0, 0);
+      h->setSpacing(6);
+      *lb = new QLabel(name, w);
+      (*lb)->setMinimumWidth(28);
+      *cb = new QComboBox(w);
+      (*cb)->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+      (*cb)->setEnabled(false);
+      connect(*cb, &QComboBox::currentIndexChanged, this, &ScanWindow::onMeterCfgChanged);
+      h->addWidget(*lb);
+      h->addWidget(*cb, 1);
+      return w;
+   };
+   m_devRowWl    = makeDevRow(QStringLiteral("波长"), &m_cbWl,    &m_lWl);
+   m_devRowRange = makeDevRow(QStringLiteral("量程"), &m_cbRange, &m_lRange);
+   m_devRowMode  = makeDevRow(QStringLiteral("模式"), &m_cbMeasMode, &m_lMeasMode);
+
    f->addRow(QStringLiteral("取样源"), m_cbMeter);
    f->addRow(QStringLiteral("手填值"), m_edManualV);
    f->addRow(QStringLiteral("噪声"), m_edRandomN);
    f->addRow(QStringLiteral("脚本"), scriptRow);
+   f->addRow(m_devRowWl);
+   f->addRow(m_devRowRange);
+   f->addRow(m_devRowMode);
 
    m_lMeter = new QLabel(box);
    m_lMeter->setWordWrap(true);
    m_lMeter->setStyleSheet(QStringLiteral("color:#7b8391;"));
    f->addRow(m_lMeter);
 
+   onMeterInfoChanged();      /* 一开始选的是模拟源 -> 把真机那三行藏起来 */
    return box;
 }
 
@@ -1418,6 +1512,67 @@ void ScanWindow::onWantDigInToggled(bool on)
    }
 }
 
+/*
+ * 「输入电平反转 (NPN)」。**运行期参数**: 不写驱动器、不进 ini、不用重连。
+ *
+ * ── 为什么不做持久化 ────────────────────────────────────────────────────────
+ * 与「让 60FDh 进 TxPDO」同一个先例 (见 scan/scanprefs.h 那份"不记什么"的清单):
+ * 反转是「这台机器的 X0~X3 就是这么接的」的一条**断言**。断言对了是省事, 断言错了的
+ * 后果不是"灯显示不对", 是**保护反过来** —— 真压着限位时它说没压着。这种东西必须
+ * 每次由人当面确认, 不能从一个 ini 里悄悄继承下来: 换台机器、或者哪天有人把 2300h
+ * 改对了, 继承下来的那个"开"就是一个已经静悄悄失效了的保护。
+ *
+ * ── 这里必须"说出来"的两件事 (界面上都看不出来) ──────────────────────────────
+ *   · 它**立即生效** —— 与上一行那个框正好相反, 别让人以为要重新连接;
+ *   · 它**只治上位机这一侧** —— 驱动器自己的 bit11 与限位保护不受影响。
+ *     这一句不能省: 省了, 人会以为勾一下就"修好了", 而实际上驱动器还按错的极性
+ *     保护着。原来那个状态至少是拦住的, 现在这个不是。
+ *
+ * ── 为什么 60FDh 读不到时要弹重话 ────────────────────────────────────────────
+ * 反转生效时判据是 LIMIT_RULE_INVERT (不看 bit11), 所以读不到 60FDh 就等于
+ * **一条判据都没有** -> 限位信号一律按「有效」中止 -> 扫描永远开不了。这不是"可能出问题",
+ * 是必然开不了, 所以要在勾的一瞬间就说, 并指清那两条出路。
+ */
+void ScanWindow::onDiInvertToggled(bool on)
+{
+   m_thr->setDiInvert(on);
+
+   if (!on)
+   {
+      hint(QStringLiteral("已关掉输入反转: 限位判据退回 6041h bit11 单独判定。"), false);
+      return;
+   }
+
+   const BusTelem t = m_thr->telemetry();
+
+   if (!t.connected)
+   {
+      hint(QStringLiteral(
+         "已打开输入反转 (连上之后生效)。**它只治本程序这一侧** —— "
+         "驱动器自己的 6041h bit11 与限位保护不受影响。"), false);
+      return;
+   }
+
+   if (!t.ax[0].dig_known)
+   {
+      hint(QStringLiteral(
+         "已打开输入反转, 但**读不到 60FDh** —— 反转生效时 bit11 不参与判定, "
+         "所以现在一条判据都没有: 扫描会因为「限位信号有效」永远开不了。\n"
+         "两条出路: 先把 60FDh 弄进 TxPDO (勾上一行那个框, 再重新「连接」), "
+         "或者把这个反转关掉、退回只看 bit11。"), true);
+      return;
+   }
+
+   const AxisTelem &a = t.ax[0];
+   hint(QStringLiteral(
+      "已打开输入反转 (轴0 反相后: 正限位 %1 / 负限位 %2)。\n"
+      "**它只治本程序这一侧** —— 驱动器自己的 bit11 与限位保护不受影响; "
+      "能改 2300h 还是去改它, 那个修的才是根。")
+         .arg(a.dig_pos ? QStringLiteral("压着") : QStringLiteral("松开"),
+              a.dig_neg ? QStringLiteral("压着") : QStringLiteral("松开")),
+      false);
+}
+
 void ScanWindow::onCenterAllClicked()
 {
    m_thr->postCenterAll();
@@ -1450,30 +1605,109 @@ void ScanWindow::onMeterChanged(int idx)
 {
    if (m_ctl->running())
    {
-      /* 扫描中途换源 = 同一张图上的数据来自两个不同的东西。禁掉 */
+      /* 扫描中途换源 = 同一张图上的数据来自两个不同的东西。禁掉。
+       *
+       * 回退时**必须挡掉信号**: setCurrentIndex 会再进来一次, 又落到这一句,
+       * 又是回退 —— 两个下标之间来回弹, 直接把栈撑爆 */
       hint(QStringLiteral("扫描进行中, 不能换取样源"), false);
-      m_cbMeter->setCurrentIndex(idx == 0 ? (idx + 1) : (idx - 1));
+      QSignalBlocker b(m_cbMeter);
+      m_cbMeter->setCurrentIndex(m_cbMeter->findText(m_meter->kind()));
       return;
    }
 
    m_meter->close();
 
-   m_meter = (idx == 0) ? (PowerMeter *)m_manual
-           : (idx == 1) ? (PowerMeter *)m_random
-                        : (PowerMeter *)m_script;
+   PowerMeter *pick = nullptr;
+   switch (idx)
+   {
+   case 0:  pick = m_manual; break;
+   case 2:  pick = m_script; break;
+   case 3:  pick = m_ophir;  break;
+   default: pick = m_random; break;
+   }
+   m_meter = pick;
 
+   /* open() 对真机是**阻塞**的 (枚举 USB → 开设备 → 读探头 → 开流), 上限 12s。
+    * 换源本来就不该在扫描中做, 所以这一下卡住不会拖慢任何采集。 */
    QString err;
-   m_meter->open(&err);
+   const bool ok = m_meter->open(&err);
 
    /* **必须告诉控制器**, 否则它还在听旧的源 —— 而旧源还活着, 会照常出数 */
    m_ctl->setMeter(m_meter);
 
    if (!err.isEmpty())
       hint(QStringLiteral("功率计打不开: ") + err, true);
+   else if (ok && m_meter == m_ophir)
+   {
+      const OphirInfo i = m_ophir->info();
+      hint(i.summary.isEmpty()
+              ? QStringLiteral("取样源已切到「%1」").arg(m_meter->kind())
+              : QStringLiteral("功率计已接上: ") + i.summary,
+           false);
+   }
    else
       hint(QStringLiteral("取样源已切到「%1」").arg(m_meter->kind()), false);
 
+   onMeterInfoChanged();
    refresh();
+}
+
+/*
+ * 设备信息回来了 —— 把这四样落到界面上:
+ *   1. 真机那三行该不该露出来
+ *   2. 三个下拉框的选项表 (设备给的, 原样装进去)
+ *   3. 当前选中项
+ *   4. 没选上/没这一项的那个框灰掉
+ *
+ * **只在 infoChanged 时跑, 不放进 30Hz 的 refresh()**: 那个频率下重填下拉框会跟
+ * 操作员正在点的那一下抢, 而且每帧重建选项是白烧 CPU。
+ */
+void ScanWindow::onMeterInfoChanged()
+{
+   const bool is_ophir = (m_meter == m_ophir);
+
+   m_devRowWl->setVisible(is_ophir);
+   m_devRowRange->setVisible(is_ophir);
+   m_devRowMode->setVisible(is_ophir);
+   if (!is_ophir)
+      return;
+
+   const OphirInfo i = m_ophir->info();
+   const bool open = m_ophir->isOpen();
+
+   /* 填的时候挡掉信号 —— 否则每 addItem 一次就当成操作员改了一次配置,
+    * 一连串 stop/set/start 打到设备上 */
+   m_meterCfgQuiet = true;
+
+   auto fill = [&](QComboBox *cb, QLabel *lb, const QStringList &opts, int cur) {
+      cb->clear();
+      cb->addItems(opts);
+      if (cur >= 0 && cur < cb->count())
+         cb->setCurrentIndex(cur);
+      /* 探头没有这一项 (手册: options 为空 / index 为 -1) 是**正常**的, 灰掉就是 */
+      const bool usable = open && !opts.isEmpty();
+      cb->setEnabled(usable);
+      lb->setEnabled(usable);
+   };
+   fill(m_cbWl,    m_lWl,    i.wavelengths, i.wl_index);
+   fill(m_cbRange, m_lRange, i.ranges,      i.range_index);
+   fill(m_cbMeasMode, m_lMeasMode, i.modes, i.mode_index);
+
+   m_meterCfgQuiet = false;
+}
+
+/* 操作员改了波长/量程/模式。**异步** —— 工作线程收到后是 停流 → 改 → 重新开流,
+ * 改完再发一次 infoChanged 回来 (见 ophirmeter.h)。这里不阻塞等结果 */
+void ScanWindow::onMeterCfgChanged()
+{
+   if (m_meterCfgQuiet || m_meter != m_ophir || !m_ophir->isOpen())
+      return;
+   if (m_ctl->running())
+      return;                 /* 扫描中那三个框本来就是灰的, 这是兜底 */
+
+   m_ophir->setWavelengthIndex(m_cbWl->currentIndex());
+   m_ophir->setRangeIndex(m_cbRange->currentIndex());
+   m_ophir->setModeIndex(m_cbMeasMode->currentIndex());
 }
 
 void ScanWindow::onManualValueChanged(double v)
@@ -1561,8 +1795,17 @@ void ScanWindow::onStartClicked()
       return;
    }
 
-   m_meter->close();
-   m_meter->open(nullptr);
+   /* 开跑之前把源重开一遍 —— 脚本源要靠这个把游标拨回第一个数。
+    *
+    * **真机不跟着做**: 它那次 close/open 是 收线程 → 枚举 USB → 开设备 → 读探头
+    * → 重新开流, 几百毫秒起步, 而且它本来就没有"游标"要复位 (取数逻辑按设备时间戳
+    * 走水位线, 缓冲区里压着的旧数一概不要)。为一件没发生的事每次按开始都去动一次
+    * USB, 换来的是"设备偶尔不高兴就开不了扫描" —— 不值。 */
+   if (m_meter != m_ophir)
+   {
+      m_meter->close();
+      m_meter->open(nullptr);
+   }
 
    m_banner->setVisible(false);
    refresh();
@@ -1794,60 +2037,47 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
           * **顺带把当时的 60FDh 打到 stdout。** 30Hz 的面板灯可能一闪而过, 而 stdout
           * 会把证据留下 —— 这是真机上唯一能定"bit11 到底什么时候置起"的东西:
           *
-          *   bit11 置起, 而三位全 0  -> 2310h~2312h 的功能码没配对, 或 bit11 另有来源;
-          *   bit11 置起, 只有原点位  -> 扫描经过原点就会误中止, 该打开
-          *                              kRefineLimitWithDigIn (见 ecatworker.h);
-          *   bit11 置起, 正/负限位位 -> 正常, 就是撞上了。
+          *   bit11 置起, 而三位全 0  -> 两个视图**不一致**。按手册它们同源, 所以最可能
+          *                              是 2310h~2312h 的功能码没配对 (那两位于是恒 0);
+          *   bit11 置起, 只有原点位  -> 若原点也让 bit11 置起, 扫描经过原点就会误中止,
+          *                              该打开 kRefineLimitWithDigIn (见 ecatworker.h);
+          *   bit11 置起, 正/负限位位 -> 自洽: 那一路限位信号确实有效。
+          *
+          * 注意三行说的都是**信号**, 不是"撞上了" —— 手册对这一位的定义就是
+          * 「硬件限位信号有效时置 1」, 它是电平不是闩锁 (见 ecatworker.h 顶部那段)。
           *
           * 这里**不改判定**。判定的开关在 ecatworker.h, 而它必须是一次有证据的改动。
           */
          if (a.dig_known)
-            std::printf("[scan] 轴%d 6041h bit11 上升沿: sw=0x%04X  60FDh 位: "
+            std::printf("[scan] 轴%d 限位判据置起: 反转=%d  sw=0x%04X  60FDh 位: "
                         "原点(bit2)=%d 正限位(bit1)=%d 负限位(bit0)=%d\n",
-                        i, (unsigned)a.sw, a.dig_home ? 1 : 0,
+                        i, t.di_invert ? 1 : 0, (unsigned)a.sw, a.dig_home ? 1 : 0,
                         a.dig_pos ? 1 : 0, a.dig_neg ? 1 : 0);
          else
-            std::printf("[scan] 轴%d 6041h bit11 上升沿: sw=0x%04X  "
+            std::printf("[scan] 轴%d 限位判据置起: 反转=%d  sw=0x%04X  "
                         "60FDh 不在生效映射里 (三个开关的状态无从得知)\n",
-                        i, (unsigned)a.sw);
+                        i, t.di_invert ? 1 : 0, (unsigned)a.sw);
          std::fflush(stdout);
 
          /*
-          * 措辞里**不许出现"已撞上"这种话**。
+          * 「是什么状态」与「接下来查哪儿」两句都从 ecatcmd 里取 —— 那里是**唯一**
+          * 一处定义, 拒绝启扫与自动中止用的也是同一对函数。三处各写各的措辞会在某一天
+          * 只改了其中一处 (措辞里为什么不许出现"已撞上", 见 limit_hit_advice 上面那段)。
           *
-          * bit11 是 CiA402 的 "internal limit active", 而驱动器拿它表示什么**本机还没
-          * 实测过** —— 可能是限位开关真的压着, 也可能只是一片没配的 607Dh 软限位,
-          * 甚至可能"只有原点开关压着"时它就置起 (这三条都记在 docs/scan_sweep.md §13 的
-          * 待验证清单里)。我们**知道的**只有两件事: 6041h 报了这一位; 60FDh 说了什么。
-          * 那就只说这两件, 再说清现在能做什么 —— 把"可能"讲成"就是", 操作员会去处理一个
-          * 不存在的问题, 而这比少一条提示坏得多。
+          * 开场白也是一样: 反转开着时判据不看 bit11 (见 limit_hit_headline), 所以
+          * 它**不能**再写"bit11 置起" —— 那会让人去查一个决定不了任何事的位。
+          * 上面那行 printf 同理: 记下反转状态, 否则同一行日志在两种配置下看着一模一样。
           */
          const QString ev = QString::fromUtf8(
-            ecatcmd::limit_switch_text(a.dig_known, a.dig_pos, a.dig_neg));
-
-         QString act;
-         if (!a.dig_known)
-            act = QStringLiteral(
-               "读不到 60FDh, 所以**分不清是原点还是限位**。让 60FDh 可读就能分清: "
-               "勾上「让 60FDh 进 TxPDO」再重新「连接」, 或用厂家上位机改一次 1A00h。");
-         else if (a.dig_pos || a.dig_neg)
-            act = QStringLiteral("先手动把它走离压着的那个开关。");
-         else if (a.dig_home)
-            act = QStringLiteral(
-               "**正/负限位都没压着, 压着的是原点开关。** 滑台要是正停在原点附近, "
-               "这一位多半就是这么来的 —— 但「任何开关压着就置起」这件事本机还没实测过, "
-               "所以先按「它真的会让扫描中止」对待。");
-         else
-            act = QStringLiteral(
-               "那就要往别处找原因了: 607Dh 软限位? 还是 2310h~2312h 功能码没配? "
-               "它照样会让扫描自动中止, 别当它是假的; `motor_test` 的只读诊断里会打印 "
-               "607Dh 的两个软限位值。");
+            ecatcmd::limit_switch_text(a.dig_known, a.dig_pos, a.dig_neg, t.di_invert));
+         const QString act = QString::fromUtf8(
+            ecatcmd::limit_hit_advice(a.dig_known, a.dig_pos, a.dig_neg, a.dig_home,
+                                      t.di_invert));
 
          const QString banner =
-            QStringLiteral("轴%1 的 6041h bit11 置起 —— 驱动器报「内部限位有效」。\n"
-                           "%2\n%3")
-               .arg(i)
-               .arg(ev, act);
+            QStringLiteral("%1。\n%2\n%3")
+               .arg(QString::fromUtf8(ecatcmd::limit_hit_headline(t.di_invert)).arg(i),
+                    ev, act);
 
          hint(banner, true);
          m_limBanner[i] = banner;
@@ -1967,6 +2197,13 @@ void ScanWindow::refresh()
    for (QWidget *w : locked)
       w->setEnabled(!running);
 
+   /* 真机那三项**不进 locked 那张表**: 它们的可用性还取决于"这台设备有没有这一项"
+    * (探头没有可调量程时选项表是空的, 得灰着)。扫描中一起锁上。 */
+   const bool dev_ok = !running && (m_meter == m_ophir) && m_ophir->isOpen();
+   m_cbWl->setEnabled(dev_ok && m_cbWl->count() > 0);
+   m_cbRange->setEnabled(dev_ok && m_cbRange->count() > 0);
+   m_cbMeasMode->setEnabled(dev_ok && m_cbMeasMode->count() > 0);
+
    refreshAxisSignals(t);
 
    const bool can_move = m_connected && !running;
@@ -2001,6 +2238,18 @@ void ScanWindow::refresh()
     * 里被读一次, 当前这一次连接一个字都不会被它改动。
     */
    m_cbWantDigIn->setEnabled(true);
+
+   /*
+    * 「输入电平反转 (NPN)」同理**不跟着 onair 变灰**, 而且理由更强 —— 它是个**运行期**
+    * 参数, 任何时候勾都立刻生效, 连"下次才生效"这个代价都没有 (见 onDiInvertToggled)。
+    * 它是安全相关的, 让它按不了只会把人挡在一个正当的修法外面。
+    *
+    * 但**不从遥测回灌它的勾选状态** (曾经想加): setDiInvert 是立刻写、publish 是每周期
+    * 才拷一次, 界面在中间那一拍回灌就会把它弹回去 —— 表现为"勾上又自己跳开, 下一拍再
+    * 跳回来"。而能改这个原子量的**只有这一个勾选框**, 所以它不会和实际生效值分叉,
+    * 回灌本身也就没有要修的东西。措辞那边走的是 BusTelem::di_invert (那是真值)。
+    */
+   m_cbDiInvert->setEnabled(true);
 
    const bool meter_ok = (m_meter != nullptr) && m_meter->isOpen();
    const bool params_ok = m_ctl->paramsError().isEmpty();
@@ -2054,6 +2303,15 @@ void ScanWindow::refresh()
       if (m_meter == m_script)
          s += QStringLiteral(" · %1 个值, 游标 %2")
                  .arg(m_script->count()).arg(m_script->cursor());
+      else if (m_meter == m_ophir)
+      {
+         /* 真机把"到底接的是什么"摆出来: 表头型号/序列号, 探头型号/序列号,
+          * 当前波长/量程/模式。**这一行是排查时唯一能证明链路真的通了的东西**,
+          * 所以它由工作线程拼 (ophirmeter.cpp 的 buildSummary), 这里原样显示 */
+         const OphirInfo i = m_ophir->info();
+         if (i.valid && !i.summary.isEmpty())
+            s += QStringLiteral(" · ") + i.summary;
+      }
       m_lMeter->setText(s);
    }
 
