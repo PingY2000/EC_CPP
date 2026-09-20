@@ -205,7 +205,9 @@ static const double kViewHalfUnits = 16.0;
  */
 static const double kPadL = 38.0;   /* 左边: Y 标尺的刻度与数字 */
 static const double kPadR = 74.0;   /* 右边: 色标条 + 它的数字 */
-static const double kPadT = 20.0;   /* 上边: "区域超出量程" 那行红字 */
+/* 上边两段: 贴顶那一段是**空带**, 给浮在画布上的横幅 (见 MapCanvas::kBannerBand);
+ * 它下面那 20px 才是 "区域超出量程" 那行红字与 HUD 头几行落脚的地方。 */
+static const double kPadT = 20.0 + MapCanvas::kBannerBand;
 static const double kPadB = 38.0;   /* 下边: X 标尺的刻度与数字, 再加那行"视野"说明 */
 
 double MapCanvas::viewHalfUnits() const

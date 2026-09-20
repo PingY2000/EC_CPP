@@ -51,7 +51,9 @@ static const char *kBannerFault =
 static const char *kBannerInfo =
    "QLabel#banner { background:#1d3346; color:#a9cfe8; padding:6px; border-radius:4px; }";
 
-/* 横幅浮在画布顶上时离画布左边/上边留的空。贴着边也行, 但画布那圈边框会把它的圆角吃掉 */
+/* 横幅浮在画布顶上时离画布左边/上边留的空。贴着边也行, 但画布那圈边框会把它的圆角吃掉。
+ * 画布顶上本身已经空出一条带子给它了 (MapCanvas::kBannerBand, 40px) —— 这个数说的是
+ * 横幅**在那条带子里**再缩进多少, 两个数合起来才是"HUD 不会被压住"。 */
 static const int kBannerInset = 6;
 
 /* 默认 CSV 目录, 相对当前工作目录 (从仓库根敲 ./bin/scan.exe 时就落在 scan_out/) */
@@ -1121,11 +1123,16 @@ QWidget *ScanWindow::buildHomePanel()
    m_edHomeVel->setToolTip(QStringLiteral("八个按钮共用的找原点速度 6099h:01 (返回速度是它的 1/4, 加减速由它派生)。**它同时是「能找多远」的上限**: 速度 × 30 秒。够不着开关请先把滑台挪近, **不要**为了够得着去调高速度。第一次在陌生的机器上试方向, 压到下限 100。"));
 
    g->addWidget(new QLabel(QStringLiteral("速度"), box), 0, 0);
-   g->addWidget(m_edHomeVel, 0, 1, 1, 4);
+   g->addWidget(m_edHomeVel, 0, 1, 1, 2);   /* 占 1~2 列 */
 
-   /* 门控行 [编辑][保存][取消]。QGridLayout 没有 insertRow, 追加到末行 (第 3 行:
-    * 速度 0 / 轴X 1 / 轴Y 2) */
-   g->addWidget(gateBar(GI_HOME, box), 3, 0, 1, 5);
+   /* 门控行 [编辑][保存][取消] 就摆在**速度右边那一行**(2026-09-21 改, 原先是框底单独
+    * 一行)。这一框里只有速度是参数, 那三个按钮管的也就是它 —— 摆在同一行一眼能看出
+    * "这三个按钮管的是这个数"; 单独一行时中间隔着两行按钮, 且白占一行高。
+    *
+    * **靠右**: 传 Qt::AlignRight 让这一格里的 [编辑] 顶着框的右边界 (不传的话它填满
+    * 格子、按钮就贴在速度框后面, 右边空一大块)。那一格是 3~4 列, 宽度够同时放两个
+    * 按钮 —— 编辑态里 [编辑] 是藏起来的, 可见的永远最多两个, 所以不会挤出去。 */
+   g->addWidget(gateBar(GI_HOME, box), 0, 3, 1, 2, Qt::AlignRight);
    addGate(GI_HOME, box,
            /* 只有「速度」是参数; 八个按钮是动作, 不进表 (它们不归编辑态管, 归连接态管) */
            QList<GateItem>{ GateItem{ m_edHomeVel, false, false } });

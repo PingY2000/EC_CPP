@@ -59,6 +59,15 @@ public:
    /* 扫描中/跨区域时由窗口置位。**它只管手动定位那一条路** —— 查看是只读的, 不吞 */
    void setManualAllowed(bool on) { m_manual_ok = on; }
 
+   /* 画布顶上那条**空带**(像素): 留给 ScanWindow 那条**浮在画布上**的横幅 (它不进布局,
+    * 见 scanwindow.cpp 的 placeBanner)。画布不认识横幅, 但它知道自己顶上得空出这么高 ——
+    * 不空的话横幅一出现就盖住 HUD 的头两行 (进度 / 状态)。
+    *
+    * 算式 (都在下面的注释里量过): 横幅占 6..34, 画图区顶 = 20 + 这个数 = 40,
+    * HUD 第一行从画图区顶 +6 = 46 起 —— 中间剩 12px。**下限是 8**: 再小横幅就压住第一行。
+    * 横幅那 6 与 28 在 scanwindow.cpp 的 kBannerInset 与那三条样式表里, 改了要连这个一起改。 */
+   static const int kBannerBand = 20;
+
 signals:
    /* Shift+左键点了一下: 请把滑台移到这个显示坐标。窗口负责转成 setTarget */
    void manualMove(int32_t x_pul, int32_t y_pul);
