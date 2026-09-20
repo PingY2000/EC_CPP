@@ -103,8 +103,7 @@ int main(int argc, char *argv[])
 
                 // Shutdown
                 controlword = CW_SHUTDOWN;
-                // 这里假设默认 RxPDO 包含 Controlword（偏移需根据实际 PDO 调整）
-                // 简化：直接用 SDO 写控制字（更可靠）
+                // 用 SDO 写控制字，不依赖 RxPDO 偏移
                 ecx_SDOwrite(&ecx_context, slave, INDEX_CONTROLWORD, 0, FALSE,
                              sizeof(controlword), &controlword, EC_TIMEOUTRXM);
                 usleep(50000);
@@ -136,13 +135,9 @@ int main(int argc, char *argv[])
                     wkc = ec_receive_processdata(EC_TIMEOUTRET);
 
                     if (wkc >= expectedWKC) {
-                        // 这里需要根据实际 PDO 映射偏移来读写
-                        // 示例：如果默认 RxPDO 前 2 字节是 Controlword，后 4 字节是 Target Position
-                        // 请用 TwinCAT 或 SOEM slaveinfo 工具确认偏移！
-                        // *(uint16*)(ec_slave[slave].outputs) = controlword;
-                        // *(int32*)(ec_slave[slave].outputs + 2) = target_pos;
-
-                        // 更安全的方式：继续用 SDO 更新目标位置（调试用，实时性差）
+                        // 默认 RxPDO 偏移须用 SOEM slaveinfo/TwinCAT 确认
+                        // （前 2B Controlword，后 4B Target Position）
+                        // 用 SDO 更新目标位置，调试用，实时性差
                         if (i % 100 == 0) {  // 每 100ms 更新一次
                             target_pos += 1000;  // 每次增加 1000 脉冲
                             ecx_SDOwrite(&ecx_context, slave, INDEX_TARGET_POS, 0, FALSE,

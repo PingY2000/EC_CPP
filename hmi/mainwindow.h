@@ -1,9 +1,5 @@
-/*
- * hmi/mainwindow.h —— 顶栏 + 每轴一个面板 + 状态栏
- *
- * 主窗口只做三件事: 收集操作、把操作转成 EcatThread 的 post 系列 / set 系列、30Hz 刷遥测。
- * **它不持有 em_bus_t, 也不 include SOEM**; 连 em_csp_set_target 都是经 EcatThread 走的。
- */
+/* hmi/mainwindow.h —— 顶栏 + 每轴一个面板 + 状态栏。主窗口把操作转成 EcatThread 的
+ * post / set 系列, 自己不持有 em_bus_t。 */
 #pragma once
 
 #include <QMainWindow>
@@ -70,7 +66,6 @@ private:
    QTimer *m_tick        = nullptr;
    QTimer *m_bannerTimer = nullptr;
 
-   /* 全部从遥测推出来, 不用"点过哪个按钮"来推 —— 那种推法会和线程的真实状态错开 */
    bool m_connected = false;
    bool m_faultShown = false;
    bool m_warnedLive = false;

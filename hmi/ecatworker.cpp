@@ -7,14 +7,14 @@
 #include <cstdio>
 #include <cstdlib>
 
-/* ---------------------------------------------------------------- 构造 */
-
 EcatThread::EcatThread(QObject *parent) : QThread(parent)
 {
    for (int i = 0; i < EM_MAX_AXES; i++)
    {
       m_vel[i]  = HMI_VEL_DEF;
       m_want[i] = 0;
+      /* "还没读过"必须显式写: 0 是一个合法的模式号 (未定义), 不能拿它冒充"没读过" */
+      m_mode_disp[i] = HMI_MODE_DISP_UNREAD;
    }
 }
 
@@ -24,10 +24,7 @@ EcatThread::~EcatThread()
    wait(15000);
 }
 
-/*
- * 记录一句给操作员看的话: 存进遥测 (状态栏一直显示) + 打到控制台 + 发给界面弹一次。
- * 工作线程调, 所以 emit 是跨线程的排队投递 —— 界面还没起事件循环时也不会卡住这里。
- */
+/* 记一句给操作员看的话: 存进遥测 + 打到控制台 + 发给界面弹一次。工作线程调 */
 void EcatThread::note(const QString &s)
 {
    {
@@ -39,8 +36,6 @@ void EcatThread::note(const QString &s)
    std::fflush(stdout);
    emit notify(s);
 }
-
-/* ---------------------------------------------------------------- 命令 */
 
 void EcatThread::postListAdapters()
 {
@@ -99,19 +94,9 @@ void EcatThread::postHome(int axis, int method, uint32_t vel_fast)
    m_cmds.enqueue(c);
 }
 
-/*
- * 「停止」在回零期间走这一个。**这是全程序唯一一处 GUI 线程直呼 motor_api**
- * (见头文件顶部那条边界的第二个例外)。
- *
- * 它为什么安全, 是**结构性**的, 不是"小心一点就行": em_request_stop() 只往一个
- * `static volatile sig_atomic_t` 里存 1 —— 不碰 em_bus_t、不碰网卡、不做任何 I/O。
- * motor_api 自己就是按"信号处理器里也能调"设计它的 (它唯一的生产调用方是
- * motor_test 的 SIGINT 处理器)。
- *
- * 它为什么非直呼不可, 也是结构性的: 回零阻塞在工作线程里, 而命令队列是那个线程在
- * run() 顶部排空的 —— 一条 CMD_STOP 要等回零自己退出来才轮到, 那时 30 秒超时早就
- * 过去了。**"按停止键直接停"这条需求, 靠队列实现不了。**
- */
+/* 「停止」在回零期间走这一个 —— **全程序唯一一处 GUI 线程直呼 motor_api**。
+ * 安全: em_request_stop() 只往一个 `static volatile sig_atomic_t` 里存 1, 不碰总线/网卡。
+ * 非如此不可: 回零阻塞在工作线程里, 一条 CMD_STOP 要等它自己退出来才轮到。 */
 void EcatThread::requestMotionStop()
 {
    em_request_stop();
@@ -129,11 +114,8 @@ bool EcatThread::wantDigIn() const
    return m_want_dig_in;
 }
 
-/*
- * 「输入电平反转 (NPN)」—— 运行期参数, 所以**不加锁、不进命令队列** (见头文件那段):
- * 界面勾一下, 下一帧 publish() 就用上了。语义 (同时换掉限位判据) 在
- * ecatcmd::limit_rule_for 里, 不在调用点。
- */
+/* 「输入电平反转 (NPN)」—— 运行期参数, 所以不加锁、不进命令队列: 界面勾一下,
+ * 下一帧 publish() 就用上了。 */
 void EcatThread::setDiInvert(bool on)
 {
    m_di_invert.store(on);
@@ -208,8 +190,6 @@ BusTelem EcatThread::telemetry() const
 
 void EcatThread::requestQuit() { m_quit.store(true); }
 
-/* ---------------------------------------------------------------- 主循环 */
-
 void EcatThread::run()
 {
    QElapsedTimer clk;
@@ -226,11 +206,7 @@ void EcatThread::run()
          uint32_t dt = (uint32_t)(now - last);
          last = now;
 
-         /*
-          * dt 用**实测值**, 不假设 2ms —— Windows 不是实时系统。卡了一下就按 100ms 封顶:
-          * CSP 下让目标一次跳一大步, 就是一次高速冲刺, 而卡顿本身往往意味着总线不稳。
-          * 这个口径与 motor_api 的 em_csp_move_multi 一致。
-          */
+         /* dt 用**实测值** (Windows 不是实时系统); 卡顿按 100ms 封顶 */
          if (dt == 0)  dt = 1;
          if (dt > 100) dt = 100;
 
@@ -248,11 +224,7 @@ void EcatThread::run()
       {
          last = clk.elapsed();
 
-         /*
-          * 没进 OP 也要刷一次遥测。**不能只在发帧时刷**: 界面的按钮形态是从遥测推出来的
-          * (in_op || busy), 而"正在连接"和"连接失败"这两件事恰好都发生在不发帧的时候 ——
-          * 不刷的话界面就永远停在点下去之前的样子。
-          */
+         /* 没进 OP 也要刷遥测: 界面的按钮形态从遥测推出来, 而连接期不发帧 */
          publish(0);
       }
 
@@ -274,29 +246,9 @@ void EcatThread::drainCommands()
          c = m_cmds.dequeue();
       }
 
-      /*
-       * ---- 每一条命令都从"干净"开始 ------------------------------------
-       *
-       * g_stop 是**进程级**的 (motor_api 为了能在信号处理器里调, 只能这么做),
-       * 而且它**不会自己清**。上一条命令留下的那个 1 会让下一条命令在它的第一次
-       * 检查处当场中止 —— em__cw_step / em__wait_sw / em_set_mode / em_home /
-       * em_fault_reset 全都读它。那是一种最难查的失败: "点了使能没反应, 控制台说
-       * 被中止了"。故障复位那条更糟 —— 它是在写完 6040h = 0x0000 (**已经卸力**)
-       * 之后才中止的。
-       *
-       * 所以在这里清, 一条命令清一次。会话只有两种, 都正确:
-       *   · 空闲时被置起   -> 下一条命令开始前就清掉了, 它一个字都不受影响;
-       *   · 命令运行中被置起 -> 由**正在跑的那一条**理会, 跑完即清。
-       *
-       * 「停止」在回零期间正是靠第二条生效的 (见 requestMotionStop)。
-       *
-       * ⚠️ 但这留下一个洞, 由 doHome() 的收尾自己补: 回零被中止之后, **收尾**那几步
-       * 会立刻被这个还没清的标志打断 (它的第一步 em_disable 内部就有 em__cw_step),
-       * 于是轴就停在"使能 + HM + bit4 可能还举着"—— 正是我们要防的那个状态。
-       *
-       * interpolate() / em_service() 不读这个标志, 所以从"置起"到"下一条命令出队"
-       * 之间它们照跑, 无害。hmi 那边没有任何人置它, 所以这一句对它是空操作。
-       */
+      /* 每一条命令都从"干净"开始: g_stop 是**进程级**的而且不会自己清, 上一条命令留下的
+       * 那个 1 会让下一条在第一次检查处当场中止 (em__cw_step / em_wait_sw / em_set_mode /
+       * em_home / em_fault_reset 都读它)。 */
       em_clear_stop();
 
       switch (c.type)
@@ -340,12 +292,7 @@ void EcatThread::drainCommands()
    }
 }
 
-/* ---------------------------------------------------------------- 生命周期 */
-
-/*
- * 填网卡下拉框。返回的是**这块网卡在 SOEM 里的名字** (`\Device\NPF_{GUID}`), 不是描述 ——
- * 描述只是给人看的, 名字才是 postConnect 要的东西。
- */
+/* 填网卡下拉框。返回的是**这块网卡在 SOEM 里的名字** (`\Device\NPF_{GUID}`), 不是描述 */
 void EcatThread::doListAdapters()
 {
    em_adapter_t list[32];
@@ -371,27 +318,9 @@ void EcatThread::doListAdapters()
    emit adaptersListed(names, descs);
 }
 
-/*
- * m_busy 的**唯一一对**写点就在这个壳里 —— 里面那个函数一个都不管。
- *
- * 为什么单拆一层: 里面那个函数有七条出口, 其中**两条是光秃秃的 `return`**
- * (em_bus_new 失败、打不开网卡) —— 既没调 teardown(), 也没有第二个人清 m_busy,
- * 于是 m_busy **永远是 true**。(其余几条走 teardown(), 而 teardown 末尾自己会把它
- * 清掉, 所以那几条本来是好的 —— 修的时候别把它们一起算进去。)
- *
- * 那不只是"按钮形态不对": 界面把 `onair = in_op || busy` 当成"占着总线"
- * (见 ScanWindow::refresh()), 于是 m_connected 也永远为真 —— 「使能」「设为零点」
- * 「开始扫描」全部亮着, 而底下什么都没有。
- * (scan 那个「让 60FDh 进 TxPDO」勾选框从前正是被这个坑卡住的: 它 setEnabled(!onair),
- * 而"连接失败过一次"的人恰恰是最需要勾它的那个 —— 现在那个框不跟着 onair 变灰了,
- * 见 ScanWindow::refresh() 与 onWantDigInToggled()。)
- *
- * ⚠️ 另外要认清一件事: **界面在连接期间其实看不到 busy**。中间那几秒是阻塞的, 而
- * publish() 与本函数同线程 (run() 里 drainCommands 在循环顶、publish 在循环底),
- * 那期间一次都跑不到 —— 所以"界面据此把按钮锁住, 免得点两下"这件事并没有真的发生
- * (docs/scan_sweep.md §13 小瑕疵记着这一条)。这个壳的职责是**把状态收干净**,
- * 不是"让按钮在连接期间变形态"; 真要后者得照 doFaultReset() 那样加锁直写。
- */
+/* m_busy 的**唯一一对**写点就在这里 —— 内层有光秃秃的 return (em_bus_new 失败、打不开
+ * 网卡): 既没调 teardown() 也没人清 m_busy, 于是 m_busy 永远是 true, 界面把
+ * in_op || busy 当成"占着总线", 亮着一片本不存在的按钮。 */
 void EcatThread::doConnect(const QString &ifname)
 {
    m_busy = true;
@@ -433,10 +362,8 @@ void EcatThread::doConnectInner(const QString &ifname)
       return;
    }
 
-   /*
-    * 选**总线上全部从站**, 不是"前两台": em_setup 的硬要求 —— 留在 PRE_OP 的从站不参与
-    * 过程数据交换, 会让整帧的 WKC 持续偏短, 与"过程数据没落地"分不开。
-    */
+   /* 选**总线上全部从站**, 不是"前两台": em_setup 的硬要求 —— 留在 PRE_OP 的从站
+    * 不参与过程数据交换, 会让整帧的 WKC 持续偏短。 */
    em_axis_cfg_t cfg[EM_MAX_AXES];
    for (int i = 0; i < n; i++)
    {
@@ -444,10 +371,8 @@ void EcatThread::doConnectInner(const QString &ifname)
       cfg[i].pos_tol = 0;      /* 0 = 用 EM_POS_TOL_DEF */
    }
 
-   /*
-    * 60FDh 那个可选项必须在 em_setup **之前**设 —— 它是个连接期参数。
-    * 默认关着: 只绑不补, 不动驱动器的映射 (理由见 motor_api 的 em_require_dig_in)。
-    */
+   /* 60FDh 那个可选项必须在 em_setup **之前**设 —— 它是个连接期参数。
+    * 默认关着: 只绑不补, 不动驱动器的映射。 */
    {
       QMutexLocker lk(&m_mtx);
       em_require_dig_in(m_bus, m_want_dig_in ? 1 : 0);
@@ -475,6 +400,10 @@ void EcatThread::doConnectInner(const QString &ifname)
    m_origin_ready = false;
    m_fault_latched = false;
 
+   /* 刚进 OP 时读一次 6061h —— 读到的是驱动器上电后自己认的模式 */
+   for (int i = 0; i < m_naxis; i++)
+      readModeDisp(i);
+
    {
       QMutexLocker lk(&m_mtx);
       for (int i = 0; i < m_naxis; i++)
@@ -486,8 +415,7 @@ void EcatThread::doConnectInner(const QString &ifname)
       }
    }
 
-   /* 这里**不写 m_busy** —— 它是外面那个壳一个人的事 (见 doConnect 上面那段)。
-    * 底下也故意不写: 漏一条就是"永远忙", 而那会连带把界面锁死一大片 */
+   /* 这里**不写 m_busy** —— 它是外面那个壳一个人的事 (见 doConnect 上面那段) */
    note(QStringLiteral("已进 OP, %1 根轴。电机仍未带电 —— 点「使能」才会带电")
            .arg(m_naxis));
 }
@@ -524,10 +452,11 @@ void EcatThread::doEnable()
       return;
    }
 
-   /*
-    * 使能成功了。把目标钉在"现在这里": em_arm() 在使能前已经把 607Ah 钉在当前实际位置,
-    * 这里把界面侧的目标值也对齐 —— 于是**使能那一帧不会产生任何运动**。
-    */
+   /* 使能走完, 6061h 应当就是上面刚设的 CSP, 读一次为界面留一份 */
+   for (int i = 0; i < m_naxis; i++)
+      readModeDisp(i);
+
+   /* 使能成功了。把界面侧的目标值也钉在"现在这里", 于是**使能那一帧不会产生任何运动** */
    {
       QMutexLocker lk(&m_mtx);
       for (int i = 0; i < m_naxis; i++)
@@ -541,24 +470,9 @@ void EcatThread::doEnable()
            .arg(m_naxis));
 }
 
-/*
- * 故障复位 (6040h bit7 上升沿)。
- *
- * 与 doEnable() 同一种形状: 阻塞最多 1 秒/轴, 跑在工作线程里, 期间遥测不刷新。
- *
- * ── 为什么这里要自己再筛一遍"哪根轴真的报了故障" ──────────────────────────────
- *
- * em_fault_reset() 里头确实会看一眼 6041h bit3, 但那是**到函数末尾**才看的, 用来报告
- * "本来就没有故障, 这次是空操作"。而它的动作顺序是**先**写 6040h = 0x0000
- * (Disable voltage = 卸力) 打十帧, **然后**才抬 bit7 —— bit7 是上升沿触发, 不先把 0
- * 压下去就构不成沿, 这个顺序本身是对的。
- *
- * 问题在于: 对**一根没有故障的轴**做这件事, 那一轴会**真的卸力**。竖直滑台会掉下来。
- * 所以"哪根轴该复位"必须在**调用之前**定好, 而判据只能是 6041h bit3。
- *
- * 判据本身在 ecatcmd::axis_needs_reset() (头文件里) —— 放那里的理由是 scan_selftest
- * 不编这个 .cpp, 写在 .cpp 里那条逻辑就永远验不到。
- */
+/* 故障复位 (6040h bit7 上升沿), 阻塞最多 1 秒/轴。
+ * em_fault_reset() 先写 6040h = 0x0000 (卸力) 打十帧、才抬 bit7, 而"本来就没故障"是到
+ * 函数末尾才报的 —— 对一根健康的轴做这件事会**真的卸力**, 所以判据必须在调用之前。 */
 void EcatThread::doFaultReset()
 {
    if (m_bus == nullptr || !m_in_op)
@@ -573,10 +487,7 @@ void EcatThread::doFaultReset()
 
    for (int i = 0; i < m_naxis; i++)
    {
-      /*
-       * 用**刚读到的**状态字, 不用自己上一轮发布的快照 —— 快照可能已经是 2ms 前的,
-       * 那 2ms 里故障可能刚起来, 也可能已经自己清了。而这一条判断决定要不要卸力。
-       */
+      /* 用**刚读到的**状态字, 不用遥测快照 —— 而这一条判断决定要不要卸力 */
       if (ecatcmd::axis_needs_reset(true,
                                     em_mirror_ok(m_ax[i]) != 0,
                                     (em_sw(m_ax[i]) & EM_SW_FAULT) != 0))
@@ -585,29 +496,16 @@ void EcatThread::doFaultReset()
 
    if (ntodo == 0)
    {
-      /*
-       * 这一句是本函数的重点, 不是"顺便提一句": **真的一个字节都没写**。
-       *
-       * 不能改成"那就调一下 em_fault_reset 让它自己发现没故障" —— 它照样会先把
-       * 那十帧 6040h = 0x0000 (卸力) 打出去, 然后才打印"本来就没有故障, 是空操作"。
-       * 那道闸必须在**调用之前**, 这就是它。
-       */
+      /* 这一句是重点: **真的一个字节都没写** */
       note(QStringLiteral("没有轴报故障 (6041h bit3 都是 0) -> **一个字节都没写**。"
                           "复位只对报故障的轴做: 它的动作是先把 6040h 写成 0x0000 "
                           "(卸力) 再抬 bit7, 对一根健康的轴做这件事会松开它的保持力矩"));
       return;
    }
 
-   /*
-    * ---- 2. 逐轴复位。这一段是阻塞的 (每轴最多 EM_STEP_TMO_MS = 1000ms) ----
-    *
-    * 下面那两次**加锁直写 m_telem.resetting** 是界面能看见"正在复位…"的唯一原因:
-    * run() 里 drainCommands 与 publish 是同一根线程上的前后两步, 而这里一阻塞就是
-    * 最多两三秒, 期间 publish 一次都跑不到 (详见 publish() 里 t.resetting 那段注释)。
-    * 界面线程是独立的 30Hz 轮询, 所以它读得到; 而 resetting 一旦置起就**没有"取消"**
-    * —— em_fault_reset 里那个 em_stop_requested() 在 GUI 里是死的 (只有 motor_test
-    * 装了 SIGINT), 所以只能让界面看起来被占住 (按钮禁用 + 文案), 不能真去中断它。
-    */
+   /* ---- 2. 逐轴复位, 阻塞 (每轴最多 EM_STEP_TMO_MS = 1000ms) ----
+    * 下面那两次**加锁直写 m_telem.resetting** 是界面能看见"正在复位…"的唯一原因
+    * (publish() 与本函数同线程); 复位**不可中断**, 界面只能把它按住。 */
    m_resetting = true;
    {
       QMutexLocker lk(&m_mtx);
@@ -621,13 +519,7 @@ void EcatThread::doFaultReset()
       const int i = todo[k];
       const QString nm = (i == 0) ? QStringLiteral("轴X") : QStringLiteral("轴Y");
 
-      /*
-       * 比的是 0, 不是 EM_R_OK —— 后者是**内部**宏 (在 ec_motor_internal.h 里),
-       * 而界面这一侧只 include ec_motor.h。公开头文件给 em_fault_reset 定的约定
-       * (见 ec_motor.h:514-519) 就是 "0 = 成功 / -1 = 失败 / 1 = 收到停止请求",
-       * 与 em_enable / em_disable 同一套。别为了好看把它 import 进来 —— 那会让界面
-       * 侧开始依赖内部头, 而"界面不碰 motor_api 内部"正是这个文件开头那条边界。
-       */
+      /* 比的是 0, 不是 EM_R_OK (那是 ec_motor_internal.h 里的内部宏, 界面侧不 include) */
       if (em_fault_reset(m_ax[i]) == 0)
          ok << nm;
       else
@@ -640,12 +532,7 @@ void EcatThread::doFaultReset()
       m_telem.resetting = false;
    }
 
-   /*
-    * ---- 3. 一次说完 ----
-    *
-    * note() 是**覆盖写** (它自己会 emit notify), 逐轴各 note 一句的话前一句会被冲掉 ——
-    * 两根轴一起复位时操作员只会看到最后一句, 而"哪一根失败了"才是要看的。
-    */
+   /* ---- 3. 一次说完: note() 是**覆盖写**, 逐轴各 note 一句的话前一句会被冲掉 ---- */
    QString s;
 
    if (!ok.isEmpty())
@@ -660,32 +547,14 @@ void EcatThread::doFaultReset()
                           "603Fh 是故障码), 不要靠反复点硬顶").arg(bad.join(QStringLiteral("/")));
    }
 
-   /*
-    * m_fault_latched **不在这里碰**。它只有一个写者 (publish()), 而清除条件就是
-    * "bit3 掉了"。手工清是活的危险: 万一上面复位失败、bit3 还举着, 手工清会让
-    * publish() 不再冻结目标 —— 于是插补恢复写 607Ah, 而界面说"没故障"。一个所有者。
-    *
-    * m_tgt / m_want 也不碰: 复位后该轴是失能态, interpolate() 跳过失能轴, 冻着的值
-    * 不会产生任何运动; 下一次「使能」会在 doEnable() 里重新对齐。
-    */
+   /* m_fault_latched **不在这里碰**: 它只有一个写者 (publish()), 清除条件就是 "bit3 掉了"。
+    * m_tgt / m_want 也不碰 —— 复位后该轴是失能态, interpolate() 跳过失能轴。 */
    note(s);
 }
 
-/*
- * 回零 —— 驱动器自带的 HM 模式 (6060h = 6)。正/反向就是方式 24 / 29。
- *
- * 结构是三段, 顺序不能动: **闸 (一个字节都不写) -> 宣告 -> 动作 + 无条件收尾**。
- *
- * 收尾那段才是本函数的主体, 因为 em_home() 的五条返回路径**没有一条**留下的状态是
- * 调用方可以不管的:
- *   · 到位        (ec_motor_motion.c:1265) -> 使能 + HM + bit4 已放下
- *   · 被中止      (:1192)                 -> 使能 + HM + bit4 已撤 (它**特意**保持使能:
- *                                            回零中途位置不明, 卸力会让滑台自由下滑)
- *   · bit3 故障   (:1208)                 -> 使能 + HM + **bit4 还举着**
- *   · bit13 回零错(:1217)                 -> 同上
- *   · 超时        (:1239)                 -> 同上, 而且那一刻**驱动器还在找**
- * 所以这里只有一个出口, 没有"成功就早返回"这种写法。
- */
+/* 回零 —— 驱动器自带的 HM 模式 (6060h = 6)。正/反向就是方式 24 / 29。
+ * 三段顺序不能动: **闸 (一个字节都不写) -> 宣告 -> 动作 + 无条件收尾**, 因为 em_home() 的
+ * 五条返回路径留下的状态没有一条可以不管 (后三条举着 bit4 返回, 驱动器那一刻还在找)。 */
 void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
 {
    if (axis < 0 || axis >= EM_MAX_AXES)
@@ -694,13 +563,8 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
    const bool bus_ready = (m_bus != nullptr) && m_in_op;
    em_axis_t *ax = bus_ready ? m_ax[axis] : nullptr;
 
-   /*
-    * 「还有轴在走」用工作线程**自己的真相** (m_want 对 m_tgt), 不用遥测 —— 遥测是
-    * 界面那个 30Hz 轮询的快照, 有一个周期的滞后。同 doZero 的先例。
-    *
-    * 这条判据不是装饰: 回零期间 interpolate() 整个不跑, 所以若另一根轴正在走, 它的
-    * 目标会**停在半途**。
-    */
+   /* 「还有轴在走」用工作线程**自己的真相** (m_want 对 m_tgt), 不用遥测 (有滞后);
+    * 回零期间 interpolate() 不跑, 另一根轴的目标会停在半途。 */
    bool any_moving = false;
    {
       QMutexLocker lk(&m_mtx);
@@ -709,14 +573,11 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
             any_moving = true;
    }
 
-   /* 用**刚读到的** 6041h, 不用上一轮发布的快照 —— 同 doFaultReset。
-    * 这一条尤其要紧: 本函数的第一件事是 em_disable(), 它**真的会撤掉保持力矩**。
-    * 等 em_home() 自己去发现"不该做", 力矩已经撤了。 */
+   /* 用**刚读到的** 6041h: 本函数第一件事 em_disable() 真的会撤掉保持力矩 */
    const bool mirror_ok = (ax != nullptr) && em_mirror_ok(ax) != 0;
    const bool fault     = (ax != nullptr) && (em_sw(ax) & EM_SW_FAULT) != 0;
 
-   /* 只放行 24/29。em_home() 自己只查 [1,35] —— 那个范围里其它方式的方向语义在这台
-    * 机器上一次都没验过, 放进来就是拿滑台去试。 */
+   /* 只放行 24/29 (em_home() 自己只查 [1,35], 其它方式的方向语义没验过, 放进来是拿滑台去试) */
    const bool negative = (method == ecatcmd::home_method_for(true));
    if (method != ecatcmd::home_method_for(false) && !negative)
    {
@@ -738,10 +599,7 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
    const QString nm = QString::fromUtf8(ecatcmd::axis_label(axis));
 
    /* ---- 宣告"正在回零"。**必须在第一个阻塞调用之前** ----
-    *
-    * 界面靠它把四个回零按钮按住、把「停止」换成立即中止。下面那两次加锁直写是
-    * "阻塞期间界面还看得见"的唯一原因 —— 与 doFaultReset 那一对一字不差, 理由见
-    * publish() 里 t.resetting 那段。 */
+    * 下面那两次加锁直写是"阻塞期间界面还看得见"的唯一原因, 界面靠它把「停止」换成立即中止。 */
    m_homing = true;
    m_homing_axis = axis;
    m_homing_method = method;
@@ -757,48 +615,26 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
    cfg.method   = method;
    cfg.vel_fast = ecatcmd::home_vel_clamp((int32_t)vel_fast);
    cfg.vel_slow = ecatcmd::home_vel_slow(cfg.vel_fast);
-   /* **acc 必须跟着速度一起算**, 不能留 em_home_cfg_default 那个 5000 —— 它配 2000 pul/s
-    * 是 0.4 秒斜坡, 配放开的 100000 就是 20 秒斜坡 (一次回零全在加速)。见
-    * ecatcmd::home_accel_for 那段。offset 保持 0: 界面上没有它的控件, 确认弹窗把
-    * 这两个数念给操作员听。 */
+   /* **acc 必须跟着速度一起算** (见 home_accel_for); offset 保持 0, 界面上没有它的控件 */
    cfg.acc      = ecatcmd::home_accel_for(cfg.vel_fast);
 
-   /*
-    * ★ 先失能。6098h/6099h/609Ah/607Ch **只在未使能时可写**, em_home() 的第一句检查
-    * 就是 em_is_enabled (ec_motor_motion.c:1096)。也就是说这一刻该轴失去保持力矩,
-    * 竖直轴可能下滑 —— 这件事躲不掉, 只能每次都写在确认弹窗里。
-    */
+   /* ★ 先失能。6098h/6099h/609Ah/607Ch **只在未使能时可写** —— 这一刻该轴失去保持力矩,
+    * 竖直轴可能下滑, 这件事躲不掉。 */
    int rc_disable = 0;
    if (em_is_enabled(ax))
       rc_disable = em_disable(ax);
 
-   /* 0 = 到位 / 1 = 被停止请求中止 / 负 = 失败 (ec_motor.h:661 那一段给 em_home 定的)。
-    * 比字面量, 不比 EM_R_OK —— 那是 ec_motor_internal.h 里的宏, 而界面这一侧刻意
-    * 不 include 内部头 (同 doFaultReset 里那段注释)。 */
+   /* 0 = 到位 / 1 = 被停止请求中止 / 负 = 失败。比字面量, 不比 EM_R_OK (那是内部宏) */
    const int rc_home = em_home(ax, &cfg, HMI_HOME_TMO_MS);
 
-   /* ==================================================================
-    * 收尾。**无条件, 顺序不能动。**
-    * ================================================================== */
+   /* 收尾。**无条件, 顺序不能动。** */
 
-   /*
-    * ---- 0. 再清一次停止标志 ----
-    *
-    * 这是补 drainCommands() 留下的那个洞。那个停止请求瞄的是**运动**, 而收尾的全部
-    * 职责是抵达一个确定状态 —— 半途而废严格地比做完更糟。不补这一句, 一个被中止的
-    * 回零会停在第 1 步的中间 (em_disable 内部就有 em__cw_step, 它读这个标志), 于是
-    * 轴落在"使能 + HM + bit4 可能还举着" —— 而那正是本函数存在的意义。
-    */
+   /* ---- 0. 再清一次停止标志 ---- 补 drainCommands() 留下的洞: 那个停止请求瞄的是
+    * **运动**, 而收尾的全部职责是抵达一个确定状态。 */
    em_clear_stop();
 
-   /*
-    * ---- 1. 失能 ----
-    *
-    * ★ 这一步**不是冗余**。em_home() 在 bit3 / bit13 / 超时那三条路上是**举着 bit4
-    * 返回**的 (它一次都没写回 0x000F), 也就是说驱动器那一刻**还在找**。让它停下来的
-    * 正是这里: 0x0007 / 0x0006 / 0x0000 都没有 bit4。
-    * 将来别以"回零都结束了"为理由把它省掉 —— 省掉就是让它一直找下去。
-    */
+   /* ---- 1. 失能 ---- ★ 不冗余: em_home() 在 bit3 / bit13 / 超时那三条路上是**举着
+    * bit4 返回**的, 驱动器那一刻**还在找**, 让它停下来的正是这里。 */
    if (em_is_enabled(ax))
    {
       const int rc = em_disable(ax);
@@ -806,33 +642,18 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
          rc_disable = rc;
    }
 
-   /* ---- 2. 切回 CSP ----
-    * em_set_mode 在已使能时会被拒, 所以它必须排在 1 之后。此刻轴停在 HM 模式里, 而
-    * interpolate() 只会按 CSP 解释 607Ah —— 不切回来, 插补写的目标就是一串噪音。 */
+   /* ---- 2. 切回 CSP: em_set_mode 在已使能时会被拒, 所以必须排在 1 之后。
+    * 不切回来, interpolate() 写的 607Ah 会被驱动器按 HM 解释。 */
    const int rc_mode = em_set_mode(ax, EM_MODE_CSP);
 
-   /* ---- 3. 重新使能到 CSP ----
-    * em_arm 会把 607Ah 钉在**此刻的** 6064h (ec_motor_motion.c:115), 所以使能那一帧
-    * 本身就是"原地不动"。 */
+   /* ---- 3. 重新使能到 CSP: em_arm 把 607Ah 钉在此刻的 6064h, 使能那一帧原地不动 */
    int rc_enable = -1;
    if (rc_mode == 0)
       rc_enable = em_enable(ax);
 
-   /*
-    * ---- 4. 重新锚定显示原点 ----
-    *
-    * ★ **这一行漏掉, 就是一次没人按过按钮的全速运动。**
-    *
-    * 回零之后驱动器自报的 6064h 会跳到它的回零坐标系里 (等不等于 0 由 2214h 与 607Ch
-    * 共同决定, em_home 刻意不断言这件事)。而界面上每一个显示坐标都是 6064h - m_origin。
-    * 若 m_origin 还是回零之前那个值, 下一次 interpolate() 就会算出 m_origin + m_tgt,
-    * 并把**回零之前的那个物理位置**当成 CSP 目标发出去。
-    *
-    * **必须在 3 之后**: em_arm 钉 607Ah 用的是"使能那一刻的 6064h"。先锚定再使能的话,
-    * 失能窗口里自重下滑的那一段会让 m_origin 停在**下滑之前**的位置, 而 607Ah 钉在
-    * **下滑之后**的位置 —— 同样是一次回跳。放在后面, origin + m_tgt / 607Ah / 6064h
-    * 三者自洽, 一帧都不动。
-    */
+   /* ---- 4. 重新锚定显示原点 ---- ★ **这一行漏掉, 就是一次没人按过按钮的全速运动**:
+    * m_origin 若还是回零之前的值, 下一次 interpolate() 会把**回零之前的物理位置**当成
+    * CSP 目标发出去。**必须在 3 之后** —— em_arm 钉 607Ah 用"使能那一刻的 6064h"。 */
    m_origin[axis] = em_pos(ax);
    m_tgt[axis]    = 0;
    {
@@ -840,10 +661,13 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
       m_want[axis] = 0;
    }
 
+   /* ---- 4b. 读一次 6061h: 手册 §3.7 把「6061h 读回 6」当作 HM 的前提。
+    * 收尾之后应当是 8 (CSP), 不是 8 就得在结论句里喊出来; 读失败 (-1) 也照实写。 */
+   readModeDisp(axis);
+
    /* ---- 5. 判定 + 复位旗标 + 一次说完 ---- */
 
-   /* 判据是**收尾结束这一刻的实测状态**, 不是上面那几个返回码的排列组合 ——
-    * 理由见 ecatcmd::home_end_state 的注释。 */
+   /* 判据是**收尾结束这一刻的实测状态**, 不是上面那几个返回码的排列组合 */
    const bool end_enabled = em_is_enabled(ax) != 0;
    const bool fault_now   = (em_sw(ax) & EM_SW_FAULT) != 0;
    const ecatcmd::HomeEnd end =
@@ -859,17 +683,16 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
       m_telem.homing_method = 0;
    }
 
-   /* 收尾没能确认到"已卸力" -> 走既有的动力电源告警那条路 (ec_shutdown 也是它)。
-    * 这是**复用**: ScanWindow::refresh() 看到 maybeLive() 就会弹那个"立即断开驱动器
-    * 的动力电源, 不要只依赖软件"的模态 —— 正是"失能未确认"该说的一句话。 */
+   /* 收尾没能确认到"已卸力" -> 走既有的动力电源告警那条路 (ec_shutdown 也是它) */
    if (end == ecatcmd::HOME_END_STRANDED)
       m_maybe_live = true;
 
-   /* note() 是**覆盖写**, 所以这里一次说完 (同 doFaultReset 最后那段)。 */
-   QString s = QStringLiteral("%1 %2找原点 (方式 %3): %4。\n%5")
+   /* note() 是**覆盖写**, 所以这里一次说完 */
+   QString s = QStringLiteral("%1 %2找原点 (方式 %3): %4 (rc = %5)。\n%6")
                   .arg(nm, QString::fromUtf8(ecatcmd::home_dir_text(negative)),
                        QString::number(method),
                        QString::fromUtf8(ecatcmd::home_cause_text(rc_home)),
+                       QString::number(rc_home),
                        QString::fromUtf8(ecatcmd::home_end_text(end)));
 
    if (end == ecatcmd::HOME_END_HOLDING)
@@ -879,18 +702,38 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
       s += QStringLiteral(" [收尾: 失能 %1 / 切 CSP %2 / 使能 %3]")
               .arg(rc_disable).arg(rc_mode).arg(rc_enable);
 
+   /* 6061h 单独一格, 并**把期望值写进去**: 它是"驱动器现在按哪种模式解释 607Ah"的唯一显示器 */
+   {
+      const int md = m_mode_disp[axis];
+
+      s += QStringLiteral(" [6061h = %1 (%2)%3]")
+              .arg(md)
+              .arg(QString::fromUtf8(ecatcmd::mode_text(md)),
+                   (md == EM_MODE_CSP)
+                      ? QString()
+                      : QStringLiteral(" <<< 不是 CSP(8): 607Ah 会被按别的模式解释, "
+                                       "先别再走"));
+   }
+
    s += QStringLiteral(" [6099h:01 = %1, :02 = %2 pul/s, 609Ah = %3, 上限 %4 秒]")
            .arg(cfg.vel_fast).arg(cfg.vel_slow).arg(cfg.acc).arg(HMI_HOME_TMO_MS / 1000);
 
    note(s);
 }
 
+/* 读一次该轴的实际运行模式 (6061h, SDO) 存进 m_mode_disp[axis] —— 界面与 doHome 那句
+ * 结果话都从这里取值。**只许在本来就阻塞/便宜的时刻调**, publish() 与 interpolate() 不许。 */
+void EcatThread::readModeDisp(int axis)
+{
+   if (axis < 0 || axis >= EM_MAX_AXES || m_ax[axis] == nullptr)
+      return;
+
+   m_mode_disp[axis] = em_get_mode(m_ax[axis]);
+}
+
 void EcatThread::doStop()
 {
-   /*
-    * 停止 = 把目标冻在当前插值点上。**不写 6040h=0x0000**: 那是卸力, 滑台会自由滑;
-    * 带保持力矩停住才是这里要的。要不要撤电由「失能」决定。
-    */
+   /* 停止 = 把目标冻在当前插值点上。**不写 6040h=0x0000**: 那是卸力, 滑台会自由滑 */
    {
       QMutexLocker lk(&m_mtx);
       for (int i = 0; i < EM_MAX_AXES; i++)
@@ -916,12 +759,9 @@ void EcatThread::doZero(int axis)
       return;
    }
 
-   /*
-    * 原来的显示坐标: disp = pos - origin。要让**现在这点**变成 0:
-    *   origin' = origin + disp   ->  新 disp' = pos - origin' = 0
-    * 光动 origin 会让同一个物理位置换一个显示值, 而 want/tgt 还是老的显示值 ——
-    * 那就等于凭空下了一条新指令。所以 want/tgt 一起平移, **物理目标点一个脉冲都不动**。
-    */
+   /* disp = pos - origin, 要让现在这点变成 0 就取 origin' = origin + disp。
+    * 光动 origin 会让 want/tgt 还是老的显示值 —— 那就等于凭空下了一条新指令,
+    * 所以 want/tgt 一起平移, **物理目标点一个脉冲都不动**。 */
    m_origin[axis] += disp;
    m_tgt[axis]    -= disp;
    {
@@ -939,16 +779,9 @@ void EcatThread::doCenter(int axis)
    setTarget(axis, 0);      /* 显示坐标 0 = 界面上那个正中 */
 }
 
-/*
- * 改量程。**这一步有个必须绕开的陷阱**:
- *
- * interpolate() 是"先夹 m_tgt、再用 m_tgt 算 CSP 目标"的。所以如果把量程**改小**、
- * 而滑台此刻正停在旧量程的边缘外, 那一夹就会把 m_tgt 拽回来 —— 那等于**凭空产生一次
- * 运动, 而且是没人按过任何按钮的运动**。
- *
- * 所以这里的规矩是: 放大无条件允许(放大夹不到东西); 缩小只在新范围装得下所有轴的
- * 当前 m_tgt 时才允许, 装不下就拒绝。**绝不为了迁就新量程去改 want/tgt。**
- */
+/* 改量程。interpolate() 是"先夹 m_tgt、再用 m_tgt 算 CSP 目标"的, 所以**改小**时若滑台
+ * 正停在旧量程边缘外, 那一夹会把 m_tgt 拽回来 —— 等于凭空一次没人按过按钮的运动。
+ * 放大无条件允许; 缩小只在新范围装得下所有轴当前的 m_tgt 时才允许。 */
 void EcatThread::doRange(int32_t range)
 {
    const int32_t old = m_range.load();
@@ -1081,24 +914,10 @@ void EcatThread::publish(int wkc)
    t.connected    = (m_bus != nullptr);
    t.in_op        = m_in_op;
    t.busy         = m_busy;
-   /*
-    * 与 m_busy 同一个写法: 源是工作线程的成员, 每周期向遥测拷贝一次。
-    *
-    * 但**它不是界面上"正在复位…"能亮起来的原因** —— 这一条要说清, 否则下次改的人
-    * 会把真正起作用的那半删掉。publish() 和 doFaultReset() 都在 run() 这一个线程里
-    * (drainCommands 在循环顶部, publish 在循环底部), 而 doFaultReset 里那段复位是
-    * **阻塞**的 (每轴最多 1 秒): 这期间 run() 整个卡在里面, publish 一次都跑不到,
-    * 所以下面这句在复位期间根本没机会执行, 而复位回来时 m_resetting 已经被置回 false
-    * —— 只靠这一句, 界面永远看不到 resetting == true。
-    *
-    * 真正让界面看到的是 doFaultReset 里那两次**加锁直写 m_telem.resetting**: 界面线程
-    * 以 30Hz 独立轮询 telemetry(), 工作线程阻塞期间它照样读得到。两处都要:
-    * 加锁直写负责"阻塞期间看得见", 这一句负责"循环恢复后整个结构体仍然是自洽的"
-    * (也是万一以后把复位改成跨周期状态机时唯一还需要的那半)。
-    */
+   /* 与 m_busy 同一个写法。**它不是界面"正在复位…"能亮起来的原因** —— 真正让界面看到
+    * 的是 doFaultReset 里那两次加锁直写 (同线程, 阻塞期间这一句跑不到); 这一句负责自洽。 */
    t.resetting    = m_resetting;
-   /* 回零同一套, 理由与上面那段一字不差 —— 而且它更长 (回零能跑满 30 秒): 真正让
-    * 界面看到"正在回零…"的是 doHome() 里那两次加锁直写, 这一句负责循环恢复后自洽。 */
+   /* 回零同一套, 而且它更长 (回零能跑满 30 秒) */
    t.homing        = m_homing;
    t.homing_axis   = m_homing_axis;
    t.homing_method = m_homing_method;
@@ -1106,11 +925,8 @@ void EcatThread::publish(int wkc)
    t.wkc          = wkc;
    t.expected_wkc = (m_bus != nullptr) ? em_expected_wkc(m_bus) : 0;
    t.range        = m_range.load();
-   /* 界面靠它知道"现在生效的是哪一条判据" —— 措辞与灯都随它变 (见 BusTelem::di_invert)。
-    *
-    * **一次 load 出一个局部量**, 下面每根轴都用这一个。不能在循环里一轴 load 一次:
-    * 界面正好在两次 load 之间勾了那个框的话, 同一次 publish 里会一半轴按老值算、
-    * 一半按新值算 —— 一份自相矛盾的电文, 而它看起来和正常电文一模一样。 */
+   /* 界面靠它知道"现在生效的是哪一条判据"。**一次 load 成局部量**: 不能在循环里一轴
+    * load 一次, 否则同一次 publish 里会一半轴按老值、一半按新值算。 */
    const bool di_invert = m_di_invert.load();
    t.di_invert = di_invert;
 
@@ -1121,6 +937,8 @@ void EcatThread::publish(int wkc)
 
       a.valid     = true;
       a.mirror_ok = em_mirror_ok(ax) != 0;
+      /* 只是搬一份**上次读到**的 6061h —— 这里不做 SDO 读 */
+      a.mode_disp = m_mode_disp[i];
       a.frames    = em_mirror_frames(ax);
       a.sw        = em_sw(ax);
       a.state     = QString::fromUtf8(em_sw_state_str(a.sw));
@@ -1132,25 +950,16 @@ void EcatThread::publish(int wkc)
       a.vel       = vel[i];
       a.at_target = (a.want == a.tgt);
 
-      /*
-       * 60FDh 三个开关。**dig_known 与那三个 bool 分开算**:
-       * 读不到时 em_di_*() 一律返回 0, 而"三个都没压住"在界面上是个看起来完全正常的
-       * 结论 —— 不知道和"都没压住"必须分得开, 这里就是分的那一处。
-       */
+      /* 60FDh 三个开关。**dig_known 与那三个 bool 分开算**: 读不到时 em_di_*() 一律返回 0,
+       * 而"三个都没压住"在界面上是个看起来完全正常的结论。 */
       a.dig_known = em_dig_in_known(ax) != 0;
       a.dig_home  = em_di_home(ax)   != 0;
       a.dig_pos   = em_di_poslim(ax) != 0;
       a.dig_neg   = em_di_neglim(ax) != 0;
 
-      /*
-       * 「输入电平反转 (NPN)」。**三个一起翻, 不能只翻一个** —— 2300h 配反了是整排
-       * 一起反相 (手册 V2.4 p84 那句话反过来读就是这个意思), 分开翻反而会造出一个
-       * "看着对"的错状态, 而那种状态比全错更难发现。
-       *
-       * 读不到 60FDh 时那三个都是 0, 翻完变成"三个都压着"。**这个方向是故意的**:
-       * dig_known 那条规矩本来就是"不知道 ≠ 没压着", 翻成"压着"与它同一个方向 ——
-       * 万一有人在别处漏判了 dig_known, 看到的是"压着"(会拦下来), 而不是"松开"(会放过去)。
-       */
+      /* 「输入电平反转 (NPN)」。**三个一起翻, 不能只翻一个** —— 2300h 配反了是整排一起
+       * 反相。读不到 60FDh 时那三个都是 0, 翻完变成"三个都压着", **这个方向是故意的**:
+       * 万一有人在别处漏判了 dig_known, 看到的是"压着"(会拦下来)而不是"松开"(会放过去)。 */
       if (di_invert)
       {
          a.dig_home = !a.dig_home;
@@ -1158,8 +967,7 @@ void EcatThread::publish(int wkc)
          a.dig_neg  = !a.dig_neg;
       }
 
-      /* 撞限位: **只此一处算**, 控制器 / 参数栏 / 画布都读这个字段。
-       * 判据由 limit_rule_for(di_invert) 选, 见 ecatworker.h。 */
+      /* 撞限位: **只此一处算**, 控制器 / 参数栏 / 画布都读这个字段 */
       a.limit_active = ecatcmd::limit_hit(a.sw, a.dig_known, a.dig_pos, a.dig_neg,
                                           di_invert);
 
@@ -1175,8 +983,7 @@ void EcatThread::publish(int wkc)
          for (int i = 0; i < EM_MAX_AXES; i++)
             m_want[i] = m_tgt[i];
       }
-      /* 不写 0x0000: 故障时驱动器自己会退电, 我们只停止下发新目标。
-       * 措辞要在 hmi 和 scan **两边都成立** —— 这句话是共用的, 而 scan 那边有「故障复位」。 */
+      /* 不写 0x0000: 故障时驱动器自己会退电, 这里只停止下发新目标 */
       note(QStringLiteral("6041h bit3 = Fault -> 已冻结目标。查清故障原因 (603Fh 是故障码), "
                           "再用「故障复位」清故障位"));
    }
@@ -1218,11 +1025,8 @@ void EcatThread::teardown()
       std::printf("\n==== hmi 收尾 ====\n");
       std::fflush(stdout);
 
-      /*
-       * em_shutdown 自己会: 给使能中的轴写 6040h=0x0000 -> 打 250ms 过程数据 ->
-       * 用 6041h 确认 bit2 已清 -> 还原 PDO 映射 -> 降回 PRE_OP -> 关网卡。
-       * 这里不再单独调 em_disable_all, 那只会让每根轴多等一次状态机超时。
-       */
+      /* em_shutdown 自己会: 写 6040h=0x0000 -> 250ms 过程数据 -> 用 6041h 确认 bit2 已清
+       * -> 还原 PDO 映射 -> 降回 PRE_OP -> 关网卡。这里不再单独调 em_disable_all。 */
       em_shutdown(m_bus, /*restore_mapping=*/1, &live);
       if (live)
          m_maybe_live = true;

@@ -1,22 +1,14 @@
 /*
- * sm_motion.c - CiA402 使能状态机 (S3) 与微动反馈闭环 (S4)
- *
- * 本文件**不含任何 ecx_SDOwrite** —— 所有写都经由 sm_guard.c 的
- * sm_wr_*() / sm_set_cw(), 未授权时它们直接拒绝。这里只负责"写什么、按什么顺序写、
- * 写完等什么位、等超时了怎么办"。
- *
- * 为什么用 SDO 而不是 PDO (见设计决策 D1):
- *   YKD2205PE 出厂默认 TxPDO (1A00h) 是空的, 要让 PDO 通路可用必须写
- *   1C12h/1C13h/1600h/1A00h —— 而 PP 模式的速度规划器本来就在驱动器内部,
- *   走 SDO 写 607Ah/6081h/6040h 一样能跑完整动作, 且零持久配置变更、
- *   不暴露 SM 看门狗 (SAFE_OP/PRE_OP 下不发过程数据, 不会被看门狗判故障)。
- *
- * 使能序列用**位判断**, 不用数值比较 —— 手册明确该驱动器 6041h 低 4 位是
+ * sm_motion.c - CiA402 使能状态机 (S3) 与微动反馈闭环 (S4)。
+ * 本文件不含任何 ecx_SDOwrite, 所有写都经 sm_guard.c 的 sm_wr_*() / sm_set_cw(),
+ * 未授权时它们直接拒绝。这里只负责写什么、按什么顺序写、写完等什么位、超时怎么办。
+ * 用 SDO 而非 PDO: YKD2205PE 出厂默认 TxPDO (1A00h) 是空的, 启用 PDO 必须写
+ * 1C12h/1C13h/1600h/1A00h; 走 SDO 写 607Ah/6081h/6040h 一样能跑完整动作, 且
+ * 零持久配置变更、不暴露 SM 看门狗 (SAFE_OP/PRE_OP 下不发过程数据)。
+ * 使能序列全程用位判断, 不用数值比较: 手册明确 6041h 低 4 位是
  * 0000/0001/0011/0111 的非标准编码。
- *
- * 微动完成判据用**位置静止**而不是 bit10/bit12 握手: SDO 轮询 (5ms 节拍 + 邮箱
- * 往返) 大概率抓不到 PP 的瞬态握手位, 靠位会误判。位置静止 + 行程断言
- * 把"动作结束了吗"和"动得对不对"干净地分成两件事。
+ * 微动完成判据用位置静止而不是 bit10/bit12 握手: SDO 轮询 (5ms 节拍 + 邮箱往返)
+ * 大概率抓不到 PP 的瞬态握手位, 靠位会误判。
  */
 
 #include <stdio.h>
@@ -24,25 +16,17 @@
 
 #include "sm.h"
 
-/* ======================================================================
- * 状态字出参: 值 + "这个值到底读到了没有"
- *
- * 为什么必须两个一起带: 没读到时若只剩一个 uint16_t, 打印出来就是 0x0000,
- * 而 0x0000 在 CiA402 里是**合法的** "Not ready to switch on" —— 一次读失败
- * 会被伪装成一个驱动器状态, 看日志的人会去查一个并不存在的故障。0x0000 是
- * 陷阱值, 不是哨兵值, 所以这里不能用哨兵, 只能显式带一个有效位。
- * ====================================================================== */
+/* 状态字出参: 值 + 有效位, 两者必须一起带。0x0000 在 CiA402 里是合法的
+ * "Not ready to switch on", 是陷阱值不是哨兵值 —— 读失败若只留一个 uint16_t,
+ * 就会被伪装成驱动器状态。 */
 typedef struct
 {
    uint16_t v;   /* 6041h 的值, 仅在 ok=1 时有意义 */
    int      ok;  /* 1 = 真实读到; 0 = 从未读到, 值无意义 */
 } sm_sw_t;
 
-/*
- * 把状态字渲染成可打印片段。没读到 -> "----"。
- * 只在失败路径才需要 (调一次), 所以由调用者给缓冲, 不共用静态缓冲 ——
- * 静态缓冲会让同一个 printf 里的两次调用互相覆盖。
- */
+/* 把状态字渲染成可打印片段, 没读到 -> "----"。由调用者给缓冲: 静态缓冲会让同一个
+ * printf 里的两次调用互相覆盖。 */
 static void sw_str(char *dst, size_t n, const sm_sw_t *s)
 {
    if (s->ok)
@@ -51,24 +35,9 @@ static void sw_str(char *dst, size_t n, const sm_sw_t *s)
       snprintf(dst, n, "----");
 }
 
-/* ======================================================================
- * 等待状态字某组位
- *
- * fault_aborts = 1 时, 等到 Fault 位置起就立即中止 (运动期应该这样 —— 有故障就停)。
- * fault_aborts = 0 时忽略 Fault 位, 只按 mask/want 判 (故障复位等待要用这个:
- * 复位过程中 Fault 位本来就是 1, 不能因此中止)。
- *
- * 返回: 1 = 满足; 0 = 超时; -1 = 已中止 (Fault / Ctrl-C / 掉线)
- *
- * **读失败不再在这里中止**。以前 SM_RD_TIMEOUT 一命中就 abort(SM_ABORT_IO),
- * 于是单次 200ms 邮箱往返慢一拍 = 整轮动作报废, 日志还写着"总线读写失败" ——
- * 而"这次没读到"和"总线坏了"是两回事 (诊断计数全 0 时尤其明显)。现在读失败
- * 只是重试, 窗口内一直读不到就由 return 0 如实报告为超时。
- * 副作用是把"总线还活着吗"整个交给看门狗 —— 所以下面那个 watchdog 检查不是
- * 可选项, 它是被让出去的那份责任的新承担者。
- *
- * *last 同时带回有效位, 调用者在 FAIL 路径上必须用 sw_str() 打印。
- * ====================================================================== */
+/* 等待状态字某组位。fault_aborts=1: 等到 Fault 位立即中止 (运动期用); =0: 忽略 Fault
+ * 位只按 mask/want 判 (故障复位等待用)。读失败只重试不中止, 窗口内一直读不到就 return 0
+ * 报超时。返回 1 = 满足; 0 = 超时; -1 = 已中止 (Fault / Ctrl-C / 掉线)。 */
 static int wait_sw(sm_axis_t *ax, uint16_t mask, uint16_t want,
                    uint32_t tmo_ms, sm_sw_t *last, int fault_aborts)
 {
@@ -89,11 +58,8 @@ static int wait_sw(sm_axis_t *ax, uint16_t mask, uint16_t want,
          return -1;
       }
 
-      /*
-       * 掉线判定: 看"距上一次成功交互多久", 不是"这一次失败没有"。
-       * 判据必须是前者 —— 一次失败说明不了什么, 一直失败才是掉线。
-       * 读失败路径已经不自己中止了, 这是唯一的兜底。
-       */
+      /* 掉线判定看"距上一次成功交互多久", 不是"这一次失败没有": 一直失败才是掉线。
+       * 读失败路径不自己中止, 这是兜底。 */
       if (sm_guard_watchdog_expired())
       {
          sm_xfer_flush();   /* 掉线证据要出现在这条结论之前 */
@@ -129,7 +95,7 @@ static int wait_sw(sm_axis_t *ax, uint16_t mask, uint16_t want,
       }
       /* 读失败 (超时 / 从站 abort): 下一轮再试, 不中止 */
 
-      /* 差值法比较, 回绕安全 (理由见 sm_guard.c 的 guard_wait_sw) */
+      /* 差值法比较, 回绕安全 */
       if ((int32_t)(sm_now_ms() - t0) >= (int32_t)tmo_ms)
       {
          sm_xfer_flush();
@@ -154,25 +120,16 @@ static int read_i32_or_abort(sm_axis_t *ax, uint16_t index, int32_t *v)
    return -1;
 }
 
-/* ======================================================================
- * 只读快照: 6081h / 6083h / 6084h / 6060h
- *
- * 微动会临时改这四个对象, 收尾必须恢复原值。预演模式也要用 —— 好让操作员
- * 在真正动手前就看到"收尾会把它们恢复成什么"。全程只读。
- * ====================================================================== */
+/* 只读快照: 6081h / 6083h / 6084h / 6060h。微动会临时改这四个对象, 收尾必须
+ * 恢复原值; 预演模式也要用。 */
 void sm_snapshot_pp(sm_axis_t *ax)
 {
    static const uint16_t idx[3] = { SM_OID_PROF_VEL, SM_OID_PROF_ACC,
                                     SM_OID_PROF_DEC };
    int k;
 
-   /*
-    * 只补空缺, 不覆盖已有快照 —— 这点很关键:
-    *   S3 会先把 6060h 写成 1 (PP)。如果 S4 再调一次本函数并覆盖 6060h,
-    *   快照记录的就成了我们**自己写进去的 1**, 收尾会把它"恢复"成 1,
-    *   而真正的原值 (0) 就丢了。同理 6081h/6083h/6084h 也一样。
-    *   "谁先读到谁说了算"保证了无论调用顺序如何, 记下的都是原始值。
-    */
+   /* 只补空缺, 不覆盖已有快照: S3 会先把 6060h 写成 1 (PP), S4 若覆盖就会把"恢复"
+    * 写成 1 而丢掉原值。谁先读到谁说了算, 保证记下的都是原始值。 */
    for (k = 0; k < 3; k++)
    {
       uint8_t buf[4];
@@ -212,12 +169,8 @@ void sm_snapshot_pp(sm_axis_t *ax)
    sm_xfer_flush();
 }
 
-/* ======================================================================
- * 前置检查 (全程只读, 在第一次写之前)
- *
- * 任一条件命中就拒绝执行, 退出码 SM_EXIT_REFUSED —— 此时**一个字节都没写**,
- * 操作员可以把"拒绝"和"动了但失败"清楚地区分开。
- * ====================================================================== */
+/* 前置检查 (全程只读, 在第一次写之前)。任一条件命中即拒绝执行, 退出码
+ * SM_EXIT_REFUSED, 此时一个字节都没写。 */
 int sm_preflight(sm_axis_t *ax, int nslaves, int32_t delta)
 {
    int      i;
@@ -270,7 +223,7 @@ int sm_preflight(sm_axis_t *ax, int nslaves, int32_t delta)
    }
 
    /* P2: 位置与速度读数。前置阶段一律不用 read_i32_or_abort ——
-      它会把失败升级成全局中止, 而这里只想干净地"拒绝", 不动全局状态。 */
+      它会把失败升级成全局中止, 这里只想干净地拒绝, 不动全局状态。 */
    for (i = 0; i < 3; i++)
    {
       if (sm_rd_i32(ax->slave, SM_OID_ACT_POS, 0, &pos[i], SM_SDO_TMO_IDLE,
@@ -311,13 +264,8 @@ int sm_preflight(sm_axis_t *ax, int nslaves, int32_t delta)
    {
       int32_t vel = 0;
 
-      /*
-       * 读不到 606Ch 必须**拒绝**, 不能"跳过这一项继续"。
-       * 这一项问的是"轴现在是不是正在动?"; 答不出来就意味着可能有另一套
-       * 程序(或上一次中止残留)正在驱动这根轴。此时再使能并叠加一次微动,
-       * 是与未知运动抢控制权 —— 正是本检查存在的原因。6041h/6064h 读不到
-       * 都判拒绝, 这里没有理由例外。
-       */
+      /* 读不到 606Ch 必须拒绝, 不能跳过: 这一项问的是"轴现在是不是正在动", 答不出来
+       * 意味着可能有另一套程序 (或上次中止残留) 正在驱动这根轴。 */
       if (sm_rd_i32(ax->slave, SM_OID_ACT_VEL, 0, &vel, SM_SDO_TMO_IDLE,
                     &ab) != SM_RD_OK)
       {
@@ -334,8 +282,8 @@ int sm_preflight(sm_axis_t *ax, int nslaves, int32_t delta)
       }
    }
 
-   /* P3: 相对微动的原点保护。相对模式下 607Ah 是小偏移量; 万一驱动器忽略了
-      bit6 当成绝对位置, 从很远处出发就会是一次不受控的长距离运动。 */
+   /* P3: 相对微动的原点保护。相对模式下 607Ah 是小偏移量; 驱动器若忽略 bit6
+      当成绝对位置, 从很远处出发就是一次不受控的长距离运动。 */
    if (pos[0] > SM_ORIGIN_GUARD || pos[0] < -SM_ORIGIN_GUARD)
    {
       printf("      [拒绝] 当前位置 %d 距原点超过保护距离 %ld, "
@@ -344,8 +292,7 @@ int sm_preflight(sm_axis_t *ax, int nslaves, int32_t delta)
       return SM_EXIT_REFUSED;
    }
 
-   /* P4: 限位 (60FDh)。只在**运动方向**上的限位已触发才拒绝 ——
-      反方向的限位压着不影响往另一侧走。 */
+   /* P4: 限位 (60FDh)。只在运动方向上的限位已触发才拒绝, 反方向压着不影响。 */
    {
       uint8_t dbuf[4];
       int     dsz = 0;
@@ -381,8 +328,8 @@ int sm_preflight(sm_axis_t *ax, int nslaves, int32_t delta)
       ax->warn = 1;
    }
 
-   /* P5: 软限位 (607Dh)。文档没列这个对象, 很可能不存在 —— 读得到就是硬约束,
-      读不到就把微动行程收紧到 SM_NO_SOFTLIMIT_CAP。 */
+   /* P5: 软限位 (607Dh)。文档没列该对象: 读得到就是硬约束, 读不到则把微动
+      行程收紧到 SM_NO_SOFTLIMIT_CAP。 */
    {
       int32_t lo = 0, hi = 0;
       int32_t ab1 = 0, ab2 = 0;
@@ -406,11 +353,7 @@ int sm_preflight(sm_axis_t *ax, int nslaves, int32_t delta)
       }
       else
       {
-         /*
-          * 没有软限位可依据, 就**真的**把行程卡死在这里 —— 只是打印一句
-          * "将被限制在 ±N" 而代码里没有对应约束, 是对操作者的误导: 一旦
-          * 有人用 --force-caps 放大 --jog, 提示与实际就分道扬镳了。
-          */
+         /* 没有软限位可依据就真的把行程卡死在这里, 不能只打印而代码无对应约束。 */
          printf("      607Dh 软限位不可读 (abort 0x%08X/0x%08X), 该驱动器可能不支持; "
                 "微动行程将被限制在 ±%d 脉冲内。\n",
                 (unsigned)ab1, (unsigned)ab2, SM_NO_SOFTLIMIT_CAP);
@@ -431,17 +374,9 @@ int sm_preflight(sm_axis_t *ax, int nslaves, int32_t delta)
    return 0;
 }
 
-/* ======================================================================
- * S3: 使能状态机
- *
- * 步骤 (位判断, 数值不作为判据):
- *   0  故障复位 (仅在 --reset-fault 时)
- *   1  6040h = 0x0006 Shutdown        -> 等 bit0 & bit1
- *   2  6040h = 0x0007 Switch On       -> 等 bit1 且无 bit3
- *   3  6040h = 0x000F Enable Op       -> 等 bit2
- *   4  保持 enable_hold_ms, 期间 bit2 不得掉、bit3 不得起
- *   5  写 6060h=1 (PP), 回读 6061h 验证写入生效
- * ====================================================================== */
+/* S3: 使能状态机 (位判断, 数值不作为判据)。步 0 = 故障复位 (仅 --reset-fault);
+ * 步 1 = 6040h 0x0006 -> 等 bit0&bit1; 步 2 = 0x0007 -> 等 bit1 且无 bit3;
+ * 步 3 = 0x000F -> 等 bit2; 步 4 = 保持 enable_hold_ms; 步 5 = 6060h=1 (PP), 回读 6061h。 */
 int sm_stage_enable(sm_axis_t *ax, uint32_t enable_hold_ms)
 {
    sm_sw_t  last = { 0, 0 };   /* 值 + 有效位: FAIL 路径要靠 sw_str() 打印 */
@@ -452,28 +387,19 @@ int sm_stage_enable(sm_axis_t *ax, uint32_t enable_hold_ms)
    printf("\n  === 位置 %d: 使能状态机 (S3) ===\n", ax->pos);
    g_guard.t_start_ms = sm_now_ms();
 
-   /*
-    * 从这里起打开 SDO 事务日志, 一直到收尾 (sm_guard_teardown) 才关。
-    * 范围刻意只覆盖运动窗口: S0/S1/预检的读已经有自己的报告 (逐项参数表),
-    * 这里再叠一层只是重复; 而 S3/S4/S5 以前是**完全静默**的 —— 6041h 被
-    * 轮询几十次, 每次的结果一个字都没落下来, 于是 S3 失败时日志只剩一句
-    * 6041h=----。新观测放在唯一缺观测的位置。
-    */
+   /* 从这里起打开 SDO 事务日志, 到收尾 (sm_guard_teardown) 才关; 范围只覆盖运动窗口,
+    * S0/S1/预检的读已有逐项参数表。 */
    sm_xfer_set_active(1);
 
-   /*
-    * 从这里起这根轴归本次运行接管。收尾与急停只处理 engaged 的轴, 所以
-    * "接管"这一步的时机决定了我们会去动哪些轴 —— 放在前置检查已经通过、
-    * 马上要写第一个字节的位置。置位之后无论从哪条路径退出, 收尾都会覆盖它。
-    */
+   /* 从这里起这根轴归本次运行接管 (前置检查已通过, 马上要写第一个字节)。
+    * 收尾与急停只处理 engaged 的轴。 */
    ax->engaged = 1;
 
-   /* 看门狗基准也在这里落一次, 免得一个过期的 last_io_ms 让第一条轮询就
-     误判成掉线。 */
+   /* 看门狗基准在这里落一次, 免得过期的 last_io_ms 让第一条轮询误判成掉线。 */
    sm_guard_feed();
 
-   /* 在**任何写之前**抓原始快照 (6081h/6083h/6084h/6060h), 收尾按它恢复。
-     放在这里而不是 S4, 是因为 S3 第 5 步就会把 6060h 写成 1。 */
+   /* 在任何写之前抓原始快照 (6081h/6083h/6084h/6060h), 收尾按它恢复:
+     放在这里而不是 S4, 因为 S3 第 5 步就会把 6060h 写成 1。 */
    sm_snapshot_pp(ax);
 
    /* 0. 故障复位 (可选) */
@@ -494,11 +420,8 @@ int sm_stage_enable(sm_axis_t *ax, uint32_t enable_hold_ms)
       if (wait_sw(ax, SM_SW_FAULT, 0, SM_ENABLE_TMO_MS, &last, 0) != 1)
       {
          sw_str(sws, sizeof(sws), &last);
-         /*
-          * 这里只说"没等到 bit3 清零", 不能说"bit3 仍为 1" —— 后者是一句
-          * 关于驱动器的话。最后一次读失败时我们压根不知道 bit3 是什么,
-          * (6041h=----) 正是这个意思, 别让措辞把不确定说成确定。
-          */
+         /* 只说"没等到 bit3 清零", 不能说"bit3 仍为 1": 最后一次读失败时我们不知道
+          * bit3 是什么 (6041h=----)。 */
          printf("      [FAIL] 故障复位后未等到 bit3 清零 (6041h=%s)。\n", sws);
          return SM_V_FAIL;
       }
@@ -554,8 +477,8 @@ printf("      [PASS] Ready to switch on (6041h=0x%04X)\n",
    }
    printf("      [PASS] Switched on (6041h=0x%04X)\n", (unsigned)last.v);
 
-   /* 3. Enable Operation —— 这是本工具最关键的一步, 也是"PRE_OP/SAFE_OP 下
-      SDO 写 6040h 到底能不能真的把功率级打开"这个未知问题的答案所在。 */
+   /* 3. Enable Operation —— 本工具最关键的一步: PRE_OP/SAFE_OP 下用 SDO 写
+      6040h 能否真的打开功率级。 */
    printf("  3. Enable Operation\n");
    if (sm_set_cw(ax, SM_CW_ENABLE_OP, "S3-3 Enable Operation") != 0)
       return SM_V_FAIL;
@@ -665,15 +588,9 @@ printf("      [PASS] Ready to switch on (6041h=0x%04X)\n",
    return SM_V_PASS;
 }
 
-/* ======================================================================
- * S4: 单腿微动
- *
- * 完成判据是"位置静止", 不是 bit10/bit12:
- *   - 已经动过 (|pos-p0| > 噪声) 且位置连续 SM_SETTLE_MS 不变 -> 结束
- *   - 一直没动过且超过 SM_STALL_MS -> 失速中止
- *   - 超过单腿 deadline -> 超时中止
- * 动得对不对由调用者的断言负责, 这里只回答"停了吗"。
- * ====================================================================== */
+/* S4: 单腿微动。完成判据是位置静止, 不是 bit10/bit12: 动过 (|pos-p0| > 噪声) 且位置
+ * 连续 SM_SETTLE_MS 不变 -> 结束; 一直没动过且超过 SM_STALL_MS -> 失速中止; 超过单腿
+ * deadline -> 超时中止。动得对不对由调用者的断言负责, 这里只回答"停了吗"。 */
 static int jog_leg(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
                    uint32_t dec, uint32_t move_tmo_ms, int32_t *p0_out,
                    int32_t *p1_out, int32_t *peak_out, uint32_t *ms_out,
@@ -714,12 +631,8 @@ static int jog_leg(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
    {
       int32_t rb = 0;
 
-      /*
-       * 回读失败也必须放弃本腿。607Ah 的回读是"驱动器到底接受了什么目标"
-       * 的唯一证据 —— 尤其在加急写 (4 字节) 上, 这份 SOEM 会把从站的 SDO
-       * abort 当成写成功(见 sm_guard.c 里 guard_force_disable 的说明), 所以
-       * 写返回 0 并不能说明目标被接受。读不回来就当作没写进去。
-       */
+      /* 回读失败也必须放弃本腿。607Ah 的回读是"驱动器接受了什么目标"的唯一证据:
+       * 这份 SOEM 在加急写 (4 字节) 上会把从站的 SDO abort 当成写成功。 */
       if (sm_rd_i32(ax->slave, SM_OID_TARGET_POS, 0, &rb, SM_SDO_TMO_MOTION,
                     &ab) != SM_RD_OK)
       {
@@ -741,19 +654,15 @@ static int jog_leg(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
       return -1;
    if (sm_set_cw(ax, SM_CW_PP_TRIGGER, "微动 触发新设定点") != 0)
       return -1;
-   /* bit4 必须落下去, 否则下一腿的上升沿不存在, 那一腿会直接失速。
-      落沿失败没有别的补救办法, 只能放弃本腿。 */
+   /* bit4 必须落下去, 否则下一腿没有上升沿, 会直接失速; 落沿失败只能放弃本腿。 */
    if (sm_set_cw(ax, SM_CW_PP_IDLE, "微动 落沿") != 0)
    {
       printf("      [FAIL] bit4 落沿写失败 —— 无法为下一腿准备上升沿。\n");
       return -1;
    }
 
-   /*
-    * 计时起点放在**触发之后**。写在前面的话, 几次邮箱往返 (几个 200ms 的
-    * SDO 超时窗口) 会被算进"命令发出后位置仍无变化"的窗口里, 一条刚起步的
-    * 健康运动可能在触发瞬间就被判失速。
-    */
+   /* 计时起点放在触发之后: 写在前面的话, 几次邮箱往返会被算进"命令发出后位置仍无
+    * 变化"的窗口, 刚起步的健康运动会在触发瞬间被判失速。 */
    t0 = sm_now_ms();
 
    /* 单腿时间预算: 梯形速度曲线下的理论时间 × 3 + 余量 */
@@ -782,11 +691,8 @@ static int jog_leg(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
          return -1;
       }
 
-      /*
-       * dead-man 检查。掉线不会自己举手 —— 这份 SOEM 里 islost 从不被置位,
-       * 从站静静地不来只表现为 SDO 一直超时。所以用"距上次成功交互多久"
-       * 判断总线是不是还活着。电机正带电时这是必须的。
-       */
+      /* dead-man 检查。这份 SOEM 里 islost 从不被置位, 从站不来只表现为 SDO 一直超时,
+       * 所以用"距上次成功交互多久"判断总线是否还活着。电机带电时这是必须的。 */
       if (sm_guard_watchdog_expired())
       {
          sm_xfer_flush();
@@ -892,18 +798,9 @@ static int jog_leg(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
    return rc;
 }
 
-/*
- * S4: 微动 + 反馈闭环 (去一趟 + 回一趟, 可重复 N 次)
- *
- * 断言:
- *   A1 行程  |实测Δ - 命令Δ| <= max(SM_POS_NOISE_PULSES, 2% × |命令Δ|)
- *   A2 方向  sign(实测Δ) == sign(命令Δ)
- *   A3 速度  峰值速度 > 0           (驱动器真的动了, 反馈不是死的)
- *   A4 限速  峰值速度 <= 设定速度 × 1.2                      (超了记 WARN)
- *   A5 回程  反向腿方向正确
- *   A6 归位  |终点 - 起点| <= 容差    (往返闭环能回到原点)
- *   A7 单调  方向违例次数 == 0                               (有则记 WARN)
- */
+/* S4: 微动 + 反馈闭环 (去一趟 + 回一趟, 可重复 N 次)。断言 A1 行程 |实测Δ - 命令Δ| <=
+ * max(SM_POS_NOISE_PULSES, 2% × |命令Δ|); A2 方向一致; A3 峰值速度 > 0; A4 峰值速度 <=
+ * 设定速度 × 1.2 (WARN); A5 反向腿方向正确; A6 归位 <= 容差; A7 方向违例 == 0 (WARN)。 */
 int sm_stage_jog(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
                  uint32_t dec, uint32_t move_tmo_ms, int repeats,
                  int32_t tol_pulses)
@@ -923,11 +820,8 @@ int sm_stage_jog(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
    if (tol_pulses > 0)
       tol = tol_pulses;
 
-   /*
-    * 再兜一次底。调用者已经夹过容差, 但这是个公开入口 —— 容差一旦大于行程
-    * 本身, A1/A6 就恒成立, 日志会显示 PASS, 而"动得对不对"其实没被检查。
-    * 这类"检查悄悄失效"的失效方式比直接报错危险得多, 所以在最后一道也夹住。
-    */
+   /* 再兜一次底: 这是公开入口, 容差一旦大于行程本身, A1/A6 就恒成立, 日志显示 PASS
+    * 而"动得对不对"其实没被检查。 */
    {
       int64_t a = (delta < 0) ? -(int64_t)delta : (int64_t)delta;
       int64_t cap = a / 4;
@@ -1133,12 +1027,8 @@ int sm_stage_jog(sm_axis_t *ax, int32_t delta, uint32_t vel, uint32_t acc,
    return SM_V_PASS;
 }
 
-/* ======================================================================
- * 预演: 打印将要写什么, 一个字节都不写
- *
- * 这是零风险的端到端自检路径 —— 参数解析、身份门、基线比对、S3/S4 的
- * 完整写入序列与断言逻辑都会跑到, 只是不落到总线上。
- * ====================================================================== */
+/* 预演: 打印将要写什么, 一个字节都不写。参数解析、身份门、基线比对、S3/S4 的
+ * 完整写入序列与断言逻辑都会跑到, 只是不落到总线上。 */
 void sm_stage_dry_run(const sm_axis_t *axes, int nslaves, int32_t delta,
                       uint32_t vel, uint32_t acc, uint32_t dec,
                       uint32_t move_tmo_ms, int repeats)

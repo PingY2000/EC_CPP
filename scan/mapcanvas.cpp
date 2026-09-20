@@ -15,8 +15,7 @@ namespace scan {
 
 /* ---------------------------------------------------------------- 配色 */
 
-/* 与 hmi/axispanel.cpp / main.cpp 里那套是同一套, 照抄过来而不是 include ——
- * 那是个 .cpp 里的局部变量, 抽出来要动 hmi/, 而这一版的原则是 hmi 一个字不改。 */
+/* 与 hmi 那套是同一组颜色 */
 static const QColor C_BG     ("#15181e");   /* 画布底色, 比面板 #1f232a 再深一点 */
 static const QColor C_AREA   ("#3c434e");   /* 扫描区域框 */
 static const QColor C_GRID   ("#23272f");   /* 网格线, 要很轻 */
@@ -28,24 +27,15 @@ static const QColor C_TGT    ("#33d17a");   /* 本周期下发的插值目标 (�
 static const QColor C_CUR    ("#ffffff");   /* 实测位置: 见下 */
 static const QColor C_FAIL   ("#d03b3b");   /* 采失败的那一格 */
 static const QColor C_SEL    ("#c8ced8");   /* 左键查看选中的格 */
-/* 撞限位。**故意不复用 C_FAIL** —— 那个红的意思是"这一格没采到数", 是数据的问题;
- * 这个是机械压在开关上, 是要立刻去处理的事。同一块画布上两种红必须能分开。 */
+/* 撞限位。故意不复用 C_FAIL: 那个红的意思是"这一格没采到数", 这个是机械压在开关上 */
 static const QColor C_LIMIT  ("#ff5f5f");
 
-/*
- * 实测位置在 hmi 里是蓝色的 (#4a9eff)。**这里刻意换成白色。**
- *
- * 因为这块画布上蓝色已经是**数据**了 (热力图就是蓝色顺序色标)。位置标记再用蓝色,
- * 就变成"一个中值的格子和滑台现在在哪儿"分不清 —— 而这两个意思是完全不同的东西。
- * 白色在所有色阶上都最跳, 也正是"现场光标"该有的样子。
- * hmi 那边画布上没有数据, 所以它用蓝色没问题, 不必跟着改。
- */
+/* 实测位置用白色 (hmi 里是蓝色): 这块画布上蓝色已是热力图的数据色, 位置标记再用蓝会分不清 */
 static const QColor C_POS    ("#ffffff");
 
 /* ---------------------------------------------------------------- OKLab */
 
-/* Björn Ottosson 的 OKLab。用它插值是因为 sRGB 直插在中段会塌下去 (发灰发暗),
- * 一条本该均匀的色带看上去像被分成了几节。 */
+/* Björn Ottosson 的 OKLab。用它插值: sRGB 直插在中段会发灰, 色带看着像分成几节。 */
 struct Lab { double L, a, b; };
 
 static double s2l(double c)
@@ -98,11 +88,8 @@ static QColor fromLab(const Lab &v)
 /* ---------------------------------------------------------------- 顺序色标 */
 
 /*
- * 蓝色的 13 级 (100 -> 700)。这一组是**校验过的**: 明度严格单调、色相跨度 4°,
- * 也就是"读起来确实是一个从暗到亮的量, 而不是两种颜色混在一起"。
- *
- * 顺序是**由暗到亮**(数组第 0 项最暗), 因为底色是暗的 —— 近零要退回底色去,
- * 大的值才亮起来。色标条上会写死数值, 这就是暗端对比度低 (1.5:1) 的兜底。
+ * 蓝色的 13 级 (100 -> 700): 明度严格单调、色相跨度 4°。顺序由暗到亮 (第 0 项最暗),
+ * 因为底色是暗的 —— 近零要退回底色。
  */
 static const char *RAMP_HEX[] = {
    "#0d366b", "#104281", "#184f95", "#1c5cab", "#256abf", "#2a78d6", "#3987e5",
@@ -114,8 +101,7 @@ static const int RAMP_N = (int)(sizeof(RAMP_HEX) / sizeof(RAMP_HEX[0]));
 
 MapCanvas::MapCanvas(QWidget *parent) : QWidget(parent)
 {
-   /* 下限压到 240: 这块画布是**跟着窗口长**的那一半, 而右边那列现在自己会滚。
-    * 320 那会儿窗口一缩小, 是右边先被挤没, 而不是画布先变小 */
+   /* 下限 240: 画布是跟着窗口长的那一半, 右边那列自己会滚 */
    setMinimumSize(240, 240);
    setMouseTracking(true);
    setAutoFillBackground(false);
@@ -208,21 +194,14 @@ void MapCanvas::clearSelection()
 /* ---------------------------------------------------------------- 坐标 */
 
 /*
- * 画布视野**固定**成 30×30 单位 (每边 ±15), 再各留 1 单位余量。
- *
- * 以前这里是跟着区域参数缩放的 —— 那样子区域一小, 框还是铺满整块画布: 两次不同尺寸的
- * 扫描, 画出来一模一样大, 颜色也看不出疏密, 图与图没法比。固定视野之后 1 单位恒等于
- * 固定的一格, 区域框反而成了**图里的一个量**, 一眼就能读出它占多大。
- *
- * 区域框画在这个视野**里面**: 默认 27×27, 每边还剩 2.5 单位余量, 手点对位够用。
- * 每 5 单位一条的网格线落在 ±5/±10/±15 上, 正好与 30×30 的边界对齐。
+ * 画布视野固定 30×30 单位 (每边 ±15 = kViewHalfUnits=16 减 1 单位余量), 不跟区域参数缩放:
+ * 1 单位恒等于固定的一格, 区域框成了图里的一个量 (默认 27×27)。网格线每 5 单位一条。
  */
 static const double kViewHalfUnits = 16.0;
 
 /*
- * 画图区四周的留白 (像素)。标尺 / 色标条 / 超量程红字各占一条, **四个数写在一处** ——
- * 谁要往框外画东西 (比如标尺), 就得从这儿拿宽度。散在各处的话, 改了 plotRect 而标尺
- * 还按旧宽度摆, 数字就画到框上去了。
+ * 画图区四周的留白 (像素)。标尺 / 色标条 / 超量程红字各占一条, 四个数写在一处 ——
+ * 要往框外画东西就得从这儿拿宽度, 散在各处会画到框上去。
  */
 static const double kPadL = 38.0;   /* 左边: Y 标尺的刻度与数字 */
 static const double kPadR = 74.0;   /* 右边: 色标条 + 它的数字 */
@@ -243,8 +222,7 @@ QRectF MapCanvas::plotRect() const
    if (side < 40.0)
       return QRectF(0, 0, 0, 0);
 
-   /* **居中**。以前是钉在左上角 8,8 —— 窗口一宽, 正方形画布右边就剩一大块空白,
-    * 而画布恰恰是这里唯一要看的东西。 */
+   /* 居中: 窗口一宽, 钉在左上角会让正方形画布右边剩一大块空白 */
    const double x = kPadL + std::max(0.0, (w - side) / 2.0);
    const double y = kPadT + std::max(0.0, (h - side) / 2.0);
    return QRectF(x, y, side, side);
@@ -305,15 +283,7 @@ void MapCanvas::rebuildImage()
 
 void MapCanvas::rebuildPath()
 {
-   /*
-    * 存的是**单位, 不是像素**。像素由 drawPath 现算 —— 单位是扫描点的本来样子,
-    * 窗口多大跟它没关系。
-    *
-    * 以前这里存的是 pxOf(...) 的像素, 只在"网格数/点数变了"时才重建: 窗口一缩放,
-    * 热力图跟着走了 (它每帧现算), 蛇形线却还停在旧的像素位置上 —— 画布拉大了,
-    * 线只占左上角一小块。像素根本不是这份数据的属性, 存它就得靠一个容易忘的失效
-    * 标记去救。存单位, 这类 bug 就不存在了。
-    */
+   /* 存的是单位, 不是像素 (像素由 drawPath 现算): 单位是扫描点的本来样子, 与窗口大小无关 */
    m_path = QPainterPath();
    if (m_ctl == nullptr || m_ctl->totalPoints() <= 0)
       return;
@@ -383,10 +353,7 @@ void MapCanvas::drawHeat(QPainter &p)
    const int ny = m_ctl->gridNy();
    const double res = m_ctl->params().res_unit;
 
-   /*
-    * 每一格是 res×res 的方块, **以网格点为中心** —— 所以整块热力图比网格点跨距
-    * 两头各多出半格。和网格线对齐: 网格点画在格子的中心, 而不是格子的角。
-    */
+   /* 每格是 res×res 的方块, 以网格点为中心 —— 整块比网格点跨距两头各多出半格 */
    const double half_x = (double)nx * res / 2.0;
    const double half_y = (double)ny * res / 2.0;
 
@@ -443,8 +410,7 @@ void MapCanvas::drawGrid(QPainter &p)
    p.setPen(QPen(clipped ? C_FAIL : C_AREA, clipped ? 2 : 1));
    p.drawRect(area);
 
-   /* 框下那行"视野 ±16 单位"归 drawRulers 管 —— 它得跟刻度数字排在同一条带子里,
-    * 两处各画各的就会叠上 */
+   /* 框下那行"视野"归 drawRulers 画 —— 它要跟刻度数字排在同一条带子里, 两处各画会叠上 */
 
    if (clipped)
    {
@@ -456,12 +422,8 @@ void MapCanvas::drawGrid(QPainter &p)
 }
 
 /*
- * 坐标标尺: 下边是 X, 左边是 Y。每 1 单位一个小刻度, 每 5 单位一个带数字的 ——
- * **与网格线同一组位置**, 所以线和对得上的数永远是同一个。
- *
- * 以前框下面只有一行"视野 ±16 单位", 那是**说明**, 不是标尺: 图上任何一个点离零点
- * 多远, 得自己拿手指头数格子。而这块画布的手动定位恰恰是按坐标下发的 (点一下 =
- * 走到那个显示坐标), 读不出坐标就只能靠试 —— 标尺是给这件事用的。
+ * 坐标标尺: 下边是 X, 左边是 Y。每 1 单位一个小刻度, 每 5 单位一个带数字的,
+ * 与网格线同一组位置。手动定位是按坐标下发的, 读不出坐标就只能靠试。
  */
 void MapCanvas::drawRulers(QPainter &p)
 {
@@ -511,10 +473,7 @@ void MapCanvas::drawRulers(QPainter &p)
       p.drawLine(QPointF(a.x(), r.bottom()), QPointF(a.x(), r.bottom() + kTick));
       p.drawLine(QPointF(r.left(), b.y()), QPointF(r.left() - kTick, b.y()));
 
-      /*
-       * 数字**隔一个画一个**当画布小到"5 单位还不到一个数字宽"的时候 (k < 8, 也就是
-       * 画布被拖到 300px 出头)。刻度线一根不少 —— 少的是数字, 线还得跟网格线对得上。
-       */
+      /* 画布小到"5 单位还不到一个数字宽"时 (k < 8), 数字隔一个画一个; 刻度线一根不少 */
       if (k >= 8.0 || i % 2 == 0)
       {
          const QString s = QString::number(u, 'f', 0);
@@ -531,8 +490,7 @@ void MapCanvas::drawRulers(QPainter &p)
    p.drawText(QRectF(r.left() - kTick - 30.0, r.bottom() + kTick + kGap, 30.0, 12.0),
               Qt::AlignRight | Qt::AlignVCenter, QStringLiteral("单位"));
 
-   /* 视野是固定的, 所以这行写的永远是同一个数 —— 它现在是**刻度说明**,
-    * 不是"这块区域多大" (那写在图里那个框上, 以及左上角那三行里) */
+   /* 视野固定, 这行永远写同一个数; 区域多大写在图里那个框上 */
    p.drawText(QRectF(r.left(), r.bottom() + kTick + kGap + 14.0, r.width(), 14.0),
               Qt::AlignHCenter | Qt::AlignTop,
               QStringLiteral("视野 ±%1 单位 (固定)").arg(half, 0, 'f', 1));
@@ -558,8 +516,7 @@ void MapCanvas::drawPath(QPainter &p)
 
    /* 预览线要很淡: 它的作用是"告诉你待会儿怎么走", 不该压过热力图 */
    QPen pen(QColor(107, 116, 128, 150), 1);
-   /* **cosmetic 不能省**: 世界变换会把线宽一起放大 k 倍 (这里 k ≈ 20), 不写的话
-    * 那条 1px 的细线会变成一条 20px 的灰带, 把整张热力图盖掉 */
+   /* cosmetic 不能省: 世界变换会把线宽一起放大 k 倍 (k ≈ 20), 1px 细线会变成盖掉热力图的灰带 */
    pen.setCosmetic(true);
    p.setBrush(Qt::NoBrush);
    p.setPen(pen);
@@ -602,10 +559,7 @@ void MapCanvas::drawMarkers(QPainter &p)
       f.setPointSizeF(8.0);
       p.setFont(f);
 
-      /*
-       * 数值 —— **没采到也写出来, 写"未采集"**。空着的话跟"这里根本没选中"分不清,
-       * 而这两种情况的下一步动作完全不同 (一个去重测, 一个去检查是不是点歪了)。
-       */
+      /* 数值: 没采到也写出来 (写"未采集") —— 空着会跟"这里根本没选中"分不清 */
       const bool has = m_ctl->cellHasValue(m_sel_ix, m_sel_iy);
       p.setPen(has ? C_TEXT : C_MUTED);
       p.drawText(QRectF(q.x() - 70, q.y() - h - 18, 140, 16), Qt::AlignCenter,
@@ -665,15 +619,8 @@ void MapCanvas::drawMarkers(QPainter &p)
       p.setBrush(C_POS);
       p.drawEllipse(q, R, R);
 
-      /*
-       * 限位判据成立 (默认 = 6041h bit11「硬件限位信号有效」) —— 红圈套在位置点上 +
-       * 写清是哪根轴。
-       * 光一个红圈说不清是 X 还是 Y, 而这两件事的处理办法完全不同; 状态栏里
-       * 也有同样的显示, 这里是为了**眼睛在画布上时不用挪开去读状态栏** ——
-       * 它是扫描中会自动中止的那一类, 值得用两种方式说同一件事。
-       */
-      /* 读的是**已经算好的那一个字段** (由 ecatcmd::limit_hit 一处算出), 不在这里
-       * 再判一次 bit11 —— 这里从前就是那"三处各算一遍"里的一处 */
+      /* 限位判据成立 (默认 = 6041h bit11「硬件限位信号有效」): 红圈套在位置点上 + 写清是哪根轴。
+       * 读的是已经算好的字段 (由 ecatcmd::limit_hit 一处算出), 不在这里再判一次 bit11。 */
       const bool lim_x = t.ax[0].limit_active;
       const bool lim_y = t.ax[1].limit_active;
       if (lim_x || lim_y)
@@ -682,8 +629,7 @@ void MapCanvas::drawMarkers(QPainter &p)
          p.setPen(QPen(C_LIMIT, 2));
          p.drawEllipse(q, R + 7, R + 7);
 
-         /* 措辞与状态栏一致: 「有效」而不是「撞」—— bit11 是那路信号的电平, 不是
-          * 一次已经发生的碰撞 (见 ecatworker.h 里 limit_hit_headline 上面那段) */
+         /* 措辞与状态栏一致: 「有效」而非「撞」—— bit11 是那路信号的电平, 不是已发生的碰撞 */
          const QString s = (lim_x && lim_y) ? QStringLiteral("X / Y 轴限位有效")
                          : lim_x           ? QStringLiteral("X 轴限位有效")
                                            : QStringLiteral("Y 轴限位有效");
@@ -718,10 +664,7 @@ void MapCanvas::drawScaleBar(QPainter &p)
    p.setPen(QPen(C_AREA, 1));
    p.drawRect(QRectF(x0, y0, w, h));
 
-   /*
-    * **数字必须有。** 色标暗的那一端跟底色只有 1.5:1, 光看颜色分不出"最小"和"没数据" ——
-    * 数字就是这条色标的兜底, 不是装饰。
-    */
+   /* 数字必须有: 色标暗端跟底色只有 1.5:1, 光看颜色分不出"最小"和"没数据" */
    QFont f = p.font();
    f.setPointSizeF(7.5);
    p.setFont(f);
@@ -741,11 +684,8 @@ void MapCanvas::drawScaleBar(QPainter &p)
 
 void MapCanvas::drawHud(QPainter &p)
 {
-   /*
-    * HUD 贴的是**画图区**, 不是窗口边 —— 窗口下沿那条带子现在是 X 标尺的,
-    * 还按 height() 摆的话这两行字会正好压在刻度数字上。
-    * 宽度也收到画图区内: 越过去就压到右边的色标条上了。
-    */
+   /* HUD 贴的是画图区, 不是窗口边: 按 height() 摆会压在 X 标尺的刻度数字上,
+    * 宽度越出画图区则会压到右边的色标条 */
    const QRectF r = plotRect();
    const int    x = (int)r.left() + 8;
    const int    w = (int)(r.right() - x - 6);
@@ -768,10 +708,8 @@ void MapCanvas::drawHud(QPainter &p)
    p.drawText(QRect(x, (int)r.top() + 21, w, 15), Qt::AlignLeft | Qt::AlignVCenter,
               m_ctl->stateText());
 
-   /* 第三行: 区域尺寸。视野固定之后, 图里那个框多大就不再是"画布多大"了 ——
-    * 数字写出来, 免得把 27 的框当成铺满的 30 看。
-    * **接在状态那一行下面, 而不是钉在右上角**: 画布可以被拖到 240px 宽, 右对齐的话
-    * 那块文字会压到左边这行进度上去 */
+   /* 第三行: 区域尺寸 (视野固定后, 图里那个框多大不再是"画布多大")。
+    * 接在状态行下面而不是右上角: 画布能被拖到 240px 宽, 右对齐会压到左边的进度 */
    p.setPen(C_MUTED);
    const Params &q = m_ctl->params();
    p.drawText(QRect(x, (int)r.top() + 36, w, 15), Qt::AlignLeft | Qt::AlignVCenter,
@@ -779,8 +717,7 @@ void MapCanvas::drawHud(QPainter &p)
                  .arg(q.area_x_unit, 0, 'f', 2)
                  .arg(q.area_y_unit, 0, 'f', 2));
 
-   /* 下沿: 悬停读数 (单位 + 脉冲)。**有标尺之后这行更好用了** ——
-    * 标尺给到 5 单位, 这里是任意位置的精确值 */
+   /* 下沿: 悬停读数 (单位 + 脉冲) */
    if (m_hover && m_ctl != nullptr)
    {
       const double ppu = m_ctl->params().pulses_per_unit;
@@ -793,8 +730,7 @@ void MapCanvas::drawHud(QPainter &p)
                  Qt::AlignLeft | Qt::AlignVCenter, s);
    }
 
-   /* 再下面一行: 操作提示。两个键各干什么不写出来就没人知道。
-    * 扫描中那一句也照实说 —— 查看还能用, 不能用的是手动定位 */
+   /* 再下面一行: 操作提示。扫描中那句照实说 —— 查看还能用, 不能用的是手动定位 */
    p.setPen(m_manual_ok ? C_MUTED : C_WANT);
    const QString hint = m_manual_ok
       ? QStringLiteral("左键 = 查看该格    Shift+左键 = 手动定位")
@@ -805,12 +741,8 @@ void MapCanvas::drawHud(QPainter &p)
 
 /* ---------------------------------------------------------------- 交互 */
 
-/*
- * 查看那一格: 选中最近的网格点, 把它的数值 / 索引 / 坐标显示出来。
- *
- * **只读, 不动滑台** —— 所以扫描中照样能用 (盯着数据一格格长出来的时候, 正想问
- * "这一点采到多少")。窗口那边也只把 `m_manual_ok` 用在手动定位那条路上。
- */
+/* 查看那一格: 选中最近的网格点, 显示它的数值 / 索引 / 坐标。只读, 不动滑台,
+ * 所以扫描中照样能用; 窗口那边只把 m_manual_ok 用在手动定位那条路上。 */
 void MapCanvas::pickCell(double xu, double yu)
 {
    const Params &q = m_ctl->params();
@@ -823,15 +755,13 @@ void MapCanvas::pickCell(double xu, double yu)
    const double span_x = ((double)nx - 1.0) * res;
    const double span_y = ((double)ny - 1.0) * res;
 
-   /* lround 取的就是**最近**的那个格点, 所以下面不必再判"落在半格之内" ——
-    * 它按定义恒成立 (|round(t) - t| <= 0.5) */
+   /* lround 取的就是最近的格点 (|round(t) - t| <= 0.5), 不必再判"落在半格之内" */
    const int ix = (int)std::lround((xu + span_x / 2.0) / res);
    const int iy = (int)std::lround((yu + span_y / 2.0) / res);
 
    if (ix < 0 || ix >= nx || iy < 0 || iy >= ny)
    {
-      /* 点在网格外面 (区域框外那圈余量): **取消选中, 而不是什么都不做**。
-       * 不做的话, 选错了的那个框会一直赖在图上, 而人以为自己已经点掉了 */
+      /* 点在网格外面 (区域框外那圈余量): 取消选中 —— 否则选错的那个框会一直赖在图上 */
       clearSelection();
       return;
    }
@@ -863,8 +793,7 @@ void MapCanvas::mousePressEvent(QMouseEvent *e)
       return;
    }
 
-   /* from here: Shift + 左键 = 手动定位。**扫描中一律吞掉。**
-    * 手动插一脚的话, 那一点的数据说不清是哪来的 */
+   /* Shift + 左键 = 手动定位。扫描中一律吞掉: 手动插一脚的话, 那一点的数据说不清是哪来的 */
    if (!m_manual_ok)
       return;
 
@@ -873,10 +802,8 @@ void MapCanvas::mousePressEvent(QMouseEvent *e)
       return;
 
    /*
-    * 夹在**实际生效的量程**之内。视野固定成 ±16 单位之后, 画布上有一圈是扫描区外面、
-    * 也超出量程的地方 —— 在那一圈点一下就是一次走到量程尽头的长动作, 而界面上完全
-    * 看不出"我要的是 16 单位、实际只会走到 14.5"。夹掉之后橙色三角会停在量程边上,
-    * 那一停就是"到了这里就不动了"的说明。量程还没读到 (range <= 0) 时不夹。
+    * 夹在实际生效的量程之内: 画布上有一圈是扫描区外、也超出量程的地方, 在那一圈点一下
+    * 就是一次走到量程尽头的长动作。量程还没读到 (range <= 0) 时不夹。
     */
    double lim = half;
    if (m_bus != nullptr)

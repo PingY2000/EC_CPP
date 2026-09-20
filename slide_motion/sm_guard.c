@@ -1,20 +1,13 @@
 /*
- * sm_guard.c - 安全护栏与**全工程唯一的写入口**
- *
- * 这是 slide_motion 里唯一出现 ecx_SDOwrite 的文件。
- * 审阅"这个工具到底会往驱动器里写什么"时, 只看这一个文件就够了:
- *
- *      grep -rn ecx_SDOwrite slide_motion   ->  只有本文件一处
- *
+ * sm_guard.c - 安全护栏与全工程唯一的写入口。
+ * 本文件是 slide_motion 里唯一出现 ecx_SDOwrite 的文件。
  * 三个层次:
- *   guard_write()       低层原语, 不做授权判断。**只允许本文件的停机/收尾路径调用**。
- *   sm_wr_*()/sm_set_cw()  带授权的写, 供 sm_motion.c 调用。未授权直接拒绝。
- *   sm_guard_emergency_stop() / sm_guard_teardown()
- *                       绕过授权 (否则 Ctrl-C 之后反而停不下来), 但只写"去使能"
- *                       方向的值, 结构上不可能让轴动起来。
- *
+ *   guard_write()          低层原语, 不做授权判断, 只允许本文件的停机/收尾路径调用。
+ *   sm_wr_*() / sm_set_cw() 带授权的写, 供 sm_motion.c 调用, 未授权直接拒绝。
+ *   sm_guard_emergency_stop() / sm_guard_teardown()  绕过授权 (否则 Ctrl-C 后停不下来),
+ *                          但只写去使能方向的值, 结构上不可能让轴动起来。
  * 关键安全不变量:
- *   I1. 未给 --allow-motion 时, sm_wr_* / sm_set_cw 一律拒绝 -> 一根线都不会动。
+ *   I1. 未给 --allow-motion 时 sm_wr_* / sm_set_cw 一律拒绝, 一根线都不会动。
  *   I2. 停机与收尾永远可写, 不受 abort 标志阻挡。
  *   I3. 上限只能收紧; 放宽必须显式 --force-caps。
  *   I4. Ctrl-C 处理器只置标志位, 绝不碰 SOEM (它在另一个线程里跑, SOEM 非线程安全)。
@@ -36,9 +29,7 @@
 /* 护栏全局状态 */
 sm_guard_t g_guard;
 
-/* ======================================================================
- * 判定码 / 中止原因 文本
- * ====================================================================== */
+/* 判定码 / 中止原因 文本 */
 const char *sm_verdict_str(int v)
 {
    switch (v)
@@ -68,19 +59,9 @@ const char *sm_abort_str(int r)
    }
 }
 
-/* ======================================================================
- * I4: Ctrl-C 处理器
- *
- * Windows 的控制处理器运行在**另一个线程**上, 而 SOEM 的上下文 (邮箱状态、
- * 收发缓冲) 不是线程安全的。所以这里**只置标志位**: 不发 SDO、不 printf、不分配。
- * 主循环在下一个轮询周期 (≤ SM_POLL_MS) 察觉, 由主线程执行安全停机。
- *
- * 最坏反应时间 ≈ SM_SDO_TMO_MOTION (200ms) + 一次轮询 —— 因为主线程可能正卡在
- * 一次 SDO 读里。这就是运动期必须把 SDO 超时从 EC_TIMEOUTRXM (700ms) 降到
- * 200ms 的原因。
- *
- * 第二次 Ctrl-C 交给系统默认处理, 立即结束进程 —— 这是最后的逃生通道。
- * ====================================================================== */
+/* I4: Ctrl-C 处理器。它运行在另一个线程而 SOEM 上下文非线程安全, 所以这里只置标志位:
+ * 不发 SDO、不 printf、不分配。主循环下一个轮询周期 (≤ SM_POLL_MS) 察觉后由主线程
+ * 安全停机; 第二次 Ctrl-C 交给系统默认处理。 */
 #ifdef _WIN32
 static BOOL WINAPI sm_ctrl_handler(DWORD type)
 {
@@ -142,25 +123,18 @@ int sm_guard_watchdog_expired(void)
 {
    if (g_guard.watchdog_ms == 0)
       return 0;
-   /* 差值法, 回绕安全 (见 guard_wait_sw 的说明) */
+   /* 差值法, 回绕安全 */
    return ((int32_t)(sm_now_ms() - g_guard.last_io_ms) >
            (int32_t)g_guard.watchdog_ms) ? 1 : 0;
 }
 
-/*
- * 距上一次成功总线交互过去了多少毫秒 (回绕安全)。
- * 给失联日志用 —— 那里要报的是"已经多久没通上话", 不是阈值。两处失联消息
- * 曾经把 watchdog_ms 打印了两遍, 于是超时时间显示成 1000 还是 700 全看配置,
- * 真正想知道的那个数反倒没有。
- */
+/* 距上一次成功总线交互过去了多少毫秒 (回绕安全); 失联日志要报的是"已经多久没通上话"。 */
 uint32_t sm_guard_io_idle_ms(void)
 {
    return (uint32_t)(sm_now_ms() - g_guard.last_io_ms);
 }
 
-/* ======================================================================
- * I3: 上限收紧
- * ====================================================================== */
+/* I3: 上限收紧 */
 uint32_t sm_guard_clamp_u32(const char *name, uint32_t val,
                             uint32_t hard_max, uint32_t dflt)
 {
@@ -185,12 +159,8 @@ uint32_t sm_guard_clamp_u32(const char *name, uint32_t val,
 int32_t sm_guard_clamp_i32(const char *name, int32_t val,
                            int32_t hard_max, int32_t dflt)
 {
-   /*
-    * 绝对值必须在 int64 里取。若写成 int32 的 (val < 0) ? -val : val,
-    * 当 val == INT32_MIN 时 -val 溢出仍是 INT32_MIN(负), 于是 a > hard_max
-    * 恒为假, INT32_MIN 会**原样**穿过上限检查 —— 那是一条 2^31 脉冲的
-    * 相对运动指令, 一路直达机械死挡。这是本函数唯一的值域陷阱。
-    */
+   /* 绝对值必须在 int64 里取: int32 的 -INT32_MIN 溢出仍为负, 上限检查恒为假,
+    * INT32_MIN 会原样穿过, 变成 2^31 脉冲的运动指令。 */
    int64_t a = ((int64_t)val < 0) ? -(int64_t)val : (int64_t)val;
 
    if (val == 0)
@@ -205,8 +175,7 @@ int32_t sm_guard_clamp_i32(const char *name, int32_t val,
          return val;
       }
 
-      /* --force-caps 只能把硬上限放宽到绝对天花板, 再往上仍然收紧 ——
-         否则一个 INT32_MIN 就能变成 2^31 脉冲的行程。 */
+      /* --force-caps 只能放宽到绝对天花板, 再往上仍然收紧。 */
       {
          int32_t lim = (g_guard.force_caps && a > SM_CAP_ABS_MAX)
                           ? (int32_t)SM_CAP_ABS_MAX
@@ -227,10 +196,8 @@ int32_t sm_guard_clamp_i32(const char *name, int32_t val,
    return val;
 }
 
-/*
- * 看门狗必须严格大于"一次轮询的最坏耗时", 否则正常慢轮询会被误判成故障。
- * 一次轮询 = 3 次 SDO 读 (6041h / 6064h / 606Ch) × SM_SDO_TMO_MOTION。
- */
+/* 看门狗必须严格大于一次轮询的最坏耗时 (3 次 SDO 读 × SM_SDO_TMO_MOTION),
+ * 否则正常慢轮询会被误判成故障。 */
 int sm_guard_check_caps(uint32_t watchdog_ms)
 {
    uint32_t floor_ms = (uint32_t)SM_SDO_TMO_MOTION * 3u;
@@ -245,9 +212,7 @@ int sm_guard_check_caps(uint32_t watchdog_ms)
    return 0;
 }
 
-/* ======================================================================
- * I1: 授权
- * ====================================================================== */
+/* I1: 授权 */
 int sm_guard_check_authorization(int want_motion, int want_jog)
 {
    if (want_jog && !want_motion)
@@ -269,8 +234,7 @@ int sm_guard_check_authorization(int want_motion, int want_jog)
    return 0;
 }
 
-/* 打开总线后立刻打印的"我现在处于什么授权级别"横幅 —— 让日志第一屏就能看出
-   这次运行有没有可能写东西。 */
+/* 打开总线后立刻打印的授权级别横幅, 让日志第一屏就能看出本次运行会不会写东西。 */
 void sm_guard_banner(const char *ifname, int nslaves)
 {
    printf("\n==================== 授权级别 ====================\n");
@@ -287,9 +251,7 @@ void sm_guard_banner(const char *ifname, int nslaves)
    printf("==================================================\n");
 }
 
-/* ======================================================================
- * 授权横幅 + 交互确认
- * ====================================================================== */
+/* 交互确认 */
 int sm_guard_confirm(const char *ifname, int nslaves, int n_jog_axes,
                      int32_t jog_pulses, uint32_t jog_vel, uint32_t jog_acc,
                      uint32_t move_tmo_ms, uint32_t watchdog_ms)
@@ -334,14 +296,9 @@ int sm_guard_confirm(const char *ifname, int nslaves, int n_jog_axes,
    return 0;
 }
 
-/* ======================================================================
- * 低层写原语 —— 全工程唯一的 ecx_SDOwrite 调用点
- *
- * **不做授权判断**。调用者负责。只有下面三类调用者:
- *   1. sm_wr_* / sm_set_cw        (已做授权判断)
- *   2. sm_guard_emergency_stop()  (去使能方向, 必须绕过授权)
- *   3. sm_guard_teardown()        (去使能方向 + 恢复参数, 必须绕过授权)
- * ====================================================================== */
+/* 低层写原语 —— 全工程唯一的 ecx_SDOwrite 调用点。不做授权判断, 调用者负责。
+ * 只有三类调用者: sm_wr_* / sm_set_cw (已做授权判断),
+ * sm_guard_emergency_stop() 与 sm_guard_teardown() (去使能方向, 必须绕过授权)。 */
 static int guard_write(int slave, uint16_t index, uint8_t sub, int size,
                        const void *p, const char *why)
 {
@@ -350,10 +307,8 @@ static int guard_write(int slave, uint16_t index, uint8_t sub, int size,
    int      ecerr;
    uint32_t t0, dt;
 
-   /*
-    * 运动期与非运动期用不同超时。运动期必须短: 主线程可能正卡在这里,
-    * 而 Ctrl-C / 故障停机要在这个窗口之后才能发出去。
-    */
+   /* 运动期与非运动期用不同超时。运动期必须短: 主线程可能正卡在这里, Ctrl-C / 故障
+    * 停机要在这个窗口之后才能发出去。 */
    timeo = g_guard.ds402_enabled ? SM_SDO_TMO_MOTION : SM_SDO_TMO_IDLE;
 
    g_ctx.ecaterror = FALSE;   /* 清粘滞位, 与读路径同理 */
@@ -377,11 +332,6 @@ static int guard_write(int slave, uint16_t index, uint8_t sub, int size,
    {
       int32_t abort = sm_take_abort(slave, index, sub);
 
-      /*
-       * 以前这里固定打 "abort 0x%08X", 于是 abort 码为 0 时看不出是
-       * "驱动器明确回了 abort 0" 还是 "压根没收到回信, 什么都没捞到" ——
-       * 同一个 0, 两种相反的结论。分开说: 有数就是有数, 没有就说没有。
-       */
       printf("      [WRITE-FAIL] 从站%d %04Xh:%02X <- %s 失败 "
              "(wkc=%d ecaterror=%d)\n",
              slave, (unsigned)index, (unsigned)sub,
@@ -429,9 +379,7 @@ int sm_wr_i32(int slave, uint16_t index, uint8_t sub, int32_t v, const char *why
    return sm_wr_raw(slave, index, sub, 4, &v, why);
 }
 
-/* ======================================================================
- * 控制字写入 (内部版, 不做授权判断; 停机/收尾也用这个)
- * ====================================================================== */
+/* 控制字写入 (内部版, 不做授权判断; 停机/收尾也用这个) */
 static int guard_set_cw(sm_axis_t *ax, uint16_t cw, const char *why)
 {
    uint16_t old = 0;
@@ -442,8 +390,7 @@ static int guard_set_cw(sm_axis_t *ax, uint16_t cw, const char *why)
    if (ax == NULL)
       return -1;
 
-   /* 读旧值只为打印审计行。固定用短超时 —— 这是审计用途,
-      在停机/收尾路径上不能让一次读超时把反应时间拖到 700ms。 */
+   /* 读旧值只为打印审计行。固定用短超时, 免得停机/收尾路径被一次读超时拖到 700ms。 */
    (void)sm_rd_u16(ax->slave, SM_OID_CONTROLWORD, 0, &old,
                    SM_SDO_TMO_MOTION, &ab);
 
@@ -456,8 +403,7 @@ static int guard_set_cw(sm_axis_t *ax, uint16_t cw, const char *why)
              (why != NULL) ? why : "", (unsigned)old, (unsigned)cw);
    }
 
-   /* 记录轨迹。只在写**成功**时记录 —— 轨迹表是审计材料, 记下没送出去的
-      值会让它看起来比实际顺利。 */
+   /* 记录轨迹, 只在写成功时记录 (轨迹表是审计材料, 不能记下没送出去的值)。 */
    if (rc == 0 && ax->trace_n < SM_TRACE_MAX)
    {
       ax->trace[ax->trace_n].cw = cw;
@@ -493,11 +439,8 @@ void sm_trace_fill_sw(sm_axis_t *ax, uint16_t sw, int valid)
    if (ax == NULL || ax->trace_n <= 0)
       return;
 
-   /*
-    * valid=0 时**什么都不写**: sw_valid 保持 0, 报告与 CSV 就会打 "----"。
-    * 若在这里退而写入 0x0000, 一条"没读到状态字"的记录会伪装成驱动器报的
-    * "Not ready to switch on" —— 那是凭空造出来的现场证据。
-    */
+   /* valid=0 时什么都不写: sw_valid 保持 0, 报告与 CSV 打 "----"。写入 0x0000 会让
+    * 一条"没读到状态字"伪装成驱动器报的 "Not ready to switch on"。 */
    if (valid)
    {
       ax->trace[ax->trace_n - 1].sw = sw;
@@ -505,23 +448,15 @@ void sm_trace_fill_sw(sm_axis_t *ax, uint16_t sw, int valid)
    }
 }
 
-/* ======================================================================
- * 停机与收尾
- *
- * I2: 这两个函数**不受 abort 标志影响**。Ctrl-C 之后最需要的就是它们能跑完。
- * I5: teardown 幂等, 且每一步都尽力执行 —— 前一步失败不阻止后一步。
- * ====================================================================== */
+/* 停机与收尾。I2: 这两个函数不受 abort 标志影响 (Ctrl-C 之后最需要它们跑完)。
+ * I5: teardown 幂等, 每一步都尽力执行, 前一步失败不阻止后一步。 */
 
 /* 等 6041h 满足条件, 最多 tmo_ms。返回 1 = 满足 */
 static int guard_wait_sw(sm_axis_t *ax, uint16_t mask, uint16_t want,
                          uint32_t tmo_ms)
 {
-   /*
-    * 用"已过去多少"做比较, 不用绝对 deadline。sm_now_ms() 是 32 位毫秒计数,
-    * 约 49.7 天回绕一次; 若写成 now >= t0 + tmo, 当 t0 落在回绕点前 tmo 之内
-    * 时小端会立刻成立, 等待窗口直接塌成 0 —— 健康的轴会被判成"没停住"。
-    * 差值法在回绕处依然正确 (只要间隔远小于 2^31 ms)。
-    */
+   /* 用"已过去多少"比较, 不用绝对 deadline: sm_now_ms() 是 32 位毫秒计数, 约 49.7 天
+    * 回绕一次, now >= t0 + tmo 在回绕点附近会让等待窗口塌成 0, 健康的轴被判成没停住。 */
    uint32_t t0 = sm_now_ms();
 
    for (;;)
@@ -540,10 +475,8 @@ static int guard_wait_sw(sm_axis_t *ax, uint16_t mask, uint16_t want,
    }
 }
 
-/*
- * 读 6041h 判断是否已脱离 Operation enabled。
- * 返回 1 = 已脱离; 0 = 仍在使能; -1 = 读不到 (读不到**不能**当成功)。
- */
+/* 读 6041h 判断是否已脱离 Operation enabled。
+ * 返回 1 = 已脱离; 0 = 仍在使能; -1 = 读不到 (读不到不能当成功)。 */
 static int guard_is_disabled(sm_axis_t *ax)
 {
    uint16_t sw = 0;
@@ -555,12 +488,8 @@ static int guard_is_disabled(sm_axis_t *ax)
    return ((sw & SM_SW_OP_ENABLED) == 0) ? 1 : 0;
 }
 
-/*
- * 写一个参数并**回读确认**。
- *
- * 不能只看 guard_write 的返回值 —— 见 guard_force_disable 的注释: 这份 SOEM
- * 在加急写路径上会把从站的 SDO abort 帧当成成功。返回值 1 = 已回读确认一致。
- */
+/* 写一个参数并回读确认。不能只看 guard_write 的返回值: 这份 SOEM 在加急写路径上会把
+ * 从站的 SDO abort 帧当成成功。返回 1 = 已回读确认一致。 */
 static int guard_write_verified(int slave, uint16_t index, uint8_t sub,
                                 int size, const void *p, const char *why)
 {
@@ -587,30 +516,17 @@ static int guard_write_verified(int slave, uint16_t index, uint8_t sub,
    return 1;
 }
 
-/*
- * 把一根轴强制降到失能态, 并回读确认, 必要时重试。
- *
- * 为什么必须回读: 本仓库这份 SOEM 的 ecx_SDOwrite 在**加急**路径 (psize<=4)
- * 上把从站回的 SDO abort 帧也当成成功 —— abort 响应的 mbxtype/service/index/
- * subindex 与请求完全相同, 于是命中 ec_coe.c 里 "all OK" 那个分支, 既不压
- * 错误栈也不置 ctx.ecaterror, wkc 还是 > 0。而 6040h 正好是 2 字节的加急写:
- * 也就是说"写失能"有没有真的进驱动器, 唯一的证据是回读 6041h。
- * (这份 SOEM 是下载的第三方库, 按约定不改它, 所以在本层补上回读。)
- *
- * 返回 1 = 已确认失能; 0 = 未能确认 (调用者必须当成严重失败上报)。
- */
+/* 把一根轴强制降到失能态, 并回读确认, 必要时重试。必须回读: 这份 SOEM 的
+ * ecx_SDOwrite 在加急路径 (psize<=4) 上把从站回的 SDO abort 帧也当成成功。
+ * 返回 1 = 已确认失能; 0 = 未能确认 (调用者必须当成严重失败上报)。 */
 static int guard_force_disable(sm_axis_t *ax)
 {
    int attempt;
 
    for (attempt = 0; attempt < 3; attempt++)
    {
-      /*
-       * 每一步都走完整顺序。这里**不**用 g_guard.ds402_enabled 做条件: 那是
-       * 一个全局标志, 处理完第一根轴就被清成 0, 第二根轴就会从 Operation
-       * enabled 直接跳到 Shutdown。那虽也是合法降级路径, 但"每根轴都按完整
-       * 顺序降级"更可预期。对本来就没使能的轴多写一次 0x0007 是无害的。
-       */
+      /* 每一步都走完整顺序。不用 g_guard.ds402_enabled 做条件: 那是全局标志, 处理完
+       * 第一根轴就被清成 0, 第二根轴会跳级; 对没使能的轴多写一次 0x0007 无害。 */
       guard_set_cw(ax, SM_CW_SWITCHON, "收尾 Disable operation");
       guard_wait_sw(ax, SM_SW_OP_ENABLED, 0, SM_TEARDOWN_TMO_MS);
 
@@ -634,10 +550,8 @@ static int guard_force_disable(sm_axis_t *ax)
    return 0;
 }
 
-/*
- * 急停: 按"最快停住"的顺序尝试, 每步短超时, best-effort。
- * 只写去使能方向的值 —— 结构上不可能让轴动起来。
- */
+/* 急停: 按"最快停住"的顺序尝试, 每步短超时, best-effort; 只写去使能方向的值,
+ * 结构上不可能让轴动起来。 */
 void sm_guard_emergency_stop(sm_axis_t *axes, int nslaves)
 {
    int i;
@@ -647,8 +561,8 @@ void sm_guard_emergency_stop(sm_axis_t *axes, int nslaves)
    {
       sm_axis_t *ax = &axes[i];
 
-      /* 只停我们接管过的轴: 别的轴我们没检查过它的状态, 贸然写 0x0000
-         可能把另一套程序正在控制的轴拽停。 */
+      /* 只停接管过的轴: 别的轴没检查过它的状态, 写 0x0000 可能把另一套
+         程序正在控制的轴拽停。 */
       if (!ax->is_ykd || !ax->engaged)
          continue;
 
@@ -735,7 +649,7 @@ void sm_guard_teardown(sm_axis_t *axes, int nslaves)
                 "6081h/6083h/6084h/6060h。\n");
    }
 
-   /* 收尾是日志窗口的最后一站: 里面那些写 (尤其是失能序列与回读确认)
-     正是"电机到底断开没有"的证据, 所以关窗必须放在它们之后。 */
+   /* 收尾是日志窗口的最后一站: 里面的写 (失能序列与回读确认) 正是"电机到底
+      断开没有"的证据, 关窗必须放在它们之后。 */
    sm_xfer_set_active(0);
 }

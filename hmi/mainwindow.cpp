@@ -12,8 +12,7 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
-/* 界面上同时摆几根轴。真轴数在「连接」之后才知道 —— 连接前先摆两个灰的占位,
- * 免得窗口是空的让人以为没编好 */
+/* 连接前先摆两个灰面板占位, 真轴数连接之后才知道 */
 static const int HMI_PLACEHOLDER_AXES = 2;
 
 static const char *kBannerWarn =
@@ -34,7 +33,6 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 
    buildUi();
 
-   /* 遥测 30Hz 刷。**不逐周期 emit 信号**: 1kHz × N 根轴会淹掉事件循环 */
    m_tick = new QTimer(this);
    connect(m_tick, &QTimer::timeout, this, &MainWindow::refresh);
    m_tick->start(33);
@@ -50,7 +48,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
    });
 
    m_thr->start();
-   m_thr->postListAdapters();   /* 工作线程里列网卡, 结果走信号回来 */
+   m_thr->postListAdapters();
 
    hint(QStringLiteral("未连接: 界面此时是**只读**的, 一个字节都不往总线上写。"
                        "先选网卡再点「连接」"), false);
@@ -58,18 +56,15 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 
 MainWindow::~MainWindow()
 {
-   /* 正常路径在 closeEvent 里已经收过尾了; 这里只兜底, 别让线程活着跑出 main() */
+   /* 兜底, 别让线程活着跑出 main() */
    if (m_thr->isRunning())
       disconnectAndStop();
 }
-
-/* ---------------------------------------------------------------- 界面 */
 
 void MainWindow::buildUi()
 {
    QWidget *central = new QWidget(this);
 
-   /* ---- 顶栏 ---- */
    m_nic = new QComboBox(central);
    m_nic->setMinimumWidth(360);
 
@@ -112,15 +107,12 @@ void MainWindow::buildUi()
    bar->addSpacing(12);
    bar->addWidget(m_btnCenter);
 
-   /* ---- 横幅 ---- */
    m_banner = new QLabel(central);
    m_banner->setObjectName(QStringLiteral("banner"));
    m_banner->setWordWrap(true);
    m_banner->setStyleSheet(kBannerInfo);
    m_banner->setVisible(false);
 
-   /* ---- 常驻的一行须知。**不做成启动弹窗**: 每次都要点掉的弹窗会被条件反射地关掉,
-    * 而"点远处就是一次长距离移动"这件事必须一直在眼前 ---- */
    QLabel *caution = new QLabel(QStringLiteral(
       "范围 ±500000 脉冲 (50000 pul/圈 => ±10 圈), 零点 = 连接时读到的位置。"
       "电机带电后点画布即走 —— 点远处就是一次长距离移动; "
@@ -128,7 +120,6 @@ void MainWindow::buildUi()
    caution->setObjectName(QStringLiteral("caution"));
    caution->setWordWrap(true);
 
-   /* ---- 轴面板 ---- */
    m_axisHost = new QWidget(central);
    m_axisLay  = new QHBoxLayout(m_axisHost);
    m_axisLay->setContentsMargins(0, 0, 0, 0);
@@ -141,7 +132,6 @@ void MainWindow::buildUi()
    v->addWidget(m_axisHost, 1);
    setCentralWidget(central);
 
-   /* ---- 状态栏 ---- */
    m_lNote = new QLabel(this);
    m_lWkc  = new QLabel(this);
    m_lWkc->setFont(QFont("Consolas"));
@@ -171,7 +161,6 @@ void MainWindow::rebuildPanels(int n)
       connect(p, &AxisPanel::centerRequested, this,
               [this](int ax) { m_thr->postCenter(ax); });
 
-      /* 面板是新建的, 速度滑块在默认值上; 工作线程里可能还留着上一轮的值 —— 以面板为准 */
       m_thr->setSpeed(i, p->speed());
 
       m_axisLay->addWidget(p, 1);
@@ -201,8 +190,6 @@ void MainWindow::hint(const QString &s, bool fault)
       m_bannerTimer->start(8000);
 }
 
-/* ---------------------------------------------------------------- 操作 */
-
 void MainWindow::onConnectClicked()
 {
    if (m_connected)
@@ -218,7 +205,6 @@ void MainWindow::onConnectClicked()
       return;
    }
 
-   /* 连接会进 OP 并开始发帧 —— 这是"会写总线"的第一步, 值得说清它写的是什么 */
    QMessageBox box(QMessageBox::Question,
                    QStringLiteral("连接并进 OP"),
                    QStringLiteral(
@@ -237,14 +223,12 @@ void MainWindow::onConnectClicked()
 
    hint(QStringLiteral("正在连接... (选轴 / 补映射 / 进 OP 都要做 SDO, 慢是正常的)"), false);
 
-   /* **不在这里切按钮形态**: 按钮由 refresh() 从遥测的 in_op|busy 推出来。
-    * 在这里乐观地置一次, 就会和线程的真实状态错开 (比如连接失败时按钮还写着「断开」) */
    m_thr->postConnect(m_nic->currentData().toString());
 }
 
 void MainWindow::onEnableClicked()
 {
-   /* 「使能」= CLI 的 --allow-motion。**每次都问**, 不做持久勾选、不自动使能 */
+   /* 「使能」= CLI 的 --allow-motion。每次都问, 不做持久勾选、不自动使能 */
    QMessageBox box(QMessageBox::Warning,
                    QStringLiteral("使能 —— 电机会带电"),
                    QStringLiteral(
@@ -313,18 +297,12 @@ void MainWindow::onSpeed(int axis, uint32_t vel)
    m_thr->setSpeed(axis, vel);
 }
 
-/* ---------------------------------------------------------------- 刷新 */
-
 void MainWindow::refresh()
 {
    BusTelem t = m_thr->telemetry();
 
-   /*
-    * 按钮形态完全由遥测决定:
-    *   in_op   = 正在发帧 (真连上了)
-    *   busy    = 正在连接或正在收尾 (中间那段阻塞的 SDO / 状态机迁移)
-    * 两者任一为真就是"占着总线", 于是网卡选择与「连接」都锁住。
-    */
+   /* 按钮形态完全由遥测决定: in_op = 正在发帧, busy = 正在连接或收尾 (中间那段阻塞的
+    * SDO / 状态机迁移)。两者任一为真就是"占着总线", 网卡选择与「连接」都锁住。 */
    bool onair = t.in_op || t.busy;
    if (onair != m_connected)
       setConnected(onair);
@@ -340,7 +318,7 @@ void MainWindow::refresh()
    {
       m_lWkc->setText(QStringLiteral("WKC %1 / 期望 %2")
                          .arg(t.wkc).arg(t.expected_wkc));
-      /* WKC 偏短 = 有从站没参与过程数据交换。这是"帧在发但没落地"的唯一现场信号 */
+      /* WKC 偏短 = 有从站没参与过程数据交换 */
       m_lWkc->setStyleSheet(t.wkc >= t.expected_wkc ? "color:#7b8391"
                                                     : "color:#ffb020; font-weight:bold");
    }
@@ -352,8 +330,6 @@ void MainWindow::refresh()
 
    m_lNote->setText(t.note);
 
-   /* 故障横幅只在**上升沿**弹一次: 这段是 30Hz 跑的, 每帧都设一遍会把重绘刷爆,
-    * 也会把操作员刚点掉的提示又顶回来 */
    if (t.fault && !m_faultShown)
    {
       m_faultShown = true;
@@ -365,11 +341,8 @@ void MainWindow::refresh()
       m_faultShown = false;
    }
 
-   /*
-    * 收尾时没能确认失能 (CLI 退出码 10 的语义)。这是**唯一必须弹模态**的事:
-    * 软件已经没有通道去撤力矩了, 只能让人去断电。用 singleShot 挪出当前这一帧再弹,
-    * 免得在 30Hz 的槽里嵌套一个事件循环。
-    */
+   /* 收尾时没能确认失能 (CLI 退出码 10 的语义) —— 唯一必须弹模态的事。用 singleShot
+    * 挪出当前这一帧再弹, 免得在 30Hz 的槽里嵌套事件循环。 */
    if (m_thr->maybeLive() && !m_warnedLive)
    {
       m_warnedLive = true;
@@ -387,22 +360,15 @@ void MainWindow::warnMaybeLive()
          "通道去撤它。"));
 }
 
-/* ---------------------------------------------------------------- 收尾 */
-
 void MainWindow::disconnectAndStop()
 {
    if (!m_thr->isRunning())
       return;
 
-   /* 断开 = 让工作线程自己走 teardown (失能 -> 还原映射 -> 降 PRE_OP -> 关网卡)。
-    * 用队列命令而不是 ::terminate: 收尾这几步不能被打断 */
    m_thr->postDisconnect();
 
-   /*
-    * 等它真的收完 —— 条件是**不在发帧且不在忙**, 不是"点过断开"。
-    * teardown 是排队执行的, 从投递到开跑之间有一小段, 只看 in_op 会在那一段里误判成"收完了"。
-    * 每根轴的失能确认与状态机迁移都有超时, 所以给到 12 秒。
-    */
+   /* 等它真的收完 —— 条件是**不在发帧且不在忙**, 不是"点过断开" (teardown 是排队执行的,
+    * 从投递到开跑有一小段)。每根轴的失能确认与状态机迁移都有超时, 所以给到 12 秒。 */
    for (int i = 0; i < 600; i++)
    {
       BusTelem t = m_thr->telemetry();

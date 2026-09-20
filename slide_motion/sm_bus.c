@@ -1,8 +1,6 @@
 /*
- * sm_bus.c - SOEM 总线底座: 初始化、身份判定、只读 SDO、原始寄存器、诊断
- *
- * 本文件**不含任何写操作**。所有 ecx_SDOwrite 调用点都在 sm_guard.c。
- * 这里只读: SDOread / 寄存器读 / 状态检查。
+ * sm_bus.c - SOEM 总线底座: 初始化、身份判定、只读 SDO、原始寄存器、诊断。
+ * 本文件不含任何写操作, 所有 ecx_SDOwrite 调用点都在 sm_guard.c。
  */
 
 #include <stdio.h>
@@ -79,19 +77,14 @@ int sm_is_ykd(uint32_t eep_man, uint32_t eep_id)
    return 0;
 }
 
-/* ======================================================================
- * 数据类型
- * ====================================================================== */
+/* 数据类型 */
 int sm_dt_is_signed(int dt)
 {
    return (dt == SM_DT_I8) || (dt == SM_DT_I16) || (dt == SM_DT_I32);
 }
 
-/*
- * 把驱动器自报的字节解读为 int64。
- * size 来自 SDO 实际返回的字节数 (不是我们猜的类型), 所以即使手册没给类型
- * 也不会读错宽度。dt 只决定符号性。
- */
+/* 把驱动器自报的字节解读为 int64。size 是 SDO 实际返回的字节数 (不是猜的类型),
+ * dt 只决定符号性。 */
 int64_t sm_bytes_to_i64(const uint8_t *buf, int size, int dt)
 {
    int     is_signed = sm_dt_is_signed(dt);
@@ -111,12 +104,8 @@ int64_t sm_bytes_to_i64(const uint8_t *buf, int size, int dt)
          break;
       }
       case 3:
-         /*
-          * 3 字节也要解对。掉进 default 的话会返回 0 —— 而 0 在这里不是
-          * "无法解读", 是一个看起来完全正常的值: 放在 60FDh 上就是
-          * "两个限位都没压住", 放在 606Ch 上就是"轴没在动"。宁可解错也不要
-          * 用一个合法值去掩盖读失败。
-          */
+         /* 3 字节也要解对: 掉进 default 返回 0 会伪装成一个完全正常的读数 (60FDh 上
+          * 就是"两个限位都没压住"), 掩盖读失败。 */
          v = (int64_t)((uint32_t)buf[0] |
                        ((uint32_t)buf[1] << 8) |
                        ((uint32_t)buf[2] << 16));
@@ -131,10 +120,8 @@ int64_t sm_bytes_to_i64(const uint8_t *buf, int size, int dt)
          break;
       }
       default:
-         /*
-          * 到不了这里: sm_rd_raw() 给 ecx_SDOread 的缓冲就是 4 字节, psize
-          * 回出来必然 <= 4。保留 8 字节分支只为万一将来放开读宽度。
-          */
+         /* 到不了这里: sm_rd_raw() 给的缓冲就是 4 字节, psize 必然 <= 4; 8 字节分支
+          * 只为将来放开读宽度保留。 */
          if (size >= 8)
          {
             uint32_t u;
@@ -146,14 +133,9 @@ int64_t sm_bytes_to_i64(const uint8_t *buf, int size, int dt)
    return v;
 }
 
-/* ======================================================================
- * 只读 SDO
- * ====================================================================== */
+/* 只读 SDO */
 
-/*
- * 消费 ctx.ecaterror 并取回首个匹配本对象的 abort 码。
- * 不清栈 —— 由 sm_drain_errors() 统一排空。
- */
+/* 消费 ctx.ecaterror 并取回首个匹配本对象的 abort 码。不清栈, 由 sm_drain_errors() 排空。 */
 int32_t sm_take_abort(int slave, uint16_t index, uint8_t sub)
 {
    ec_errort err;
@@ -172,14 +154,9 @@ int32_t sm_take_abort(int slave, uint16_t index, uint8_t sub)
    return abort;
 }
 
-/*
- * 读一个对象 (≤4 字节 expedited)。
- *
- * 关键: g_ctx.ecaterror 是粘滞位, SOEM 报错后不会自动清零, 必须在每次
- * SDO 读前手动复位, 否则上一个失败会污染下一次判定 (slide_verify.c 已验证此坑)。
- *
- * 返回 SM_RD_*; *size 返回驱动器自报的字节数; 命中 abort 时 *abort_code 给出中止码。
- */
+/* 读一个对象 (≤4 字节 expedited)。g_ctx.ecaterror 是粘滞位, SOEM 报错后不会自动清零,
+ * 每次读前必须手动复位, 否则上一个失败会污染下一次判定。
+ * 返回 SM_RD_*; *size = 驱动器自报字节数; 命中 abort 时 *abort_code 给出中止码。 */
 int sm_rd_raw(int slave, uint16_t index, uint8_t sub, int timeout,
               uint8_t *buf, int *size, int32_t *abort_code)
 {
@@ -198,13 +175,8 @@ int sm_rd_raw(int slave, uint16_t index, uint8_t sub, int timeout,
                      &psize, buf, timeout);
    dt = sm_now_ms() - t0;
 
-   /*
-    * 必须在 sm_take_abort() 之前存下 ecaterror: ecx_poperror() 把错误栈
-    * 排空之后会顺手把它清成 FALSE, 之后再读就恒为 0 —— 而"这一笔有没有被
-    * 压进错误栈"正是 ABORT 与 TIMEOUT 的唯一分野。
-    * (sm_take_abort 里那个 abort 码对 <=4 字节的加急读通常是取不到的,
-    *  原因见 sm_xfer_run_t 上方的注释。)
-    */
+   /* 必须在 sm_take_abort() 之前存下 ecaterror: ecx_poperror() 排空错误栈后会把它清成
+    * FALSE, 之后再读恒为 0。这是 ABORT 与 TIMEOUT 的唯一分野。 */
    ecerr = g_ctx.ecaterror ? 1 : 0;
 
    if (abort_code != NULL)
@@ -275,25 +247,12 @@ int sm_rd_i32(int slave, uint16_t index, uint8_t sub, int32_t *v, int timeout,
    return rc;
 }
 
-/* ======================================================================
- * SDO 事务日志
- *
- * 接口与设计理由见 sm.h。这里只补一条实现上的关键点:
- * g_ctx.ecaterror 必须在调用 sm_take_abort() **之前**存下来 ——
- * ecx_poperror() 排空错误栈后会把 ecaterror 清成 FALSE, 之后再读就永远是 0,
- * 而"这次到底有没有被压错误栈"正是区分 ABORT 与 TIMEOUT 的唯一依据。
- * ====================================================================== */
+/* SDO 事务日志 (接口与设计理由见 sm.h) */
 #define SM_XFER_MAX_VALS 6   /* 一行里最多列几个不同的值, 再多就退化成"首->末" */
 
-/*
- * 槽位数 = 同时挂着的不同"结果签名"的最大个数。
- *
- * 为什么必须是**一张表**而不是"记住上一笔": S4 的轮询循环是按
- * 6041h -> 6064h -> 606Ch 交替读的, 单槽的键每一笔都在变, 于是每一笔都会
- * 触发一次 flush —— 归并等于没做, 每轮照样吐 3 行。要真正折叠, 就得让每个
- * 对象各自记住自己的累加器, 不管它们之间隔了多少别的对象。
- * 8 个足够: 轮询里最多 3 个对象, S3 每步也不超过 4 个, 超出会整批交出。
- */
+/* 槽位数 = 同时挂着的不同"结果签名"的最大个数。S4 轮询按 6041h -> 6064h -> 606Ch
+ * 交替读, 单槽会让每笔签名都变、归并失效, 所以按对象各占一格。8 个足够: 轮询最多
+ * 3 个对象, S3 每步不超过 4 个。 */
 #define SM_XFER_SLOTS 8
 
 typedef struct
@@ -338,17 +297,9 @@ static void xfer_val_str(char *dst, size_t n, const uint8_t *b, int size)
 
 static const char *xfer_rc_str(char dir, int rc)
 {
-   /*
-    * 写的成功**不能**写 "ok"。
-    *
-    * 这份 SOEM 在加急写路径 (psize<=4, 6040h 正是 2 字节) 上把从站回的 abort
-    * 帧当成写成功 —— abort 响应的 mbxtype/service/index/subindex 与请求完全
-    * 一致, 命中 "all OK" 分支, 既不压错误栈也不置 ecaterror, wkc 还 > 0
-    * (见 sm_guard.c 里 guard_force_disable 上方那段)。也就是说 rc==0 只证明
-    * "有个应答回来了", **不证明驱动器接受了这个值**。写成 "应答" 是这里
-    * 能诚实说出的全部; 真要确认写生效, 只能靠回读 (guard_write_verified /
-    * 随后的 6041h 轮询)。读就没有这个问题: 读到字节就是真读到了。
-    */
+   /* 写的成功不能写 "ok": 这份 SOEM 在加急写路径 (psize<=4, 6040h 正是 2 字节) 上把
+    * 从站回的 abort 帧当成写成功 (不置 ecaterror, wkc 还 > 0), 所以 rc==0 只证明
+    * "有个应答回来了", 只能写 "应答"; 确认写生效只能靠回读。读没有这个问题。 */
    if (dir == 'W')
       return (rc == 0) ? "应答" : "失败";
    switch (rc)
@@ -409,20 +360,9 @@ static void xfer_emit(const sm_xfer_run_t *r)
    printf("      [SDO ] %c %04Xh:%02X %s", r->dir, (unsigned)r->index,
           (unsigned)r->sub, xfer_rc_str(r->dir, r->rc));
 
-   /*
-    * abort 码: 只有非 0 才算一个真实的数字。
-    *
-    * 这份 SOEM 在**加急路径** (psize<=4, 本项目所有对象都是) 上拿不到真正的
-    * abort 码, 两头都丢:
-    *   读 —— 从站回的 abort 帧通过了结构检查, 于是 Command(0x80) 走进普通
-    *         数据分支, abort 码被当成"数据长度", 因为大得离谱而落到
-    *         wkc=0 + ecx_packeterror(), 压进错误栈的是 PACKET_ERROR 而不是
-    *         SDO_ERROR; 而 sm_take_abort 只认 SDO_ERROR, 所以取回来是 0。
-    *   写 —— abort 帧的 mbxtype/service/index/subindex 与请求完全一致, 命中
-    *         "all OK" 分支, 被当成写成功 (sm_guard.c 那句注释记的就是这个)。
-    * 所以 0 绝不能打成一个数字 —— 那等于把"拿不到"说成"驱动器回了 0",
-    * 正是这次要消掉的二义性。说不清的地方就说说不清。
-    */
+   /* abort 码只有非 0 才算一个真实的数字。本版 SOEM 在加急路径 (psize<=4, 本项目所有
+    * 对象都是) 上拿不到真正的 abort 码: 读时被压成 PACKET_ERROR (sm_take_abort 只认
+    * SDO_ERROR, 取回 0), 写时被当成写成功。 */
    if (r->abort != 0)
       printf("  abort 0x%08X", (unsigned)r->abort);
    else if (r->rc == SM_RD_ABORT)
@@ -464,11 +404,8 @@ static void xfer_emit(const sm_xfer_run_t *r)
    else
       printf("  wkc=%d..%d", r->wkc_min, r->wkc_max);
 
-   /*
-    * 超时时 ecaterror 必然是 0 —— 打出来是为了说明"什么都没被压进错误栈",
-    * 也就是这一笔连一个像样的应答都没有, 而不是"驱动器拒绝了这个请求"。
-    * ABORT 的情况上面那行已经说过, 写路径则由 [WRITE-FAIL] 负责, 不重复。
-    */
+   /* 超时时 ecaterror 必然是 0: 打出来表示这一笔连一个像样的应答都没有, 而不是驱动器
+    * 拒绝了请求。 */
    if (r->dir == 'R' && r->rc == SM_RD_TIMEOUT)
       printf("  ecaterror=%d", r->ecerr);
 
@@ -501,17 +438,9 @@ void sm_xfer_note(char dir, int slave, uint16_t index, uint8_t sub,
    if (!g_xfer_active)
       return;
 
-   /*
-    * 写不参与归并。
-    *
-    * 写的频率本来就低 (整个 S3 加收尾也就二十来笔), 而"这一笔写的是什么"
-    * 恰恰是要看的东西 —— 把使能序列的 0x0006 / 0x0007 / 0x000F 折叠成一行
-    * "×3" 等于把序列本身抹掉了, 签名里再带上值也救不回来 (那样只会得到
-    * 三行长得一模一样、分不清谁是谁的输出)。
-    * 所以写: 先把挂着的读 run 交出去, 自己单打一行, 立刻打印 ——
-    * 顺带保证了日志里读写的先后顺序与总线上真实发生的顺序一致。
-    * 需要归并的只有读 (S4 的忙轮询每秒上千笔)。
-    */
+   /* 写不参与归并: 写频率低, 且"写的是什么"正是要看的东西 (0x0006/0x0007/0x000F 折叠
+    * 成一行等于抹掉使能序列)。写先交出挂着的读 run 再单打一行, 日志顺序与总线实际
+    * 顺序一致。归并只对读。 */
    if (dir == 'W')
    {
       sm_xfer_run_t one;
@@ -542,14 +471,7 @@ void sm_xfer_note(char dir, int slave, uint16_t index, uint8_t sub,
       return;
    }
 
-   /*
-    * 读: 找签名相同的槽累加。
-    *
-    * 为什么是表而不是单槽: S4 的 jog_leg 按 6041h -> 6064h -> 606Ch 交替轮询,
-    * 相邻两笔的 index 必然不同 —— 单槽下"签名变了"每笔都成立, 于是每笔都
-    * flush, 归并等于没做, 日志照样每轮吐三行。8 槽让交错着的几路轮询各自
-    * 占一格, 谁也不打断谁。
-    */
+   /* 读: 找签名相同的槽累加 */
    i = xfer_find(dir, slave, index, sub, rc, abort);
    if (i < 0)
    {
@@ -592,11 +514,8 @@ void sm_xfer_note(char dir, int slave, uint16_t index, uint8_t sub,
    }
 }
 
-/* ======================================================================
- * 原始寄存器读
- * 注意: ecx_*RD 的首参是 ecx_portt *, 不是 context —— 传 &g_ctx.port。
- * 返回 wkc > 0 才算成功。
- * ====================================================================== */
+/* 原始寄存器读。注意 ecx_*RD 的首参是 ecx_portt *, 不是 context (传 &g_ctx.port);
+ * wkc > 0 才算成功。 */
 int sm_reg_read16(int slave, uint16_t ado, uint16_t *v)
 {
    int wkc;
@@ -617,11 +536,8 @@ int sm_reg_read8(int slave, uint16_t ado, uint8_t *v)
    return (wkc > 0) ? 0 : -1;
 }
 
-/*
- * 诊断计数: Rx 错误 / 转发 Rx 错误 / 处理单元错误 / 丢链次数。
- * 用于在动作前后对比, 判断"这次动作有没有伴随通信质量恶化"。
- * 任一寄存器读失败返回 -1。
- */
+/* 诊断计数: Rx 错误 / 转发 Rx 错误 / 处理单元错误 / 丢链次数 (ECT_REG_RXERR 等)。
+ * 任一寄存器读失败返回 -1。 */
 int sm_diag_counters(int slave, uint32_t *rxerr, uint32_t *frxerr,
                      uint32_t *pe_cnt, uint32_t *ll_cnt)
 {
@@ -650,11 +566,8 @@ int sm_diag_counters(int slave, uint32_t *rxerr, uint32_t *frxerr,
    return 0;
 }
 
-/*
- * 排空 SOEM 错误栈。返回排空的条数。
- * 运动期必须定期调用: EMCY (紧急事件) 和 SDO 错误都从这里出来,
- * 不排空会静默丢掉驱动器报的故障原因。
- */
+/* 排空 SOEM 错误栈, 返回条数。运动期必须定期调用, 否则静默丢掉驱动器报的
+ * EMCY 与 SDO 错误。 */
 int sm_drain_errors(int slave, int print_emcy)
 {
    ec_errort err;
@@ -683,18 +596,11 @@ int sm_drain_errors(int slave, int print_emcy)
    return n;
 }
 
-/* ======================================================================
- * 状态
- * ====================================================================== */
+/* 状态 */
 
-/*
- * 把全部从站请求到指定 AL 状态并等待。
- *
- * manualstatechange = 1 让 ecx_config_map_group 不再自动请求 SAFE_OP,
- * 由本函数统一负责状态升降, 收尾时才能干净地降回 PRE_OP。
- *
- * 返回 0 = 全部到位; 否则返回未到位的台数。
- */
+/* 把全部从站请求到指定 AL 状态并等待。manualstatechange = 1 让 ecx_config_map_group
+ * 不再自动请求 SAFE_OP, 状态升降由本函数统一负责, 收尾时才能干净地降回 PRE_OP。
+ * 返回 0 = 全部到位; 否则返回未到位的台数。 */
 int sm_enter_state(int requested_state, int verbose)
 {
    int slave;

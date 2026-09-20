@@ -1,11 +1,5 @@
-/*
- * hmi/main.cpp —— 两台滑台的 ±500000 脉冲 CSP 点击定位台
- *
- * 界面侧**完全不碰 SOEM**: 这个文件只 include mainwindow.h 与 ec_motor.h, 而
- * ec_motor.h 是纯 C 的公开接口 (只有一个 stdint.h)。所有 ecx_* 都在 EcatThread 里。
- *
- * 默认是只读的: 启动之后一个字节都不写总线。「连接」才进 OP 开始发帧, 「使能」才让电机带电。
- */
+/* hmi/main.cpp —— 两台滑台的 ±500000 脉冲 CSP 点击定位台。
+ * 界面侧不碰 SOEM; 默认只读: 「连接」才进 OP 发帧, 「使能」才让电机带电。 */
 
 #include <QApplication>
 #include <QFont>
@@ -15,20 +9,15 @@
 
 int main(int argc, char **argv)
 {
-   /*
-    * 必须是第一句: 它把控制台代码页设成 UTF-8, 而本程序的中文日志既有我们自己打的
-    * (note()), 也有 motor_api 打的 (选轴 / 偏移证明 / 使能阶梯)。晚一步, 那之前的汉字
-    * 就全是乱码 (实测把「多轴」打成「澶氳酱」)。
-    *
-    * 这是界面线程唯一一次调 motor_api —— 它只设代码页, 不碰总线、不碰网卡。
-    */
+   /* 必须是第一句: 把控制台代码页设成 UTF-8, 晚一步它之前的汉字日志就是乱码。
+    * 界面线程唯一一次调 motor_api —— 只设代码页, 不碰总线、不碰网卡。 */
    em_console_init();
 
    QApplication app(argc, argv);
    app.setApplicationName(QStringLiteral("hmi"));
    app.setApplicationDisplayName(QStringLiteral("滑台 CSP 定位台"));
 
-   /* 不显式设字体的话, 中文在默认族里可能落不到有汉字的字体上 -> 方框 */
+   /* 不显式设字体的话, 中文可能落到没有汉字的字体上 -> 方框 */
    QFont f(QStringLiteral("Microsoft YaHei UI"), 9);
    f.setStyleStrategy(QFont::PreferAntialias);
    app.setFont(f);
@@ -58,11 +47,6 @@ int main(int argc, char **argv)
       QToolTip           { background:#20242b; color:#c8ced8; border:1px solid #3c434e; }
    )"));
 
-   /*
-    * **启动时不弹任何对话框。** 免责的话写在主窗口里常驻 (见 MainWindow 的 caution 一行),
-    * 而真正危险的两个动作各有自己的模态确认 (「连接」说清它写什么、「使能」要求人在设备旁)。
-    * 每次启动都要点一次的弹窗只会被条件反射地关掉 —— 常驻的一行反而看得见。
-    */
    MainWindow w;
    w.resize(1180, 560);
    w.show();

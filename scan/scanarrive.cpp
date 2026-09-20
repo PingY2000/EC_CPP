@@ -28,15 +28,8 @@ void ArrivalJudge::feed_reset_window()
 
 ArrivalJudge::Verdict ArrivalJudge::feed(const ArrivalObs &o, int64_t now_ms, std::string *why)
 {
-   /* ---- 1. 先看该不该继续等 ----
-    *
-    * 这三条都会**永久性地**让窗口开不起来, 所以要报成 Faulted 而不是 Waiting:
-    * 状态机要是把它们当"再等等", 就会死等下去 ——
-    *   !in_op   : 总线掉了, 遥测冻在最后一帧
-    *   fault    : 6041h bit3, 驱动器已经不跟指令了
-    *   !enabled : interpolate() 对未使能的轴直接 continue (ecatworker.cpp:513),
-    *              m_tgt 不再推进, 于是 want != tgt 永远成立 —— 死等的经典现场
-    */
+   /* ---- 1. 这三条会永久性地让窗口开不起来, 必须报 Faulted 而不是 Waiting:
+    *   !in_op = 总线掉了 / fault = 6041h bit3 / !enabled = 插值目标不推进, want != tgt 恒成立 */
    if (!o.in_op)
    {
       if (why) *why = "总线已掉出 OP";
@@ -53,14 +46,12 @@ ArrivalJudge::Verdict ArrivalJudge::feed(const ArrivalObs &o, int64_t now_ms, st
       return Verdict::Faulted;
    }
 
-   /* ---- 2. 镜像不可信时位置是陈值, 不能拿来判到位 ---- */
    if (!o.valid || !o.mirror_ok)
    {
       feed_reset_window();
       return Verdict::Waiting;
    }
 
-   /* ---- 3. 开窗前的门: 必须先见过一次 at_target == false ---- */
    if (!m_seen_moving)
    {
       if (!o.at_target)
@@ -78,7 +69,6 @@ ArrivalJudge::Verdict ArrivalJudge::feed(const ArrivalObs &o, int64_t now_ms, st
       }
    }
 
-   /* ---- 4. 窗口条件 ---- */
    int64_t d = std::llabs((int64_t)o.pos - (int64_t)m_target);
    bool in_window = o.at_target && (d <= (int64_t)m_tol);
 
@@ -100,8 +90,7 @@ ArrivalJudge::Verdict ArrivalJudge::feed(const ArrivalObs &o, int64_t now_ms, st
       if (o.pos > m_max) m_max = o.pos;
    }
 
-   /* 尾端复验是天然的: 只有当条件**此刻仍成立**才会走到这里。
-    * 落进 CSV 的 spread 就是这条判据的可观测证据 —— 极差大说明它在振。 */
+   /* 走到这里说明条件此刻仍成立; 落进 CSV 的 spread 是这条判据的可观测证据 */
    if (now_ms - m_win_start >= (int64_t)m_settle)
       return Verdict::Arrived;
 

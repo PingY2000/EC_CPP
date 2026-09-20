@@ -1,15 +1,7 @@
 /*
- * ec_motor_motion.c - 运动层
- *
- * 负责"写什么、按什么顺序写、写完等哪个位": 使能状态机 / CSP 多轴轨迹 / PV 速度 /
- * 回零。不负责"怎么发出去" —— 那是 ec_motor.c 的 SDO 与过程数据层。
- *
- * ============================================================================
- * 头文件顺序在这里同样是硬的
- * ============================================================================
- * ec_motor_internal.h 里 struct em_bus 含一个**完整的** ecx_contextt 成员, 所以
- * soem.h 必须先于它被包含。本文件不需要 windows.h, 也就不必写那一段 —— 但 soem.h
- * 在前的顺序不能动。
+ * ec_motor_motion.c - 运动层: "写什么、按什么顺序写、写完等哪个位" (使能状态机 /
+ * CSP 多轴轨迹 / PV 速度 / 回零); "怎么发出去"是 ec_motor.c 的 SDO 与过程数据层。
+ * include 顺序同样是硬的: struct em_bus 含完整的 ecx_contextt, soem.h 必须先于内部头。
  */
 #include <stdio.h>
 #include <string.h>
@@ -19,28 +11,13 @@
 
 #include "ec_motor_internal.h"
 
-/* ======================================================================
- * 6041h 低位四位的状态掩码
- *
- * 与 test2.c 的 SW_MASK 完全一致: 只用手册定义的 bit0/1/2/3。
- * **注意这四位不是标准 CiA402 编码** (标准是 0x40/0x21/0x23/0x27/0x31...), 该驱动器
- * 手册走的是自己的 8 态迁移表, 所以全程按位判, 不做数值比较, 也不用 bit6。
- * 真机上量到的: 刚上电 0x0210 (低四位 0000), 写 6040h=0x0000 后 0x0231 (低四位 0001
- * = Ready to switch on, 电机释放) —— 所以"未使能"的判据里**不能出现低四位 == 0000**。
- * ====================================================================== */
+/* 6041h 低位四位的状态掩码, 只用手册定义的 bit0/1/2/3。这四位不是标准 CiA402 编码 (标准是
+ * 0x40/0x21/0x23/0x27/0x31...), 该驱动器手册走自己的 8 态迁移表, 所以全程按位判, 不用 bit6。
+ * 真机实测: 刚上电 0x0210 (低四位 0000), 写 6040h=0x0000 后 0x0231 (低四位 0001 = Ready to switch on) */
 #define EM_SW_MASK_STATE \
    (EM_SW_RTSO | EM_SW_SWITCHED | EM_SW_OP_ENABLED | EM_SW_FAULT)
 
-/* ======================================================================
- * 使能 / 失能 / 故障复位
- * ====================================================================== */
-
-/*
- * 取该轴当前的实际位置: 优先用最新一帧过程数据, 镜像不可信时走 SDO 兜底。
- *
- * **绝不拿 0 当"当前位置"**: 0 是一个完全合法的位置值, 用它的后果是让 CSP 的第一帧
- * 变成一个凭空的位置跳变。取不到就返回失败, 让调用方去处理。
- */
+/* 取该轴当前的实际位置: 优先用最新一帧过程数据, 镜像不可信时走 SDO 兜底; 绝不拿 0 当"当前位置" */
 static int em__cur_pos(em_axis_t *ax, int32_t *out)
 {
    if (ax == NULL || out == NULL)
@@ -79,22 +56,12 @@ int em_arm(em_axis_t *ax)
       return EM_R_FAIL;
    }
 
-   /*
-    * 6060h 在生效 RxPDO 里时, 把镜像那一字节**对齐到驱动器实际认的模式**。
-    *
-    * 这里读到的是驱动器自报的 6061h, 也就是"它现在按哪种模式解释 607Ah"。使能那一
-    * 帧如果镜像里的 6060h 与它不一致, 驱动器就会在我们刚刚钉好目标值之后换一种解释
-    * 方式 —— 钉目标值的意义就没了。重钉一次是零成本的, 而漂一次的代价是一次意外运动。
-    */
+   /* 6060h 在生效 RxPDO 里时, 把镜像那一字节对齐到驱动器实际认的模式 (6061h):
+    * 使能那一帧若不一致, 驱动器会在刚钉好目标值之后换一种解释 607Ah 的方式 */
    if (ax->off_modes >= 0)
       em__put_u8(ax->out, ax->off_modes, (uint8_t)mode);
 
-   /*
-    * 6083h / 6084h 也重钉一次。它们在生效 RxPDO 里时是主站拥有的, 不写就是下发 0 ——
-    * 而 6083h = 0 会让 PV 的斜坡起不来 (驱动器收下速度指令、bit12 清零、却一步不走)。
-    * setup 时已经钉过一次, 这里是使能前的第二次: 纯镜像写、不发帧、不做 SDO, 零成本,
-    * 而漏一次的代价是一次"全 PASS 但电机没转"。
-    */
+   /* 6083h / 6084h 也重钉一次: 在生效 RxPDO 里不写就是下发 0, 而 6083h = 0 会让 PV 的斜坡起不来 */
    em__pin_ramp(ax);
 
    switch (mode)
@@ -171,10 +138,7 @@ int em_enable(em_axis_t *ax)
    }
    if (!em_sw_remote_ok(ax->sw))
    {
-      /*
-       * bit9 = Remote。它为 0 表示"控制字不可操作", 这时整套 6040h 状态机是无效的 ——
-       * 推下去也不会有反应, 只会白等一个超时。
-       */
+      /* bit9 = Remote。为 0 表示控制字不可操作, 整套 6040h 状态机无效 —— 推下去没反应, 只会白等超时 */
       em__err("%s: 6041h bit9 = 0 (Remote 未就绪), 控制字不可操作 -> 拒绝使能 "
               "(0x%04X)", ax->label, (unsigned)ax->sw);
       return EM_R_FAIL;
@@ -187,13 +151,8 @@ int em_enable(em_axis_t *ax)
    if (rc != EM_R_OK)
       return rc;
 
-   /*
-    * 上行阶梯取自 test2.c:962-985 (真机上跑通过的顺序与期望值):
-    *   0x0000 -> 低四位 0x1 (RTSO)        先归位, 这样入口状态是什么都不影响后面判定
-    *   0x0006 -> 低四位 0x1 (RTSO)        Shutdown
-    *   0x0007 -> 低四位 0x3 (RTSO|SW)     Switch on
-    *   0x000F -> 低四位 0x7 (RTSO|SW|OPE) Enable operation —— 电机从这里开始带电
-    */
+   /* 上行阶梯 (真机跑通过的顺序与期望值): 0x0000 -> 低四位 0x1 (RTSO) 先归位;
+    * 0x0006 -> 0x1 Shutdown; 0x0007 -> 0x3 (RTSO|SW) Switch on; 0x000F -> 0x7 (电机带电) */
    rc = em__cw_step(ax, "0. 归位 Disable voltage", EM_CW_DISABLE_V,
                     EM_SW_MASK_STATE, EM_SW_RTSO, EM_STEP_TMO_MS);
    if (rc != EM_R_OK)
@@ -236,10 +195,7 @@ int em_disable(em_axis_t *ax)
 
    printf("  ---- %s 失能 ----\n", ax->label);
 
-   /*
-    * 下行就逐级退回去。只测上行的话, "能不能干净地停"恰恰是没测到的 ——
-    * 而在真实设备上, 那一半比上行重要。
-    */
+   /* 下行逐级退回去。只测上行的话"能不能干净地停"恰恰没测到, 那在真机上比上行重要 */
    if (em_is_enabled(ax))
    {
       rc = em__cw_step(ax, "Disable operation", EM_CW_SWITCHON, EM_SW_MASK_STATE,
@@ -253,12 +209,8 @@ int em_disable(em_axis_t *ax)
          return rc;
    }
 
-   /*
-    * 最后一步的判据用**bit2 本身**, 不用 (sw & 0x000F) == 0:
-    * 驱动器上电自检完成后合法地停在低四位 = 0001 (Ready to switch on, 电机释放),
-    * 要求读到 0000 在一台完全正常的驱动器上必然失败 —— 那是期望值不对, 不是故障。
-    * 掩码里带上 bit3 是因为"带故障的未使能"不算失能成功。
-    */
+   /* 最后一步的判据用 bit2 本身, 不用 (sw & 0x000F) == 0: 驱动器自检完成后合法地停在低四位
+    * = 0001 (Ready to switch on), 要求读到 0000 必然失败; 掩码带 bit3 = "带故障的未使能"不算成功 */
    return em__cw_step(ax, "Disable voltage", EM_CW_DISABLE_V,
                       EM_SW_OP_ENABLED | EM_SW_FAULT, 0, EM_STEP_TMO_MS);
 }
@@ -286,10 +238,8 @@ int em_fault_reset(em_axis_t *ax)
    was_fault = (ax->sw & EM_SW_FAULT) != 0;
    printf("  ---- %s 故障复位 (6040h bit7 上升沿) ----\n", ax->label);
 
-   /*
-   * bit7 是**上升沿**触发: 若它本来就是 1, 直接写 0x0080 不构成上升沿, 什么也不会
-   * 发生 (而且会静默地"成功")。所以先把 bit7 压到 0, 打几帧确认它发出去了, 再抬起来。
-   */
+   /* bit7 是上升沿触发: 它本来就是 1 的话, 直接写 0x0080 不构成上升沿, 什么也不会发生
+    * (而且会静默地"成功")。所以先把 bit7 压到 0, 打几帧确认发出去了再抬起来 */
    em__set_cw(ax, EM_CW_DISABLE_V);
    for (k = 0; k < 10; k++)
    {
@@ -333,10 +283,8 @@ int em_fault_reset(em_axis_t *ax)
 
    if (!was_fault)
    {
-      /*
-       * 本来就没故障。上面那个循环看到 bit3 = 0 就"成功"了, 但那不代表复位动作起了
-       * 作用 —— 如实说清楚, 不让调用者以为自己清掉了一个不存在的故障。
-       */
+      /* 本来就没故障。上面那个循环看到 bit3 = 0 就"成功"了, 但那不代表复位动作起了作用 ——
+       * 如实说清楚, 不让调用者以为清掉了一个不存在的故障 */
       printf(" [PASS] 但本来就没有故障 (6041h bit3 未曾置位) —— 这次复位是空操作\n");
       return EM_R_OK;
    }
@@ -357,10 +305,7 @@ int em_enable_all(em_bus_t *bus)
       rc = em_enable(bus->axis[i]);
       if (rc != EM_R_OK)
       {
-         /*
-          * 一根轴没使能上, 就把已经使能的退回去 —— 停在"一半带电一半不带电"上是最难
-          * 收拾的状态: 滑台一头有保持力矩一头没有, 手推不得也说不上安全。
-          */
+         /* 一根轴没使能上就把已经使能的退回去 —— 停在"一半带电一半不带电"上最难收拾 */
          em__err("%s 使能失败 -> 把已使能的轴退回去", bus->axis[i]->label);
          for (j = 0; j < i; j++)
          {
@@ -382,19 +327,12 @@ int em_disable_all(em_bus_t *bus)
 
    for (i = 0; i < bus->naxis; i++)
    {
-      /*
-       * 一根轴失能失败不妨碍继续退其它的 —— 这里的目标是"尽可能多地把电撤掉",
-       * 不是"全部成功"。哪根没退掉由 em_disable 自己打印, 最后统一报失败。
-       */
+      /* 一根轴失能失败不妨碍继续退其它的: 目标是"尽可能多地把电撤掉", 哪根没退掉由 em_disable 打印 */
       if (em_disable(bus->axis[i]) != EM_R_OK)
          bad = 1;
    }
    return bad ? EM_R_FAIL : EM_R_OK;
 }
-
-/* ======================================================================
- * CSP —— 位置同步模式, 多轴同周期下发
- * ====================================================================== */
 
 int em_csp_move_multi(em_axis_t **axes, const int32_t *target, const uint32_t *vel,
                       int n, uint32_t tmo_ms)
@@ -416,7 +354,6 @@ int em_csp_move_multi(em_axis_t **axes, const int32_t *target, const uint32_t *v
       return EM_R_FAIL;
    bus = axes[0]->bus;
 
-   /* ---- 前置检查: 逐轴独立判, 有一根不合格就整体不动 ---- */
    for (i = 0; i < n; i++)
    {
       em_axis_t *ax = axes[i];
@@ -437,10 +374,8 @@ int em_csp_move_multi(em_axis_t **axes, const int32_t *target, const uint32_t *v
       {
          if (axes[j] == ax)
          {
-            /*
-             * 同一根轴出现两次: 下面那个循环里后一次会**直接覆盖**前一次的 607Ah,
-             * 于是"走到了两个不同的终点"这件事谁也不知道, 两条命令都像成功。
-             */
+            /* 同一根轴出现两次: 后一次会直接覆盖前一次的 607Ah, 于是"走到了两个不同的终点"
+             * 谁也不知道, 两条命令都像成功 */
             em__err("%s: 在同一批里出现了两次 -> 拒绝 (后一次会静默覆盖前一次)",
                     ax->label);
             return EM_R_FAIL;
@@ -472,10 +407,7 @@ int em_csp_move_multi(em_axis_t **axes, const int32_t *target, const uint32_t *v
 
       if (v[i] == 0)
       {
-         /*
-          * 速度为 0 就是不动。让它走"运动"这条路会得到一个必然超时的等待, 而且
-          * 期间电机带电 —— 与其如此, 不如直说是参数错了。
-          */
+         /* 速度为 0 就是不动: 走"运动"这条路会得到一个必然超时的等待, 期间电机还带电 */
          em__err("%s: 速度是 0 -> 拒绝 (速度 0 是「不动」, 不是「尽快」)", ax->label);
          return EM_R_FAIL;
       }
@@ -514,11 +446,8 @@ int em_csp_move_multi(em_axis_t **axes, const int32_t *target, const uint32_t *v
 
       if (em_stop_requested())
       {
-         /*
-          * 收到停止请求: 把目标冻结在当前插值点上, 再打几帧让"停在这"确实发出去。
-          * **不写 0x0000** —— 那会让电机瞬间卸力, 垂直轴会自由下落。带保持力矩停住
-          * 才是这里该做的; 要不要撤电由调用方决定。
-          */
+         /* 收到停止请求: 把目标冻结在当前插值点上, 再打几帧让"停在这"确实发出去。
+          * 不写 0x0000 —— 那会让电机瞬间卸力, 垂直轴会自由下落; 要不要撤电由调用方决定 */
          printf("  [中止] 目标冻结在当前插值点, 保持使能\n");
          for (i = 0; i < n; i++)
          {
@@ -538,19 +467,14 @@ int em_csp_move_multi(em_axis_t **axes, const int32_t *target, const uint32_t *v
       dt   = now - last;
       last = now;
 
-      /*
-       * 用**实测 dt** 推进, 不用假设的周期: Windows 不是实时系统, 假设 2ms 而实际
-       * 卡了 30ms, 会让插值目标落后于真实时间 —— CSP 下驱动器跟着目标走, 落后就是
-       * 实际速度比命令值低, 而且低多少完全不可预知。
-       */
+      /* 用实测 dt 推进, 不用假设的周期: Windows 不是实时系统, 假设 2ms 而实际卡了 30ms
+       * 会让插值目标落后于真实时间 —— CSP 下驱动器跟着目标走, 落后就是实际速度比命令值低 */
       if (dt == 0)
          dt = 1;
       if (dt > 100)
       {
-         /*
-          * 卡了一下。一次最多按 100ms 推进: 让插值慢慢补回来, 好过让目标一次跳一大步 ——
-          * CSP 下跳一大步就是一次高速冲刺, 而卡顿本身往往意味着总线状态不稳。
-          */
+         /* 卡了一下。一次最多按 100ms 推进: 让插值慢慢补回来, 好过让目标一次跳一大步
+          * (CSP 下跳一大步就是一次高速冲刺, 而卡顿本身往往意味着总线状态不稳) */
          em__log(bus, "过程数据间隔 %ums > 100ms, 本次按 100ms 推进 (不让目标跳步)", dt);
          dt = 100;
       }
@@ -576,10 +500,7 @@ int em_csp_move_multi(em_axis_t **axes, const int32_t *target, const uint32_t *v
                done[i] = 1;
          }
 
-         /*
-          * 每个周期都要重发控制字: 6040h 是过程数据, 它不像 SDO 那样"写一次就记住了" ——
-          * 停发或发成别的值, 驱动器下一周期就不再处于 Operation enabled。
-          */
+         /* 每个周期都要重发控制字: 6040h 是过程数据, 停发或发成别的值下一周期就不再 Operation enabled */
          em__set_cw(ax, EM_CW_ENABLE_OP);
          em__put_i32(ax->out, ax->off_target_pos, cur[i]);
          ax->csp_target = cur[i];
@@ -595,10 +516,7 @@ int em_csp_move_multi(em_axis_t **axes, const int32_t *target, const uint32_t *v
       {
          int all_in = 1;
 
-         /*
-          * 插值目标到了终点**还不够**: 目标是我们发出去的, 位置是驱动器报回来的。
-          * 到位要两个都成立 —— 否则就等于"我发了个数, 就当它走到了"。
-          */
+         /* 插值目标到了终点还不够: 目标是发出去的, 位置是驱动器报回来的, 到位要两个都成立 */
          for (i = 0; i < n; i++)
          {
             if (!axes[i]->mirror_ok)
@@ -667,19 +585,13 @@ int em_csp_set_target(em_axis_t *ax, int32_t target)
       return EM_R_FAIL;
    if (ax->off_target_pos < 0)
    {
-      /*
-       * 607Ah 不在这一轴实读的映射里。**不退回 SDO**: 这条路径是每周期调的, 一次 SDO
-       * 往返 700ms, 而且 OP 下的 SDO 往返本身就是上一期怀疑会把驱动器踢出 OP 的诱因。
-       * 写不进去就直说写不进去。
-       */
+      /* 607Ah 不在这一轴实读的映射里。不退回 SDO: 这条路径是每周期调的, 一次 SDO 往返
+       * 700ms, 且 OP 下的 SDO 往返本身就可能把驱动器踢出 OP。写不进去就直说写不进去 */
       em__err("%s: 607Ah 不在本轴实读的映射里 -> 目标位置下发不出去", ax->label);
       return EM_R_FAIL;
    }
 
-   /*
-    * 只写镜像。**使能状态与 6061h==CSP 由调用方保证** —— 见 ec_motor.h 的说明:
-    * 这是每周期路径, 上面不能有 SDO。
-    */
+   /* 只写镜像。使能状态与 6061h==CSP 由调用方保证 —— 这是每周期路径, 上面不能有 SDO */
    em__put_i32(ax->out, ax->off_target_pos, target);
    return EM_R_OK;
 }
@@ -724,13 +636,7 @@ int em_csp_move_rel_multi(em_axis_t **axes, const int32_t *delta,
    if (axes == NULL || delta == NULL || vel == NULL || n <= 0 || n > EM_MAX_AXES)
       return EM_R_FAIL;
 
-   /*
-    * 第一步: 把**所有**轴的起点取完, 一个字节都还没下发。
-    *
-    * 顺序很重要。如果取一根、下发一根, 各轴的起点就落在不同时刻、不同帧上 ——
-    * 而"两轴同时从各自此刻的位置出发"正是这个函数存在的理由。
-    * 先取完再算: 起点是**同一个决定时刻**的一组实际位置。
-    */
+   /* 第一步: 把所有轴的起点取完, 一个字节都还没下发 —— 取一根下发一根的话各轴起点就落在不同帧上 */
    for (i = 0; i < n; i++)
    {
       if (axes[i] == NULL)
@@ -758,10 +664,7 @@ int em_csp_move_rel_multi(em_axis_t **axes, const int32_t *delta,
       tgt[i] = (int32_t)t;
    }
 
-   /*
-    * 把基准显式打出来。用户要确认的就是"607Ah 相对于开始这一刻的实际位置",
-    * 那就让这句话出现在日志里, 而不是只存在于代码的意图中。
-    */
+   /* 把基准显式打出来: 要确认的就是"607Ah 相对于开始这一刻的实际位置" */
    printf("  相对运动的起点 (调用这一刻各轴的实际位置):\n");
    for (i = 0; i < n; i++)
       printf("    %s: %d -> %d pul (位移 %d)\n", axes[i]->label, cur[i], tgt[i],
@@ -771,12 +674,8 @@ int em_csp_move_rel_multi(em_axis_t **axes, const int32_t *delta,
    return em_csp_move_multi(axes, tgt, vel, n, tmo_ms);
 }
 
-/* ======================================================================
- * PV —— 速度模式
- *
- * 这台驱动器**没有 CSV (6060h=9)**: 手册 6502h = 0x00A5 = PP + PV + HM + CSP。
- * 所以"速度模式"只有 PV 一种, 别处不要再找一遍。
- * ====================================================================== */
+/* PV —— 速度模式。这台驱动器没有 CSV (6060h=9): 手册 6502h = 0x00A5 = PP + PV + HM + CSP,
+ * 所以"速度模式"只有 PV 一种 */
 
 int em_pv_stop(em_axis_t *ax)
 {
@@ -791,21 +690,13 @@ int em_pv_stop(em_axis_t *ax)
    em__set_cw(ax, EM_CW_ENABLE_OP);
    em__put_i32(ax->out, ax->off_target_vel, 0);
 
-   /*
-    * 写 0 之后要看驱动器**真的停了**: 6041h bit12 在 PV 下是 Speed (1 = 速度为 0)。
-    * "我发了 0" 和 "它停了" 是两件事。
-    */
+   /* 写 0 之后要看驱动器真的停了: 6041h bit12 在 PV 下是 Speed (1 = 速度为 0)。
+    * "我发了 0"和"它停了"是两件事 */
    return em__wait_sw(ax, EM_SW_PV_SPEED_ZERO, EM_SW_PV_SPEED_ZERO,
                       EM_STEP_TMO_MS, "PV 速度归零 (6041h bit12)");
 }
 
-/*
- * 把所有轴的速度写 0 并打若干帧 —— 出事时的统一收尾。
- *
- * 多轴下这件事必须是"全部", 不是"出事那一根": 返回错误却留着别的轴在转, 比单轴时
- * 更难收场。只写 0 不在这里断言 bit12 —— 断言留给调用方逐轴做, 因为一根没停住不该
- * 让其余轴的停机流程走不完。
- */
+/* 把所有轴的速度写 0 并打若干帧 —— 出事时的统一收尾; 不在这里断言 bit12, 一根没停住不该拖住其余轴 */
 static void em__pv_stop_all(em_axis_t **axes, int n)
 {
    int i, k;
@@ -838,11 +729,8 @@ int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_m
    if (axes == NULL || vel == NULL || n <= 0 || n > EM_MAX_AXES)
       return EM_R_FAIL;
 
-   /*
-    * ---- 全部校验, 一根都不动 ----
-    * 多轴下"跑到一半才发现第 2 根不行"意味着一根在动、一根没动。所以这里全部查完
-    * 才写第一个字节。
-    */
+   /* ---- 全部校验, 一根都不动 ---- 多轴下"跑到一半才发现第 2 根不行"意味着一根在动一根
+    * 没动, 所以全部查完才写第一个字节 */
    for (i = 0; i < n; i++)
    {
       em_axis_t *ax = axes[i];
@@ -869,12 +757,8 @@ int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_m
                  "em_set_mode(ax, EM_MODE_PV)", ax->label, em_get_mode(ax));
          return EM_R_FAIL;
       }
-      /*
-       * 取起跑位置 —— 这是"转没转"唯一的客观依据, 所以取不到就整体拒绝。
-       * 光断言 6041h bit12 (Speed=0) 是不够的: 那个位说的是**驱动器收下了速度指令**,
-       * 不是**电机动了**。真机上出现过 bit12 正常清零、606Ch 恒为 0、6064h 一个计数
-       * 不动的情形 (主站把 6083h 加速度下发成了 0, 斜坡起不来) —— 那一趟全阶段 PASS。
-       */
+      /* 取起跑位置 —— "转没转"唯一的客观依据 (6064h), 取不到就整体拒绝。光断言 6041h bit12
+       * 不够: 那位说的是"收下了速度指令"不是"电机动了" (真机: bit12 清零而 6064h 一个计数不动) */
       if (em__cur_pos(ax, &pos0[i]) != EM_R_OK)
       {
          em__err("%s: 取不到起跑时的实际位置 (6064h) -> 无法判断这趟到底转没转, "
@@ -907,14 +791,10 @@ int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_m
          em__put_i32(axes[i]->out, axes[i]->off_target_vel, vel[i]);
       }
 
-      /* >>> 一帧喂所有轴 —— "同时调用两个驱动器"就发生在这一行 <<< */
       (void)em__cycle(axes[0]->bus);
 
-      /*
-       * 用**同一帧**的镜像逐轴检查。跑的过程中也要盯着: PV 期间出故障或撞限位,
-       * 驱动器会自己停, 但主站若只顾跑满 hold_ms 就会把"它已经停了"当成"跑完了" ——
-       * 那等于把一次异常说成正常。
-       */
+      /* 用同一帧的镜像逐轴检查: PV 期间出故障或撞限位, 驱动器会自己停, 主站若只顾跑满
+       * hold_ms 就会把"它已经停了"当成"跑完了" —— 那等于把一次异常说成正常 */
       for (i = 0; i < n; i++)
       {
          em_axis_t *ax = axes[i];
@@ -956,10 +836,7 @@ int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_m
       em__sleep_ms(EM_POLL_MS);
    }
 
-   /*
-    * 逐轴判"这趟读数到底有没有发生过"。整段 hold_ms 里一笔 6041h 都没取到, 上面那些
-    * "运行中检查"就是一次都没真正做过 —— 不能因为"没查到问题"就说这趟跑得正常。
-    */
+   /* 逐轴判"这趟读数到底有没有发生过": 一笔 6041h 都没取到, 上面那些"运行中检查"就是一次都没做过 */
    for (i = 0; i < n; i++)
    {
       if (reads[i] == 0)
@@ -975,17 +852,9 @@ int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_m
       printf("  %s: 跑满 %ums (期间 %d 次读数, 6041h=%s)\n", axes[i]->label,
              (unsigned)hold_ms, reads[i], em_sw_describe(axes[i]->sw));
 
-   /*
-    * ---- 判"到底转没转" ----
-    * 这是本函数从上一趟真机运行里补上的一条断言。那一趟 6041h 全程正常 (bit12 该清的
-    * 清、该置的置)、退出码 0, 而 6064h 一个计数没动、606Ch 恒为 0 —— 断言齐了, 却把
-    * "没转"报成了 PASS。原因是所有检查都在问"驱动器收下指令了吗", 没有一条在问
-    * "电机动了吗"。
-    *
-    * 用**位置**判而不是用速度判: 606Ch 是驱动器按自己的斜坡算出来的瞬时值, 在
-    * "斜坡起不来"这种故障下它恒为 0, 但有些驱动器会直接回报指令值 —— 那样就用它
-    * 判不出问题。位置不会骗人: 走没走, 6064h 说了算。
-    */
+   /* 判"到底转没转": 6041h 正常、退出码 0 而 6064h 一个计数没动是出现过的 (上述检查都在问
+    * "驱动器收下指令了吗"); 位置不会骗人, 走没走 6064h 说了算 (606Ch 是驱动器按自己斜坡算
+    * 的瞬时值, 有些驱动器直接回报指令值) */
    for (i = 0; i < n; i++)
    {
       int32_t moved;
@@ -1017,13 +886,8 @@ int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_m
       }
    }
 
-   /*
-    * 停机: **先把所有轴的速度一起写 0, 再逐轴断言** bit12 (Speed = 0)。
-    *
-    * 不逐轴调 em_pv_stop(): 那个函数写完 0 就等在自己那根轴上, 于是第 2 根要等第 1 根
-    * 停稳了才开始减速 —— 多轴下这等于"先后停", 而我们要的是"一起停"。
-    * 写 0 是一次性的(下一帧就发出去), 断言才是要花时间的部分, 两者分开正好。
-    */
+   /* 停机: 先把所有轴的速度一起写 0, 再逐轴断言 bit12 (Speed = 0)。不逐轴调 em_pv_stop():
+    * 那个函数写完 0 就等在自己那根轴上, 多轴下会变成"先后停", 这里要的是"一起停" */
    for (i = 0; i < n; i++)
    {
       em__set_cw(axes[i], EM_CW_ENABLE_OP);
@@ -1053,24 +917,24 @@ int em_pv_run_for(em_axis_t *ax, int32_t vel, uint32_t hold_ms)
    return em_pv_run_multi(one, v, 1, hold_ms);
 }
 
-/* ======================================================================
- * 回零
- * ====================================================================== */
+/* 手册 V2.3 §3.7: 驱动器支持 1~14、17~30、33、34、35 回原点方法, 其中 1~14、33、34
+ * 需配套带 Z 信号的闭环步进电机。这道闸就限死这个集合, 15/16/31/32 一律拒绝 */
+static int em__home_method_ok(int m)
+{
+   return (m >= 1 && m <= 14) || (m >= 17 && m <= 30) || m == 33 || m == 34 || m == 35;
+}
+
+/* 回零等待里 bit11 那一行的最小打印间隔 (ms): 只在变化时打, 这道缝是给抖动/接触不良的开关留的 */
+#define EM_HOME_LIM_PRINT_MIN_MS  500u
 
 void em_home_cfg_default(em_home_cfg_t *c)
 {
    if (c == NULL)
       return;
 
-   /*
-    * 方式 24 = 原点开关 (X0) 为原点, **正向先找**。
-    * 选 24 而不是出厂默认的 17/18, 依据是真机上量到的端子功能 (2310h):
-    * X0 = 原点, X1 = 正限位, X2 = 负限位。
-    * 但**滑台停在哪一侧、原点开关在行程的哪个位置只有现场知道** —— 首次回零务必把
-    * 速度收得很低, 人在急停旁; 方向不对就换 29 或 35 再试, 别硬顶。
-    *
-    * 默认速度刻意保守: 按 2400h 细分 = 50000 pul/圈 算, 2000 pul/s ≈ 0.04 圈/秒。
-    */
+   /* 方式 24 = 原点开关 (X0) 为原点, 正向先找。选 24 而不是出厂默认的 17/18, 依据是真机量到的
+    * 端子功能 (2310h): X0 = 原点, X1 = 正限位, X2 = 负限位。首次回零务必把速度收得很低, 人在
+    * 急停旁, 方向不对就换 29 或 35。默认速度按 2400h 细分 = 50000 pul/圈 算 (2000 pul/s ≈ 0.04 圈/s) */
    c->method   = 24;
    c->vel_fast = 2000;
    c->vel_slow = 500;
@@ -1110,10 +974,10 @@ int em_home(em_axis_t *ax, const em_home_cfg_t *cfg, uint32_t tmo_ms)
               (unsigned)ax->sw);
       return EM_R_FAIL;
    }
-   if (cfg->method < 1 || cfg->method > 35)
+   if (!em__home_method_ok(cfg->method))
    {
-      em__err("%s: 回零方式 %d 超出本驱动器支持的范围 (手册: 1~14, 17~30, 33~35)",
-              ax->label, cfg->method);
+      em__err("%s: 回零方式 %d 不在本驱动器支持的范围里 (手册 §3.7: 1~14, 17~30, "
+              "33, 34, 35) -> 一个字节都没写", ax->label, cfg->method);
       return EM_R_FAIL;
    }
 
@@ -1121,7 +985,6 @@ int em_home(em_axis_t *ax, const em_home_cfg_t *cfg, uint32_t tmo_ms)
           "原点偏移 %d) ----\n", ax->label, cfg->method, (unsigned)cfg->vel_fast,
           (unsigned)cfg->vel_slow, (unsigned)cfg->acc, cfg->offset);
 
-   /* ---- 1. 写回零参数 (每一条都写后回读) ---- */
    if (em__wr_i8(ax, EM_OID_HOMING_MODE, 0, (int8_t)cfg->method,
                  "回零方式 6098h") != EM_R_OK)
       return EM_R_FAIL;
@@ -1138,10 +1001,7 @@ int em_home(em_axis_t *ax, const em_home_cfg_t *cfg, uint32_t tmo_ms)
                   "原点偏移 607Ch") != EM_R_OK)
       return EM_R_FAIL;
 
-   /*
-    * 2. 读 2214h (回零辅助)。它决定回零完成后 6064h 显示什么, 所以本函数**只把它
-    *    读出来打印, 不断言"回零后位置 == 0"** —— 那个断言在这台设备上不成立。
-    */
+   /* 2. 读 2214h (回零辅助): 它决定回零完成后 6064h 显示什么, 所以只读出来打印, 不断言位置为 0 */
    {
       uint32_t aux = 0;
 
@@ -1173,15 +1033,21 @@ int em_home(em_axis_t *ax, const em_home_cfg_t *cfg, uint32_t tmo_ms)
           (unsigned)tmo_ms);
    fflush(stdout);
 
+   /* 这几个观测量只为本段日志服务, 理由都是"轴一步不动"这一个问题: pos0/pos_ok = 抬 bit4 那
+    * 一刻的位置 —— 超时时回答"到底动没动", 这是区分「在走、只是没找到开关」与「一步都没走」唯一
+    * 的事实来源; lim_shown = bit11 上次打印过的值 (-1 = 还没打过); lim_all = bit11 是否全程有效 */
+   int32_t  pos0    = 0;
+   int      pos_ok  = (em__cur_pos(ax, &pos0) == EM_R_OK);
+   int      lim_shown    = -1;
+   int      lim_all      = 1;
+   uint32_t t_lim_print  = 0;
+
    t0 = em__now_ms();
    for (;;)
    {
       if (em_stop_requested())
       {
-         /*
-          * 撤掉 bit4 = 放弃这次回零。**保持使能** —— 回零中途停机位置不明, 卸力可能
-          * 让滑台自由下滑。
-          */
+         /* 撤掉 bit4 = 放弃这次回零。保持使能 —— 回零中途停机位置不明, 卸力可能让滑台自由下滑 */
          printf(" [中止] 撤掉 6040h bit4, 保持使能\n");
          em__set_cw(ax, EM_CW_ENABLE_OP);
          for (rc = 0; rc < 20; rc++)
@@ -1222,37 +1088,115 @@ int em_home(em_axis_t *ax, const em_home_cfg_t *cfg, uint32_t tmo_ms)
                    (unsigned)(em__now_ms() - t0));
             break;
          }
-         if ((ax->sw & EM_SW_INTLIMIT) != 0)
-            printf(" [..] bit11 硬件限位有效, 仍在找原点 ...");
+         /* bit11 只在变化时打一行 (外加 EM_HOME_LIM_PRINT_MIN_MS 那道缝, 给抖动/接触不良的
+          * 开关留的)。lim_all 决定超时那条消息说"驱动器自己不许动"还是"接着找" */
+         {
+            const int lim = ((ax->sw & EM_SW_INTLIMIT) != 0);
+
+            if (!lim)
+               lim_all = 0;
+
+            /* 第一次观察就是"没压着" —— 那是常态, 不值得一行 */
+            if (lim_shown < 0 && !lim)
+               lim_shown = 0;
+
+            if (lim != lim_shown)
+            {
+               const uint32_t now = em__now_ms();
+
+               if (t_lim_print == 0 ||
+                   (int32_t)(now - t_lim_print) >= (int32_t)EM_HOME_LIM_PRINT_MIN_MS)
+               {
+                  t_lim_print = now;
+                  lim_shown   = lim;
+                  printf("\n  [..] 6041h bit11 %s\n",
+                         lim ? "硬件限位有效 (仍在找原点) —— 见 2204h 超程停车方式, "
+                               "以及 2300h 输入逻辑与接线是否配反"
+                             : "已清 (驱动器不再报硬件限位)");
+                  fflush(stdout);
+               }
+            }
+         }
       }
 
       if ((int32_t)(em__now_ms() - t0) >= (int32_t)tmo_ms)
       {
          printf(" [FAIL]\n");
          if (reads == 0)
-            em__err("%s: 等 bit12 超时 (%ums), 且一笔完整的 6041h 都没取到: "
-                    "状态未知", ax->label, (unsigned)tmo_ms);
-         else
-            em__err("%s: 等 bit12 超时 (%ums), 实测 %s。回零仍在进行或已卡住 —— "
-                    "先确认滑台在哪、限位/原点开关是否触发", ax->label,
-                    (unsigned)tmo_ms, em_sw_describe(ax->sw));
-         return EM_R_FAIL;
+         {
+            em__err("%s: 等 bit12 超时 (%ums), 且一笔完整的 6041h 都没取到: 状态未知",
+                    ax->label, (unsigned)tmo_ms);
+            return EM_R_FAIL;
+         }
+
+         {
+            int32_t   pos1    = 0;
+            const int pos_ok1 = (em__cur_pos(ax, &pos1) == EM_R_OK);
+            /* -1 = 不知道 (两次里有一次没读出来), 0 = 一步都没动, 1 = 动了 */
+            const int moved   = (pos_ok && pos_ok1) ? (pos1 != pos0) : -1;
+
+            em__err("%s: 等 bit12 超时 (%ums), 实测 %s", ax->label, (unsigned)tmo_ms,
+                    em_sw_describe(ax->sw));
+
+            if (lim_all)
+            {
+               /* bit11 = 硬件限位有效 (手册 §3.3.2: 限位信号有效时该位置 1)。2204h 超程停车
+                * 方式 = 0 (停止) 时驱动器按"已经压着限位"处理, 一个方向都不许走 —— 现象是
+                * "模式对、使能对、bit4 也抬了, 轴却一步不动, 也不报 bit3/bit13" */
+               if (moved == 0)
+               {
+                  printf("        6041h bit11 = 硬件限位有效**全程举着** (一次都没清), "
+                         "而位置一步没变 (%d pul)。\n"
+                         "        这多半不是「没找到开关」, 而是**驱动器自己不许动** —— "
+                         "按顺序查这三处:\n"
+                         "        1) 2300h 输入逻辑与现场接线是否一致: 常开的驱动器配 NPN "
+                         "传感器 (高电平 = 未触发) 时 X0/X1/X2 **一起反相**, bit11 因此\n"
+                         "           恒置 1。改法是把 2300h 的 bit0~bit2 都置 1 (= 0x0007), "
+                         "再用 2102h 存 EEPROM (先写 0, 再写 2);\n"
+                         "        2) 2204h 超程停车方式 (= 0 停止 / 1 急停 / 2 无效);\n"
+                         "        3) 2310h~2312h 的端子分配 (X0 原点 / X1 正限位 / X2 负限位)。\n"
+                         "        界面上那个「输入电平反转」勾**帮不了这里**: 它只改主站的"
+                         "判据, 开关是驱动器自己读的。\n", pos1);
+                  fflush(stdout);
+               }
+               else if (moved > 0)
+               {
+                  printf("        6041h bit11 全程有效, 但位置**确实变了** (现在是 %d pul, "
+                         "抬 bit4 时是 %d pul):\n"
+                         "        驱动器在限位有效下仍然走了, 那 bit11 就不是拦住它的原因。"
+                         "回零仍在进行或已卡住 ——\n"
+                         "        先确认滑台在哪、原点开关是否触发。\n", pos1, pos0);
+                  fflush(stdout);
+               }
+               else
+               {
+                  printf("        6041h bit11 全程有效, 而位置读不出来 —— 先查 2300h 输入"
+                         "逻辑与现场接线\n"
+                         "        (常开配 NPN 时三个信号一起反相, bit11 恒置 1), 再查 "
+                         "2204h 与 2310h~2312h。\n");
+                  fflush(stdout);
+               }
+            }
+            else
+            {
+               printf("        回零仍在进行或已卡住 —— 先确认滑台在哪、限位/原点开关是否"
+                      "触发\n"
+                      "        (别硬顶: 够不着就把滑台先挪近, 而不是把速度调快)。\n");
+               fflush(stdout);
+            }
+            return EM_R_FAIL;
+         }
       }
 
       em__sleep_ms(EM_POLL_MS);
    }
 
-   /* ---- 7. 到达后撤掉 bit4, 并确认 bit12 仍然成立 ---- */
    rc = em__cw_step(ax, "回零结束 (6040h bit4 -> 0)", EM_CW_ENABLE_OP,
                     EM_SW_HM_ATTAINED, EM_SW_HM_ATTAINED, EM_STEP_TMO_MS);
    if (rc != EM_R_OK)
       return rc;
 
-   /*
-    * 只打印不判定。原因见上面 2214h 那一段: 回零完成后 6064h 显示的是"原点偏移之后的
-    * 坐标系里的位置", 它等不等于 0 由 2214h 与 607Ch 共同决定 —— 在这台设备上"不等于 0"
-    * 是完全正常的。把它打出来, 让操作者自己判断坐标系对不对。
-    */
+   /* 只打印不判定: 回零完成后 6064h 是"原点偏移之后的坐标系里的位置", 等不等于 0 由 2214h 与 607Ch 定 */
    {
       int32_t pos_m = ax->pos, pos_s = 0;
 

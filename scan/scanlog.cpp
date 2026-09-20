@@ -83,16 +83,8 @@ bool ScanLog::beginAppend(const QString &path, QString *err)
    return true;
 }
 
-/*
- * 把最后那半行切掉。
- *
- * **这一步是必须的, 不是讲究。** 掉电/被杀的那一刻正好卡在写行的中间, 文件就会
- * 停在一个没有换行的半行上。而续写是纯 append —— 下一个数据行会**粘在这半行后面**,
- * 变成一行字段串了位的垃圾: 网格索引错位, 那一行以后的数据全废。
- *
- * 而且那半行留着也没用: 它本来就是"没写完的那一行"。所以切掉是唯一既安全
- * 又不丢东西的选择 —— 丢的只是一个没写完的字节序列。
- */
+/* 把最后那半行切掉 (文件末尾没有换行 = 掉电时写了一半)。不切的话续写的下一个
+ * 数据行会粘在它后面, 字段错位, 那一行以后的数据全废。 */
 bool ScanLog::trimTail(const QString &path, QString *err)
 {
    QFile probe(path);
@@ -166,7 +158,7 @@ bool ScanLog::append(const Row &r)
       return false;
    }
 
-   /* **每行都 flush**。整个设计就靠这一条: 采到一点就是一点, 崩了不丢 */
+   /* 每行都 flush: 崩了不丢已采的点 */
    m_f->flush();
    m_written++;
    return true;
@@ -187,8 +179,6 @@ bool ScanLog::isOpen() const
 {
    return m_f != nullptr && m_f->isOpen();
 }
-
-/* ---------------------------------------------------------------- 读回 */
 
 bool readCsvText(const QString &path, std::string *text, QString *err)
 {

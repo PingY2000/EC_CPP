@@ -1,40 +1,32 @@
 /*
- * sm_state - CiA402 状态机切换验证 (独立小程序, 只干这一件事)
+ * sm_state - CiA402 状态机切换验证 (独立小程序, 只干这一件事)。
  *
- * 与 slide_motion 的区别 (也是它存在的理由):
- *   slide_motion 的 S3 只走**上行** (0x0006 -> 0x0007 -> 0x000F), 下行只在
- *   收尾里顺带做一遍, 而且中间态没有独立断言。本程序走一个**完整闭环**,
- *   每一步都回读 6041h 并断言该步应有的状态位:
+ * 走完整闭环, 每一步都回读 6041h 并断言该步应有的状态位:
+ *   0. 0x0000 -> 0x0000  未使能且无故障        (归到已知起点)
+ *   1. 0x0006 -> 0x0001  Ready to switch on
+ *   2. 0x0007 -> 0x0003  Switched on
+ *   3. 0x000F -> 0x0007  Operation enabled    <<< 功率级打开, 电机带电
+ *   4. 保持观察 hold 毫秒, 期间轮询 Fault 位
+ *   5. 0x0007 -> 0x0003  Switched on          (Disable operation)
+ *   6. 0x0006 -> 0x0001  Ready to switch on   (Shutdown)
+ *   7. 0x0000 -> 0x0000  未使能且无故障        (Disable voltage)
  *
- *     0. 0x0000 -> 0x0000  未使能且无故障        (先归到已知起点, 入口状态无关)
- *     1. 0x0006 -> 0x0001  Ready to switch on
- *     2. 0x0007 -> 0x0003  Switched on
- *     3. 0x000F -> 0x0007  Operation enabled    <<< 功率级打开, 电机带电
- *     4. 保持观察 hold 毫秒, 期间轮询 Fault 位
- *     5. 0x0007 -> 0x0003  Switched on          (Disable operation)
- *     6. 0x0006 -> 0x0001  Ready to switch on   (Shutdown)
- *     7. 0x0000 -> 0x0000  未使能且无故障        (Disable voltage)
+ * 本程序只写 6040h。不写 6060h / 607Ah / 任何参数对象, 不发运动指令 —— 全程没有
+ * 一个字节会让滑台动起来。第 3 步之后电机会通电 (有保持力矩), 真跑时必须有人在
+ * 设备旁、手放在物理急停上。
  *
- *   想验证"驱动器在 PRE_OP / SAFE_OP 下能不能用 SDO 打开功率级", 看第 3 步。
- *
- * 本程序**只写 6040h**。不写 6060h, 不写 607Ah, 不写任何参数对象, 不发运动
- * 指令 —— 全程没有一个字节会让滑台动起来。第 3 步之后电机会通电 (有保持力
- * 矩), 所以真跑时必须有人在设备旁、手放在物理急停上。
- *
- * 安全约定 (与 slide_motion 一致, 但复用的是同一套写法而不是同一份代码):
+ * 安全约定:
  *   - 默认只读: 不给 --allow-enable 就一个字节都不写, 只打印当前 6041h 就退出。
- *   - 只碰选中的那一根轴。别的轴哪怕也在总线上, 我们一个字节都不写过去 ——
- *     它可能正被另一套程序控制。
+ *   - 只碰选中的那一根轴, 别的轴一个字节都不写过去 —— 它可能正被另一套程序控制。
  *   - 任何异常退出路径 (Ctrl-C / 故障 / 超时 / 丢站) 都要把 6040h 写回 0x0000。
  *   - 收尾写完 0x0000 后必须回读 6041h 确认 bit2 已清。本仓库这份 SOEM 的
  *     ecx_SDOwrite 在加急路径 (psize<=4) 上把从站回的 SDO abort 帧也当成成功,
- *     而 6040h 正好是 2 字节加急写 —— "写失能有没有真的进去"唯一的证据就是
- *     回读。回读仍报 Operation enabled = 电机可能还带电, 退出码 10。
+ *     而 6040h 正好是 2 字节加急写 —— "写失能有没有真的进去"唯一的证据就是回读。
+ *     回读仍报 Operation enabled = 电机可能还带电, 退出码 10。
  *
- * 注意: 本文件是 slide_motion 目录下**第二个**出现 ecx_SDOwrite 的文件
- * (第一个是 sm_guard.c)。它刻意不链接 sm_guard.c/sm_bus.c —— 那套护栏是为
- * "带动作验收"设计的, 对本程序是多余的复杂度。审计本程序"会写什么"只需要
- * 看 st_wr_cw() 和 main() 里那 8 行步骤表。
+ * 本文件是 slide_motion 目录下第二个出现 ecx_SDOwrite 的文件 (第一个是 sm_guard.c)。
+ * 它刻意不链接 sm_guard.c/sm_bus.c —— 那套护栏是为"带动作验收"设计的。审计本程序
+ * "会写什么"只需要看 st_wr_cw() 和 main() 里那 8 行步骤表。
  */
 
 #ifdef _WIN32
@@ -50,14 +42,9 @@
 
 #include "soem/soem.h"
 
-/* ======================================================================
- * 常量
- * ====================================================================== */
+/* 常量 */
 
-/*
- * 网卡写死。换机器/换网卡就改这一行 —— 本程序不带网卡参数, 也不列举网卡
- * (只有在 ecx_init 打不开它的时候才把可用网卡列出来当诊断)。
- */
+/* 网卡写死。换机器/换网卡就改这一行 (本程序不带网卡参数) */
 #define ST_IFNAME "\\Device\\NPF_{7C64E0FA-D69A-4C92-A821-E5D341E63575}"
 
 /* 受支持的 YKD2205PE (厂商 + 产品码集合, 与 slide_verify / slide_motion 一致) */
@@ -74,31 +61,18 @@
 #define CW_ENABLE_OP 0x000F  /* -> Operation enabled         */
 #define CW_FAULT_RST 0x0080  /* Fault reset, 随后回 0x0000   */
 
-/*
- * 状态字 (6041h) 位。
- * 6041h 低 4 位用 0000/0001/0011/0111 编码, 所以全程用位判断, 禁止数值比较。
- *
- * **只定义 YKD2205PE 手册 (docs/ykd2205pe_ci402.md) 明确列出的位**: 0/1/2/3。
- * 标准 CiA402 里区分 "Not ready to switch on" 与 "Switch on disabled" 的 bit6,
- * 该驱动器手册**没有定义** —— sm.h 里也没有。所以本程序不碰 bit6:
- * 拿一个手册没承诺的位做 PASS/FAIL 断言, 会在驱动器本来正常的时候报失败,
- * 而那个失败还长得像"驱动器坏了"。
- */
+/* 状态字 (6041h) 位: 只定义 YKD2205PE 手册列出的位 0/1/2/3。低 4 位是
+ * 0000/0001/0011/0111 编码, 全程用位判断, 禁止数值比较; 标准 CiA402 区分 Not ready
+ * 与 Switch on disabled 的 bit6 手册未定义, 本程序不碰。 */
 #define SW_RTSO      0x0001  /* bit0  Ready to switch on   */
 #define SW_SWITCHED  0x0002  /* bit1  Switched on          */
 #define SW_OP_ENABLED 0x0004 /* bit2  Operation enabled    */
 #define SW_FAULT     0x0008  /* bit3  Fault                */
 #define SW_QUICKSTOP 0x0020  /* bit5  Quick stop (未定义, 仅用于状态名) */
 
-/*
- * 断言掩码 = 手册定义的那四位。bit4(Voltage enabled)/bit9(Remote) 等只记录不断言。
- *
- * 第 0/7 步期望 (sw & SW_MASK) == 0x0000, 也就是"四位全 0 = 未使能且无故障"。
- * 这同时覆盖 "Not ready to switch on" 与 "Switch on disabled" 两种标准状态 ——
- * 而写 0x0000 (Disable voltage) 只负责把驱动器拉进后者, 不对前者作任何承诺
- * ("Not ready → Switch on disabled" 是驱动器内部初始化完成的自动迁移, 控制字
- * 触发不了它)。所以这里断言"未使能且无故障"是对的, 断言某一个具体状态名不是。
- */
+/* 断言掩码 = 手册定义的那四位; bit4(Voltage enabled)/bit9(Remote) 等只记录不断言。
+ * 第 0/7 步期望 (sw & SW_MASK) == 0x0000: 写 0x0000 只保证 Switch on disabled,
+ * Not ready -> Switch on disabled 是驱动器内部自动迁移, 控制字触发不了。 */
 #define SW_MASK 0x000F
 
 #define ST_TMO_DEF 1000
@@ -115,16 +89,12 @@
 #define ST_EXIT_NO_DISABLE 10 /* 收尾写了 6040h=0 但 6041h 仍报 Operation enabled:
                                  电机可能仍然带电 —— 最严重的一类失败, 覆盖其它码 */
 
-/* ======================================================================
- * 全局状态
- * ====================================================================== */
+/* 全局状态 */
 
 static ecx_contextt g_ctx;
 
-/*
- * Ctrl-C 标志。信号处理器**只置这一位, 不做任何 I/O** —— 在信号上下文里发
- * SDO 是非法的。停机由主循环看到这一位之后走正常路径去做。
- */
+/* Ctrl-C 标志。信号处理器只置这一位, 不做任何 I/O (信号上下文里发 SDO 是非法的);
+ * 停机由主循环看到这一位后走正常路径做。 */
 static volatile sig_atomic_t g_stop = 0;
 
 /* 本次运行是否写过 6040h。收尾只在写过的时候动手。 */
@@ -139,9 +109,7 @@ static void st_on_ctrl_c(int sig)
    g_stop = 1;
 }
 
-/* ======================================================================
- * 基础设施 (为了不链接 sm_bus.c, 这几件小事在这里各来一份)
- * ====================================================================== */
+/* 基础设施 (为了不链接 sm_bus.c, 这几件小事在这里各来一份) */
 
 static void st_console_utf8(void)
 {
@@ -194,16 +162,10 @@ static int st_is_ykd(uint32_t eep_man, uint32_t eep_id)
    return (eep_man == ST_VENDOR_ID) && (eep_id == 0x2000UL || eep_id == 0x3000UL);
 }
 
-/* ======================================================================
- * 6041h 解读
- * ====================================================================== */
+/* 6041h 解读 */
 
-/*
- * 状态名 —— 只按手册定义的低 4 位判读, 不替驱动器猜 bit6。
- * 四位全 0 时, 标准 CiA402 里 "Not ready to switch on" 与 "Switch on disabled"
- * 靠 bit6 区分, 而本驱动器没定义 bit6, 所以这里统一写作 "未使能": 把这两种可能
- * 合并成一个诚实的说法, 好过挑一个听起来更像故障的。
- */
+/* 状态名 —— 只按手册定义的低 4 位判读, 不替驱动器猜 bit6; 四位全 0 时统一写作
+ * "未使能"。 */
 static const char *st_name(uint16_t sw)
 {
    if ((sw & SW_FAULT) != 0)
@@ -223,9 +185,7 @@ static void st_sw_str(char *dst, size_t n, uint16_t sw)
    snprintf(dst, n, "0x%04X (%s)", (unsigned)sw, st_name(sw));
 }
 
-/* ======================================================================
- * SDO 读写
- * ====================================================================== */
+/* SDO 读写 */
 
 /* 读 6041h。返回 0 = 读到, -1 = 超时/无回音 (此时 *v 无意义, 不要拿它当读数) */
 static int st_rd_sw(int slave, uint16_t *v)
@@ -256,12 +216,8 @@ static int32_t st_take_abort(int slave, uint16_t index, uint8_t sub)
    return abort;
 }
 
-/*
- * 写 6040h —— 本程序唯一的写入口 (也是本文件唯一的 ecx_SDOwrite)。
- *
- * 返回值**不代表驱动器接受了**: 加急路径会把 abort 帧当成功 (见文件头注释)。
- * 真正的判据是写完之后回读 6041h, 也就是 st_step() 干的事。
- */
+/* 写 6040h —— 本程序唯一的写入口 (也是本文件唯一的 ecx_SDOwrite)。返回值不代表驱动器
+ * 接受了: 加急路径会把 abort 帧当成功; 真正的判据是写完后回读 6041h。 */
 static int st_wr_cw(int slave, uint16_t cw, int timeout)
 {
    int      wkc;
@@ -284,14 +240,9 @@ static int st_wr_cw(int slave, uint16_t cw, int timeout)
    return -1;
 }
 
-/* ======================================================================
- * 一步切换: 写控制字 -> 等到状态字符合断言
- *
- * fail_on_fault: 见到 Fault 位是否立即判失败。除"故障复位"之外的每一步都是 1
- *               —— 那些步的期望状态里 Fault 本来就是 0, 早报早停, 不用等满超时。
- *
- * 返回 0 = PASS, -1 = FAIL, -2 = 被中止 (Ctrl-C)
- * ====================================================================== */
+/* 一步切换: 写控制字 -> 等到状态字符合断言。fail_on_fault = 1: 见到 Fault 位立即判
+ * 失败 (除故障复位外每步都是 1, 那些步期望里 Fault 本来就是 0)。
+ * 返回 0 = PASS, -1 = FAIL, -2 = 被中止 (Ctrl-C) */
 static int st_step(int slave, const char *name, uint16_t cw, uint16_t mask,
                    uint16_t expect, int fail_on_fault, uint16_t *sw_out)
 {
@@ -348,10 +299,8 @@ static int st_step(int slave, const char *name, uint16_t cw, uint16_t mask,
       printf(" [FAIL] 断言未成立\n");
       if (reads == 0)
       {
-         /*
-          * 一笔都没读到。这里**不能**把 sw (被清过零的缓冲) 当成"实测 0x0000" ——
-          * 那是把"我们不知道"说成了"驱动器报了个 Not ready to switch on"。
-          */
+         /* 一笔都没读到。不能把 sw (被清过零的缓冲) 当成"实测 0x0000": 那是把"我们
+          * 不知道"说成"驱动器报了个 Not ready to switch on"。 */
          printf("       6041h 一次都没读到 (%ums 内总线静默): 状态未知, "
                 "检查从站是否掉线\n", (unsigned)g_tmo_ms);
       }
@@ -374,10 +323,8 @@ static int st_step(int slave, const char *name, uint16_t cw, uint16_t mask,
    return 0;
 }
 
-/*
- * 收尾: 无条件把 6040h 写回 0x0000, 并回读 6041h 确认 bit2 已清。
- * 返回 0 = 已确认失能, 1 = 未确认 (电机可能仍带电)。
- */
+/* 收尾: 无条件把 6040h 写回 0x0000, 并回读 6041h 确认 bit2 已清。
+ * 返回 0 = 已确认失能, 1 = 未确认 (电机可能仍带电)。 */
 static int st_shutdown(int slave)
 {
    uint16_t sw = 0;
@@ -390,10 +337,7 @@ static int st_shutdown(int slave)
 
    printf("\n---- 收尾: 写 6040h=0x0000 (Disable voltage) ----\n");
 
-   /*
-    * 这里不过 st_wr_cw 之外的检查: 即写失败也要继续回读, 因为"写失败"和
-    * "没停下来"是两件事, 而后者才是要命的那个。
-    */
+   /* 这一行不判写成功与否: 写失败也要继续回读 —— "写失败"和"没停下来"是两件事。 */
    (void)st_wr_cw(slave, CW_DISABLE_V, g_tmo_ms);
 
    t0 = st_now_ms();
@@ -408,11 +352,8 @@ static int st_shutdown(int slave)
       st_sleep_ms(ST_POLL_MS);
    }
 
-   /*
-    * "读到了 bit2=0" 才算确认。"一笔都没读到" 不是确认 —— 在最坏的一类判断
-    * 上(电机还带不带电), 没有消息不能当成好消息。这条路径宁可报 10 让用户
-    * 去看一眼, 也不能打一行 [PASS] 把一次失联说成一次成功停机。
-    */
+   /* 只有"读到 bit2=0"才算确认, "一笔都没读到"不是确认: 宁可报退出码 10, 也不能打
+    * 一行 [PASS] 把一次失联说成一次成功停机。 */
    if (reads == 0)
    {
       printf("  [FAIL] 收尾期间一笔 6041h 都没读到, 失能状态**无法确认**。\n");
@@ -433,9 +374,7 @@ static int st_shutdown(int slave)
    return 0;
 }
 
-/* ======================================================================
- * 用法
- * ====================================================================== */
+/* 用法 */
 static void st_usage(void)
 {
    printf(
@@ -456,9 +395,7 @@ static void st_usage(void)
       ST_IFNAME, ST_HOLD_DEF, ST_HOLD_MAX, ST_TMO_DEF, ST_TMO_MAX);
 }
 
-/* ======================================================================
- * main
- * ====================================================================== */
+/* main */
 int main(int argc, char *argv[])
 {
    int   allow_enable = 0;
@@ -651,17 +588,14 @@ int main(int argc, char *argv[])
          goto out;
    }
 
-   /* ================================================================
-    * 状态机切换闭环
-    *
-    * 每一步都在 st_step() 里: 写 6040h -> 轮询 6041h 直到断言成立。
-    * 断言表的 "期望值" 就是 CiA402 规定的该状态的状态字低 4 位 + bit6。
-    * ================================================================ */
+   /*
+    * 状态机切换闭环。每一步都在 st_step() 里: 写 6040h -> 轮询 6041h 直到断言成立。
+    */
    printf("\n---- CiA402 状态机切换 ----\n");
    printf("  断言只用手册定义的 6041h 位 0/1/2/3 (SW_MASK=0x%04X);\n", SW_MASK);
    printf("  该驱动器手册未定义 bit6, 所以 \"未使能\" 不区分 Not ready / Switch on disabled。\n");
 
-   /* 0. 先归到已知起点, 这样入口状态是什么都不影响后面的判定 */
+   /* 0. 先归到已知起点, 入口状态是什么都不影响后面的判定 */
    rc = st_step(target, "0. 归位 Disable voltage", CW_DISABLE_V,
                 SW_MASK, 0x0000, 1, &sw);
    if (rc != 0) { any_fail = 1; goto out; }
@@ -725,8 +659,7 @@ int main(int argc, char *argv[])
       printf(" [PASS] 稳定 (6041h=%s, %d 次读数)\n", buf, reads);
    }
 
-   /* 5-7. 下行: 逐级退回去。每一步同样是独立断言 —— 只测上行的话,
-          "能不能干净地停"这件事恰恰是没测到的。 */
+   /* 5-7. 下行: 逐级退回去。每一步同样是独立断言: 只测上行就测不到"能不能干净地停"。 */
    rc = st_step(target, "5. Disable operation", CW_SWITCHON,
                 SW_MASK, SW_RTSO | SW_SWITCHED, 1, &sw);
    if (rc != 0) { any_fail = 1; goto out; }
@@ -740,10 +673,8 @@ int main(int argc, char *argv[])
    if (rc != 0) { any_fail = 1; goto out; }
 
 out:
-   /*
-    * 收尾无条件执行。走到这里的路径有三种: 正常跑完 / 某步 FAIL / Ctrl-C。
-    * st_shutdown() 自己会在没写过东西时直接返回, 所以不用在外面判。
-    */
+   /* 收尾无条件执行 (正常跑完 / 某步 FAIL / Ctrl-C 都会到这里);
+    * st_shutdown() 自己会在没写过东西时直接返回。 */
    if (st_shutdown(target) != 0)
       exit_code = ST_EXIT_NO_DISABLE;
    else if (g_stop)
@@ -755,11 +686,8 @@ out:
    else if (any_fail)
    {
       exit_code = ST_EXIT_FAIL;
-      /*
-       * 逐级上行没动, 而 6041h 也不是故障态 —— 最值得先试的一步是换 AL 状态。
-       * 很多驱动器要求至少 SAFE_OP 才肯跑 CiA402 状态机 (PRE_OP 下没有过程
-       * 数据, 状态机根本没启动), 这时无论写什么控制字 6041h 都纹丝不动。
-       */
+      /* 逐级上行没动且不是故障态: 先试换 AL 状态 —— 很多驱动器要至少 SAFE_OP 才肯跑
+       * CiA402 状态机 (PRE_OP 下没有过程数据), 此时写什么控制字 6041h 都不动。 */
       if (req_state == EC_STATE_PRE_OP &&
           g_ctx.slavelist[target].state == EC_STATE_PRE_OP)
          printf("\n提示: 本次在 PRE_OP 下跑, 从站也停在 PRE_OP。若每步 6041h 都\n"

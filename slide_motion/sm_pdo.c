@@ -1,66 +1,45 @@
 /*
- * sm_pdo - 用 PDO + OP 验证 CiA402 状态机切换 (独立小程序, 只干这一件事)
+ * sm_pdo - 用 PDO + OP 验证 CiA402 状态机切换 (独立小程序, 只干这一件事)。
  *
- * 与 sm_state 的关系 (也是它存在的理由):
- *   sm_state 在 PRE_OP/SAFE_OP 下用 **SDO** 写 6040h, 实测 6041h 恒为 0x0210,
- *   一位未变。当时的结论是"该驱动器要求控制字走 PDO 且要进 OP"。这个归因方向
- *   是对的, 但根因比它更靠前一步, 而且已经记在 docs/slide_motion_verify.md §6:
+ * 起因: sm_state 在 PRE_OP/SAFE_OP 下用 SDO 写 6040h, 实测 6041h 恒为 0x0210。
+ * 根因更靠前一步: 出厂默认 TxPDO (1A00h) 是空的 -> SM3 长度为 0 -> 从站以 AL
+ * 状态码 0x001E (Invalid input configuration) 拒绝 PRE_OP -> SAFE_OP; SAFE_OP 与
+ * OP 都进不去, 只剩 PRE_OP, 而 PRE_OP 下 CiA402 状态机根本不响应 6040h。
+ * 本程序先让 TxPDO 合法, 再逐级上到 SAFE_OP 与 OP, 然后把 6040h 写进 RxPDO 过程
+ * 数据镜像、把 6041h 从 TxPDO 过程数据镜像读出, 走完同构的 8 步闭环。
  *
- *     出厂默认 TxPDO (1A00h) 是**空的** -> SM3 长度为 0 -> 从站以 AL 状态码
- *     0x001E (Invalid input configuration) 拒绝 PRE_OP -> SAFE_OP。
- *     SAFE_OP 和 OP 都进不去, 只剩 PRE_OP; 而 PRE_OP 下 CiA402 状态机根本不
- *     响应 6040h。所以失败不是"功率级打不开", 是"轮不到它"。
+ * 本程序会写 PDO 映射 (与 slide_motion 的"不改 PDO 映射"承诺不同, 这是刻意的):
+ *   - 必须先写 1A00h/1C13h, 否则空 TxPDO 让从站连 SAFE_OP 都进不去。
+ *   - 只写 RAM, 从不写 2102h (EEPROM), 掉电即回出厂空 TxPDO。
+ *   - 默认跑完还原成运行前快照 (加 --keep-mapping 才保留)。
+ *   - 默认只往 TxPDO 追加 6041h 一项 (16 bit), 已有映射项原样保留; 追加后偏移
+ *     仍要能按字节证出来, 证不出就拒绝, 绝不猜。
+ *   - 加 --no-map 可以完全不写映射 (此时映射必须已经合法, 否则拒绝)。
  *
- *   本程序把那条断掉的前置条件正面接上: 先让 TxPDO 合法, 再逐级上到 SAFE_OP
- *   与 OP, 然后把 6040h **写进 RxPDO 过程数据镜像**、把 6041h **从 TxPDO 过程
- *   数据镜像读出**, 走完与 sm_state 同构的 8 步闭环。
- *
- *   一句话: sm_state 问的是"PRE_OP + SDO 行不行", 本程序问的是"OP + PDO 行不行"。
- *
- * ---- 本程序必须写 PDO 映射 (与 slide_motion 的承诺不同, 这里是刻意的) ----
- *   slide_motion 承诺"不改 PDO 映射"。本程序存在的唯一目的就是验证 PDO 通路,
- *   而空 TxPDO 会让从站连 SAFE_OP 都进不去, 所以**必须先写 1A00h/1C13h**。
- *   边界收在这几处:
- *     - 只写 RAM, **从不写 2102h** (EEPROM), 掉电即回出厂空 TxPDO。
- *     - 默认**跑完还原**成运行前快照 (加 --keep-mapping 才保留)。
- *     - 默认只往 TxPDO **追加 6041h 一项** (16 bit), 已有的映射项原样保留;
- *       追加后偏移仍要能按字节证出来, 证不出就拒绝, 绝不猜。
- *     - 加 --no-map 可以完全不写映射 (此时映射必须已经合法, 否则拒绝)。
- *
- * ---- 安全边界 (改代码前先读这一段) ----
- *   1. 本文件是整个 slide_motion 目录里**第三个**出现 ecx_SDOwrite 的文件
- *      (另两个是 sm_guard.c 与 sm_state.c)。唯一的写入口是 pd_wr_raw() 的
- *      两个封装, 用途只有两种: (a) PDO 映射对象 1A00h/1C13h, (b) --reset-fault
- *      清故障。6040h **不经 SDO 写** —— 它只经过程数据镜像写, 这正是被测变量。
+ * 安全边界 (改代码前先读这一段):
+ *   1. 本文件是整个 slide_motion 目录里第三个出现 ecx_SDOwrite 的文件 (另两个是
+ *      sm_guard.c 与 sm_state.c)。唯一写入口是 pd_wr_raw() 的两个封装, 用途只有
+ *      两种: (a) PDO 映射对象 1A00h/1C13h, (b) --reset-fault 清故障。6040h 不经
+ *      SDO 写 —— 它只经过程数据镜像写, 这正是被测变量。
  *      审阅"什么会动"只需要看 pd_set_cw() 与 main() 里那张 8 步表。
  *   2. 推送过的 6040h 值只有 0x0000 / 0x0006 / 0x0007 / 0x000F (加 --reset-fault
- *      的 0x0080)。**永不写** 607Ah/6060h/6081h/6083h/6084h/607Dh/2102h,
- *      不发任何运动指令, 滑台不会移动。但第 3 步之后电机会通电 (有保持力矩)。
+ *      的 0x0080)。永不写 607Ah/6060h/6081h/6083h/6084h/607Dh/2102h, 不发任何
+ *      运动指令, 滑台不会移动。但第 3 步之后电机会通电 (有保持力矩)。
  *   3. 默认只读: 不给 --allow-pdo 就一个字节都不写, 只打印 PDO 现状。
- *   4. 只碰选中的那一根轴。别的从站哪怕在总线上, 我们也不请求它的 OP ——
- *      它留在 PRE_OP, SM2 未使能, 过程数据不会被它用到输出上。
+ *   4. 只碰选中的那一根轴。别的从站我们不请求它的 OP, 让它留在 PRE_OP (SM2 未使能)。
  *   5. 任何异常路径 (Ctrl-C / 故障 / 超时 / 丢站 / 进不去 OP) 都走 pd_teardown():
  *      镜像写 0x0000 -> 降回 PRE_OP -> 还原映射。
  *
- * ---- 顺带补上的一个诊断 (sm_state 缺的) ----
- *   每步结束时用 **SDO 回读 6040h**, 看它是不是真的等于我们经 PDO 写进去的值。
- *   这一行把两种失败分开了, 而它们的修法完全不同:
- *     - 回读一致但 6041h 不变 -> 控制字到了驱动器, 驱动器不受理 (问题在驱动器侧);
- *     - 回读是 0 (或别的值)   -> 我们写的过程数据根本没落到控制字对象上
- *                                (问题在主站侧: 偏移算错 / 从站不在 OP / WKC 短)。
+ * 每步结束时用 SDO 回读 6040h, 看它是否等于经 PDO 写进去的值, 这把两种失败分开:
+ *   - 回读一致但 6041h 不变 -> 控制字到了驱动器, 驱动器不受理;
+ *   - 回读是 0 (或别的值)   -> 过程数据没落到控制字对象 (主站侧: 偏移/OP/WKC)。
  *
- * 注意: 本文件链接 sm_bus.c (只读底座: 时钟 / SDO 读 / 寄存器读 / 错误栈排空 /
- * 身份判定), 它不含任何写。这不影响"唯一的写入口"这条边界 —— 写只在本文件。
+ * 本文件链接 sm_bus.c (只读底座: 时钟 / SDO 读 / 寄存器读 / 错误栈排空 / 身份判定)。
  */
 
-/*
- * 这里**刻意没有** <windows.h>: 本文件不直接调 Sleep()/GetTickCount64() —— 时钟和
- * 睡眠都走 sm_bus.c 的 sm_now_ms()。这不是洁癖, 是必需的: <windows.h> 会把老的
- * <winsock.h> 拉进来, 而 SOEM 的 osal 用 <winsock2.h>; 两个都进同一个编译单元就
- * 会撞 sockaddr/ip_mreq 重定义 (MSVC: error C2011)。
- * 若将来确实需要 windows.h, 必须把它放在 "sm.h" **之后** (sm_bus.c / slide_motion.c
- * 就是这么做的), 让 winsock2.h 先占住位置。
- */
+/* 这里刻意没有 <windows.h>: 它会把老的 <winsock.h> 拉进来, 与 SOEM 用的 <winsock2.h>
+ * 在同一个编译单元里撞 sockaddr/ip_mreq 重定义 (MSVC: error C2011)。确需时必须放在
+ * "sm.h" 之后。 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,14 +47,9 @@
 
 #include "sm.h"   /* 复用 SOEM 头 + 本工程对象索引/控制字/状态字常量 */
 
-/* ======================================================================
- * 常量
- * ====================================================================== */
+/* 常量 */
 
-/*
- * 网卡写死, 与 sm_state.c 用同一条 (换机器/换网卡改这一行, 或用 --ifname=)。
- * 本程序不带必需的位置参数, 也不列举网卡 (只有 ecx_init 打不开它时才列出来当诊断)。
- */
+/* 网卡写死 (换机器/换网卡改这一行, 或用 --ifname=) */
 #define PD_IFNAME "\\Device\\NPF_{7C64E0FA-D69A-4C92-A821-E5D341E63575}"
 
 /* 受支持的 YKD2205PE 由 sm_is_ykd() 判定 (厂商 0x0994 + 产品码 0x2000/0x3000) */
@@ -94,14 +68,10 @@
 /* 映射对象一次最多读几项 (本驱动器只有 1~2 项, 留余量) */
 #define PD_MAP_MAX 8
 
-/*
- * 断言掩码 = 手册定义的低 4 位。该驱动器手册 (docs/ykd2205pe_ci402.md) 只定义
- * 6041h 的位 0/1/2/3/10/12, **没有定义 bit6**, 所以不碰 bit6、也不做数值比较 ——
- * 沿用的正是 sm_state 当初修掉那个"拿启发式位报失败"的做法。
- */
+/* 断言掩码 = 手册定义的低 4 位。手册未定义 bit6, 所以不碰 bit6、不做数值比较。 */
 #define PD_SW_MASK (SM_SW_RTSO | SM_SW_SWITCHED | SM_SW_OP_ENABLED | SM_SW_FAULT)
 
-/* 等待与超时 */
+/* 等待与超时 (ms) */
 #define PD_TMO_DEF        1000
 #define PD_TMO_MAX        5000
 #define PD_HOLD_DEF       500
@@ -112,10 +82,7 @@
 #define PD_CYCLE_MIN_US   250
 #define PD_CYCLE_MAX_US   4000
 
-/*
- * 连续多少轮过程数据 WKC 偏短就判"过程数据没落地"。不是 1 轮: 刚进 OP 的
- * 头几帧可能还没排上, 单轮偏短说明不了什么; 一直偏短才是问题。
- */
+/* 连续多少轮过程数据 WKC 偏短才判"过程数据没落地"; 刚进 OP 的头几帧可能还没排上。 */
 #define PD_WKC_BAD_MAX    200
 
 /* 过程数据镜像缓冲。与 SOEM samples 同款做法 (固定大缓冲)。 */
@@ -134,9 +101,7 @@
 #define PD_EXIT_NO_PDO     6   /* 过程数据未落地 (WKC 持续偏短) */
 #define PD_EXIT_NO_DISABLE 10  /* 收尾写了 0x0000 但 6041h 仍报 Operation enabled: 电机可能仍带电 */
 
-/* ======================================================================
- * 全局状态
- * ====================================================================== */
+/* 全局状态 */
 
 /* Ctrl-C 标志。信号处理器只置这一位, 不做任何 I/O (信号上下文里发 SDO 是未定义行为) */
 static volatile sig_atomic_t g_stop = 0;
@@ -197,7 +162,7 @@ static const char *pd_name(uint16_t sw)
    if ((sw & SM_SW_RTSO) != 0)
       return "Ready to switch on";
    /* 位 0-3 全 0: 标准 CiA402 里 "Not ready" 与 "Switch on disabled" 靠 bit6 分,
-      该驱动器没定义 bit6, 所以合并成一个诚实的说法 */
+      该驱动器没定义 bit6, 所以合并成一个说法 */
    return "未使能 (位0-3 全 0)";
 }
 
@@ -218,9 +183,7 @@ static void pd_entry_str(char *dst, size_t n, uint32_t e)
                (unsigned)(e & 0xFFu));
 }
 
-/* ======================================================================
- * SDO 读 (只读底座来自 sm_bus.c)
- * ====================================================================== */
+/* SDO 读 (只读底座来自 sm_bus.c) */
 
 static int pd_rd_u8(int slave, uint16_t index, uint8_t sub, uint8_t *v)
 {
@@ -242,10 +205,7 @@ static int pd_rd_u16(int slave, uint16_t index, uint8_t sub, uint16_t *v)
           ? 0 : -1;
 }
 
-/*
- * 读 U32。要求驱动器自报宽度 >= 4 才按 U32 解 —— 宽度不足时解出来的数会在
- * 高位补零, 看起来像一个完全正常的映射项/对象值 (与 sm_bytes_to_i64 同一个理由)。
- */
+/* 读 U32。要求驱动器自报宽度 >= 4, 否则高位补零会解出一个看起来正常的映射项。 */
 static int pd_rd_u32(int slave, uint16_t index, uint8_t sub, uint32_t *v)
 {
    uint8_t buf[4];
@@ -260,15 +220,9 @@ static int pd_rd_u32(int slave, uint16_t index, uint8_t sub, uint32_t *v)
    return 0;
 }
 
-/* ======================================================================
- * SDO 写 —— 本文件的唯一写入口
- *
- * 返回值**不代表驱动器接受了**: 这份 SOEM 在加急路径 (psize<=4) 上把从站回的
- * SDO abort 帧当成写成功 (abort 帧的 mbxtype/service/index/subindex 与请求完全
- * 一致, 命中 "all OK" 分支, 既不压错误栈也不置 ecaterror, wkc 还 > 0)。
- * 6040h 与所有映射对象都是 2+ 字节的加急写, 全在这条路径上 —— 所以映射对象的
- * 写一律走 pd_wr_*_verified(), 它写后回读, 回读才是唯一的确认。
- * ====================================================================== */
+/* SDO 写 —— 本文件的唯一写入口。返回值不代表驱动器接受了: 这份 SOEM 在加急路径
+ * (psize<=4) 上把从站回的 SDO abort 帧当成写成功 (wkc 仍 > 0, 不置 ecaterror)。映射对象的
+ * 写一律走 pd_wr_*_verified(): 回读才是确认。 */
 static int pd_wr_raw(int slave, uint16_t index, uint8_t sub, int size,
                      const void *p, const char *why)
 {
@@ -354,9 +308,7 @@ static int pd_wr_u32_verified(int slave, uint16_t index, uint8_t sub,
    return 0;
 }
 
-/* ======================================================================
- * PDO 映射: 读 / 解析 / 偏移 / 快照 / 还原
- * ====================================================================== */
+/* PDO 映射: 读 / 解析 / 偏移 / 快照 / 还原 */
 
 typedef struct
 {
@@ -383,14 +335,8 @@ static int pd_read_map(int slave, uint16_t index, pd_map_t *m)
    return 0;
 }
 
-/*
- * 求 (index, sub) 在映射里的**字节偏移**。找不到 / 位宽不符 / 前面累计位数不是
- * 8 的整数倍 -> 返回 -1。
- *
- * 为什么死守这条: 偏移算错 = 把控制字字节写进一个别的字段。万一那个字段是 607Ah
- * (目标位置), 我们就在毫不知情的情况下下了一个目标位置。所以证不出偏移必须拒绝,
- * 不允许"大概是 0 吧"。
- */
+/* 求 (index, sub) 在映射里的字节偏移; 找不到 / 位宽不符 / 前面累计位数不是 8 的整数倍
+ * -> -1。证不出偏移必须拒绝: 偏移算错就可能把控制字字节写进 607Ah (目标位置)。 */
 static int pd_map_offset(const pd_map_t *m, uint16_t index, uint8_t sub,
                          int want_bits)
 {
@@ -448,10 +394,8 @@ static int pd_snap_take(int slave, uint16_t index, pd_snap_t *s)
    return 0;
 }
 
-/*
- * 还原快照。顺序是规范要求的: 计数写 0 (关闭映射) -> 逐项写 -> 计数回原值。
- * 直接从原值改到原值是不行的: 映射对象在计数非 0 时子索引不可写。
- */
+/* 还原快照。顺序是规范要求的: 计数写 0 (关闭映射) -> 逐项写 -> 计数回原值; 映射对象在
+ * 计数非 0 时子索引不可写。 */
 static int pd_snap_restore(int slave, const pd_snap_t *s)
 {
    int i;
@@ -474,9 +418,7 @@ static int pd_snap_restore(int slave, const pd_snap_t *s)
    return 0;
 }
 
-/* ======================================================================
- * 只读诊断: PDO 现状
- * ====================================================================== */
+/* 只读诊断: PDO 现状 */
 
 static void pd_dump_map_obj(int slave, uint16_t index, const char *label)
 {
@@ -502,8 +444,7 @@ static void pd_dump_map_obj(int slave, uint16_t index, const char *label)
 }
 
 /*
- * SM 起始地址与长度。长度 0 就是"这个 SM 没被使能" —— 空 TxPDO 的直接证据,
- * 也是跑完补映射之后该消失的东西。
+ * SM 起始地址与长度。长度 0 = 该 SM 未使能, 是空 TxPDO 的直接证据。
  */
 static void pd_dump_sm_one(int slave, const char *label, uint16_t reg)
 {
@@ -531,11 +472,8 @@ static void pd_dump_pdo(int slave)
    pd_dump_sm_one(slave, "SM3 (TxPDO)", ECT_REG_SM3);
 }
 
-/* ======================================================================
- * 补 TxPDO: 确保 1C13h 分配 1A00h, 且 1A00h 含 6041h
- *
- * 返回 0 = 已完成 (可能没改动) / -1 = 读失败 / -2 = 拒绝 (不替驱动器猜)
- * ====================================================================== */
+/* 补 TxPDO: 确保 1C13h 分配 1A00h, 且 1A00h 含 6041h。
+ * 返回 0 = 已完成 (可能没改动) / -1 = 读失败 / -2 = 拒绝 */
 
 static int pd_ensure_tx_assign(int slave, pd_snap_t *s13)
 {
@@ -557,10 +495,7 @@ static int pd_ensure_tx_assign(int slave, pd_snap_t *s13)
    }
    if (a.n > 0)
    {
-      /*
-       * 已经分配了别的 TxPDO, 而且不是 1A00h。要把它换掉就必须替驱动器决定
-       * "哪个 TxPDO 是可有可无的" —— 那是它的配置, 不是我们的。拒绝。
-       */
+      /* 已分配别的 TxPDO 且不是 1A00h: 换掉它就得替驱动器决定哪一项可有可无 -> 拒绝。 */
       printf("  1C13h 已分配了别的东西 (count=%d, 首项 0x%08X), 不是 1A00h。\n",
              a.n, (unsigned)a.e[0]);
       printf("  不替驱动器猜该替换哪一项 -> 拒绝。请先用厂商工具把 1A00h 配成\n");
@@ -601,10 +536,8 @@ static int pd_ensure_tx_map(int slave, pd_snap_t *s1a)
       return 0;
    }
 
-   /*
-    * 追加一项 6041h, 已有的项原样保留 (不覆盖别人的配置)。追加后整张表必须仍能
-    * 按字节解释出 6041h 的偏移, 否则拒绝 —— 宁可不动, 也不要留下一个读不准的表。
-    */
+   /* 追加一项 6041h, 已有的项原样保留 (不覆盖别人的配置)。追加后整张表必须仍能按
+    * 字节解释出 6041h 的偏移, 否则拒绝。 */
    if (m.n >= PD_MAP_MAX)
    {
       printf("  1A00h 已有 %d 项, 加不下 6041h -> 拒绝\n", m.n);
@@ -650,9 +583,7 @@ static int pd_ensure_tx_map(int slave, pd_snap_t *s1a)
    return 0;
 }
 
-/* ======================================================================
- * 过程数据
- * ====================================================================== */
+/* 过程数据 */
 
 /* 打一轮过程数据 (发 + 收), 返回接收侧的 WKC */
 static int pd_cycle(void)
@@ -661,11 +592,8 @@ static int pd_cycle(void)
    return ecx_receive_processdata(&g_ctx, EC_TIMEOUTRET);
 }
 
-/*
- * 镜像写入必须按小端字节写: SOEM 把 IOmap 原样塞进 EtherCAT 帧, 而 EtherCAT
- * 线上是小端。本工程只跑 Windows/x86, 所以 memcpy 一个 uint16 就是小端表示。
- * 用 memcpy 而不是强制转换, 是为了不依赖 off_cw 的对齐。
- */
+/* 镜像写入按小端字节写: EtherCAT 线上是小端, 本工程只跑 Windows/x86, memcpy 一个
+ * uint16 就是小端表示; 用 memcpy 而不是强制转换是为了不依赖 off_cw 的对齐。 */
 static void pd_set_cw(uint16_t cw)
 {
    if (g_out == NULL || g_off_cw < 0)
@@ -681,10 +609,7 @@ static int pd_rd_sw_pdo(uint16_t *sw)
    return 0;
 }
 
-/*
- * 用 SDO 回读 6040h —— 这是"控制字到底有没有进到驱动器"的直接证据 (见文件头)。
- * 与经 PDO 写入的值比对, 计数进汇总。
- */
+/* 用 SDO 回读 6040h: 控制字到底有没有进到驱动器的直接证据; 与经 PDO 写入的值比对。 */
 static void pd_check_cw_landed(int slave, uint16_t wrote)
 {
    uint16_t back = 0;
@@ -703,15 +628,10 @@ static void pd_check_cw_landed(int slave, uint16_t wrote)
                           : "<<< 不一致 -> 过程数据没落到控制字对象上");
 }
 
-/* ======================================================================
- * AL 状态阶梯
- * ====================================================================== */
+/* AL 状态阶梯 */
 
-/*
- * 请求目标轴的 AL 状态。
- * 若从站当前处于 AL 错误态 (状态字 bit4), 必须把 ACK 一起写进去才能清掉它 ——
- * ecx_writestate() 只把 slavelist[].state 原样写下去, 不会自动置 ACK。
- */
+/* 请求目标轴的 AL 状态。从站处于 AL 错误态 (状态字 bit4) 时必须把 ACK 一起写进去才能
+ * 清掉: ecx_writestate() 只把 slavelist[].state 原样写下去, 不会自动置 ACK。 */
 static void pd_request_state(int slave, uint16_t want)
 {
    uint16_t cur = g_ctx.slavelist[slave].state;
@@ -729,12 +649,9 @@ static void pd_request_state(int slave, uint16_t want)
    ecx_writestate(&g_ctx, (uint16_t)slave);
 }
 
-/*
- * 等目标轴进入 want。**每轮都打过程数据**再查状态: 状态迁移期间 (尤其进 OP)
- * 过程数据不能断, 否则若驱动器的 SM 看门狗是开着的, 会反过来把我们从迁移里踢出来。
- *
- * 返回 0 = 到达; -1 = 失败 (已打印原因); -2 = 被 Ctrl-C 中止。
- */
+/* 等目标轴进入 want。每轮都打过程数据再查状态: 迁移期间过程数据不能断, 否则驱动器的
+ * SM 看门狗若开着会反过来把我们从迁移里踢出来。
+ * 返回 0 = 到达; -1 = 失败; -2 = 被 Ctrl-C 中止。 */
 static int pd_wait_state(int slave, uint16_t want, uint32_t tmo_ms)
 {
    uint32_t t0 = sm_now_ms();
@@ -746,20 +663,14 @@ static int pd_wait_state(int slave, uint16_t want, uint32_t tmo_ms)
       if (g_stop)
          return -2;
 
-      /*
-       * 状态迁移期间过程数据不能断 (驱动器若开着 SM/过程数据看门狗, 断流会把它
-       * 从迁移里踢出来)。这里特意**不**判 WKC: 迁移途中它本来就可能偏短, 判了
-       * 只会误报; 过程数据的判据在 pd_step(), 那时从站必须已经稳定在 OP。
-       */
+      /* 这里特意不判 WKC: 迁移途中它本来就可能偏短, 判了只会误报; 过程数据的判据在
+       * pd_step()。 */
       (void)pd_cycle();
 
       st = ecx_statecheck(&g_ctx, (uint16_t)slave, want, 1000);
 
-      /*
-       * ecx_statecheck() 把状态按 0x000F 掩过, 所以错误位(0x10)在它的返回值里
-       * 看不见 —— 必须单独查 slavelist[].state。这正是文档里记的 sm_state 那个
-       * "进 SAFE_OP 失败却只打印一行 0x12" 的坑, 这里正面处理成显式失败。
-       */
+      /* ecx_statecheck() 把状态按 0x000F 掩过, 错误位 (0x10) 在它的返回值里看不见,
+       * 必须单独查 slavelist[].state 显式判失败。 */
       if ((g_ctx.slavelist[slave].state & EC_STATE_ERROR) != 0)
       {
          printf("  [FAIL] 请求 %s 被拒绝: AL 状态 0x%02X (含错误位), "
@@ -785,11 +696,8 @@ static int pd_wait_state(int slave, uint16_t want, uint32_t tmo_ms)
    }
 }
 
-/* ======================================================================
- * 一步切换: 写 RxPDO 里的 6040h -> 等 TxPDO 里的 6041h 符合断言
- *
- * 返回 0 = PASS / -1 = FAIL / -2 = 被中止 / -3 = 过程数据未落地
- * ====================================================================== */
+/* 一步切换: 写 RxPDO 里的 6040h -> 等 TxPDO 里的 6041h 符合断言。
+ * 返回 0 = PASS / -1 = FAIL / -2 = 被中止 / -3 = 过程数据未落地 */
 static int pd_step(int slave, const char *name, uint16_t cw, uint16_t mask,
                    uint16_t expect, int fail_on_fault, uint16_t *sw_out)
 {
@@ -859,11 +767,8 @@ static int pd_step(int slave, const char *name, uint16_t cw, uint16_t mask,
       printf(" [FAIL] 断言未成立\n");
       if (reads == 0)
       {
-         /*
-          * 一笔都没取到。这里**不能**把 sw (零初始化的变量) 当成"实测 0x0000" ——
-          * 0x0000 在 CiA402 里是合法的 "未使能", 那会把"我们不知道"说成
-          * "驱动器报了个状态"。
-          */
+         /* 一笔都没取到。不能把 sw (零初始化的变量) 当成"实测 0x0000": 0x0000 在 CiA402
+          * 里是合法的"未使能", 那会把"我们不知道"说成"驱动器报了个状态"。 */
          printf("       一笔 6041h 都没从 TxPDO 取到 (%ums 内): 状态未知\n",
                 (unsigned)g_tmo_ms);
       }
@@ -901,11 +806,8 @@ static int pd_step(int slave, const char *name, uint16_t cw, uint16_t mask,
    return 0;
 }
 
-/* ======================================================================
- * 收尾 (幂等; 覆盖所有退出路径)
- *
- * 返回 0 = 已确认失能 / 1 = 未能确认失能 (电机可能仍带电)
- * ====================================================================== */
+/* 收尾 (幂等; 覆盖所有退出路径)。
+ * 返回 0 = 已确认失能 / 1 = 未能确认失能 (电机可能仍带电) */
 static int pd_teardown(int slave, pd_snap_t *s13, pd_snap_t *s1a)
 {
    uint16_t sw = 0;
@@ -916,10 +818,8 @@ static int pd_teardown(int slave, pd_snap_t *s13, pd_snap_t *s1a)
 
    printf("\n---- 收尾 ----\n");
 
-   /*
-    * 1. 只要动过控制字, 就先在镜像里写 0x0000 并把过程数据继续打一段 ——
-    *    让驱动器**真的收到**这个失能字, 而不是把它留在缓冲里。
-    */
+   /* 1. 只要动过控制字, 先在镜像里写 0x0000 并把过程数据继续打一段, 让驱动器真的收到
+    *    这个失能字, 而不是把它留在缓冲里。 */
    if (g_wrote && g_out != NULL && g_off_cw >= 0)
    {
       printf("  写 RxPDO[6040h]=0x0000 (Disable voltage), 继续打 %dms 过程数据\n",
@@ -972,10 +872,8 @@ static int pd_teardown(int slave, pd_snap_t *s13, pd_snap_t *s1a)
       g_in_op = 0;
    }
 
-   /*
-    * 4. 用 SDO 独立复核一次 6041h。PDO 那一路的确认只在我们确实到过 OP 时才有效,
-    *    这一步在**任何**状态下都能做, 所以它是最后一道保险。
-    */
+   /* 4. 用 SDO 独立复核一次 6041h: PDO 那一路的确认只在我们确实到过 OP 时才有效,
+    *    这一步在任何状态下都能做, 是最后一道保险。 */
    if (g_wrote)
    {
       uint16_t sdo_sw = 0;
@@ -1019,9 +917,7 @@ static int pd_teardown(int slave, pd_snap_t *s13, pd_snap_t *s1a)
    return 0;
 }
 
-/* ======================================================================
- * 用法
- * ====================================================================== */
+/* 用法 */
 static void pd_usage(void)
 {
    printf(
@@ -1054,9 +950,7 @@ static void pd_usage(void)
       PD_HOLD_DEF, PD_HOLD_MAX, PD_TMO_DEF, PD_TMO_MAX);
 }
 
-/* ======================================================================
- * main
- * ====================================================================== */
+/* main */
 int main(int argc, char *argv[])
 {
    const char *ifname = PD_IFNAME;
@@ -1137,10 +1031,8 @@ int main(int argc, char *argv[])
       }
       else if (a[0] != '-' && !ifname_given)
       {
-         /* 裸的位置参数当网卡名 (与 slide_verify 等一致)。
-            用标志位判断"是否已被覆盖", 不用 ifname == PD_IFNAME 比指针 ——
-            那是在比字符串字面量的地址, 行为未定义 (编译器可能把相同的字面量
-            合并, 也可能不合并)。 */
+         /* 裸的位置参数当网卡名。用标志位判断"是否已被覆盖", 不比 ifname == PD_IFNAME:
+            那是比字符串字面量的地址, 行为未定义 (编译器可能合并相同的字面量, 也可能不合并)。 */
          ifname = a;
          ifname_given = 1;
       }
@@ -1270,11 +1162,9 @@ int main(int argc, char *argv[])
       return PD_EXIT_OK;
    }
 
-   /*
-    * 故障门。放这里而不是等到 OP 之后, 是为了保住退出码 4 的"未写任何东西"承诺。
-    * --reset-fault 的复位动作要等到进 OP 之后经 PDO 做 —— 故障复位需要 CiA402
-    * 状态机在跑, 而 PRE_OP 下它根本没启动 (这正是 sm_state 里那一步无效的原因)。
-    */
+   /* 故障门放在这里 (而不是等到 OP 之后) 以保住退出码 4 的"未写任何东西"承诺。
+    * --reset-fault 的复位要等到进 OP 之后经 PDO 做: 故障复位要 CiA402 状态机在跑,
+    * PRE_OP 下它没启动。 */
    if ((sw & SM_SW_FAULT) != 0)
    {
       if (!g_reset_fault)
@@ -1289,9 +1179,7 @@ int main(int argc, char *argv[])
              (unsigned)SM_CW_FAULT_RST);
    }
 
-   /* ================================================================
-    * 1. 补 PDO 映射 (快照 - 改动 - 默认跑完还原)
-    * ================================================================ */
+   /* 1. 补 PDO 映射 (快照 - 改动 - 默认跑完还原) */
    printf("\n---- 补 TxPDO (让 SM3 非零, 否则从站拒绝 SAFE_OP: AL 0x001E) ----\n");
 
    if (g_no_map)
@@ -1310,10 +1198,7 @@ int main(int argc, char *argv[])
    }
    else
    {
-      /*
-       * 注意顺序: 先快照, 再改。如果先改再快照, 快照记的就是改后的值,
-       * "还原"会还原到我们自己改出来的状态 —— 那就不是还原了。
-       */
+      /* 顺序: 先快照, 再改; 先改再快照的话, "还原"就还原到我们自己改出来的状态。 */
       rc = pd_ensure_tx_assign(target, &s13);
       if (rc == -2)
       {
@@ -1344,12 +1229,8 @@ int main(int argc, char *argv[])
    printf("\n---- 补完后的 PDO 现状 ----\n");
    pd_dump_pdo(target);
 
-   /* ================================================================
-    * 2. 建过程数据映射
-    *
-    * manualstatechange = 1: 让 ecx_config_map_group 不要顺手把从站推进 SAFE_OP,
-    * 状态阶梯归我们自己管 —— 否则收尾时降不回干净的状态。
-    * ================================================================ */
+   /* 2. 建过程数据映射。manualstatechange = 1: 让 ecx_config_map_group 不要顺手把从站
+    * 推进 SAFE_OP, 状态阶梯归我们自己管, 否则收尾时降不回干净的状态。 */
    g_ctx.manualstatechange = 1;
 
    {
@@ -1380,12 +1261,8 @@ int main(int argc, char *argv[])
    g_out = g_ctx.slavelist[target].outputs;
    g_in = g_ctx.slavelist[target].inputs;
 
-   /*
-    * 3. 证出 6040h / 6041h 在过程数据镜像里的字节偏移。
-    *
-    * 证不出就拒绝: 偏移算错 = 把控制字字节写进一个别的字段, 万一那是 607Ah
-    * (目标位置) 就凭空下了一个目标位置。这个"绝不猜"的底线比"能跑起来"重要。
-    */
+   /* 3. 证出 6040h / 6041h 在过程数据镜像里的字节偏移。证不出就拒绝: 偏移算错 = 把控制字
+    * 字节写进别的字段, 万一那是 607Ah (目标位置) 就凭空下了一个目标位置。 */
    {
       pd_map_t mo, mi;
 
@@ -1439,9 +1316,7 @@ int main(int argc, char *argv[])
       }
    }
 
-   /* ================================================================
-    * 4. 可选 DC
-    * ================================================================ */
+   /* 4. 可选 DC */
    if (g_use_dc)
    {
       printf("\n---- 配置 DC (周期 %dus) ----\n", g_cycle_us);
@@ -1451,9 +1326,7 @@ int main(int argc, char *argv[])
       printf("  SYNC0 已在目标轴上启用\n");
    }
 
-   /* ================================================================
-    * 5. 状态阶梯: 先喂一轮过程数据 -> SAFE_OP -> (OP)
-    * ================================================================ */
+   /* 5. 状态阶梯: 先喂一轮过程数据 -> SAFE_OP -> (OP) */
    printf("\n---- 进 AL 状态 ----\n");
    (void)pd_cycle();   /* 先进一帧, 把从站的 SM 数据通路带起来 */
 
@@ -1488,9 +1361,7 @@ int main(int argc, char *argv[])
    g_in_op = 1;
    printf("  [PASS] 已进入 OP (过程数据通路已建立)\n");
 
-   /* ================================================================
-    * 6. CiA402 8 步闭环 —— 控制字经 RxPDO 写, 状态字从 TxPDO 读
-    * ================================================================ */
+   /* 6. CiA402 8 步闭环 —— 控制字经 RxPDO 写, 状态字从 TxPDO 读 */
    printf("\n---- CiA402 状态机切换 (6040h 走 RxPDO, 6041h 读 TxPDO) ----\n");
    printf("  断言只用手册定义的 6041h 位 0/1/2/3 (掩码 0x%04X);\n", PD_SW_MASK);
    printf("  该驱动器手册未定义 bit6, 所以 \"未使能\" 不区分 Not ready / Switch on disabled。\n");
@@ -1522,7 +1393,7 @@ int main(int argc, char *argv[])
       }
    }
 
-   /* 0. 先归到已知起点, 这样入口状态是什么都不影响后面的判定 */
+   /* 0. 先归到已知起点, 入口状态是什么都不影响后面的判定 */
    rc = pd_step(target, "0. 归位 Disable voltage", SM_CW_DISABLE_V,
                 PD_SW_MASK, 0x0000, 1, &sw);
    if (rc == -2) goto out;
@@ -1613,8 +1484,7 @@ int main(int argc, char *argv[])
       printf(" [PASS] 稳定 (TxPDO 6041h=%s, %d 次读数)\n", buf, reads);
    }
 
-   /* 5-7. 下行: 逐级退回去。每一步同样是独立断言 —— 只测上行的话,
-          "能不能干净地停"这件事恰恰是没测到的。 */
+   /* 5-7. 下行: 逐级退回去。每一步同样是独立断言: 只测上行就测不到"能不能干净地停"。 */
    rc = pd_step(target, "5. Disable operation", SM_CW_SWITCHON,
                 PD_SW_MASK, SM_SW_RTSO | SM_SW_SWITCHED, 1, &sw);
    if (rc == -2) goto out;
@@ -1634,10 +1504,8 @@ int main(int argc, char *argv[])
    if (rc != 0) { any_fail = 1; goto out; }
 
 out:
-   /*
-    * 收尾无条件执行。走到这里有三类路径: 正常跑完 / 某步 FAIL / Ctrl-C /
-    * 前置条件失败。pd_teardown() 自己会在没写过东西时按需跳过, 所以不用在外面判。
-    */
+   /* 收尾无条件执行 (正常跑完 / 某步 FAIL / Ctrl-C / 前置条件失败都会到这里);
+    * pd_teardown() 自己会在没写过东西时跳过。 */
    if (pd_teardown(target, &s13, &s1a) != 0)
       exit_code = PD_EXIT_NO_DISABLE;
    else if (g_stop)

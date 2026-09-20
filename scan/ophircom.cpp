@@ -1,7 +1,6 @@
 #include "ophircom.h"
 
-/* 头文件里刻意不出现 COM 类型 (见 ophircom.h 顶部), 于是这边必须收干净:
- * windows.h 会往整个翻译单元里泼 min/max 宏和一堆用不上的声明。 */
+/* windows.h 会往整个翻译单元里泼 min/max 宏和一堆用不上的声明, 所以这边要收干净 */
 #ifndef WIN32_LEAN_AND_MEAN
 #  define WIN32_LEAN_AND_MEAN
 #endif
@@ -17,8 +16,6 @@
 #include <vector>
 
 namespace scan {
-
-/* ================================================================ 小工具 */
 
 namespace {
 
@@ -44,21 +41,11 @@ QString clsidToText(const CLSID &c)
 
 }   /* namespace */
 
-/* ================================================================ 实参表 */
-
 namespace {
 
-/*
- * 一次方法调用的实参。
- *
- * **按手册里的声明顺序 push** —— p0 先 push, 然后 p1、p2……
- * rgvarg 的规矩是反的 (rgvarg[0] 是**最后**一个参数), 倒序在 fill() 里统一做。
- *
- * 这个顺序值得单独说一句, 因为它是这类代码里最经典的一处错, 而且错得不明显:
- * 本仓库写探针时就按"先 out 后 in"给过一次, 结果 `GetErrorFromCode` 和
- * `OpenUSBDevice` 这两个两参方法全回 0x80020005 (DISP_E_TYPEMISMATCH) ——
- * 单参方法因为正反一样而照常通过, 所以只看一两个方法根本发现不了。
- */
+/* 一次方法调用的实参, 按手册里的声明顺序 push (p0 先 push, 然后 p1、p2……)。
+ * rgvarg 的规矩是反的 (rgvarg[0] 是最后一个参数), 倒序在 fill() 里统一做。
+ * 顺序错了两参方法会回 0x80020005 (DISP_E_TYPEMISMATCH), 单参方法照样通过。 */
 class Args
 {
 public:
@@ -76,7 +63,7 @@ public:
    {
       VARIANT a; VariantInit(&a);
       a.vt = VT_BSTR; a.bstrVal = toBstr(s);
-      m_owned.push_back(a.bstrVal);      /* 归我们管, 析构时释放 */
+      m_owned.push_back(a.bstrVal);      /* 本对象所有, 析构时释放 */
       m_decl.push_back(a);
       return *this;
    }
@@ -129,16 +116,14 @@ public:
 private:
    QVector<VARIANT> m_decl;    /* 声明顺序 */
    QVector<VARIANT> m_rev;     /* 倒过来给 rgvarg */
-   QVector<BSTR>    m_owned;   /* 我们分配的 BSTR */
+   QVector<BSTR>    m_owned;   /* 自己分配的 BSTR */
 };
 
 }   /* namespace */
 
-/* ================================================================ 错误码 */
-
 QString OphirCom::errorText(long hresult)
 {
-   /* 手册 "Error Codes" 那张表。中文是译文, 括号里留原始码 —— 报错要能直接拿去搜 */
+   /* 手册 "Error Codes" 表。中文是译文, 括号里留原始码 */
    struct Row { long code; const char *text; };
    static const Row kTable[] = {
       { (long)0x00000000, "没有错误" },
@@ -181,9 +166,8 @@ QString OphirCom::errorText(long hresult)
       .arg(QString::number((quint32)c, 16).toUpper().rightJustified(8, QLatin1Char('0')));
 }
 
-/* 手册 "GetData Status Codes"。**每一个返回项都要看这一列** —— 手册原话:
- * "Not every data item represents a valid measurement. The status code must always be
- *  checked to determine the meaning of each returned value." */
+/* 手册 "GetData Status Codes": 每一个返回项都要看 status。手册原话 "The status code must
+ * always be checked to determine the meaning of each returned value" */
 QString OphirCom::statusText(int status)
 {
    switch (status)
@@ -207,8 +191,7 @@ QString OphirCom::statusText(int status)
    default: break;
    }
 
-   /* BeamTrack 那三组 (X / Y / 光斑尺寸)。PD300R 是光电二极管, 走不到这儿 ——
-    * 但一个有效状态被说成"未知"会让人往错的方向查, 所以还是分出来 */
+   /* BeamTrack 那三组 (X / Y / 光斑尺寸)。PD300R 走不到这儿, 但仍分出来 */
    switch (status & 0xFFFF0000)
    {
    case 0x010000: return (status & 1) ? QStringLiteral("X 测量错误") : QStringLiteral("X 测量有效");
@@ -222,18 +205,14 @@ QString OphirCom::statusText(int status)
    return QStringLiteral("状态 %1 (保留值)").arg(status);
 }
 
-/* 数组解码那几只在下面 "数组解码" 一节里。Impl 的 getOptionList 要用其中一个,
- * 而 Impl 在前面 —— 所以在这里先报个名字。 */
+/* 前向声明: Impl::getOptionList 要用下面 "数组解码" 里的 readStringArray */
 namespace { bool readStringArray(const VARIANT &v, QStringList *out, QString *err); }
-
-/* ================================================================ 实现体 */
 
 namespace {
 
 QString makeError(HRESULT hr, const EXCEPINFO &ei)
 {
-   /* 对象把真正的错误码放在 EXCEPINFO.scode 里, hr 只是 DISP_E_EXCEPTION (0x80020009)。
-    * 拿 scode 去查表才查得到人话 */
+   /* 真正的错误码在 EXCEPINFO.scode 里, hr 只是 DISP_E_EXCEPTION (0x80020009) */
    const long code = ei.scode ? (long)ei.scode : (long)hr;
    QString s = OphirCom::errorText(code);
 
@@ -243,7 +222,7 @@ QString makeError(HRESULT hr, const EXCEPINFO &ei)
    return s;
 }
 
-/* 一行 qWarning 都不要 —— 这个仓库的诊断输出全走界面上的 hint() 或 selftest 的 printf */
+/* 不打 qWarning: 诊断输出都走界面上的 hint() 或 selftest 的 printf */
 
 }   /* namespace */
 
@@ -254,8 +233,7 @@ struct OphirCom::Impl
    ITypeLib  *tl   = nullptr;
    QHash<QString, DISPID> ids;
 
-   /* 名字 → DISPID。**不是 IDispatch::GetIDsOfNames** —— 那条路要注册表里的 typelib,
-    * 而那条注册项坏了 (见 ophircom.h 顶部)。用我们自己从 dll 资源加载的 ITypeInfo。 */
+   /* 名字 → DISPID。用从 dll 资源加载的 ITypeInfo, 不走 IDispatch::GetIDsOfNames */
    DISPID idOf(const char *name, QString *err)
    {
       const QString key = QString::fromLatin1(name);
@@ -278,10 +256,7 @@ struct OphirCom::Impl
       return mid;
    }
 
-   /*
-    * Get / Set 成对的那些方法长得一模一样 —— 五对抄五遍只会让其中一对写错。
-    * 这两个是成员而不是自由函数: Impl 是私有的, 外面那个匿名 namespace 里够不着它。
-    */
+   /* Get / Set 成对方法的公共实现。是成员而不是自由函数: Impl 是私有的, 外面够不着 */
    bool getOptionList(const char *method, long h_device, long channel,
                       long *index, QStringList *options, QString *err)
    {
@@ -342,8 +317,8 @@ struct OphirCom::Impl
       EXCEPINFO ei; ZeroMemory(&ei, sizeof(ei));
       UINT argerr = 0;
 
-      /* ITypeInfo::Invoke 而不是 IDispatch::Invoke —— 后者内部也去查注册表, 一样报
-       * TYPE_E_LIBNOTREGISTERED。派发用我们自己加载的 typeinfo 就不碰注册表了 */
+      /* 用 ITypeInfo::Invoke 而非 IDispatch::Invoke: 后者内部也查注册表, 一样报
+       * TYPE_E_LIBNOTREGISTERED (同 ophircom.h 里那条坏注册项) */
       const HRESULT hr = ti->Invoke(disp, id, DISPATCH_METHOD, &dp, &res, &ei, &argerr);
 
       VariantClear(&res);
@@ -358,8 +333,6 @@ struct OphirCom::Impl
    }
 };
 
-/* ================================================================ 注册表 */
-
 namespace {
 
 /* ProgID → CLSID。注册表里这条是好的 */
@@ -368,14 +341,7 @@ bool progIdToClsid(CLSID *out)
    return SUCCEEDED(CLSIDFromProgID(L"OphirLMMeasurement.CoLMMeasurement", out));
 }
 
-/* CLSID → 服务端 dll 的路径。
- *
- * 为什么要自己读注册表而不是 LoadRegTypeLib: 坏的只有 typelib 那条 (版本号是字面量
- * "a.a"), InprocServer32 这条是**对的** (实测 x64 指向 COM x64\OphirLMMeasurement.dll)。
- * 拿到路径就能直接 LoadTypeLibEx 读 dll 资源, 绕开坏掉的那条。
- *
- * 这里不指定 WOW64 视图: 64 位进程走 64 位视图, 32 位进程走 Wow6432Node,
- * 两边 StarLab 都注册了, 各自取各自的那份 dll —— 正是想要的。 */
+/* CLSID → 服务端 dll 的路径。不指定 WOW64 视图: 64 / 32 位进程各取各自注册的那份 dll */
 QString serverPathOf(const CLSID &clsid)
 {
    const QString sub = QStringLiteral("CLSID\\%1\\InprocServer32").arg(clsidToText(clsid));
@@ -390,8 +356,8 @@ QString serverPathOf(const CLSID &clsid)
    return QString::fromWCharArray(buf);
 }
 
-/* 从 dll 的**资源**里读 typelib, 再挑出接口的 ITypeInfo。
- * 优先 ICoLMMeasurement2 (StarLab 3.50 / COM 对象 10.0 起), 退回老接口。 */
+/* 从 dll 的**资源**里读 typelib, 再挑出接口的 ITypeInfo:
+ * 优先 ICoLMMeasurement2 (StarLab 3.50 / COM 对象 10.0 起), 退回老接口 */
 bool loadInterfaceTypeInfo(const CLSID &clsid, const QString &dll,
                            ITypeLib **out_tl, ITypeInfo **out_ti, IDispatch *disp,
                            QString *err)
@@ -407,7 +373,7 @@ bool loadInterfaceTypeInfo(const CLSID &clsid, const QString &dll,
       return false;
    }
 
-   /* 按名字挑, 不写死 IID —— 手里只有手册, IID 是 dll 里说什么就是什么 */
+   /* 按名字挑, 不写死 IID */
    ITypeInfo *ti = nullptr;
    for (const wchar_t *want : {L"ICoLMMeasurement2", L"ICoLMMeasurement"})
    {
@@ -429,8 +395,8 @@ bool loadInterfaceTypeInfo(const CLSID &clsid, const QString &dll,
             continue;
          }
 
-         /* 类型库里有这个接口, 不等于**手上这个对象**实现了它 ——
-          * QI 一下把这件事变成一句明确的错, 而不是后面某次调用莫名失败 */
+         /* 类型库里有这个接口, 不等于手上这个对象实现了它: QI 一下, 把这件事变成一句
+          * 明确的错, 而不是后面某次调用莫名失败 */
          TYPEATTR *ta = nullptr;
          if (SUCCEEDED(cand->GetTypeAttr(&ta)) && ta)
          {
@@ -471,20 +437,17 @@ bool loadInterfaceTypeInfo(const CLSID &clsid, const QString &dll,
 
 }   /* namespace */
 
-/* ================================================================ 数组解码 */
-
 namespace {
 
-/* GetData 回的三个 VARIANT 各装一个数组。手册说元素分别是 double / double / LONG,
- * 但类型库那一层是 VARIANT, 所以**不能假设它到底是 VT_ARRAY|VT_R8 还是
- * VT_ARRAY|VT_VARIANT** —— 两种都认, 认不出来就报错, 绝不猜。 */
+/* GetData 回的三个 VARIANT 各装一个数组。手册说元素是 double / double / LONG, 但类型库
+ * 那一层是 VARIANT: VT_ARRAY|VT_R8 与 VT_ARRAY|VT_VARIANT 两种都认, 认不出来就报错。 */
 bool arrayDims(const VARIANT &v, LONG *lb, LONG *ub, VARTYPE *elem, QString *err,
                const char *what)
 {
    if (v.vt == VT_EMPTY || v.vt == VT_NULL)
    {
       *lb = 0; *ub = -1; *elem = VT_EMPTY;
-      return true;                     /* 没有数据 —— **正常**, 不是错 */
+      return true;                     /* 没有数据: 正常, 不是错 */
    }
 
    if (!(v.vt & VT_ARRAY) || !v.parray)
@@ -533,7 +496,7 @@ bool readDoubleArray(const VARIANT &v, QVector<double> *out, QString *err)
          VARIANT t; VariantInit(&t);
          const HRESULT hr = SafeArrayGetElement(v.parray, &i, &t);
          if (FAILED(hr)) { VariantClear(&t); if (err) *err = QStringLiteral("取数组元素失败"); return false; }
-         /* 元素也可能是别的数值类型 —— 让 OLE 去做转换, 比自己 switch 可靠 */
+         /* 元素也可能是别的数值类型, 让 OLE 去做转换 */
          VARIANT d; VariantInit(&d);
          const HRESULT c = VariantChangeType(&d, &t, 0, VT_R8);
          VariantClear(&t);
@@ -630,8 +593,6 @@ bool readStringArray(const VARIANT &v, QStringList *out, QString *err)
 
 }   /* namespace */
 
-/* ================================================================ 生存期 */
-
 OphirCom::OphirCom() = default;
 
 OphirCom::~OphirCom()
@@ -655,7 +616,7 @@ bool OphirCom::isAvailable()
    if (dll.isEmpty())
       return false;
 
-   /* 能读出类型库才算"能用" —— dll 在但资源读不出来, 一样调不了 */
+   /* 能读出类型库才算能用: dll 在但资源读不出来一样调不了 */
    ITypeLib *tl = nullptr;
    const HRESULT hr = LoadTypeLibEx(reinterpret_cast<const wchar_t *>(dll.utf16()),
                                     REGKIND_NONE, &tl);
@@ -679,8 +640,7 @@ bool OphirCom::create(QString *err)
       return false;
    }
 
-   /* 服务端是 Apartment 线程模型, 所以创建它的线程必须已经 CoInitializeEx 过 ——
-    * 调用方 (OphirMeter 的工作线程) 负责。这里只把失败翻成人话 */
+   /* 服务端是 Apartment 模型: 创建它的线程必须已经 CoInitializeEx 过 (调用方负责) */
    HRESULT hr = CoCreateInstance(clsid, nullptr, CLSCTX_INPROC_SERVER,
                                  IID_IDispatch, (void **)&d->disp);
    if (FAILED(hr) || !d->disp)
@@ -728,8 +688,6 @@ bool OphirCom::isCreated() const
 {
    return d && d->disp;
 }
-
-/* ================================================================ 设备 */
 
 bool OphirCom::scanUsb(QStringList *serial_numbers, QString *err)
 {
@@ -810,8 +768,6 @@ bool OphirCom::isSensorExists(long h_device, long channel, bool *exists, QString
    *exists = (b != VARIANT_FALSE);
    return true;
 }
-
-/* ================================================================ 信息 */
 
 bool OphirCom::getVersion(long *version, QString *err)
 {
@@ -901,8 +857,6 @@ bool OphirCom::getSensorInfo(long h_device, long channel, SensorInfo *out, QStri
    return ok;
 }
 
-/* ================================================================ 配置 */
-
 bool OphirCom::getWavelengths(long h, long ch, long *index, QStringList *options, QString *err)
 {
    if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
@@ -952,8 +906,6 @@ bool OphirCom::setMeasurementMode(long h, long ch, long index, QString *err)
    return d->setIndex("SetMeasurementMode", h, ch, index, err);
 }
 
-/* ================================================================ 测量 */
-
 bool OphirCom::configureStreamMode(long h, long ch, long mode, long n_value, QString *err)
 {
    if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
@@ -1000,7 +952,7 @@ bool OphirCom::getData(long h, long ch, Data *out, QString *err)
 
    if (ok)
    {
-      /* 三个数组等长是手册的承诺。不等长说明对不上, 宁可报错也不要拿错位的数 */
+      /* 三个数组等长是手册的承诺; 不等长说明对不上, 宁可报错也不拿错位的数 */
       QString e1, e2, e3;
       QVector<double> vals, tss;
       const bool a1 = readDoubleArray(v_val, &vals, &e1);

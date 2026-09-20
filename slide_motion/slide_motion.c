@@ -4,17 +4,16 @@
  * 阶段:
  *   S0 身份与总线门禁      (只读)
  *   S1 参数基线与漂移      (只读)
- *   S2 OP 循环 + DC        (本版未实现, 只在阶段编号上留位置)
+ *   S2 OP 循环 + DC        (本版未实现)
  *   S3 使能状态机          (需 --allow-motion)
  *   S4 微动 + 反馈闭环     (需 --allow-jog)
  *   S5 收尾 / 安全停机     (无条件执行, 含所有错误路径)
  *build\slide_motion\slide_motion.exe "\Device\NPF_{7C64E0FA-D69A-4C92-A821-E5D341E63575}" --allow-motion
- * 本文件**不含任何 ecx_SDOwrite** —— 所有写都经由 sm_guard.c。
+ * 本文件不含任何 ecx_SDOwrite —— 所有写都经由 sm_guard.c。
  *
- * 编排上的两条硬规矩:
- *   1. 所有门禁 (授权 / 身份门 / dangerous 漂移 / 逐轴前置检查) 都在
- *      **第一次写之前** 全部跑完, 且逐轴前置检查是"全过才动":
- *      这样"拒绝"这个结论永远等价于"一个字节都没写", 报告可以干净地说清楚。
+ * 两条硬规矩:
+ *   1. 所有门禁 (授权 / 身份门 / dangerous 漂移 / 逐轴前置检查) 都在第一次写之前
+ *      全部跑完, 且逐轴前置检查是"全过才动": 这样"拒绝"永远等价于"一个字节都没写"。
  *   2. sm_guard_teardown() 在总线打开之后的每一条退出路径上都会被调用一次
  *      (用 goto out_bus 统一收口)。
  */
@@ -29,9 +28,7 @@
 #include <windows.h>
 #endif
 
-/* ======================================================================
- * 命令行选项
- * ====================================================================== */
+/* 命令行选项 */
 typedef struct
 {
    const char *ifname;
@@ -130,14 +127,8 @@ static int sm_need_val(const char *name, const char *v, const char **out)
    return 0;
 }
 
-/*
- * int64 -> int32 的收窄。
- *
- * 直接 (int32_t) 转换在超出值域时是实现定义的行为, 实践里多为截断 ——
- * `--jog=4294967496` 会变成 200, 也就是"用户想要一次超大行程, 却静默地
- * 得到默认行程"。这类静默变化在任何方向上都不可取, 所以显式夹住: 超出
- * 值域就保持"超出值域", 让后面的上限检查照常收紧它。
- */
+/* int64 -> int32 的收窄: 直接转换在超出值域时是实现定义的行为 (实践里多为截断,
+ * `--jog=4294967496` 会静默变成 200), 所以显式夹住, 让后面的上限检查照常收紧它。 */
 static int32_t sm_narrow_i32(int64_t v)
 {
    if (v > 2147483647LL)
@@ -290,16 +281,12 @@ static int sm_parse_args(int argc, char *argv[], sm_opts_t *o)
    return 0;
 }
 
-/* ======================================================================
- * CSV 导出 (可选)
- * ====================================================================== */
+/* CSV 导出 (可选) */
 static FILE *g_csv;
 
 #define CSV(...) do { if (g_csv != NULL) fprintf(g_csv, __VA_ARGS__); } while (0)
 
-/* ======================================================================
- * 报告
- * ====================================================================== */
+/* 报告 */
 static void sm_report_identity_header(void)
 {
    printf("%-5s %-5s %-8s %-12s %-11s %-11s %-11s %-6s %s\n",
@@ -310,14 +297,9 @@ static void sm_report_identity_header(void)
           "----------", "----------", "------", "----");
 }
 
-/*
- * 渲染一条轨迹里的 6041h。没读到 -> "----"。
- *
- * 不能用 0x0000 顶替: 那是 CiA402 合法的 "Not ready to switch on", 会把
- * "我们没读到" 伪装成 "驱动器报了个状态", 读报告的人会去查一个不存在的故障。
- * CSV 同理写 "----" 不写空字段 —— 空字段和输出被截断分不开, "----" 自解释
- * 且搜得出来。缓冲由调用者给 (报告里一处 printf 只用一次)。
- */
+/* 渲染一条轨迹里的 6041h。没读到 -> "----", 不能用 0x0000 顶替 (那是 CiA402 合法的
+ * Not ready to switch on, 会把"没读到"伪装成驱动器报的状态)。CSV 同理写 "----" 不写
+ * 空字段, 空字段和输出被截断分不开。缓冲由调用者给。 */
 static void trace_sw_str(char *dst, size_t n, const sm_trace_t *t)
 {
    if (t->sw_valid)
@@ -386,9 +368,7 @@ static void sm_report_s4(const sm_axis_t *ax, int32_t cmd, int32_t tol)
        (unsigned)ax->ms_fwd, (unsigned)ax->ms_rev);
 }
 
-/* ======================================================================
- * main
- * ====================================================================== */
+/* main */
 int main(int argc, char *argv[])
 {
    sm_opts_t     o;
@@ -512,12 +492,8 @@ int main(int argc, char *argv[])
       tol = o.tol;
    else
    {
-      /*
-       * 百分比也要夹住。容差是"实测行程与命令行程允许差多少", 把它放到比
-       * 行程本身还大, A1/A6 两条断言就永远成立 —— 等于把"动得对不对"的
-       * 检查整条删掉, 而运行日志还会显示 PASS。上限 50% 已经宽到不像验收,
-       * 再宽就不是在测精度了。
-       */
+      /* 百分比也要夹住: 容差比行程本身还大, A1/A6 两条断言就永远成立, 日志还会显示
+       * PASS。上限 50%。 */
       int32_t pct = base.have_tol ? (int32_t)base.tol : 2;
       int32_t a = (jog_pulses < 0) ? -jog_pulses : jog_pulses;
 
@@ -534,10 +510,8 @@ int main(int argc, char *argv[])
    if (tol < SM_POS_NOISE_PULSES)
       tol = SM_POS_NOISE_PULSES;
 
-   /*
-    * 绝对上限也用上 (--force-caps 方能越过), 并且不能超过行程的 1/4 ——
-    * 容差比行程还大时 A1 恒真, 这个上限保证断言始终还有意义。
-    */
+   /* 绝对上限也用上 (--force-caps 方能越过), 且不超过行程的 1/4: 容差比行程还大时
+    * A1 恒真。 */
    tol = sm_guard_clamp_i32("--tol", tol, SM_TOL_PULSES_MAX, tol);
    {
       int64_t a = (jog_pulses < 0) ? -(int64_t)jog_pulses : (int64_t)jog_pulses;
@@ -596,12 +570,8 @@ int main(int argc, char *argv[])
       ax->slave = slave;
       ax->pos = slave - 1;
       ax->is_ykd = (char)sm_is_ykd(s->eep_man, s->eep_id);
-      /*
-       * PRE_OP 与 SAFE_OP 都算"可用": 两者都能跑 SDO 读写, 正是本工具需要的。
-       * 只认 PRE_OP 的话, 上一次 --state=safe-op 的运行会把从站留在 SAFE_OP,
-       * 于是**下一次**运行一进来就判 FAIL —— 状态是上一次自己留下的, 却成了
-       * 这一次的失败。sm_enter_state() 之后还会按 requested_state 再收紧一次。
-       */
+      /* PRE_OP 与 SAFE_OP 都算"可用": 两者都能跑 SDO 读写; 只认 PRE_OP 的话, 上一次
+       * 用 --state=safe-op 留下的 SAFE_OP 会让下一次一进来就判 FAIL。 */
       ax->reached_state = (char)(s->state == SM_STATE_PRE_OP ||
                                  s->state == SM_STATE_SAFE_OP);
       mv[slave - 1] = SM_V_SKIP;   /* 提前置好: 后面任何早退路径的汇总都要读它 */
@@ -706,18 +676,9 @@ int main(int argc, char *argv[])
    }
    else
    {
-      /*
-       * 只读运行**不**抬 AL 状态。
-       *
-       * ecx_writestate 写的是从站的 AL 控制寄存器, 而且作用于总线上每一台
-       * 从站 —— 包括非 YKD 的第三方从站。之前 --dump-baseline / --dry-run
-       * 也会走这里, 于是 `--dry-run --state=safe-op` 会把别人的从站一起推进
-       * SAFE_OP, 与"一个字节都不写"的承诺自相矛盾 (虽然写的不是 SDO, 但对
-       * 那台第三方从站来说同样是我们在动它)。
-       *
-       * config_init() 结束后从站本来就在 PRE_OP, 而只读路径需要的正是这个
-       * 状态, 所以什么都不做就是正确的。这里只把"期望状态"的结论标出来。
-       */
+      /* 只读运行不抬 AL 状态: ecx_writestate 写的是 AL 控制寄存器, 且作用于总线上每一
+       * 台从站 (包括非 YKD 的第三方从站)。config_init() 后从站本来就在 PRE_OP, 只读
+       * 路径需要的正是这个状态。 */
       for (slave = 1; slave <= cnt; slave++)
       {
          sm_axis_t *ax = &axes[slave - 1];
@@ -800,10 +761,10 @@ int main(int argc, char *argv[])
             sm_snapshot_pp(&axes[i]);
       }
 
-      /* 顺带把前置检查也跑一遍 —— 它全程只读, 是"真动之前最值得先验证"的一段逻辑。
-         这样 --dry-run 覆盖的是从身份门到前置检查的完整决策链, 而写入仍然为零。
-         注意: 预演阶段的前置检查结论**不参与退出码** —— 它只是把真动时会得到的
-         拒绝理由提前展示出来, 不算本次运行的失败。 */
+      /* 顺带把前置检查也跑一遍 (全程只读), 这样 --dry-run 覆盖的是从身份门到前置检查
+         的完整决策链, 而写入仍然为零。
+         注意: 预演阶段的前置检查结论不参与退出码 —— 它只是把真动时会得到的拒绝理由
+         提前展示出来, 不算本次运行的失败。 */
       printf("\n---- 动作前置检查预演 (只读; 结论不计入退出码) ----\n");
       for (i = 0; i < cnt; i++)
       {
@@ -828,9 +789,7 @@ int main(int argc, char *argv[])
       goto out_bus;
    }
 
-   /* ==================================================================
-    * 从这里往下会真的写。所有门禁都必须在第一次写之前跑完。
-    * ================================================================== */
+   /* 从这里往下会真的写。所有门禁都必须在第一次写之前跑完。 */
 
    /* 门禁 1: dangerous 参数漂移 */
    if (dangerous_drift)
@@ -854,8 +813,8 @@ int main(int argc, char *argv[])
       goto out_bus;
    }
 
-   /* 门禁 3: 逐轴前置检查 (只读)。**全部通过才动** ——
-      这样"拒绝"永远等价于"一个字节都没写"。 */
+   /* 门禁 3: 逐轴前置检查 (只读)。全部通过才动 —— 这样"拒绝"永远等价于
+      "一个字节都没写"。 */
    {
       int32_t pf_delta = o.want_jog ? jog_pulses : 0;
 
@@ -914,7 +873,7 @@ int main(int argc, char *argv[])
          continue;
 
       /* 绝不在这里清 abort 标志 —— 两轴之间按下的 Ctrl-C 必须被下一轴看见。
-         标志只由信号处理器/故障路径置位, 由 sm_guard_teardown 之后的退出收口。 */
+         标志只由信号处理器/故障路径置位, 由退出收口清。 */
       if (sm_guard_should_abort())
       {
          printf("\n[中止] 上一轴的测试被中止, 不再继续下一轴。\n");
@@ -932,10 +891,9 @@ int main(int argc, char *argv[])
       }
       else if (v == SM_V_WARN)
       {
-         /* S3 只到 WARN 意味着某一步没完全到位 —— 通常是 6060h 写了但 6061h
-            回读不是 PP。此时**绝不能**进入 S4: 607Ah 与 6040h bit4 的语义依赖
-            当前操作模式, 在未知模式下翻 bit4 可能触发完全不同的动作。
-            "使能没完全成功就不动" —— 电机通电但不移动, 比动错方向安全得多。 */
+         /* S3 只到 WARN 意味着某一步没完全到位 (通常是 6060h 写了但 6061h 回读不是
+            PP)。此时绝不能进入 S4: 607Ah 与 6040h bit4 的语义依赖当前操作模式,
+            在未知模式下翻 bit4 可能触发完全不同的动作 —— 通电但不移动, 比动错安全。 */
          motion_warn = 1;
          printf("      [跳过] S3 未完全通过 (WARN), 不执行 S4 —— "
                 "在操作模式未确认的情况下不发运动指令。\n");
@@ -966,8 +924,8 @@ int main(int argc, char *argv[])
       if (g_guard.abort_reason != SM_ABORT_NONE)
       {
          printf("\n[中止] 中止原因: %s\n", sm_abort_str(g_guard.abort_reason));
-         /* 立刻停机, 不等收尾 —— 故障/失速之后每多一毫秒都是电机还在带电的
-            时间。sm_guard_emergency_stop 绕过授权检查, 只写"去使能"方向的值。 */
+         /* 立刻停机, 不等收尾 —— 故障/失速之后每多一毫秒都是电机还在带电的时间。
+            sm_guard_emergency_stop 绕过授权检查, 只写"去使能"方向的值。 */
          sm_guard_emergency_stop(axes, cnt);
          break;
       }
@@ -1009,11 +967,8 @@ out_bus:
    /* 无条件收尾: 让 6040h 回到失能态, 并恢复被临时改过的参数 */
    sm_guard_teardown(axes, cnt);
 
-   /*
-    * 收尾之后才能判断 6040h=0 到底有没有生效 (要回读 6041h)。这一条**覆盖**
-    * 其它所有退出码: 电机可能还在带电, 比"某个参数比对不过"严重得多, 不能
-    * 被一个 3 或 4 盖过去。
-    */
+   /* 收尾之后才能判断 6040h=0 有没有生效 (要回读 6041h)。这一条覆盖其它所有退出码:
+    * 电机可能还在带电, 不能被一个 3 或 4 盖过去。 */
    if (g_guard.disable_unconfirmed)
       exit_code = SM_EXIT_NOT_DISABLED;
 

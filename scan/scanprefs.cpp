@@ -6,14 +6,7 @@
 
 namespace scan {
 
-/* ---------------------------------------------------------------- 键名 */
-
-/*
- * 键名**只在这里写一遍** —— 存的与读的读同一个字符串。
- *
- * 从前这种对应关系最容易错的方式是: 写的时候手抄一遍、读的时候再手抄一遍,
- * 两边错一个字母**都不报错**, 只是那一项永远记不住。做成常量之后至少不会错开。
- */
+/* 键名只在这里写一遍: 存的与读的用同一份常量 */
 namespace k
 {
 static const char *area_x     = "scan/area_x_unit";
@@ -32,20 +25,16 @@ static const char *manspeed   = "ui/manual_speed";
 
 QString prefsPath()
 {
-   /* exe 旁边。QCoreApplication 已经在别处起过了 (main 里第一个 QApplication),
-    * 这里只是读它记下来的路径, 不会再初始化什么 */
+   /* exe 旁边 */
    return QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("scan.ini"));
 }
-
-/* ---------------------------------------------------------------- 读 */
 
 Prefs prefsLoad(const QString &path)
 {
    Prefs p;                                   /* 全部按缺省起, 缺项就留在缺省上 */
    QSettings s(path, QSettings::IniFormat);
 
-   /* QSettings 读不到文件 / 没有这一项时给的是一张无效的 QVariant, 而 toDouble()
-    * 之流会把它当 0 —— 所以每一项都**显式带上缺省值**, 不用 toDouble() 的返回值赌 */
+   /* 每项都显式带上缺省值: 缺项时 QSettings 给的是无效 QVariant, toDouble() 会当 0 */
    p.params.area_x_unit = s.value(QLatin1String(k::area_x), p.params.area_x_unit).toDouble();
    p.params.area_y_unit = s.value(QLatin1String(k::area_y), p.params.area_y_unit).toDouble();
    p.params.res_unit    = s.value(QLatin1String(k::res),    p.params.res_unit).toDouble();
@@ -62,7 +51,7 @@ Prefs prefsLoad(const QString &path)
    p.params.serpentine     = s.value(QLatin1String(k::serp),      p.params.serpentine).toBool();
    p.params.start_positive = s.value(QLatin1String(k::start_pos), p.params.start_positive).toBool();
 
-   /* 量程**从不记忆**: 它是从区域算出来的 (autoRangePul), 记一份下来就成了第二份真相 */
+   /* 量程从不记忆: 它由区域算出 (autoRangePul) */
    p.params.range_pul = 0;
 
    p.nic          = s.value(QLatin1String(k::nic)).toString();
@@ -71,14 +60,12 @@ Prefs prefsLoad(const QString &path)
    return p;
 }
 
-/* ---------------------------------------------------------------- 并 */
-
 void prefsMergeParams(Prefs *store, const Params &cur)
 {
    if (store == nullptr)
       return;
 
-   /* 判据就是界面开始按钮用的那一条 (validate) —— "能不能扫"。不能扫的不记, 见头文件 */
+   /* 判据与界面开始按钮用的那一条一致 (validate) */
    if (!validate(cur).empty())
       return;
 
@@ -86,8 +73,6 @@ void prefsMergeParams(Prefs *store, const Params &cur)
    keep.range_pul = 0;
    store->params = keep;
 }
-
-/* ---------------------------------------------------------------- 写 */
 
 void prefsSave(const QString &path, const Prefs &p)
 {
@@ -109,7 +94,7 @@ void prefsSave(const QString &path, const Prefs &p)
    s.setValue(QLatin1String(k::nic),       p.nic);
    s.setValue(QLatin1String(k::manspeed),  p.manual_speed);
 
-   /* 显式 sync 一次: 这个对象马上就析构了, 但"写没写进去"不该靠析构时机去赌 */
+   /* 显式 sync: 不靠析构时机保证写盘 */
    s.sync();
 }
 

@@ -8,8 +8,6 @@
 
 namespace scan {
 
-/* ---------------------------------------------------------------- 小工具 */
-
 static int64_t wallMs()
 {
    return QDateTime::currentMSecsSinceEpoch();
@@ -32,8 +30,7 @@ static QString fromStd(const std::string &s)
    return QString::fromStdString(s);
 }
 
-/* 我们下发的目标可能被 EcatThread::setTarget 按量程夹过 —— 拿夹过的值去比,
- * 否则区域贴着量程时会自己报自己 */
+/* 下发值可能被 EcatThread::setTarget 按量程夹过, 比较要用夹过的值 */
 static int32_t asClamped(int32_t want, int32_t range)
 {
    if (range <= 0)
@@ -56,8 +53,6 @@ static ArrivalObs obsOf(const BusTelem &t, int i)
    return o;
 }
 
-/* ---------------------------------------------------------------- 构造 */
-
 ScanController::ScanController(BusView *bus, PowerMeter *meter, QObject *parent)
    : QObject(parent), m_bus(bus), m_meter(meter)
 {
@@ -72,8 +67,7 @@ void ScanController::setMeter(PowerMeter *meter)
    if (meter == nullptr || meter == m_meter)
       return;
 
-   /* 旧的必须显式断开: 它**还活着**, 只是不再被选中 —— 不disconnect 的话它下次出数
-    * 会直接喂进状态机, 而且那条路径只有在下一个点采回来时才看得出来 */
+   /* 旧的必须显式断开: 它还活着, 不 disconnect 的话它下次出数会直接喂进状态机 */
    if (m_meter != nullptr)
    {
       disconnect(m_meter, &PowerMeter::readingReady,  this, &ScanController::onReadingReady);
@@ -84,8 +78,6 @@ void ScanController::setMeter(PowerMeter *meter)
    connect(m_meter, &PowerMeter::readingReady,  this, &ScanController::onReadingReady);
    connect(m_meter, &PowerMeter::readingFailed, this, &ScanController::onReadingFailed);
 }
-
-/* ---------------------------------------------------------------- 参数 */
 
 void ScanController::setParams(const Params &p)
 {
@@ -100,8 +92,7 @@ QString ScanController::paramsError() const
 
 void ScanController::rebuildPlan()
 {
-   /* 几何没变就什么都别动 —— 网格还是那个网格, 已有结果还是对的。
-    * 这一条是为了让"跑完之后手滑碰一下速度框"不会把刚采完的一整张图抹掉。 */
+   /* 几何没变就什么都别动: 网格还是那个网格, 已有结果还是对的 */
    if (m_nx > 0 && !m_plan.empty() && sameGeom(m_p, m_plan_p))
       return;
 
@@ -109,22 +100,9 @@ void ScanController::rebuildPlan()
    const int ny = axisCount(m_p.area_y_unit, m_p.res_unit);
    const long long total = (long long)std::max(0, nx) * (long long)std::max(0, ny);
 
-   /*
-    * 点数上限的**闸就在这里** —— 不是 validate() 里那句提示。
-    *
-    * 参数是边输边算的: 分辨率从 0.5 打到 0.001 的路上会先经过 0.05、0.01 这些值,
-    * 每一个都立刻走到这里来。而"太大"的那些值里, 小的还能勉强分配 (区域 500 ×
-    * 分辨率 0.05 = 1e8 个点 = 4 GB, 分配得下来, 然后填满它要几秒), 大的直接把
-    * 分配器打到 bad_alloc。**而界面在这期间一帧都刷不出来** —— 操作员看到的就是
-    * "参数设到某些值程序卡死", 而且再也回不去 (下一次按键又要在同一个坑里再走一遍)。
-    *
-    * 所以超过上限时**一个 Point 都不建**: 网格当成 0×0, 三个结果数组清空。
-    * 于是: 画布画空的 (rebuildImage 见到 nx<=0 直接给一张空图)、开始按钮被
-    * paramsError() 挡着 (它报的就是同一句话)、红字把原因写在参数栏里。
-    *
-    * **不能只把 m_plan 清掉而留着 m_nx/m_ny**: 那三个数组是按 nx*ny 索引的
-    * (cellDone 那条 `m_done[iy*m_nx+ix]`), 长度对不上就是越界读。
-    */
+   /* 点数上限的闸在这里 (不是 validate() 那句提示): 参数是边输边算的, 超过上限时一个
+    * Point 都不能建, 否则分配几 GB 把界面卡死。网格当成 0×0 并把三个结果数组一起清掉 ——
+    * 它们按 nx*ny 索引 (cellDone 那条 m_done[iy*m_nx+ix]), 长度对不上就是越界读。 */
    if (nx <= 0 || ny <= 0 || total > kMaxPlanPoints)
    {
       m_nx = m_ny = 0;
@@ -156,8 +134,6 @@ int ScanController::completedPoints() const
 {
    return (int)std::count(m_done.begin(), m_done.end(), (char)1);
 }
-
-/* ---------------------------------------------------------------- 查询 */
 
 bool ScanController::running() const
 {
@@ -243,8 +219,6 @@ bool ScanController::wattsRange(double *lo, double *hi) const
    return true;
 }
 
-/* ---------------------------------------------------------------- 状态迁移 */
-
 void ScanController::enter(State s)
 {
    if (m_st == s)
@@ -257,26 +231,21 @@ void ScanController::enter(State s)
 void ScanController::stopMotion()
 {
    m_bus->postStop();
-   /* 单据作废: 这一点的读数回包到了也不要了 (重走这一点时会重新发请求) */
+   /* 作废未决读数: 这一点的回包到了也不要了 (重走这一点时会重新发请求) */
    m_pending = false;
 }
-
-/* ---------------------------------------------------------------- 开始 */
 
 bool ScanController::armRun(QString *err)
 {
    const BusTelem t = m_bus->telemetry();
 
-   /* ---- Preflight。缺一条都不动 ---- */
    if (!t.connected)
       return fail(err, QStringLiteral("没连上总线 —— 先点「连接」"));
    if (!t.in_op)
       return fail(err, QStringLiteral("总线不在 OP 状态"));
 
-   /* 回零**把轴留在使能 + HM**, 所以扫描半路撞上它, 既不会像"掉使能"那样被下面那条
-    * 自动中止判据抓到, 也等不到插补 (总线线程整段阻塞在 em_home 里, 一帧不泵)。
-    * 表现是状态机以为一个点"到了", 其实滑台纹丝没动 —— 采到的是上一站的光。
-    * 界面上「开始扫描」也灰着, 但那条路不唯一 (「打开 CSV 续扫」也走 armRun)。 */
+   /* 回零把轴留在使能 + HM: 自动中止判据抓不到它, 插补也不推进 (总线线程阻塞在 em_home
+    * 里), 状态机会以为点到了而滑台没动 */
    if (t.homing)
       return fail(err, QStringLiteral("总线正在回零 —— 等它做完再启扫"));
 
@@ -311,9 +280,8 @@ bool ScanController::armRun(QString *err)
             "%1。\n"
             "%2。\n"
             "%3。\n"
-            /* 收尾这句**不许说"会撞上去"** —— 上面 %3 里有一种成因正是"那个限位根本
-             * 不存在"(极性配反), 两句话并排给人看就会自相矛盾。这里只讲**后果**:
-             * 它在扫描期间成立就会自动中止, 所以现在拒绝。原因由 %1~%3 去说。 */
+            /* 收尾只讲后果: 扫描期间限位成立就自动中止, 所以现在拒绝。
+             * 不许说"会撞上去" —— %3 里有一种成因正是那限位根本不存在 (极性配反) */
             "扫描期间它是每 tick 都查、成立就自动中止的那一类, "
             "与其采到一半停在同一格, 不如这一趟现在就不开始。")
                .arg(QString::fromUtf8(ecatcmd::limit_hit_headline(t.di_invert)).arg(i))
@@ -327,12 +295,8 @@ bool ScanController::armRun(QString *err)
       return fail(err, QStringLiteral("工作计数器不足 (%1/%2) —— 过程数据不完整, 别开始")
                             .arg(t.wkc).arg(t.expected_wkc));
 
-   /*
-    * 量程: 拿**实际生效的**那个, 而不是参数里算出来的。
-    * 这两个会不一致 —— 量程是按「连接时」的参数设进 EcatThread 的, 之后把区域放大就
-    * 对不上了。而这种不一致的表现是**边缘被静默夹掉**: 扫描照跑, 只是最外圈那几个点
-    * 永远停在原地。所以这里必须用 telemetry 里的真值挡一道。
-    */
+   /* 量程用 telemetry 里的真值, 不用参数算的: 量程是按连接时的参数设进 EcatThread 的,
+    * 之后放大区域就对不上, 最外圈的点会被静默夹掉 */
    int32_t far = 0;
    for (size_t k = 0; k < m_order.size(); k++)
    {
@@ -347,12 +311,11 @@ bool ScanController::armRun(QString *err)
          "区域改小一点, 或者断开重连一次 (量程是在连接时按区域参数设的)。")
          .arg(far).arg(t.range));
 
-   /* ---- 过了。锁参数、设速度、进第一个点 ---- */
    m_run_p   = m_p;
    m_bad_wkc = 0;
    m_ord_i   = 0;
 
-   /* 速度只在这里设一次 —— 一轮扫描从头到尾一个速度, 免得中途有人在动滑块 */
+   /* 速度只在这里设一次: 一轮扫描从头到尾一个速度 */
    m_bus->setSpeed(0, m_p.speed_pul_s);
    m_bus->setSpeed(1, m_p.speed_pul_s);
 
@@ -382,12 +345,8 @@ void ScanController::startPoint(int plan_index)
    m_judge[0].begin(pt.x_pul, tol, m_p.settle_ms, m_now_ms);
    m_judge[1].begin(pt.y_pul, tol, m_p.settle_ms, m_now_ms);
 
-   /*
-    * 走不到就中止的最后期限。**这不是可有可无的**:
-    * 目标被夹、机械卡住、驱动器跟不上, 表现都是"到位判据永远不成立" ——
-    * 没有这一条, 扫描会一声不响地停在原地, 而操作员以为它还在跑。
-    * 距离按**当前位置**量, 所以从上一行末尾折返的这一格也算得对。
-    */
+   /* 走不到就中止的最后期限 (目标被夹 / 卡住 / 跟不上时到位判据永远不成立);
+    * 距离按当前位置量, 折返的那一格也算得对 */
    int64_t dx = std::abs((int64_t)pt.x_pul - (int64_t)t.ax[0].pos);
    int64_t dy = std::abs((int64_t)pt.y_pul - (int64_t)t.ax[1].pos);
    int64_t d  = std::max(dx, dy);
@@ -402,8 +361,6 @@ void ScanController::startPoint(int plan_index)
 
    enter(State::Moving);
 }
-
-/* ---------------------------------------------------------------- 一轮 */
 
 bool ScanController::start(const QString &csv_path, QString *err)
 {
@@ -426,7 +383,7 @@ bool ScanController::start(const QString &csv_path, QString *err)
    m_cur       = -1;
    m_run_ms    = -1;
 
-   /* 新一轮 = 新的零点世代 (零点就是此刻的物理位置, 由操作员「设为区域中心」确立) */
+   /* 新一轮 = 新的零点世代 (零点就是此刻的物理位置) */
    if (m_zero_epoch < 0)
       m_zero_epoch = 0;
 
@@ -471,14 +428,8 @@ bool ScanController::resume(const QString &csv_path, bool accept_zero_epoch_chan
    if (!diff.empty())
       return fail(why != nullptr ? why : err, fromStd(diff));
 
-   /*
-    * 零点世代对不上 = 中间重连过。**不静默继续** —— 见 scancontroller.h 的说明。
-    *
-    * 比法是刻意不对称的: 只有"文件里有世代 (>=0) 且跟现在的不一样"才拦。
-    * "自己这边不知道是第几代" (-1) **也算不一样**, 于是照样拦 —— 不确定的时候
-    * 多问一句的成本是一次点击, 而猜错的成本是半张图的数据采在错的位置上。
-    * 反过来, 文件里没写世代的老文件不拦 (那时也没什么可对的)。
-    */
+   /* 零点世代对不上 = 中间重连过, 不静默继续。比法刻意不对称: 文件里写了世代 (>=0) 且
+    * 与现在不同才拦, 自己这边 -1 也算不同; 没写世代的老文件不拦 */
    if (csv_epoch >= 0 && csv_epoch != m_zero_epoch && !accept_zero_epoch_change)
    {
       return fail(why != nullptr ? why : err,
@@ -508,7 +459,7 @@ bool ScanController::resume(const QString &csv_path, bool accept_zero_epoch_chan
                   QStringLiteral("这个 CSV 里的点已经全采完了 —— 没有要补的。"
                                  "要重来一轮就换个新文件"));
 
-   /* 把已有进度**连数值一起**装进结果网格 —— 这样续扫一开始, 图上就已经有上半场了 */
+   /* 已有进度连数值一起装进结果网格, 续扫一开始图上就有上半场 */
    for (size_t i = 0; i < mask.size() && i < m_done.size(); i++)
       m_done[i] = mask[i];
    csvLoadGrid(text, m_p, &m_have, &m_watts);
@@ -573,8 +524,6 @@ bool ScanController::retest(int ix, int iy, QString *err)
    return true;
 }
 
-/* ---------------------------------------------------------------- 暂停/中止 */
-
 void ScanController::pause()
 {
    if (!running() || m_st == State::Paused)
@@ -596,8 +545,7 @@ void ScanController::resumeRun()
       return;
    }
 
-   /* **重新走完当前点并重新采样** —— 而不是从半截接着采。
-    * 否则会写进一行"位置还没停稳时采的数", 而那一行在 CSV 里看不出任何异常。 */
+   /* 重新走完当前点并重新采样: 从半截接着采会写进位置还没停稳的数 */
    startPoint(m_cur);
 }
 
@@ -619,14 +567,11 @@ void ScanController::abortInternal(const QString &why, bool automatic)
    m_cur = -1;
    enter(State::Aborted);
 
-   /* **不关文件**: 中止之后最常见的动作就是"看一眼热力图, 把可疑的那几个点重测一遍",
-    * 而重测正是往这个文件里追加。每行都已经 flush 过了, 留着它不会丢任何东西。 */
+   /* 不关文件: 中止之后常要单点重测, 而重测就是往这个文件里追加 (每行都已 flush) */
    if (automatic && !why.isEmpty())
       emit autoAborted(why);
    emit runFinished(false);
 }
-
-/* ---------------------------------------------------------------- 读数 */
 
 void ScanController::beginReading()
 {
@@ -670,7 +615,7 @@ void ScanController::onReadingFailed(const QString &err)
 
    m_pending = false;
 
-   /* 一个点读不到**不该毁掉整轮** —— 记下来继续走, 回头可以单点重测 */
+   /* 一个点读不到不毁掉整轮: 记下来继续走, 回头可以单点重测 */
    finishPoint(false, err.toStdString());
 }
 
@@ -736,14 +681,11 @@ void ScanController::advance()
       }
    }
 
-   /* 走完了 (整轮或单点重测)。**文件不关** —— 刚跑完看一眼图、随手重测几个可疑点,
-    * 是最自然的动作, 而重测正是往这个文件里追加。 */
+   /* 走完了 (整轮或单点重测)。文件不关: 重测要往同一个文件追加 */
    m_is_retest = false;
    enter(State::Done);
    emit runFinished(true);
 }
-
-/* ---------------------------------------------------------------- 节拍 */
 
 void ScanController::tick(int64_t now_ms)
 {
@@ -752,8 +694,7 @@ void ScanController::tick(int64_t now_ms)
    if (!running())
       return;
 
-   /* 安全检查在**每个 tick**、每个状态下都跑 —— 包括暂停中。
-    * 暂停不等于安全: 驱动器照样可能报故障、照样可能撞限位。 */
+   /* 安全检查每个 tick 都跑, 包括暂停中 —— 暂停时驱动器仍可能报故障或撞限位 */
    const BusTelem t = m_bus->telemetry();
    const QString bad = healthProblem(t);
    if (!bad.isEmpty())
@@ -828,20 +769,13 @@ void ScanController::tick(int64_t now_ms)
    }
 }
 
-/* ---------------------------------------------------------------- 自动中止 */
-
 bool ScanController::externalWantChanged(const BusTelem &t, int axis, int32_t *seen)
 {
    if (m_cur < 0)
       return false;
 
-   /*
-    * 暂停时目标**本来就**不是我们下发的那个了 —— postStop() 会把它冻在当前位置
-    * (want := tgt), 而那正是我们要的。不在这里放行的话, 一按暂停就会被自己
-    * 判定成"有人从别处改了目标"然后自动中止 —— 暂停按钮变成了中止按钮。
-    *
-    * 继续的时候 startPoint() 会重新下发并把确认标志清掉, 检查自然接上。
-    */
+   /* 暂停时目标本来就不是下发值 (postStop 把 want := tgt), 必须放行, 否则一按
+    * 暂停就被判成有人从旁路改了目标而自动中止 */
    if (m_st == State::Paused)
       return false;
 
@@ -851,17 +785,9 @@ bool ScanController::externalWantChanged(const BusTelem &t, int axis, int32_t *s
 
    const int32_t want = asClamped(m_issued[axis], t.range);
 
-   /*
-    * 下发到 publish 之间差一个 2ms 周期, 头几帧看到的还是**上一次**的目标,
-    * 不等自己的值出现就比, 会把自已当成外部干预。所以先等它登上去。
-    *
-    * **但等待必须有上限。** 没有上限的话: 如果有人在"我们刚下发、还没登上去"的那
-    * 几十毫秒里改了目标, 我们的值就永远不会出现 —— 这个门就永远开着, 于是这次外部
-    * 干预**一次都不会被认出来**。那不报错的后果是滑台照着别人的目标走, 而扫描
-    * 一直在等到位, 直到 m_move_deadline_ms (最长 120 秒) 才因为"走不到"停下来。
-    *
-    * 2ms 的发布周期下, 200ms 是 100 个周期 —— 够宽裕, 又不至于让人觉得卡住。
-    */
+   /* 下发到 publish 之间差一个 2ms 周期, 先等自己的值登上去再比, 否则会把自己当成外部
+    * 干预。等待必须有上限 (WANT_CONFIRM_MS): 没上限的话, 下发与登上去之间被人改了目标
+    * 就永远认不出来 */
    if (!m_want_ok[axis])
    {
       if (w == want)
@@ -886,8 +812,7 @@ QString ScanController::healthProblem(const BusTelem &t)
    if (t.fault)
       return QStringLiteral("驱动器报故障 (6041h bit3) —— 目标已被冻结, 扫描自动中止");
 
-   /* WKC 不足是"拔网线/供电掉了"最直接的表现。但单帧抖动不值得中止,
-    * 所以连续 10 帧 (30Hz 下约 1/3 秒) 才认。 */
+   /* WKC 不足 = 拔网线 / 掉了供电; 单帧抖动不值得中止, 连续 10 帧 (30Hz 下约 1/3 秒) 才认 */
    if (t.expected_wkc > 0 && t.wkc < t.expected_wkc)
    {
       m_bad_wkc++;
@@ -910,10 +835,8 @@ QString ScanController::healthProblem(const BusTelem &t)
       if (!a.enabled)
          return QStringLiteral("轴%1 掉使能 (6041h bit2) —— 扫描自动中止").arg(i);
 
-      /* 这一条是本轮最可能真触发的: 区域算错会真的压上去, 极性配反则会让它**一直**
-       * 亮着 (2026-09-18 那台机器就是后半种)。后两句是**现场诊断** —— bit11 报的是
-       * 硬件限位**信号有效**, 未必真有个开关压着 (见 ecatworker.h 那段说明),
-       * 而这行字是操作员事后唯一还能看到的东西: 面板灯早就过去了。 */
+      /* 这一条最可能真触发。后两句是现场诊断: bit11 报的是硬件限位信号有效, 未必真有
+       * 个开关压着 (见 ecatworker.h) */
       if (a.limit_active)
          return QStringLiteral(
             "%1。\n"

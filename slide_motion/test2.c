@@ -1,48 +1,33 @@
 /*
  * test2.c - 最小 PDO 例子 (test1.c 的 PDO 版)
  *
- * 与 test1.c 的关系:
- *   test1.c 名义上叫 "minimal example", 但它把 6040h 经 **SDO** 写下去, 过程数据
- *   那一圈只是空跑 —— 它验证的不是 PDO, 是 SDO。本程序把那条路真正走通: 6040h
- *   写**输出镜像**, 6041h 读**输入镜像**, 每轮都真发真收一帧。
+ * test1.c 名义上叫 "minimal example", 但它把 6040h 经 SDO 写下去, 过程数据那一圈只是
+ * 空跑 —— 它验证的是 SDO 而不是 PDO。本程序把那条路真正走通: 6040h 写输出镜像,
+ * 6041h 读输入镜像, 每轮都真发真收一帧。
+ * (test1.c 调用的 ec_init / ec_config_map 那套扁平 API 在本仓库这份 SOEM 里不存在,
+ * 它只暴露 ecx_* 上下文 API。)
+ * 完整版 (带护栏/快照/还原/双通路对照/退出码契约) 是 sm_pdo.c; 本程序是它的骨架。
  *
- *   另外 test1.c 调用的 ec_init / ec_config_map / ec_configdc / ec_slave[] 这套扁平
- *   API 在本仓库这份 SOEM 里**不存在** —— 它只暴露 ecx_* 上下文 API。风格照搬, API
- *   换成真实的。
+ * 两个绕不开的前置条件 (实测出来的):
+ *   1. 出厂默认 TxPDO (1A00h) 是空的 -> SM3 长度为 0 -> 从站以 AL 状态码 0x001E
+ *      (Invalid input configuration) 拒绝 SAFE_OP。必须先补 TxPDO, 必须在 PRE_OP 下
+ *      做, 且必须在 ecx_config_map_group 之前 —— 映射是配置时算好的。
+ *   2. 出厂 1600h 只映射了 6040h (16 bit) -> 控制字在输出镜像里的偏移是 0。这个偏移
+ *      本程序是从映射表算出来的, 不是写死的: 偏移算错 = 把控制字字节写进别的字段,
+ *      万一那是 607Ah (目标位置) 就凭空下了一个目标位置。
  *
- * 与 sm_pdo.c 的关系:
- *   sm_pdo.c 是这件事的完整版 (1685 行, 带护栏/快照/还原/双通路对照/退出码契约)。
- *   本程序是它的骨架, 只留下"要跑起来必须有的那一部分", 够短到能一眼读完。要看
- *   严谨版看 sm_pdo.c; 想快速确认 PDO 通路通不通看这个。
- *
- * ---- 两个绕不开的前置条件 (都是实测出来的, 不是猜的) ----
- *   1. 出厂默认 TxPDO (1A00h) 是**空的** -> SM3 长度为 0 -> 从站以 AL 状态码
- *      0x001E (Invalid input configuration) 拒绝 SAFE_OP。进不去 SAFE_OP 就没有
- *      OP, 没有 OP 就轮不到 CiA402 状态机响应 6040h。所以必须先补 TxPDO。
- *      必须在 PRE_OP 下做, 且必须在 ecx_config_map_group **之前** —— 映射是配置
- *      时算好的, 组完再改就晚了。
- *   2. 出厂 1600h 只映射了 6040h (16 bit) -> 控制字在输出镜像里的偏移是 0。这个
- *      偏移本程序是**从映射表算出来的**, 不是写死的: 偏移算错 = 把控制字字节写进
- *      一个别的字段, 万一那是 607Ah (目标位置) 就凭空下了一个目标位置。
- *
- * ---- 安全边界 ----
- *   - 会写 PDO 映射对象 1C13h/1A00h。只写 RAM, **从不写 2102h** (EEPROM), 掉电即
- *     回出厂值。所以本程序跑完不会还原 —— 想还原就重新上电。要跑完自动还原用
- *     sm_pdo.c。
- *   - 6040h 只经过程数据镜像写, 推送过的值只有 0x0000 / 0x0006 / 0x0007 / 0x000F。
+ * 安全边界:
+ *   - 会写 PDO 映射对象 1C13h/1A00h。只写 RAM, 从不写 2102h (EEPROM), 掉电即回出厂
+ *     值。所以本程序跑完不还原 —— 想还原就重新上电 (要跑完自动还原用 sm_pdo.c)。
+ *   - 6040h 只经过程数据镜像写, 推送过的值只有 0x0000 / 0x0006 / 0x0007 / 0x000F,
  *     不发任何运动指令, 滑台不会移动。
- *   - 但**第 3 步之后电机会通电** (有保持力矩)。真跑时人在设备旁, 手放在物理急停上。
+ *   - 但第 3 步之后电机会通电 (有保持力矩)。真跑时人在设备旁, 手放在物理急停上。
  *   - 只请求选中那一根轴的 OP, 别的从站留在 PRE_OP。
  */
 
-/*
- * 头文件顺序是硬的, 不是风格: 必须 soem.h 在前, <windows.h> 在后。
- * soem.h -> nicdrv.h -> wpcap/pcap-stdinc.h 会把 winsock2.h 拉进来 (而且它先
- * #undef _WINSOCKAPI_ 再 include, 防的就是别人先拉老 winsock.h)。windows.h 若先进
- * 来, 它自己会 include <winsock.h> 并定义 _WINSOCKAPI_, 于是 winsock.h 和 winsock2.h
- * 落在同一个编译单元里 -> sockaddr/ip_mreq 重定义 (MSVC: error C2011)。
- * sm_bus.c / slide_motion.c 也是这个顺序。
- */
+/* 头文件顺序是硬的: soem.h 必须在前, <windows.h> 在后。windows.h 若先进来会 include
+ * <winsock.h> 并定义 _WINSOCKAPI_, 两个 winsock 落在同一个编译单元里 -> sockaddr/
+ * ip_mreq 重定义 (MSVC: error C2011)。sm_bus.c 也是这个顺序。 */
 #include <stdio.h>
 #include <string.h>
 #include <signal.h>
@@ -56,9 +41,7 @@
 #include <unistd.h>
 #endif
 
-/* ======================================================================
- * 常量
- * ====================================================================== */
+/* 常量 */
 
 /* 网卡写死 (与 sm_pdo.c / sm_state.c 同一条)。换机器改这一行, 或用 argv[1] 覆盖。 */
 #define IFNAME "\\Device\\NPF_{7C64E0FA-D69A-4C92-A821-E5D341E63575}"
@@ -83,11 +66,9 @@
 #define CW_SWITCHON   0x0007
 #define CW_ENABLE_OP  0x000F
 
-/*
- * 状态字 (6041h) 低 4 位在 CiA402 里是**非标准编码** 0000/0001/0011/0111, 所以
- * 全程用位判断, 禁止数值比较。本驱动器手册只定义了位 0/1/2/3/10/12, 没定义 bit6,
- * 所以位 0-3 全 0 时无法区分 Not ready 与 Switch on disabled —— 不替它猜。
- */
+/* 状态字 (6041h) 低 4 位是非标准编码 0000/0001/0011/0111, 全程用位判断, 禁止数值比较。
+ * 本驱动器手册只定义位 0/1/2/3/10/12, 没定义 bit6, 所以位 0-3 全 0 时不区分 Not ready
+ * 与 Switch on disabled。 */
 #define SW_RTSO     0x0001
 #define SW_SWITCHED 0x0002
 #define SW_OP_EN    0x0004
@@ -116,9 +97,7 @@
 #define EXIT_NO_OP     5
 #define EXIT_NO_DISABLE 10
 
-/* ======================================================================
- * 全局状态
- * ====================================================================== */
+/* 全局状态 */
 
 /* Ctrl-C 标志。信号处理器只置这一位, 不做任何 I/O (信号上下文里发 SDO 是未定义行为) */
 static volatile sig_atomic_t g_stop = 0;
@@ -129,10 +108,7 @@ static void on_ctrl_c(int sig)
    g_stop = 1;
 }
 
-/*
- * SOEM 上下文。放在文件作用域而不是栈上 —— 它内嵌 slavelist[EC_MAXSLAVE] 等大数组,
- * 几百 KB, 栈上放不下 (与 sm_bus.c 的 g_ctx 同一个理由)。
- */
+/* SOEM 上下文。放文件作用域而不是栈上: 它内嵌 slavelist[EC_MAXSLAVE] 等大数组, 几百 KB */
 static ecx_contextt g_ctx;
 static uint8        g_iomap[IOMAP_MAX];
 
@@ -144,9 +120,7 @@ static int    g_expected_wkc = 0;
 static int    g_wrote = 0;       /* 是否写过 6040h */
 static int    g_use_dc = 0;      /* --dc: 配置分布式时钟 */
 
-/* ======================================================================
- * 时钟与睡眠
- * ====================================================================== */
+/* 时钟与睡眠 */
 
 static uint32 now_ms(void)
 {
@@ -169,23 +143,11 @@ static void msleep(int ms)
 #endif
 }
 
-/* ======================================================================
- * SDO 读 / 写
- *
- * 读之前必须清 ctx.ecaterror: 它是粘滞位, SOEM 报错后不会自己清零, 上一次的失败
- * 会污染下一次的判定。
- * ====================================================================== */
+/* SDO 读 / 写。读前必须清 ctx.ecaterror: 它是粘滞位, 上一次的失败会污染下一次判定。 */
 
-/*
- * 读一个对象 (≤4 字节)。返回 0 = 成功, *size 给出驱动器自报的宽度。
- *
- * psize 是**传入传出**: 必须先告诉 SOEM 缓冲有多大, 它才回填实际宽度; 传 0 进去
- * 这次读直接失败 (sm_bus.c 的 sm_rd_raw 里同一个坑, 那里写的是 "给足 4 字节, 让
- * 驱动器自报实际宽度")。
- *
- * 所以这里固定按 4 字节读进**内部**缓冲, 再按自报宽度拷给调用者: 调用者的变量
- * 不必有 4 字节, 也不会被写爆 —— 直接传它进来就等着越界写。
- */
+/* 读一个对象 (<=4 字节)。返回 0 = 成功, *size 给出驱动器自报的宽度。
+ * psize 是传入传出: 传 0 进去这次读直接失败, 所以固定按 4 字节读进内部缓冲, 再按
+ * 自报宽度拷给调用者 —— 调用者的变量不必有 4 字节, 也不会被写爆。 */
 static int sdo_read(int slave, uint16 index, uint8 sub, void *p, int *size)
 {
    uint8 buf[4];
@@ -205,11 +167,7 @@ static int sdo_read(int slave, uint16 index, uint8 sub, void *p, int *size)
    return 0;
 }
 
-/*
- * 读 U16 (读取失败时由调用者自己打诊断行的那条路径用)。
- * 宽度必须正好 2: 宽度不足时解出来的数会在高位补零, 看起来像一个完全正常的值 ——
- * 那是"我们不知道"冒充"读到了"。
- */
+/* 读 U16。宽度必须正好 2: 宽度不足时高位补零会解出一个看起来完全正常的值。 */
 static int sdo_read_u16(int slave, uint16 index, uint8 sub, uint16 *v)
 {
    uint8 buf[4];
@@ -221,11 +179,8 @@ static int sdo_read_u16(int slave, uint16 index, uint8 sub, uint16 *v)
    return 0;
 }
 
-/*
- * 上面几个包装把"没读到"和"读到了但宽度不对"合并成一个 -1 —— 对调用者够用, 对
- * 现场排查不够用: 真机上只看到一句 "读 1A00h 失败" 是没法往下走的。所以映射表这
- * 条路径不走包装, 自己读, 把驱动器自报的宽度打出来。
- */
+/* 上面几个包装把"没读到"和"宽度不对"合并成一个 -1, 排查不够用, 所以映射表这条路径
+ * 自己读, 把驱动器自报的宽度打出来。 */
 static int sdo_read_checked(int slave, uint16 index, uint8 sub, int want_size,
                             void *p)
 {
@@ -248,12 +203,9 @@ static int sdo_read_checked(int slave, uint16 index, uint8 sub, int want_size,
    return 0;
 }
 
-/*
- * 写后回读。这份 SOEM 在加急路径 (psize<=4) 上把从站回的 SDO abort 帧当成写成功
- * (abort 帧的 mbxtype/service/index/subindex 与请求完全一致, 命中 "all OK" 分支,
- * 既不压错误栈也不置 ecaterror, wkc 还 > 0)。映射对象全是 1/2/4 字节的加急写, 全在
- * 这条路径上 —— 所以 wkc > 0 不代表写进去了, **回读才是唯一的确认**。
- */
+/* 写后回读。这份 SOEM 在加急路径 (psize<=4) 上把从站回的 SDO abort 帧当成写成功
+ * (abort 帧字段与请求一致, 命中 "all OK" 分支, wkc 仍 > 0)。映射对象全在这条路径上,
+ * 所以 wkc > 0 不代表写进去了, 回读才是确认。 */
 static int sdo_write(int slave, uint16 index, uint8 sub, int size, const void *p)
 {
    uint8 back[4];
@@ -281,9 +233,7 @@ static int sdo_write(int slave, uint16 index, uint8 sub, int size, const void *p
    return 0;
 }
 
-/* ======================================================================
- * 映射表: 读 / 求偏移
- * ====================================================================== */
+/* 映射表: 读 / 求偏移 */
 
 /* 读一个 PDO 映射对象 (index 的 :00 是项数, :01.. 是项)。返回 0 = 成功 */
 static int map_read(int slave, uint16 index, uint32 *e, int *n)
@@ -309,14 +259,8 @@ static int map_read(int slave, uint16 index, uint32 *e, int *n)
    return 0;
 }
 
-/*
- * 求 (index, sub) 在映射里的**字节偏移**。找不到 / 位宽不符 / 前面累计位数不是
- * 8 的整数倍 -> -1。
- *
- * 为什么死守这条: 偏移算错 = 把控制字字节写进一个别的字段。万一那个字段是 607Ah
- * (目标位置), 我们就在毫不知情的情况下下了一个目标位置。所以证不出偏移必须拒绝,
- * 不允许"大概是 0 吧"。
- */
+/* 求 (index, sub) 在映射里的字节偏移; 找不到 / 位宽不符 / 前面累计位数不是 8 的整数倍
+ * -> -1。证不出偏移必须拒绝: 偏移算错就可能把控制字字节写进 607Ah (目标位置)。 */
 static int map_offset(const uint32 *e, int n, uint16 index, uint8 sub,
                       int want_bits)
 {
@@ -344,12 +288,9 @@ static int map_offset(const uint32 *e, int n, uint16 index, uint8 sub,
    return -1;
 }
 
-/* ======================================================================
- * 补 TxPDO —— 让 SM3 非零, 否则从站拒绝 SAFE_OP (AL 0x001E)
- *
- * 只往 1A00h **追加**一项 6041h (16 bit), 已有的项原样保留。必须在 PRE_OP 下、
- * 在 ecx_config_map_group 之前做。返回 0 = 完成 (可能没改动)
- * ====================================================================== */
+/* 补 TxPDO —— 让 SM3 非零, 否则从站拒绝 SAFE_OP (AL 0x001E)。
+ * 只往 1A00h 追加一项 6041h (16 bit), 已有的项原样保留; 必须在 PRE_OP 下、在
+ * ecx_config_map_group 之前做。返回 0 = 完成 (可能没改动) */
 static int fixup_txpdo(int slave)
 {
    uint32 e[MAP_MAX];
@@ -371,10 +312,8 @@ static int fixup_txpdo(int slave)
       return 0;
    }
 
-   /*
-    * 1C13h 已经分配了**别的东西**就拒绝: 要把它换掉就必须替驱动器决定"哪个 TxPDO
-    * 是可有可无的" —— 那是它的配置, 不是我们的。已经分配 1A00h 则可以继续。
-    */
+   /* 1C13h 已分配别的东西就拒绝: 换掉它就得替驱动器决定哪个 TxPDO 可有可无。
+    * 已经分配 1A00h 则可以继续。 */
    if (sdo_read_checked(slave, OID_TXPDO_ASSIGN, 0, 1, &acnt) != 0)
    {
       printf("  读 1C13h 失败 -> 拒绝\n");
@@ -431,44 +370,16 @@ static int fixup_txpdo(int slave)
    return 0;
 }
 
-/* ======================================================================
- * 过程数据
- * ====================================================================== */
+/* 过程数据 */
 
 static int cycle(void)
 {
    ecx_send_processdata(&g_ctx);
    return ecx_receive_processdata(&g_ctx, EC_TIMEOUTRET);
 }
-/*
-static int cycle_debug(void)
-{
-    int wkc;
 
-    printf("    send...\n");
-    fflush(stdout);
-
-    ecx_send_processdata(&g_ctx);
-
-    printf("    send OK\n");
-    fflush(stdout);
-
-    printf("    receive...\n");
-    fflush(stdout);
-
-    wkc = ecx_receive_processdata(&g_ctx, EC_TIMEOUTRET);
-
-    printf("    receive WKC=%d\n", wkc);
-    fflush(stdout);
-
-    return wkc;
-}*/
-
-/*
- * 写 6040h 到输出镜像。必须按小端字节写: SOEM 把 IOmap 原样塞进 EtherCAT 帧, 而
- * 线上是小端。本工程只跑 Windows/x86, memcpy 一个 uint16 就是小端表示。用 memcpy
- * 而不是强制转换, 是为了不依赖 g_off_cw 的对齐。
- */
+/* 写 6040h 到输出镜像。按小端字节写: EtherCAT 线上是小端, 本工程只跑 Windows/x86,
+ * memcpy 一个 uint16 就是小端表示; 用 memcpy 是为了不依赖对齐。 */
 static void set_cw(uint16 cw)
 {
    if (g_out == NULL || g_off_cw < 0)
@@ -512,9 +423,7 @@ static const char *state_str(uint16 st)
    }
 }
 
-/* ======================================================================
- * AL 状态阶梯
- * ====================================================================== */
+/* AL 状态阶梯 */
 
 static void print_adapters(void)
 {
@@ -526,25 +435,19 @@ static void print_adapters(void)
    ec_free_adapters(head);
 }
 
-/*
- * 请求并等待目标轴进入 want。每轮都打过程数据再查状态 —— 状态迁移期间过程数据
- * 不能断, 否则若驱动器的 SM 看门狗是开着的, 会反过来把我们从迁移里踢出来。
- * 返回 0 = 到达 / -1 = 失败 (已打印原因)
- */
+/* 请求并等待目标轴进入 want。每轮都打过程数据再查状态: 迁移期间过程数据不能断, 否则
+ * 驱动器的 SM 看门狗若开着会反过来把我们从迁移里踢出来。
+ * 返回 0 = 到达 / -1 = 失败 */
 static int goto_state(int slave, uint16 want, int tmo_ms)
 {
    uint32 t0 = now_ms();
 
-   /*
-    * 先取一次目标轴当前的原始 AL 状态字 (timeout=0 -> 一次 FPRD 就返回)。不这么做的话
-    * 下面那个 ACK 判断读的是 slavelist[] 里的陈值 —— 它可能是上一次调用留下的。
-    */
+   /* 先取一次目标轴当前的原始 AL 状态字 (timeout=0 -> 一次 FPRD 就返回); 否则下面的
+    * ACK 判断读的是 slavelist[] 里的陈值。 */
    (void)ecx_statecheck(&g_ctx, (uint16)slave, (uint16)want, 0);
 
-   /*
-    * 若从站当前处于 AL 错误态 (状态字 bit4), 必须把 ACK 一起写进去才能清掉它 ——
-    * ecx_writestate() 只把 slavelist[].state 原样写下去, 不会自动置 ACK。
-    */
+   /* 从站处于 AL 错误态 (状态字 bit4) 时必须把 ACK 一起写进去才能清掉:
+    * ecx_writestate() 只把 slavelist[].state 原样写下去, 不会自动置 ACK。 */
    if ((g_ctx.slavelist[slave].state & EC_STATE_ERROR) != 0)
       g_ctx.slavelist[slave].state = (uint16)(want | EC_STATE_ACK);
    else
@@ -563,11 +466,8 @@ static int goto_state(int slave, uint16 want, int tmo_ms)
       if (ecx_statecheck(&g_ctx, (uint16)slave, want, 1000) == want)
          return 0;
 
-      /*
-       * ecx_statecheck() 把状态按 0x000F 掩过, 错误位 (0x10) 在它的返回值里看不见,
-       * 必须单独查 slavelist[].state。这正是文档里记的 sm_state 那个"进 SAFE_OP 失败
-       * 却只打印一行 0x12"的坑。
-       */
+      /* ecx_statecheck() 把状态按 0x000F 掩过, 错误位 (0x10) 在它的返回值里看不见,
+       * 必须单独查 slavelist[].state。 */
       if ((s->state & EC_STATE_ERROR) != 0)
       {
          printf("  [FAIL] 请求 %s 被拒绝: AL 状态 0x%02X (含错误位), "
@@ -588,10 +488,7 @@ static int goto_state(int slave, uint16 want, int tmo_ms)
    }
 }
 
-/* ======================================================================
- * 一步: 写控制字到输出镜像 -> 等输入镜像里的状态字满足断言
- * 返回 0 = PASS / -1 = FAIL
- * ====================================================================== */
+/* 一步: 写控制字到输出镜像 -> 等输入镜像里的状态字满足断言。返回 0 = PASS / -1 = FAIL */
 static int step(int slave, const char *name, uint16 cw, uint16 expect)
 {
    uint32 t0 = now_ms();
@@ -640,10 +537,8 @@ static int step(int slave, const char *name, uint16 cw, uint16 expect)
       printf(" [FAIL] 断言未成立\n");
       if (reads == 0)
       {
-         /*
-          * 一笔都没取到。不能拿零初始化的 sw 冒充"实测 0x0000" —— 0x0000 在 CiA402
-          * 里是合法的 "未使能", 那会把"我们不知道"说成"驱动器报了个状态"。
-          */
+         /* 一笔都没取到。不能拿零初始化的 sw 冒充"实测 0x0000": 0x0000 在 CiA402 里是
+          * 合法的"未使能", 那会把"我们不知道"说成"驱动器报了个状态"。 */
          printf("       一笔 6041h 都没从 TxPDO 取到: 状态未知\n");
       }
       else
@@ -655,12 +550,8 @@ static int step(int slave, const char *name, uint16 cw, uint16 expect)
              (unsigned)s->state, (unsigned)s->ALstatuscode,
              ec_ALstatuscode2string(s->ALstatuscode));
 
-      /*
-       * 用 SDO 回读 6040h。这一行把两种失败分开, 而它们的修法完全不同:
-       *   回读一致 -> 控制字到了驱动器, 驱动器不受理 (问题在驱动器侧);
-       *   回读是别的值 -> 过程数据根本没落到控制字对象上 (问题在主站侧:
-       *                    偏移算错 / 从站不在 OP / WKC 短)。
-       */
+      /* 用 SDO 回读 6040h, 这一行把两种失败分开: 回读一致 -> 控制字到了驱动器但不被
+       * 受理 (驱动器侧); 回读是别的值 -> 过程数据没落到控制字对象上 (偏移 / OP / WKC)。 */
       if (sdo_read_u16(slave, OID_CONTROLWORD, 0, &back) == 0)
          printf("       6040h 回读 = 0x%04X (经 RxPDO 写的是 0x%04X) %s\n",
                 (unsigned)back, (unsigned)cw,
@@ -675,10 +566,8 @@ static int step(int slave, const char *name, uint16 cw, uint16 expect)
    return 0;
 }
 
-/* ======================================================================
- * 收尾 —— 无条件执行, 覆盖所有退出路径
- * 返回 0 = 已确认失能 / 1 = 未能确认失能 (电机可能仍带电)
- * ====================================================================== */
+/* 收尾 —— 无条件执行, 覆盖所有退出路径。
+ * 返回 0 = 已确认失能 / 1 = 未能确认失能 (电机可能仍带电) */
 static int teardown(int slave, int in_op)
 {
    uint16 sw = 0;
@@ -739,9 +628,7 @@ static int teardown(int slave, int in_op)
    return 0;
 }
 
-/* ======================================================================
- * main
- * ====================================================================== */
+/* main */
 int main(int argc, char *argv[])
 {
    const char *ifname = IFNAME;
@@ -752,10 +639,7 @@ int main(int argc, char *argv[])
    uint32 e[MAP_MAX];
    int    n;
 
-   /*
-    * 源码是 UTF-8, 但 Windows 控制台默认是 GBK 代码页, 不设这一句中文全是乱码
-    * (与 sm_bus.c 的 sm_console_utf8() 同一件事; 本程序不链接 sm_bus.c, 所以自己来)。
-    */
+   /* 源码是 UTF-8, Windows 控制台默认 GBK 代码页, 不设这一句中文全是乱码 */
 #ifdef _WIN32
    SetConsoleOutputCP(CP_UTF8);
 #endif
@@ -835,14 +719,9 @@ int main(int argc, char *argv[])
    }
    target = 1;
 
-   /*
-    * 单独读一次目标轴的状态, 不能用上面那次广播的结果:
-    *   - ecx_statecheck(slave=0) 走 BRD, 只把结果填进 slavelist[0], 不填单个从站;
-    *   - ecx_readstate() 在"所有从站状态一致且无错误位"时会提前返回, 同样不填单个
-    *     从站的 state。
-    * slave>=1 的 ecx_statecheck 走 FPRD, 把原始 AL 状态字 (连错误位 0x10 一起)
-    * 写回 slavelist[target].state, 这才是能判的读数。
-    */
+   /* 单独读一次目标轴的状态, 不能用上面那次广播的结果: ecx_statecheck(slave=0) 走 BRD
+    * 只填 slavelist[0]。slave>=1 的 ecx_statecheck 走 FPRD, 把原始 AL 状态字 (连错误位
+    * 0x10) 写回 slavelist[target].state, 这才是能判的读数。 */
    (void)ecx_statecheck(&g_ctx, (uint16)target, EC_STATE_PRE_OP, 1000);
    if (g_ctx.slavelist[target].state != EC_STATE_PRE_OP)
    {
@@ -933,11 +812,9 @@ int main(int argc, char *argv[])
           (unsigned)g_ctx.grouplist[0].outputsWKC,
           (unsigned)g_ctx.grouplist[0].inputsWKC, g_expected_wkc);
 
-   /*
-    * 可选 DC。默认不碰: 自由运行下能进 OP 就别动它。若进 OP 失败且 AL 状态码是
-    * 0x001B 一类同步/看门狗相关, 加 --dc 再来 —— 光 ecx_configdc 不够, 还得
-    * ecx_dcsync0 把 SYNC0 真的打开。
-    */
+   /* 可选 DC, 默认不碰: 自由运行能进 OP 就别动它。若进 OP 失败且 AL 状态码是 0x001B
+    * 一类同步/看门狗相关, 加 --dc 再来; 光 ecx_configdc 不够, 还得 ecx_dcsync0 打开
+    * SYNC0。 */
    if (g_use_dc)
    {
       printf("\n---- 配置 DC (周期 %dus) ----\n", DC_CYCLE_US);
@@ -965,7 +842,7 @@ int main(int argc, char *argv[])
           (unsigned)SW_MASK);
    printf("  bit6, 所以 \"未使能\" 不区分 Not ready / Switch on disabled。\n");
 
-   /* 0. 先归到已知起点, 这样入口状态是什么都不影响后面的判定 */
+   /* 0. 先归到已知起点, 入口状态是什么都不影响后面的判定 */
    if (step(target, "0. 归位 Disable voltage",
          CW_DISABLE_V, SW_RTSO) != 0)
    { exit_code = EXIT_FAIL; goto out; }

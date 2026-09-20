@@ -8,9 +8,8 @@
 
 namespace scan {
 
-/* hmi/ecatworker.h 的 HMI_VEL_MIN / HMI_VEL_MAX。这里照抄一份而不是 include 那个头:
- * 本文件要能脱离 Qt 单独编。**两边必须一致** —— 不一致的话, 界面上估的时长会和
- * 实际对不上 (EcatThread::setSpeed 会把速度夹掉, 而估算是照原值算的)。 */
+/* 同 hmi/ecatworker.h 的 HMI_VEL_MIN / HMI_VEL_MAX, 照抄一份以保持本文件不依赖 Qt。
+ * 两边必须一致: EcatThread::setSpeed 会夹速度, 而估算是照原值算的。 */
 static const uint32_t VEL_MIN = 1000;
 static const uint32_t VEL_MAX = 100000;
 
@@ -20,8 +19,6 @@ static uint32_t clampVel(uint32_t v)
    if (v > VEL_MAX) return VEL_MAX;
    return v;
 }
-
-/* ---------------------------------------------------------------- 换算 */
 
 int32_t pulseOf(double unit, double pulses_per_unit)
 {
@@ -34,8 +31,6 @@ double unitOf(int32_t pul, double pulses_per_unit)
       return 0.0;
    return (double)pul / pulses_per_unit;
 }
-
-/* ---------------------------------------------------------------- 网格 */
 
 int axisCount(double area_unit, double res_unit)
 {
@@ -51,10 +46,7 @@ std::vector<double> axisCoords(double area_unit, double res_unit)
    if (n <= 0)
       return out;
 
-   /*
-    * 居中: span = (n-1)*res。area/res 除不尽时 span < area, 于是网格整个落在区域内
-    * (两端各留半格), 而不是一头贴边一头越界。"宁可少扫一点" 是有意的。
-    */
+   /* 居中: area/res 除不尽时 span < area, 网格整个落在区域内 (两端各留半格) */
    double span = (double)(n - 1) * res_unit;
    out.reserve((size_t)n);
    for (int i = 0; i < n; i++)
@@ -101,8 +93,6 @@ std::vector<Point> buildPlan(const Params &p)
 
    return out;
 }
-
-/* ---------------------------------------------------------------- 量程与容差 */
 
 int32_t autoRangePul(const Params &p)
 {
@@ -161,8 +151,6 @@ bool fitsRange(const Params &p, std::string *why)
    return true;
 }
 
-/* ---------------------------------------------------------------- 校验 */
-
 std::string validate(const Params &p)
 {
    if (!(p.area_x_unit > 0.0) || !(p.area_y_unit > 0.0))
@@ -180,8 +168,7 @@ std::string validate(const Params &p)
    if (nx < 1 || ny < 1)
       return "网格为空 (区域或分辨率不合法)";
 
-   /* 点数上限。**常量在 scanplan.h** (kMaxPlanPoints) —— rebuildPlan() 拿它做拦截,
-    * 这里只是同一件事说给操作员听。两处写两个数字迟早会不一样 */
+   /* 上限常量在 scanplan.h (kMaxPlanPoints), rebuildPlan() 拦的是同一个 */
    long long total = (long long)nx * (long long)ny;
    if (total > kMaxPlanPoints)
    {
@@ -217,8 +204,6 @@ std::string validate(const Params &p)
    return std::string();
 }
 
-/* ---------------------------------------------------------------- 预估 */
-
 int64_t estimatePerPointMs(const Params &p)
 {
    double step_pul = p.res_unit * p.pulses_per_unit;
@@ -238,8 +223,6 @@ int64_t estimatePerPointMs(const Params &p)
    return (int64_t)per;
 }
 
-/* ---------------------------------------------------------------- CSV */
-
 std::string csvColumnHeader()
 {
    return "index,ix,iy,x_unit,y_unit,x_pul,y_pul,watts,ok,flags,"
@@ -248,11 +231,7 @@ std::string csvColumnHeader()
 
 std::string csvMetaLines(const Params &p, const std::string &started_iso, int zero_epoch)
 {
-   /*
-    * 两行 `#` 注释带全部参数。**续扫靠它做兼容性判定** ——
-    * 所以"决定物理网格的东西"一个都不能少: 两个方向的大小、分辨率、每单位脉冲数。
-    * 速度/停留/稳定这些不影响网格, 变更它们不该作废一次已经扫了一半的区域。
-    */
+   /* 两行 `#` 注释带全部参数, 续扫靠它做兼容性判定: 决定物理网格的那四项一个都不能少 */
    char buf[1024];
    std::string s = "# scan v1\n";
    s += "# area_x_unit=" + std::to_string(p.area_x_unit);
@@ -282,13 +261,12 @@ std::string csvRowLine(const Row &r)
 {
    char buf[512];
 
-   /* 数值一律用 C locale (%f / %lld 本来就是), 不用 QLocale —— 某些区域设置会把
-    * 小数点变成逗号, 那一列就废了 */
+   /* 数值用 C locale, 不用 QLocale: 某些区域设置会把小数点变成逗号 */
    char watts[64];
    if (r.ok)
       std::snprintf(watts, sizeof(watts), "%.9g", r.watts);
    else
-      watts[0] = '\0';          /* 采不到就留空, 不留 0 —— 0 是一个合法的读数 */
+      watts[0] = '\0';          /* 采不到就留空: 0 是一个合法的读数 */
 
    std::snprintf(buf, sizeof(buf),
                  "%d,%d,%d,%.9g,%.9g,%d,%d,%s,%d,%s,%d,%d,%d,%d,%lld,%lld\n",
@@ -300,8 +278,6 @@ std::string csvRowLine(const Row &r)
 
    return std::string(buf);
 }
-
-/* ---------------------------------------------------------------- 续扫 */
 
 /* 在 "# a=1 b=2" 这类行里找 key=value。找到写 *out 返回 true。 */
 static bool metaGet(const std::string &line, const char *key, double *out)
@@ -363,7 +339,6 @@ std::string csvParseForResume(const std::string &text, const Params &p,
    if (zero_epoch != nullptr)
       *zero_epoch = -1;
 
-   /* ---- 表头: 几何参数必须一致 ---- */
    double a_x = -1, a_y = -1, r_u = -1, ppu = -1;
    bool have_geom = false;
 
@@ -391,7 +366,6 @@ std::string csvParseForResume(const std::string &text, const Params &p,
          continue;
       }
 
-      /* ---- 注释行: 参数 ---- */
       if (line[0] == '#')
       {
          double v = 0;
@@ -411,7 +385,6 @@ std::string csvParseForResume(const std::string &text, const Params &p,
          continue;
       }
 
-      /* ---- 列名行: 跳过 ---- */
       if (!seen_data && line.compare(0, 5, "index") == 0)
       {
          if (nl == std::string::npos) break;
@@ -419,13 +392,12 @@ std::string csvParseForResume(const std::string &text, const Params &p,
          continue;
       }
 
-      /* ---- 数据行 ---- */
       seen_data = true;
       std::vector<std::string> f = splitCsv(line);
 
       if (f.size() < 3)
       {
-         /* 残行 (写到一半掉电) 只在**最后一行**能容忍; 中间出现就是真损坏 */
+         /* 残行 (写到一半掉电) 只在最后一行能容忍; 中间出现就是真损坏 */
          if (nl == std::string::npos)
             break;
          char buf[160];
@@ -460,7 +432,6 @@ std::string csvParseForResume(const std::string &text, const Params &p,
       return "CSV 里没有几何参数 (表头被截掉了?) —— 没法确认它跟当前参数是不是同一片区域";
    (void)seen_data;
 
-   /* ---- 逐项对比, 报**具体哪一项**变了, 而不是一句"不兼容" ---- */
    std::string diff;
    auto noteDiff = [&diff](const char *name, double was, double now)
    {
@@ -482,8 +453,6 @@ std::string csvParseForResume(const std::string &text, const Params &p,
    }
    return diff;
 }
-
-/* ---------------------------------------------------------------- 数值读回 */
 
 void csvLoadGrid(const std::string &text, const Params &p,
                  std::vector<char> *have, std::vector<double> *watts)
@@ -537,7 +506,7 @@ void csvLoadGrid(const std::string &text, const Params &p,
                   const size_t cell = (size_t)iy * (size_t)nx + (size_t)ix;
                   const bool ok = (std::atoi(f[(size_t)c_ok].c_str()) != 0);
 
-                  /* **覆盖**, 不取第一次: 重测会追加重测那一行, 图上要的就是最后那次 */
+                  /* 覆盖不取第一次: 重测追加的那一行才是图上要的 */
                   if (have != nullptr)  (*have)[cell] = ok ? 1 : 0;
                   if (watts != nullptr) (*watts)[cell] = ok ? std::atof(f[(size_t)c_w].c_str()) : 0.0;
                }
@@ -550,8 +519,6 @@ void csvLoadGrid(const std::string &text, const Params &p,
       pos = nl + 1;
    }
 }
-
-/* ---------------------------------------------------------------- 几何同一性 */
 
 bool sameGeom(const Params &a, const Params &b)
 {

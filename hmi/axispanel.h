@@ -1,15 +1,5 @@
-/*
- * hmi/axispanel.h —— 一根轴的面板
- *
- * 两个类:
- *   SlideCanvas —— 自绘的滑台轨道, 点哪里就把 want 设成哪里
- *   AxisPanel   —— 标题 + 轨道 + 速度滑块 + 读数 + 「回中 / 设为 0」按钮
- *
- * **这里一个 motor_api 函数都不调, 也不 include ec_motor.h 以外的任何总线头。**
- * 面板只认 AxisTelem (一份显示坐标的快照) 和四个信号; 谁去碰总线是 mainwindow/ecatworker 的事。
- *
- * 不引 Qt Charts / QCustomPlot (都是 GPL) —— 一个矩形加几条线用 paintEvent 就够了。
- */
+/* hmi/axispanel.h —— 一根轴的面板: SlideCanvas 轨道 + AxisPanel 面板
+ * 本文件不调任何 motor_api 函数, 也不 include 总线头; 只认 AxisTelem 与四个信号。 */
 #pragma once
 
 #include <QWidget>
@@ -20,8 +10,6 @@ class QLabel;
 class QSlider;
 class QSpinBox;
 class QPushButton;
-
-/* ---------------------------------------------------------------- 轨道 */
 
 class SlideCanvas : public QWidget
 {
@@ -34,8 +22,7 @@ public:
    void setTgt  (int32_t t) { m_tgt   = t; update(); }
    void setWant (int32_t w) { m_want  = w; update(); }
 
-   /* 未连接 / 未使能 / 无有效帧时画成灰的, 并把点击吞掉:
-    * 让"点了没反应"看起来像**功能没开**, 而不是像程序坏了 */
+   /* 未连接 / 未使能 / 无有效帧时画成灰的, 并把点击吞掉 */
    void setLive(bool live)      { m_live  = live;  update(); }
    void setMovable(bool movable){ m_movable = movable; update(); }
 
@@ -46,7 +33,7 @@ public:
    QSize minimumSizeHint() const override { return QSize(320, 96); }
 
 signals:
-   /* want 是**显示坐标** (已夹在 ±HMI_RANGE 内) */
+   /* want 是显示坐标 (已夹在 ±HMI_RANGE 内) */
    void targetRequested(int want);
 
 protected:
@@ -68,8 +55,6 @@ private:
    int     m_clamped_ms = 0;
    int     m_timer = 0;
 };
-
-/* ---------------------------------------------------------------- 面板 */
 
 class AxisPanel : public QWidget
 {

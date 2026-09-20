@@ -1,36 +1,10 @@
 /*
- * aliasinfo - 打印每个从站 ESC "Configured Station Alias" 寄存器
- * (0x0012h-0x0013h) 的内容，即拨码设定的站号。
- *
- * 背景:
- *   EtherCAT 标准里普通主站靠读每个从站的 ESC 寄存器 0x0012-0x0013
- *   (Configured Station Alias) 来识别"拨码/旋码站号"。例如研控 YKD2205PE
- *   的 SW1~6 就把站号 (0~63) 写进 0012h-0013h 供主站使用。
- *
- *   本仓库 python 框架 (pysoem) 封装的旧版 SOEM 不暴露该 ESC 寄存器，
- *   因此拨码站号对 pysoem 不可见；本工具用原生 SOEM 直接读。SOEM 在
- *   ecx_config_init() 中已对每台从站 FPRD 0x0012，结果存于
- *   ctx.slavelist[i].aliasadr，这里只把它打印出来即可 (无需进 OP，只读)。
- *
- *   注意: 别名 = 0 通常表示"未设置站号/拨码=0"，此时无法靠别名区分多台
- *   同型号驱动器，仍需按总线线序 (位置) 识别。
- *
- * 用法:
- *   aliasinfo [ifname]
- *     ifname   网卡名。Windows Npcap 形如  \Device\NPF_{GUID} ，
- *              例如: aliasinfo '\Device\NPF_{7C64E0FA-D69A-4C92-A821-E5D341E63575}'
- *              不带 ifname 时仅列出可用网卡。
- *
- * 位置/构建:
- *   本文件在本仓库自有顶层工程 (aliasinfo/)，引用根目录下载的 SOEM 库
- *   (add_subdirectory(SOEM))，不改动 SOEM 源码。
- *     cmake -S . -B build                # 仓库根 (含顶层 CMakeLists)
- *     cmake --build build --config Release --target aliasinfo
- *   产物: build/aliasinfo/Release/aliasinfo.exe
- *   MinGW/Ninja 示例:
- *     cmake -S . -B build-mingw -G Ninja -DCMAKE_BUILD_TYPE=Release \
- *           -DCMAKE_C_COMPILER=C:/msys64/ucrt64/bin/gcc.exe
- *     cmake --build build-mingw --target aliasinfo
+ * aliasinfo - 打印每个从站 ESC 寄存器 0x0012h-0x0013h (Configured Station Alias) 拨码站号。
+ * 值取自已由 ecx_config_init() 填好的 ctx.slavelist[i].aliasadr，只读，不进 OP。
+ * 别名=0 表示未设拨码站号，多台同型号时须按总线线序区分。
+ * 用法: aliasinfo [ifname]  (Windows Npcap 网卡名形如 \Device\NPF_{GUID}；不带则仅列出网卡)
+ * 构建: cmake --build build --config Release --target aliasinfo
+ *       -> build/aliasinfo/Release/aliasinfo.exe
  */
 
 #include <stdio.h>
@@ -93,7 +67,7 @@ int main(int argc, char *argv[])
              slave - 1,                /* 总线位置 0-based */
              slave,                    /* SOEM 从站序号 1-based */
              (unsigned)s->configadr,
-             (unsigned)s->aliasadr, (unsigned)s->aliasadr, /* 0012h-0013h 别名寄存器 */
+             (unsigned)s->aliasadr, (unsigned)s->aliasadr, /* 别名寄存器 0012h-0013h */
              (unsigned)s->eep_man,
              (unsigned)s->eep_id,
              s->name);

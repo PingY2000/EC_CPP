@@ -1,34 +1,13 @@
 /*
- * ec_motor.c - 多轴 CiA402 电机接口的底座层
- *
- * 这一层负责: 网卡/上下文 / 时钟 / SDO 读写 / PDO 映射的实读与追加 / 偏移证明 /
- *             AL 状态阶梯 / 过程数据收发 / 6041h 判读 / 收尾。
+ * ec_motor.c - 多轴 CiA402 电机接口的底座层: 网卡与上下文 / 时钟 / SDO 读写 /
+ * PDO 映射的实读与追加 / 偏移证明 / AL 状态阶梯 / 过程数据收发 / 6041h 判读 / 收尾。
  * 运动层 (使能状态机 / CSP 轨迹 / PV / 回零) 在 ec_motor_motion.c。
  *
- * ============================================================================
- * 本文件是 motor_api/ 里**唯一**出现 ecx_SDOwrite 的文件
- * ============================================================================
- *      grep -rn ecx_SDOwrite motor_api/    ->    只有本文件一处
- *
- * 与 slide_motion/ 里"只有 sm_guard.c 写"是同一条不变量。头文件也不导出任何裸写
- * 函数: 对外只有语义化的 em_set_mode / em_home / ... , 它们最终走本文件的
- * em__wr_*()。审计"这接口会写什么"只需要读本文件。
- *
- * 会写的对象 (全部列出, 没有别的):
- *   6060h 运行模式;  6098h/6099h/609Ah/607Ch 回零参数;
- *   1C12h/1C13h/1600h/1A00h PDO 映射 (仅 RAM);
- *   6040h **只经过程数据镜像写**, 不经 SDO。
- * 从不写: 2102h (EEPROM) / 607Dh (软限位) / 2400h / 2408h / 2409h / 2201h。
- *
- * ============================================================================
- * 头文件顺序是硬的, 不是风格
- * ============================================================================
- * 必须 soem.h 在前, <windows.h> 在后。soem.h -> nicdrv.h -> wpcap/pcap-stdinc.h
- * 会把 winsock2.h 拉进来 (而且它先 #undef _WINSOCKAPI_ 再 include, 防的就是别人
- * 先拉老 winsock.h)。windows.h 若先进来, 它自己会 include <winsock.h> 并定义
- * _WINSOCKAPI_, 于是 winsock.h 和 winsock2.h 落在同一个编译单元里 ->
- * sockaddr/ip_mreq 重定义 (MSVC: error C2011)。sm_bus.c / slide_motion.c / test2.c
- * 也是这个顺序。
+ * 全工程唯一的 ecx_SDOwrite 调用点, 头文件不导出裸写函数。会写: 6060h;
+ * 6098h/6099h/609Ah/607Ch 回零参数; 1C12h/1C13h/1600h/1A00h PDO 映射 (仅 RAM);
+ * 6040h 只经过程数据镜像写。从不写: 2102h (EEPROM) / 607Dh / 2400h / 2408h / 2409h / 2201h。
+ * include 顺序是硬的: soem.h 必须在前 —— windows.h 先进来会拉进 winsock.h 并定义
+ * _WINSOCKAPI_, 与 soem.h 的 winsock2.h 冲突 (MSVC: error C2011)。
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,23 +26,13 @@
 
 #include "ec_motor_internal.h"
 
-/* ======================================================================
- * 版本与常量
- * ====================================================================== */
-
 #define EM_VERSION "motor_api 1.0"
 
 /* SM2 = RxPDO (输出), SM3 = TxPDO (输入) —— 手册: SM0/SM1 邮箱, SM2 RxPDO, SM3 TxPDO */
 #define EM_SM_RXPDO 2
 #define EM_SM_TXPDO 3
 
-/* ======================================================================
- * 全局停止标志
- *
- * Ctrl-C 的处理器只置这一位, 不做任何 I/O —— 在信号上下文里发 SDO 是未定义行为。
- * 它是文件作用域 (不是 em_bus 的成员), 因为信号处理器拿不到 bus 指针。
- * 只有一个进程一份总线, 所以这一份标志是对的。
- * ====================================================================== */
+/* 全局停止标志: Ctrl-C 的处理器只置这一位, 不做 I/O; 用文件作用域是因为处理器拿不到 bus 指针 */
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -71,40 +40,21 @@ void em_request_stop(void)   { g_stop = 1; }
 int  em_stop_requested(void) { return g_stop != 0; }
 void em_clear_stop(void)     { g_stop = 0; }
 
-/* ======================================================================
- * 控制台
- * ====================================================================== */
-
 static int g_console_done = 0;
 
-/*
- * 对外公开版。**调用方应当在 main() 的第一句调它** —— 理由见下。
- *
- * 本函数原来只被 em_bus_new()/em__err()/em__warn()/em__log() 惰性调用, 于是
- * "在 em_bus_new() 之前打印的汉字"落在 GBK 代码页下, 全是乱码。这不是理论问题:
- * motor_test 的横幅就在 em_bus_new() 之前, 实测把「多轴」打成「澶氳酱」
- * (UTF-8 的 E5 A4 9A E8 BD B4 被按 GBK 解成 E5A4/9AE8/BDB4 三个字)。
- * 卫兵只有这一份, 多调几次没关系。
- */
+/* 把控制台代码页设成 UTF-8, 幂等。在 main() 第一句调: 那之前打印的汉字是乱码 (默认 GBK) */
 void em_console_init(void)
 {
    if (g_console_done)
       return;
    g_console_done = 1;
 #ifdef _WIN32
-   /*
-    * 源码是 UTF-8, 但 Windows 控制台默认是 GBK 代码页, 不设这一句中文全是乱码
-    * (与 sm_bus.c 的 sm_console_utf8() 同一件事)。
-    */
+   /* 源码是 UTF-8, Windows 控制台默认是 GBK 代码页, 不设这一句中文全是乱码 */
    SetConsoleOutputCP(CP_UTF8);
 #endif
 }
 
 static void em__console_init(void) { em_console_init(); }
-
-/* ======================================================================
- * 时钟与睡眠
- * ====================================================================== */
 
 uint32_t em__now_ms(void)
 {
@@ -128,10 +78,6 @@ void em__sleep_ms(int ms)
 }
 
 void em_sleep_ms(int ms) { em__sleep_ms(ms); }
-
-/* ======================================================================
- * 输出
- * ====================================================================== */
 
 void em__err(const char *fmt, ...)
 {
@@ -175,13 +121,7 @@ const char *em_version(void) { return EM_VERSION; }
 
 void em_set_verbose(em_bus_t *bus, int on) { if (bus) bus->verbose = on ? 1 : 0; }
 
-/* ======================================================================
- * 镜像的小端读写
- *
- * SOEM 把 IOmap 原样塞进 EtherCAT 帧, 而线上是小端。本工程只跑 Windows/x86,
- * memcpy 一个 uint16 就是小端表示。用 memcpy 而不是强制转换, 是为了不依赖
- * 偏移的对齐 (与 test2.c 的 set_cw 同一个理由)。
- * ====================================================================== */
+/* 镜像的小端读写: SOEM 把 IOmap 原样塞进 EtherCAT 帧 (线上小端); 用 memcpy 以不依赖偏移对齐 */
 
 void em__put_u8(uint8_t *m, int off, uint8_t v)
 {
@@ -258,10 +198,6 @@ void em__pin_ramp(em_axis_t *ax)
       em__put_u32(ax->out, ax->off_prof_dec, ax->prof_dec);
 }
 
-/* ======================================================================
- * SDO 读 (只读, 对外公开)
- * ====================================================================== */
-
 int em_sdo_read(em_bus_t *bus, int slave, uint16_t index, uint8_t sub,
                 void *p, int *size)
 {
@@ -273,20 +209,13 @@ int em_sdo_read(em_bus_t *bus, int slave, uint16_t index, uint8_t sub,
 
    memset(buf, 0, sizeof(buf));
 
-   /*
-    * 读之前必须清 ctx.ecaterror: 它是粘滞位, SOEM 报错后不会自己清零, 上一次的
-    * 失败会污染下一次的判定。
-    */
+   /* 读之前必须清 ctx.ecaterror: 它是粘滞位, 上一次的失败会污染下一次的判定 */
    bus->ctx.ecaterror = FALSE;
    if (ecx_SDOread(&bus->ctx, (uint16_t)slave, index, sub, FALSE, &psize, buf,
                    EC_TIMEOUTRXM) <= 0 || bus->ctx.ecaterror)
       return EM_R_FAIL;
 
-   /*
-    * psize 是**传入传出**: 必须先告诉 SOEM 缓冲有多大, 它才回填实际宽度。
-    * 所以这里固定按 4 字节读进内部缓冲, 再按驱动器自报宽度拷给调用者 ——
-    * 调用者的变量不必有 4 字节, 也不会被写爆。
-    */
+   /* psize 是传入传出: 必须先用缓冲大小初始化。这里按 4 字节读进内部缓冲, 再按驱动器自报宽度拷出 */
    if (psize < 0 || psize > (int)sizeof(buf))
       return EM_R_FAIL;
 
@@ -297,8 +226,7 @@ int em_sdo_read(em_bus_t *bus, int slave, uint16_t index, uint8_t sub,
    return EM_R_OK;
 }
 
-/* 固定宽度的读取包装: 宽度不符就算失败 —— 宽度不足时解出来的数会在高位补零,
- * 看起来像一个完全正常的值, 那是"我们不知道"冒充"读到了"。 */
+/* 固定宽度的读取包装: 宽度不符就算失败 —— 宽度不足时高位补零会解出一个看着正常的值 */
 static int em__rd_fixed(em_bus_t *bus, int slave, uint16_t index, uint8_t sub,
                         int want, void *p, const char *what)
 {
@@ -373,17 +301,9 @@ int em_rd_any(em_bus_t *bus, int slave, uint16_t index, uint8_t sub,
    return EM_R_OK;
 }
 
-/* ======================================================================
- * SDO 写 —— 全工程唯一的 ecx_SDOwrite 调用点
- *
- * 为什么每次都要回读确认: 本仓库这份 SOEM 的 ecx_SDOwrite 在**加急**路径
- * (psize<=4) 上把从站回的 SDO abort 帧当成写成功 —— abort 帧的 mbxtype/service/
- * index/subindex 与请求完全一致, 命中它内部的 "all OK" 分支, 既不压错误栈也不置
- * ecaterror, wkc 还 > 0。而本接口要写的对象 (6060h/6098h/6099h/609Ah/607Ch/
- * 1C12h/1C13h/1600h/1A00h) 全是 1/2/4 字节的加急写, 全在这条路径上。
- * 所以 **wkc > 0 不代表写进去了, 回读才是唯一的确认**。
- * (sm_pdo.c:263-271 记的是同一个坑。)
- * ====================================================================== */
+/* SDO 写 —— 全工程唯一的 ecx_SDOwrite 调用点。
+ * 每次回读确认: 本仓库这份 SOEM 的 ecx_SDOwrite 在加急路径 (psize<=4) 上把从站回的
+ * SDO abort 帧当成写成功 (wkc 还 > 0), 而本接口要写的对象全是 1/2/4 字节加急写。 */
 
 static int em__sdo_write_raw(em_bus_t *bus, int slave, uint16_t index, uint8_t sub,
                              int size, const void *p, int tmo)
@@ -404,10 +324,7 @@ static int em__verified_write(em_axis_t *ax, uint16_t index, uint8_t sub,
    uint8_t back[4];
    int     bsize = 0;
 
-   /*
-    * 回读缓冲只有 4 字节, 所以这里不接受更宽的写。放在写之前判: 放在写之后,
-    * "没写"和"写了但不确认"就分不开了。
-    */
+   /* 回读缓冲只有 4 字节, 所以不接受更宽的写; 必须在写之前判, 否则分不清"没写"与"写了但没确认" */
    if (size < 1 || size > 4)
       return EM_R_FAIL;
 
@@ -453,10 +370,6 @@ int em__wr_i32(em_axis_t *ax, uint16_t index, uint8_t sub, int32_t v, const char
    return em__verified_write(ax, index, sub, 4, &v, why);
 }
 
-/* ======================================================================
- * PDO 映射: 实读 / 求偏移 / 追加 / 快照还原
- * ====================================================================== */
-
 /* 映射项编码: index<<16 | sub<<8 | 位宽 */
 #define EM_MAP_ENTRY(index, sub, bits) \
    (((uint32_t)(index) << 16) | ((uint32_t)(sub) << 8) | (uint32_t)(bits))
@@ -469,33 +382,9 @@ typedef struct
    const char *name;
 } em_field_t;
 
-/*
- * RxPDO 必须含的三项。
- *
- * ============================================================================
- * 为什么**故意不把 6060h 列进来**
- * ============================================================================
- * 这张表是给 em_map_ensure() 用的: 列进来的项**缺失就补写 PDO 映射**。6060h 列进去
- * 会带来两个后果: (1) 补写映射要 --allow-pdo, 于是"选一个运行模式"变成需要动映射的
- * 操作; (2) 往表里插一项 8 bit 会**挪动它后面所有项的偏移**, 等于为了一个配置量去
- * 改动整张表。
- *
- * 更要紧的是方向错了: 6060h 在不在生效 RxPDO 里**是个现场事实, 两种事实都能跑**,
- * 各走各的传输 —— 在映射里就经过程数据驱动, 不在映射里才走 SDO。由 setup 时实读
- * 得到的 ax->off_modes 决定(见 em_set_mode), 而不是靠"强制把它补进映射"来统一。
- *
- * ---------------------------------------------------------------------------
- * 曾经写在这里的一条**错误结论**, 留个记号免得再犯:
- *   原注释说"运行模式是设一次的量, 不是周期数据 —— 走 SDO, 未使能时写一遍即可"。
- *   这句话在本机是**假的**。真机 1C12h 生效的是 1601h, 而 6060h 就是它的第 2 项,
- *   位于输出镜像字节 +2。主站每周期把整块镜像原样发出去, 而这里从来不写 +2, 于是
- *   主站一直在下发 6060h=0; 驱动器控制环连续采样 SM2, SDO 写进去的值下一帧就被
- *   盖回去 —— 现象正是 6060h 对象回读 8、6061h 却读回 0。
- *
- * 通用教训: **对象只要在生效的 RxPDO 里, 它就是主站拥有的**, 必须经过程数据驱动;
- * 对它做 SDO 写永远会被下一帧撤销。这一条与具体驱动器无关。
- * ============================================================================
- */
+/* RxPDO 必须含的三项: 这张表给 em_map_ensure() 用, 列进来的项缺失就补写 PDO 映射;
+ * 6060h 故意不列 —— 它由 setup 实读的 ax->off_modes 决定走过程数据还是 SDO。
+ * 通用约束: 对象只要在生效 RxPDO 里就是主站拥有的, SDO 写会被下一帧撤销。 */
 static const em_field_t EM_NEED_RX[] = {
    { EM_OID_CONTROLWORD, 0, 16, "6040h 控制字"        },
    { EM_OID_TARGET_POS,  0, 32, "607Ah 目标位置 (CSP)" },
@@ -507,33 +396,16 @@ static const em_field_t EM_NEED_TX[] = {
    { EM_OID_ACT_VEL,    0, 32, "606Ch 实际速度"  },
 };
 
-/*
- * 60FDh 数字输入 —— **刻意不放进 EM_NEED_TX**。
- *
- * 那张表的语义是"缺了就追加进 PDO 映射"。60FDh 只是个**只读监视量**(三个限位/原点
- * 开关的位置), 为它去改写驱动器的 1A00h 是拿配置换便利: 改完还得在收尾时还原,
- * 而崩在收尾前就把改动留在驱动器里了。
- *
- * 所以默认路径是 em__find_field(): 在生效映射里就绑, 不在就不绑 (-1), 界面显示"不知道"。
- * 真需要它时由 em_require_dig_in() 显式打开 —— 那是一个**有人按下、有人看得见**的动作。
- */
+/* 60FDh 数字输入 —— 不放进 EM_NEED_TX (那张表的语义是"缺了就追加进 PDO 映射"),
+ * 它只是只读监视量。默认由 em__find_field() 在生效映射里才绑, 强制追加要 em_require_dig_in() */
 static const em_field_t EM_FIELD_DIG_IN[] = {
    { EM_OID_DIG_IN,     0, 32, "60FDh 数字输入"  },
 };
 #define EM_NEED_RX_N ((int)(sizeof(EM_NEED_RX) / sizeof(EM_NEED_RX[0])))
 #define EM_NEED_TX_N ((int)(sizeof(EM_NEED_TX) / sizeof(EM_NEED_TX[0])))
 
-/*
- * 读一个 PDO 对象 (:00 项数, :01.. 项)。返回 0 / -1
- *
- * **ent_size 必须由调用方给, 不能写死 4** —— 这两类对象的项宽是不同的, 而且是实测
- * 出来的, 不是从规范推的:
- *   分配对象 1C12h / 1C13h : 项是 U16  -> 2 字节  (真机实测自报 2)
- *   映射对象 1600h / 1A00h : 项是 U32  -> 4 字节
- * 第一版把两者都按 4 字节读, 于是在真机上**一张映射表都读不出来**: 1C12h:01 自报
- * 2 字节就失败了 —— 而 1C12h 读不出来, 后面 1600h 整个就没机会被读。
- * (test2.c 是同一个做法: 它读 1C13h 的首项用的也是 2 字节。)
- */
+/* 读一个 PDO 对象 (:00 项数, :01.. 项), 返回 0 / -1。ent_size 必须由调用方给, 不能写死 4:
+ * 分配对象 1C12h/1C13h 项是 U16 (2 字节); 映射对象 1600h/1A00h 项是 U32 (4 字节)。 */
 static int em_map_read(em_bus_t *bus, int slave, uint16_t index, int ent_size,
                        int *n, uint32_t *e)
 {
@@ -542,11 +414,7 @@ static int em_map_read(em_bus_t *bus, int slave, uint16_t index, int ent_size,
 
    *n = 0;
 
-   /*
-    * 这条路径不走"把没读到和宽度不对合并成一个 -1"的包装 —— 对调用者够用, 对现场
-    * 排查不够用: 真机上只看到一句"读 1600h 失败"是没法往下走的。所以自己读, 把
-    * 驱动器自报的宽度打出来。
-    */
+   /* 这里不走"没读到与宽度不对合并成 -1"的包装: 要把驱动器自报的宽度打出来才能排查 */
    if (em_sdo_read(bus, slave, index, 0, &cnt, &size) != EM_R_OK)
    {
       em__err("读 %04Xh:00 (项数) 失败", (unsigned)index);
@@ -583,14 +451,8 @@ static int em_map_read(em_bus_t *bus, int slave, uint16_t index, int ent_size,
    return EM_R_OK;
 }
 
-/*
- * 求 (index, sub) 在映射里的**字节偏移**。找不到 / 位宽不符 / 前面累计位数不是 8 的
- * 整数倍 -> -1。
- *
- * 为什么死守这条: 偏移算错 = 把控制字字节写进一个别的字段。万一那个字段是
- * 607Ah (目标位置), 就在毫不知情的情况下下了一个目标位置。所以**证不出偏移必须
- * 拒绝**, 不允许"大概是 0 吧"。
- */
+/* 求 (index, sub) 在映射里的字节偏移。找不到 / 位宽不符 / 前面累计位数不是 8 的整数倍 -> -1。
+ * 必须死守: 偏移算错 = 把控制字写进别的字段 (万一那是 607Ah 就下了个位置指令)。 */
 static int em_map_offset(const uint32_t *e, int n, uint16_t index, uint8_t sub,
                          int want_bits)
 {
@@ -631,16 +493,8 @@ static int em_map_bits(const uint32_t *e, int n)
    return bit;
 }
 
-/*
- * 在**指定的**映射对象里查一个字段的字节偏移, 查不到返回 -1。
- *
- * 与 em_axis_bind() 的关系: 那个函数是"把一组需要的字段全查出来, 缺了硬的要拒绝";
- * 本函数是"只问一个字段在不在、在哪"。查法完全一样(em_map_read + em_map_offset),
- * 所以偏移一律是**实读**出来的, 没有一处写死。
- *
- * 用途是 6060h: 它属于"在映射里就得走过程数据"那一类, 不能塞进 EM_NEED_RX 的
- * "缺了就补"语义里(理由见 EM_NEED_RX 上面那段)。
- */
+/* 在指定的映射对象里查一个字段的字节偏移, 查不到返回 -1 (偏移一律实读出来, 无一处写死)。
+ * 用途是 6060h 这类"在映射里就得走过程数据"的量, 不能塞进 EM_NEED_RX 的"缺了就补"语义里。 */
 static int em__find_field(em_bus_t *bus, int slave, uint16_t pdo_index,
                           uint16_t index, uint8_t sub, int want_bits)
 {
@@ -654,17 +508,8 @@ static int em__find_field(em_bus_t *bus, int slave, uint16_t pdo_index,
    return em_map_offset(e, n, index, sub, want_bits);
 }
 
-/*
- * 定 6083h/6084h 的兜底值: 先问驱动器自己, 问不到或问回 0 才用缺省。
- *
- * **为什么"实读 0"不能采信**: 这两个对象就在生效的 RxPDO 里, 主站每周期都在下发它们。
- * 上一次带 --allow-pdo 的运行 (哪怕只是"只读观测") 已经把 0 发进去了, 所以驱动器
- * 现在回读 0 **不代表它被配置成 0**, 只代表我们上次覆盖过它。拿 0 当"驱动器自己的值"
- * 会把上一轮的破坏当成这一轮的配置, 然后继续下发 0 —— 自己骗自己, 而且症状正好是
- * 那个"全 PASS 但电机没转"。
- *
- * 此刻仍在 PRE_OP: SDO 便宜, 也不会和过程数据打架。
- */
+/* 定 6083h/6084h 的兜底值: 先问驱动器自己, 读不到或读回 0 才用缺省。"实读 0"不能采信 ——
+ * 这两个对象在生效 RxPDO 里, 回读 0 只代表被主站覆盖过, 不代表驱动器配置成 0 */
 static uint32_t em__pick_ramp(em_bus_t *bus, int slave, uint16_t index,
                               uint32_t dflt, const char *what)
 {
@@ -687,7 +532,7 @@ static uint32_t em__pick_ramp(em_bus_t *bus, int slave, uint16_t index,
    return v;
 }
 
-/* 快照一个映射对象 (写之前取, 供收尾还原) */
+/* 快照一个映射对象 (必须在写之前取, 供收尾还原) */
 static int em_snap_take(em_bus_t *bus, int slave, uint16_t index, int ent_size,
                         em_snap_t *s)
 {
@@ -756,18 +601,8 @@ static int em_snap_restore(em_bus_t *bus, int slave, em_snap_t *s, int ent_size,
    return EM_R_OK;
 }
 
-/*
- * 实读出一个方向**生效**的 PDO 映射对象索引。
- *
- * 这是本接口最容易被想当然的一步, 而真机上它就是不按套路来的:
- *   1C12h (RxPDO 分配) = { 0x1601 }   <-- **不是 1600h**
- *   1C13h (TxPDO 分配) = { 0x1A00 }
- * 所以"哪个 PDO 生效"必须**读出来**。写死 1600h 的后果不是报错, 而是**悄悄改错表**:
- * 去读/写一张没有生效的 1600h, 它里面字段齐不齐都与过程数据无关 —— 于是"映射看着
- * 没问题"和"控制字根本发不出去"可以同时成立, 而偏移证明还照样通过。
- *
- * *out 在分配为空时取 fallback (1600h / 1A00h), 并由调用方负责指派。
- */
+/* 实读出一个方向生效的 PDO 映射对象索引。真机 1C12h = { 0x1601 } (不是 1600h), 1C13h = { 0x1A00 };
+ * 写死 1600h 不报错, 只会悄悄去改一张没生效的表。*out 在分配为空时取 fallback, 由调用方指派。 */
 static int em_discover_pdo(em_bus_t *bus, int slave, uint16_t assign_index,
                            uint16_t fallback, uint16_t *out, const char *label)
 {
@@ -783,10 +618,7 @@ static int em_discover_pdo(em_bus_t *bus, int slave, uint16_t assign_index,
 
    if (n == 0)
    {
-      /*
-       * 分配为空 = 这个方向没有生效的 PDO = 该方向的 SM 长度为 0。按规范这要由主站
-       * 指派一个, 所以取 fallback 并让调用方去写分配对象。
-       */
+      /* 分配为空 = 该方向没有生效的 PDO = SM 长度为 0。取 fallback, 由调用方去写分配对象 */
       *out = fallback;
       em__log(bus, "%s: %04Xh 分配为空 (该方向没有生效的 PDO) -> 本接口将指派 %04Xh",
               label, (unsigned)assign_index, (unsigned)fallback);
@@ -795,11 +627,7 @@ static int em_discover_pdo(em_bus_t *bus, int slave, uint16_t assign_index,
 
    if (n > 1)
    {
-      /*
-       * 多个 PDO 分配给同一个 SM 时, 规范说它们的映射是**按顺序拼接**的。拼接之后
-       * 往里追加一个字段要动哪一张表、追加在哪一端, 本接口没有验证过 —— 与其猜,
-       * 不如拒绝。
-       */
+      /* 多个 PDO 拼接同一 SM 时映射是按顺序首尾相接的, 往哪张表、哪一端追加没验证过 -> 拒绝 */
       em__err("%s: %04Xh 分配了 %d 个 PDO", label, (unsigned)assign_index, n);
       for (i = 0; i < n; i++)
          printf(" 0x%04X", (unsigned)(e[i] & 0xFFFFu));
@@ -814,17 +642,9 @@ static int em_discover_pdo(em_bus_t *bus, int slave, uint16_t assign_index,
    return EM_R_OK;
 }
 
-/*
- * 确保一个 PDO 映射对象含 need[] 里的每一项。
- *
- * 只**追加**缺失项, 已有的项原样保留 —— 不动别人配的东西。
- * 写之前先把追加后的整张表证明一遍(每个需要的字段都能算出字节偏移), 证不出就拒绝。
- *
- * pdo_index 由调用方用 em_discover_pdo 实读得到, 不是写死的 1600h / 1A00h。
- *
- * 返回: 0 = 已满足 (可能没写) / -1 = 拒绝或失败
- * 通过 *changed 告知是否真的写过 (供收尾还原)
- */
+/* 确保一个 PDO 映射对象含 need[] 里的每一项: 只追加缺失项, 已有的原样保留; 写之前先把追加后的
+ * 整张表证明一遍 (每个字段都能算出字节偏移), 证不出就拒绝。pdo_index 由调用方实读得到。
+ * 返回 0 = 已满足 (可能没写) / -1 = 拒绝或失败; *changed 告知是否真写过 (供收尾还原)。 */
 static int em_map_ensure(em_bus_t *bus, int slave, uint16_t assign_index,
                          uint16_t pdo_index, const em_field_t *need, int nneed,
                          int allow_remap, em_snap_t *snap_assign,
@@ -844,10 +664,7 @@ static int em_map_ensure(em_bus_t *bus, int slave, uint16_t assign_index,
    }
    if (an > 0 && (uint16_t)(assign_e[0] & 0xFFFFu) != pdo_index)
    {
-      /*
-       * 走到这里说明调用方给的 pdo_index 与实读的分配不一致 —— em_discover_pdo 与
-       * 本函数之间被改动过。不静默按其中一个来: 那正是"改错表"的入口。
-       */
+      /* 调用方给的 pdo_index 与实读的分配不一致 = "改错表"的入口, 不静默按其中一个来 */
       em__err("%04Xh 实读分配的是 0x%04X, 但本函数被要求处理 0x%04X -> 拒绝",
               (unsigned)assign_index, (unsigned)(assign_e[0] & 0xFFFFu),
               (unsigned)pdo_index);
@@ -970,16 +787,10 @@ static int em_map_ensure(em_bus_t *bus, int slave, uint16_t assign_index,
    return EM_R_OK;
 }
 
-/* ======================================================================
- * 6041h 判读
- * ====================================================================== */
-
 em_sw_state_t em_sw_state(uint16_t sw)
 {
-   /*
-    * 按手册的 8 态迁移表 (V2.4 p9 / V1.0 p26), 逐条判 bit6/5/3/2/1/0。
-    * 低 4 位是非标准编码 0000/0001/0011/0111, 所以全程用位判断, 禁止数值比较。
-    */
+   /* 按手册的 8 态迁移表 (V2.4 p9), 逐条判 bit6/5/3/2/1/0。
+    * 低 4 位是非标准编码 0000/0001/0011/0111, 所以全程用位判断, 禁止数值比较。 */
    if ((sw & EM_SW_FAULT) != 0)
    {
       if ((sw & EM_SW_OP_ENABLED) != 0)
@@ -1033,22 +844,12 @@ const char *em_sw_describe(uint16_t sw)
 
 int em_sw_disabled_no_fault(uint16_t sw)
 {
-   /*
-    * 「未使能且无故障」 = bit2 未使能 + bit3 无故障。
-    *
-    * **不要写成 (sw & 0x000F) == 0。** 手册定义了完整 8 态迁移表, 上电自检完成后
-    * 驱动器合法地停在低 4 位 = 0001 (Ready to switch on, 电机释放), 此时写
-    * 6040h=0x0000 也仍是释放态。把"必须读到 0000"写成硬断言, 在一台已经上电自检
-    * 完成的驱动器上必然失败 —— 那是期望值不对, 不是通信故障。
-    */
+   /* 「未使能且无故障」 = bit2 未使能 + bit3 无故障。不要写成 (sw & 0x000F) == 0 ——
+    * 上电自检完成后驱动器合法地停在低 4 位 = 0001 (Ready to switch on, 电机释放)。 */
    return (sw & (EM_SW_OP_ENABLED | EM_SW_FAULT)) == 0;
 }
 
 int em_sw_remote_ok(uint16_t sw) { return (sw & EM_SW_REMOTE) != 0; }
-
-/* ======================================================================
- * AL 状态阶梯
- * ====================================================================== */
 
 static const char *em_al_str(uint16_t st)
 {
@@ -1067,9 +868,8 @@ uint16_t em_al_state(em_bus_t *bus, int slave)
    if (bus == NULL || slave < 1 || slave > bus->nslaves)
       return 0;
 
-   /* slave>=1 走 FPRD, 把**原始** AL 状态字 (连错误位 0x10 一起) 写回
-    * slavelist[].state —— 这才是能判的读数。ecx_statecheck(0) 走 BRD, 只填
-    * slavelist[0], 不填单个从站。 */
+   /* slave>=1 走 FPRD, 把原始 AL 状态字 (连错误位 0x10 一起) 写回 slavelist[].state;
+    * ecx_statecheck(0) 走 BRD, 只填 slavelist[0], 不填单个从站。 */
    (void)ecx_statecheck(&bus->ctx, (uint16_t)slave, bus->ctx.slavelist[slave].state,
                         0);
    return bus->ctx.slavelist[slave].state;
@@ -1077,10 +877,8 @@ uint16_t em_al_state(em_bus_t *bus, int slave)
 
 static void em_request_state(em_bus_t *bus, int slave, uint16_t want)
 {
-   /*
-    * 若从站当前处于 AL 错误态 (状态字 bit4), 必须把 ACK 一起写进去才能清掉它 ——
-    * ecx_writestate() 只把 slavelist[].state 原样写下去, 不会自动置 ACK。
-    */
+   /* 从站处于 AL 错误态 (状态字 bit4) 时必须把 ACK 一起写进去才能清掉 ——
+    * ecx_writestate() 只把 slavelist[].state 原样写下去, 不会自动置 ACK。 */
    uint16_t cur = bus->ctx.slavelist[slave].state;
 
    if ((cur & EC_STATE_ERROR) != 0)
@@ -1090,17 +888,13 @@ static void em_request_state(em_bus_t *bus, int slave, uint16_t want)
    (void)ecx_writestate(&bus->ctx, (uint16_t)slave);
 }
 
-/*
- * 请求并等待某根轴进入 want。每轮都打过程数据再查状态 —— 状态迁移期间过程数据
- * 不能断, 否则若驱动器的 SM 看门狗是开着的, 会反过来把我们从迁移里踢出来。
- * 返回 0 = 到达 / -1 = 失败 (已打印原因)
- */
+/* 请求并等待某根轴进入 want。每轮都打过程数据再查状态 —— 状态迁移期间过程数据不能断,
+ * 否则开着 SM 看门狗的驱动器会把我们从迁移里踢出来。返回 0 = 到达 / -1 = 失败 (已打印) */
 static int em_wait_state(em_bus_t *bus, int slave, uint16_t want, uint32_t tmo_ms)
 {
    uint32_t t0 = em__now_ms();
 
-   /* 先取一次目标轴当前的原始 AL 状态字 (timeout=0 -> 一次 FPRD 就返回)。不这么做
-    * 下面那个 ACK 判断读的是 slavelist[] 里的陈值。 */
+   /* 先取一次原始 AL 状态字 (timeout=0 -> 一次 FPRD 就返回), 否则下面的 ACK 判断读的是陈值 */
    (void)em_al_state(bus, slave);
    em_request_state(bus, slave, want);
 
@@ -1116,10 +910,7 @@ static int em_wait_state(em_bus_t *bus, int slave, uint16_t want, uint32_t tmo_m
       if (ecx_statecheck(&bus->ctx, (uint16_t)slave, want, 1000) == want)
          return EM_R_OK;
 
-      /*
-       * ecx_statecheck() 把状态按 0x000F 掩过, 错误位 (0x10) 在它的返回值里看不见,
-       * 必须单独查 slavelist[].state。
-       */
+      /* ecx_statecheck() 把状态按 0x000F 掩过, 错误位 (0x10) 在返回值里看不见 */
       if ((s->state & EC_STATE_ERROR) != 0)
       {
          em__err("请求 %s 被拒绝: AL 状态 0x%02X (含错误位), AL 状态码 0x%04X %s",
@@ -1139,10 +930,6 @@ static int em_wait_state(em_bus_t *bus, int slave, uint16_t want, uint32_t tmo_m
    }
 }
 
-/* ======================================================================
- * 过程数据
- * ====================================================================== */
-
 int em__cycle(em_bus_t *bus)
 {
    int wkc;
@@ -1154,11 +941,8 @@ int em__cycle(em_bus_t *bus)
    (void)ecx_send_processdata(&bus->ctx);
    wkc = ecx_receive_processdata(&bus->ctx, EC_TIMEOUTRET);
 
-   /*
-    * 镜像**只在整帧完整时更新**。短帧时输入镜像是陈值或半个帧, 拿它去断言等于拿
-    * "我们不知道"冒充"驱动器报了个状态" —— 而 0x0000 在 CiA402 里是个合法的
-    * "未使能", 会把"没读到"说成"驱动器报了个状态"。
-    */
+   /* 镜像只在整帧完整时更新: 短帧时输入镜像是陈值或半个帧, 而 0x0000 在 CiA402 里
+    * 是个合法的"未使能", 拿它断言会把"没读到"说成"驱动器报了个状态"。 */
    if (bus->expected_wkc <= 0 || wkc >= bus->expected_wkc)
    {
       for (i = 0; i < bus->naxis; i++)
@@ -1170,9 +954,8 @@ int em__cycle(em_bus_t *bus)
             ax->pos = em__get_i32(ax->in, ax->off_act_pos);
          if (ax->off_act_vel >= 0)
             ax->vel = em__get_i32(ax->in, ax->off_act_vel);
-         /* 60FDh: 本机多半不在映射里 (off_dig_in < 0), 那就一直是 0。
-          * **调用方必须先问 em_dig_in_known()** —— 0 在"三个开关都没压住"这个问题上
-          * 是个看起来完全正常的答案, 拿它冒充事实就是 sm_bus.c 里那条教训。 */
+         /* 60FDh: 不在映射里 (off_dig_in < 0) 就一直是 0, 而 0 看着就像"三个开关都没压住" ——
+          * 调用方必须先问 em_dig_in_known()。 */
          if (ax->off_dig_in >= 0)
             ax->dig_in = em__get_u32(ax->in, ax->off_dig_in);
 
@@ -1191,10 +974,6 @@ int em__cycle(em_bus_t *bus)
 }
 
 int em_service(em_bus_t *bus) { return em__cycle(bus); }
-
-/* ======================================================================
- * 轴: 偏移证明与绑定
- * ====================================================================== */
 
 static int em_axis_bind(em_axis_t *ax, uint16_t pdo_index, const em_field_t *need,
                         int nneed, int *offs_out, const char *label)
@@ -1223,10 +1002,6 @@ static int em_axis_bind(em_axis_t *ax, uint16_t pdo_index, const em_field_t *nee
    return EM_R_OK;
 }
 
-/* ======================================================================
- * 生命周期
- * ====================================================================== */
-
 em_bus_t *em_bus_new(void)
 {
    em_bus_t *bus;
@@ -1253,10 +1028,7 @@ void em_bus_free(em_bus_t *bus)
    }
 }
 
-/*
- * 往上限 32 块网卡。实机上一般个位数, 这个数只是"别让一个链表把数组写爆"。
- * 打印与填数组共用它 —— 分开写两份遍历, 迟早会有一份漏掉新字段。
- */
+/* 网卡上限 (实机上一般个位数); 打印与填数组共用它, 免得两份遍历漏掉新字段 */
 #define EM__MAX_ADAPTERS 32
 
 /* 遍历一次 SOEM 的网卡链表, 填进数组。返回**总条数**(可能大于 max) */
@@ -1271,10 +1043,7 @@ static int em__fill_adapters(em_adapter_t *out, int max)
    {
       if (out != NULL && n < max)
       {
-         /*
-          * 逐个 snprintf 而不是 strcpy: name/desc 与 SOEM 的字段同宽(128), 但同宽不等于
-          * 一定带了结束符 —— 那种情况下 strcpy 会越过本结构读下去。
-          */
+         /* 逐个 snprintf 而不是 strcpy: 与 SOEM 字段同宽 (128) 不等于一定带了结束符 */
          (void)snprintf(out[n].name, sizeof(out[n].name), "%s", a->name);
          (void)snprintf(out[n].desc, sizeof(out[n].desc), "%s", a->desc);
       }
@@ -1383,14 +1152,8 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
       return EM_R_FAIL;
    }
 
-   /*
-    * 每一台从站都必须是被选中的轴。
-    *
-    * 为什么: 组的 WKC 期望值是按**组里全部从站**算的, 而留在 PRE_OP 的从站不参与
-    * 过程数据交换 (它的 SM2/SM3 没使能), 帧的 WKC 就会持续偏短 —— 那会被误判成
-    * "过程数据没落地"。要么全选, 要么就别在本程序里跑。test2.c 的"多发一台就拒绝"
-    * 是同一条思路, 只是这里放成 N 台。
-    */
+   /* 每一台从站都必须是被选中的轴: WKC 期望值按组里全部从站算, 留在 PRE_OP 的从站不参与
+    * 过程数据交换, 帧的 WKC 会持续偏短, 与"过程数据没落地"分不开。 */
    if (naxis != bus->nslaves)
    {
       em__err("总线上有 %d 台从站, 但只选了 %d 根轴。本接口要求**全部选中** —— "
@@ -1425,10 +1188,8 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
          return EM_R_FAIL;
       }
 
-      /*
-       * 单独读一次目标轴的状态, 不能用 ecx_readstate() 的广播结果:
-       * 它在"所有从站状态一致且无错误位"时会提前返回, 不填单个从站的 state。
-       */
+      /* 单独读一次目标轴的状态, 不能用 ecx_readstate() 的广播结果:
+       * 它在"所有从站状态一致且无错误位"时会提前返回, 不填单个从站的 state。 */
       (void)em_al_state(bus, slave);
       if (bus->ctx.slavelist[slave].state != EC_STATE_PRE_OP)
       {
@@ -1442,7 +1203,6 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
          return EM_R_FAIL;
       }
 
-      /* 建轴对象 */
       ax = (em_axis_t *)calloc(1, sizeof(em_axis_t));
       if (ax == NULL)
       {
@@ -1457,20 +1217,14 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
       ax->move_limit = EM_MAX_DELTA_DEF;
       ax->off_cw = ax->off_target_pos = ax->off_target_vel = -1;
       ax->off_sw = ax->off_act_pos = ax->off_act_vel = -1;
-      /* 同样必须显式置 -1: calloc 给的是 0, 而 0 是输入镜像的字节 0 —— 那正是 6041h
-       * 状态字的位置, 会把状态字当成 60FDh 读, 然后一本正经地报"负限位压住了" */
+      /* 必须显式置 -1: calloc 给的是 0, 而 0 是输入镜像的字节 0 (6041h 状态字的位置),
+       * 会把状态字当成 60FDh 读 */
       ax->off_dig_in = -1;
       ax->dig_in = 0;
-      /*
-       * off_modes 必须显式置 -1。calloc 给它的是 0, 而 0 **是一个合法的偏移**
-       * (输出镜像的字节 0 正是 6040h 的低字节) —— 万一 setup 中途失败、后面又有谁
-       * 调 em_set_mode, 就会把运行模式写进控制字里。
-       */
+      /* 同上必须置 -1: calloc 给的 0 是个合法偏移 (输出镜像字节 0 正是 6040h 低字节),
+       * 会把运行模式写进控制字里 */
       ax->off_modes = -1;
-      /*
-       * 同上, off_prof_acc/off_prof_dec 也必须显式置 -1: calloc 给的 0 是个合法偏移,
-       * 而 +0 正是 6040h 控制字 —— em__pin_ramp 会把加减速度写进控制字里。
-       */
+      /* 同上: +0 正是 6040h 控制字, em__pin_ramp 会把加减速度写进控制字里 */
       ax->off_prof_acc = ax->off_prof_dec = -1;
       snprintf(ax->label, sizeof(ax->label), "轴%d(从站%d)", i, slave);
 
@@ -1484,11 +1238,8 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
    {
       em_axis_t *ax = bus->axis[i];
 
-      /*
-       * 先问"哪个 PDO 生效", 再去补它。这一步**必须**排在写之前:
-       * 真机上 1C12h 分配的是 1601h, 而 1600h 是同一台驱动器里另一张没生效的表。
-       * 去补 1600h 不会报任何错, 只会让后面所有"偏移证明"都在一张空表上通过。
-       */
+      /* 先问"哪个 PDO 生效"再补它, 必须排在写之前: 真机上 1C12h 分配的是 1601h,
+       * 去补没生效的 1600h 不报错, 只会让后面所有偏移证明都在一张空表上通过。 */
       if (em_discover_pdo(bus, ax->slave, EM_OID_RXPDO_ASSIGN, EM_OID_RXPDO0,
                           &ax->rx_pdo, "RxPDO") != EM_R_OK)
          return EM_R_FAIL;
@@ -1502,13 +1253,8 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
                         "RxPDO") != EM_R_OK)
          return EM_R_FAIL;
 
-      /*
-       * TxPDO 的需项表在这一处拼: 常规三项,**只有 em_require_dig_in() 明确要求过**
-       * 才把 60FDh 拼进去。不拼就是"只绑不补"的默认路径 —— 见 EM_FIELD_DIG_IN 上面那段。
-       *
-       * 拼成局部数组而不是写死两张表: em_map_ensure 的语义是"这张表里的缺项全补上",
-       * 想表达"这一项可选"就只有"给不给它"这一种说法, 多一张表就多一处会走岔的分叉。
-       */
+      /* TxPDO 的需项表在这里拼: 常规三项, 只有 em_require_dig_in() 明确要求过才把 60FDh
+       * 拼进去 (不拼就是"只绑不补"的默认路径)。 */
       em_field_t need_tx[EM_NEED_TX_N + 1];
       int        n_need_tx = EM_NEED_TX_N;
 
@@ -1531,10 +1277,7 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
    {
       int size;
 
-      /*
-       * 自己走状态阶梯, 不让 SOEM 在 config_map_group 里自动请求 SAFE_OP ——
-       * 那样每一级都不可见, 出问题只剩一句"没进去"。
-       */
+      /* 自己走状态阶梯, 不让 SOEM 在 config_map_group 里自动请求 SAFE_OP */
       bus->prev_manualstatechange = bus->ctx.manualstatechange;
       bus->ctx.manualstatechange = 1;
 
@@ -1593,25 +1336,13 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
       ax->off_act_pos = offs[1];
       ax->off_act_vel = offs[2];
 
-      /*
-       * 60FDh 数字输入 (U32 RO) —— **只绑不补**, 与 6060h/6083h/6084h 同一类。
-       * 它不在 EM_NEED_TX 里, 所以默认不会为了它去改写驱动器的 1A00h。
-       *
-       * 排在这里而不是别处: 上面第 2 步的 em_map_ensure 已经跑完了, 所以这一查
-       * 既认"本来就在映射里"的, 也认"刚刚被 em_require_dig_in 追加进去"的 ——
-       * 两条路合成一条, 不需要第二处代码。
-       *
-       * **绑不上也不在这里拒绝**: 与下面那条"只有 6040h/6041h 缺了才拒绝"同一个取舍 ——
-       * 一个监视项绑不上, 不该把本来能跑的 CSP 连坐掉。绑不上就是 -1, 界面显示"不知道"。
-       */
+      /* 60FDh 数字输入 (U32 RO) —— 只绑不补, 与 6060h/6083h/6084h 同一类: 不在 EM_NEED_TX 里,
+       * 所以不会为它改写 1A00h; 绑不上就是 -1 (一个监视项不该把 CSP 连坐掉) */
       ax->off_dig_in = em__find_field(bus, ax->slave, ax->tx_pdo,
                                       EM_OID_DIG_IN, 0, 32);
       if (ax->off_dig_in >= 0 && (uint32_t)ax->off_dig_in + 4 > ax->Ibytes)
       {
-         /*
-          * 偏移落在本轴输入镜像之外 = 照它读下去会读到别的从站的数据。
-          * **降级, 不拒绝**: 这里宁可少一个监视量, 也不要一个"看着有值、其实读错了地方"的。
-          */
+         /* 偏移落在本轴输入镜像之外 = 会读到别的从站的数据 -> 降级, 不拒绝 */
          em__warn("%s: 60FDh 算出的偏移 +%d 超出本轴输入镜像 (%u 字节) -> "
                   "当作不在映射里 (限位开关那三个灯会显示 --)",
                   ax->label, ax->off_dig_in, (unsigned)ax->Ibytes);
@@ -1623,12 +1354,8 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
                 : "**不在生效 TxPDO 里** -> 三个开关的灯会显示灰/-- "
                   "(本函数按设计不去补映射; 要补见 em_require_dig_in)");
 
-      /*
-       * 6040h 与 6041h 是硬要求: 没有它们连状态机都推不动, 谈不上运动。
-       * 其余四项缺了只是**用它们的模式**不能用 —— 那时让 em_csp_available() /
-       * em_pv_available() 说清楚, 而不是在这里整体拒绝 (否则一个 60FFh 补不进去
-       * 会把本来能跑的 CSP 也连坐掉)。
-       */
+      /* 6040h 与 6041h 是硬要求 (没有它们连状态机都推不动); 其余四项缺了只是用它们的
+       * 模式不能用, 由 em_csp_available()/em_pv_available() 说清楚, 不在这里整体拒绝。 */
       if (ax->off_cw < 0 || ax->off_sw < 0)
       {
          em__err("%s: 6040h 或 6041h 不在映射里, 连状态机都推不动 -> 拒绝",
@@ -1643,10 +1370,8 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
          return EM_R_FAIL;
       }
 
-      /*
-       * 6060h 单独查 —— 它**不在** EM_NEED_RX 里, 所以不走上面那条 "缺了就补" 的路。
-       * 在生效映射里就必须经过程数据驱动, 不在里面才走 SDO。见 em_set_mode()。
-       */
+      /* 6060h 单独查 (它不在 EM_NEED_RX 里, 不走"缺了就补"那条路): 在生效映射里就必须
+       * 经过程数据驱动, 不在里面才走 SDO。 */
       ax->off_modes = em__find_field(bus, ax->slave, ax->rx_pdo,
                                      EM_OID_MODES, 0, 8);
       if (ax->off_modes >= 0)
@@ -1665,18 +1390,8 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
          printf("  %s: 6060h 不在生效 RxPDO 里 -> 运行模式走 SDO\n", ax->label);
       }
 
-      /*
-       * 6083h / 6084h 轮廓加减速度 —— 和 6060h 同一个类, 但后果更隐蔽。
-       *
-       * 它们在生效映射里就是主站拥有的: 每周期都在下发, 不写就是下发 0。而 6083h = 0
-       * 意味着 PV 的斜坡永远起不来 —— 驱动器收下了速度指令 (6041h bit12 因此清零),
-       * 606Ch 却恒为 0, 6064h 一个计数不动。**断言"驱动器接受了指令"的检查全都会通过**,
-       * 这正是本期要修的那个"全 PASS 但电机没转"。
-       *
-       * 默认值采信**驱动器自己的**值 (此刻还在 PRE_OP, SDO 便宜且不影响过程数据),
-       * 而不是写死一个常数 —— 这与本工程"不写死映射、一律实读"的规矩一致:
-       * 换一台驱动器、或者现场调过加减速, 这里都跟得上。
-       */
+      /* 6083h / 6084h 轮廓加减速度 —— 在生效映射里就是主站拥有的, 不写就是下发 0, 而 6083h = 0
+       * 会让 PV 的斜坡起不来 (606Ch 恒为 0, 6064h 不动)。默认值采信驱动器自己的实读值。 */
       ax->off_prof_acc = em__find_field(bus, ax->slave, ax->rx_pdo,
                                         EM_OID_PROF_ACC, 0, 32);
       ax->off_prof_dec = em__find_field(bus, ax->slave, ax->rx_pdo,
@@ -1925,9 +1640,7 @@ void em_shutdown(em_bus_t *bus, int restore_mapping, int *motor_maybe_live)
    bus->in_op = 0;
 }
 
-/* ======================================================================
- * 轴: 访问器与只读查询
- * ====================================================================== */
+/* 轴: 访问器与只读查询 */
 
 int         em_axis_slave(const em_axis_t *ax)  { return ax ? ax->slave : 0; }
 int         em_axis_buspos(const em_axis_t *ax) { return ax ? ax->bus_pos : -1; }
@@ -1956,10 +1669,8 @@ uint32_t em_mirror_frames(const em_axis_t *ax) { return ax ? ax->frames : 0; }
 uint16_t em_rx_pdo(const em_axis_t *ax) { return ax ? ax->rx_pdo : 0; }
 uint16_t em_tx_pdo(const em_axis_t *ax) { return ax ? ax->tx_pdo : 0; }
 
-/*
- * 60FDh 的三个开关。位运算集中在这里 —— 与"状态字判读集中在 ec_motor.c"同一条规矩:
- * 让调用方各写一份 (x & 0x2), 就会出现某一天只有一处把 0x2 写成了 0x4。
- */
+/* 60FDh 的三个开关。位运算集中在这里, 与状态字判读集中在 ec_motor.c 同一条规矩:
+ * 调用方各写一份 (x & 0x2), 就会出现某处把 0x2 写成 0x4 */
 int em_dig_in_known(const em_axis_t *ax)
 {
    return (ax != NULL && ax->off_dig_in >= 0 && ax->mirror_ok) ? 1 : 0;
@@ -2004,10 +1715,7 @@ void em_set_ramp(em_axis_t *ax, uint32_t acc, uint32_t dec)
    if (ax == NULL)
       return;
 
-   /*
-    * 0 不拒绝 —— 有些驱动器把 6083h = 0 解释成"瞬时", 拒绝会把那条路堵死。但本机不是:
-    * 0 正是"斜坡永远起不来"的那个值, 也就是本期修的那个 bug 的成因, 所以说清楚。
-    */
+   /* 0 不拒绝 —— 有的驱动器把 6083h = 0 解释成"瞬时"; 但本机的 0 正是"斜坡起不来"的那个值 */
    if (acc == 0 || dec == 0)
       em__warn("%s: 把 6083h/6084h 设成 0 (acc=%u dec=%u) —— 本机驱动器在 PV 下会因此"
                "停在 0 转速: 它会收下速度指令 (6041h bit12 清零) 但一步不走",
@@ -2078,10 +1786,8 @@ int em_set_mode(em_axis_t *ax, int mode)
    if (ax == NULL)
       return EM_R_FAIL;
 
-   /*
-    * CiA402 规定运行模式只能在**未使能**时改。已使能时改模式, 驱动器要么拒绝,
-    * 要么在运动中换掉解释 607Ah 的方式 —— 后者是"毫不知情地换个意思继续跑"。
-    */
+   /* CiA402 规定运行模式只能在未使能时改: 已使能时改, 驱动器要么拒绝,
+    * 要么在运动中换掉解释 607Ah 的方式 */
    if (em_is_enabled(ax))
    {
       em__err("%s: 已使能 (6041h=0x%04X), 拒绝改运行模式。先 em_disable()",
@@ -2099,16 +1805,8 @@ int em_set_mode(em_axis_t *ax, int mode)
 
    want = (int8_t)mode;
 
-   /*
-    * ==================================================================
-    * 两条传输路径 —— 由 setup 时实读决定的 ax->off_modes 选
-    * ==================================================================
-    * 6060h 在生效的 RxPDO 里时, **它就是主站拥有的**: 主站每周期把整块输出镜像
-    * 原样发出去, 驱动器控制环连续采样 SM2, 所以 SDO 写进 6060h 的值下一帧就被
-    * 镜像里的值盖回去。真机现象正是 6060h 对象回读 8、6061h 却读回 0 ——
-    * SDO 那一侧"写成功"了, 驱动器认的却是过程数据里那个 0。
-    * 所以: 在映射里 -> 写镜像 + 打帧; 不在映射里 -> SDO 写。
-    */
+   /* 两条传输路径, 由 setup 实读的 ax->off_modes 选: 在映射里 -> 写镜像 + 打帧; 不在 -> SDO 写。
+    * 6060h 在生效 RxPDO 里时 SDO 写下一帧就被输出镜像盖回去 (真机: 6060h 回读 8, 6061h 读回 0) */
    if (ax->off_modes >= 0)
    {
       uint32_t t0    = em__now_ms();
@@ -2119,18 +1817,12 @@ int em_set_mode(em_axis_t *ax, int mode)
 
       for (;;)
       {
-         /*
-          * 每周期都重写这一字节。不是"多写一次": 确认期间只要它被任何路径改掉,
-          * 驱动器就会按别的模式理解 607Ah —— 重写是为了让它不可能漂。
-          */
+         /* 每周期都重写这一字节: 确认期间只要它被任何路径改掉, 驱动器就会按别的模式理解 607Ah */
          em__put_u8(ax->out, ax->off_modes, (uint8_t)want);
          (void)em__cycle(ax->bus);
          got_f = ax->frames;
 
-         /*
-          * 读 6061h 确认驱动器**认了**。这是 SDO 读, 不是写 —— 读不会跟过程数据打架,
-          * 而 6061h (实际模式) 本来就不在 TxPDO 里。
-          */
+         /* 读 6061h 确认驱动器认了。是 SDO 读不是写 —— 读不跟过程数据打架, 且 6061h 不在 TxPDO 里 */
          got = em_get_mode(ax);
          if (got == mode)
             break;
@@ -2142,10 +1834,7 @@ int em_set_mode(em_axis_t *ax, int mode)
          }
          if ((int32_t)(em__now_ms() - t0) >= (int32_t)EM_STEP_TMO_MS)
          {
-            /*
-             * 分清两种失败, 别都赖在"驱动器不接受"上: 一帧完整过程数据都没收到的
-             * 话, 6060h 根本没送到驱动器, 那是总线问题, 不是模式问题。
-             */
+            /* 分清两种失败: 一帧完整过程数据都没收到的话 6060h 根本没送到驱动器, 那是总线问题 */
             if (got_f == 0)
             {
                em__err("%s: %ums 内一帧完整过程数据都没收到 (short_frames=%u) "
@@ -2186,9 +1875,7 @@ int em_set_mode(em_axis_t *ax, int mode)
    return EM_R_OK;
 }
 
-/* ======================================================================
- * 控制字步骤 —— 写镜像 -> 每周期打过程数据 -> 等状态字满足
- * ====================================================================== */
+/* 控制字步骤 —— 写镜像 -> 每周期打过程数据 -> 等状态字满足 */
 
 int em__cw_step(em_axis_t *ax, const char *name, uint16_t cw,
                 uint16_t mask, uint16_t want, uint32_t tmo_ms)
@@ -2251,10 +1938,8 @@ int em__cw_step(em_axis_t *ax, const char *name, uint16_t cw,
       printf(" [FAIL] 断言未成立\n");
       if (reads == 0)
       {
-         /*
-          * 一笔都没取到。不能拿零初始化的 sw 冒充"实测 0x0000" —— 0x0000 在 CiA402
-          * 里是合法的"未使能", 那会把"我们不知道"说成"驱动器报了个状态"。
-          */
+         /* 一笔都没取到。不能拿零初始化的 sw 冒充"实测 0x0000" —— 0x0000 在 CiA402 里
+          * 是合法的"未使能", 那会把"不知道"说成"驱动器报了个状态" */
          printf("        一笔 6041h 都没从 TxPDO 取到: 状态未知\n");
       }
       else
@@ -2268,12 +1953,8 @@ int em__cw_step(em_axis_t *ax, const char *name, uint16_t cw,
              ec_ALstatuscode2string(
                 ax->bus->ctx.slavelist[ax->slave].ALstatuscode));
 
-      /*
-       * 用 SDO 回读 6040h。这一行把两种失败分开, 而它们的修法完全不同:
-       *   回读一致 -> 控制字到了驱动器, 驱动器不受理 (问题在驱动器侧);
-       *   回读是别的值 -> 过程数据根本没落到控制字对象上 (问题在主站侧:
-       *                    偏移算错 / 从站不在 OP / WKC 短)。
-       */
+      /* 用 SDO 回读 6040h, 把两种失败分开: 回读一致 = 控制字到了驱动器, 不受理在驱动器侧;
+       * 回读是别的值 = 过程数据根本没落到控制字对象上 (主站侧: 偏移算错 / 从站不在 OP / WKC 短) */
       {
          uint16_t back = 0;
 
@@ -2358,10 +2039,6 @@ int em__check_motion_ready(const em_axis_t *ax, const char *stage)
    return EM_R_OK;
 }
 
-/* ======================================================================
- * 只读诊断: PDO 映射实读转储
- * ====================================================================== */
-
 static void em_dump_one_map(em_bus_t *bus, int slave, uint16_t assign_index,
                             uint16_t fallback, int sm, const em_field_t *need,
                             int nneed, const char *label)
@@ -2385,11 +2062,8 @@ static void em_dump_one_map(em_bus_t *bus, int slave, uint16_t assign_index,
       printf("  0x%04X", (unsigned)(ae[i] & 0xFFFFu));
    printf("\n");
 
-   /*
-    * 映射对象**由分配对象指定**, 不是写死的 1600h / 1A00h。真机上 1C12h 指的是 1601h;
-    * 若这里去 dump 1600h, 打印出来的是一张与过程数据毫无关系的表 —— 而且它长得"很对",
-    * 所以这种错最难看出来。
-    */
+   /* 映射对象由分配对象指定, 不是写死的 1600h / 1A00h。真机 1C12h 指的就是 1601h;
+    * 去 dump 1600h 打出来的是一张与过程数据无关的表, 且它长得"很对" */
    if (an == 0)
    {
       pdo_index = fallback;
@@ -2457,10 +2131,8 @@ static void em_dump_one_map(em_bus_t *bus, int slave, uint16_t assign_index,
    }
 }
 
-/*
- * 打印生效 RxPDO 里某一项的处置: 在映射里的给出偏移与"驱动/不驱动"及理由,
- * 不在映射里的说明主站不会覆盖它。见 em_dump_pdo 里那段说明这张表为什么要逐项交代。
- */
+/* 打印生效 RxPDO 里某一项的处置: 在映射里给出偏移与"驱动/不驱动"及理由,
+ * 不在映射里的说明主站不会覆盖它 */
 static void em_dump_disposition(em_bus_t *bus, int slave, uint16_t rx_pdo,
                                 uint16_t index, uint8_t sub, int bits,
                                 const char *name, const char *disposition)
@@ -2488,11 +2160,8 @@ void em_dump_pdo(em_bus_t *bus, int slave)
       printf("    过程数据镜像: 输出 %u 字节 / 输入 %u 字节\n",
              (unsigned)s->Obytes, (unsigned)s->Ibytes);
    else
-      /*
-       * config_map_group 之前 SOEM 还没从 CoE 读到映射, slavelist[].Obytes/Ibytes
-       * 就是 0。把 0 打印成"输出 0 字节"会被读成"这台设备没有过程数据" —— 那是把
-       * "还没读"说成"读到了 0"。
-       */
+      /* config_map_group 之前 SOEM 还没从 CoE 读到映射, slavelist[].Obytes/Ibytes 就是 0;
+       * 把它打印成"输出 0 字节"是"还没读"说成"读到了 0" */
       printf("    过程数据镜像: (尚未建立 —— ecx_config_map_group 之前这两个字段还是 0,\n"
              "                   不代表设备没有过程数据; 下面那张实读的映射表才是依据)\n");
    printf("    >>> 偏移一律从下面这张**实读**的表推; 手册值 / ESI 声明值 / ESI 字典\n"
@@ -2503,10 +2172,8 @@ void em_dump_pdo(em_bus_t *bus, int slave)
    em_dump_one_map(bus, slave, EM_OID_TXPDO_ASSIGN, EM_OID_TXPDO0, EM_SM_TXPDO,
                    EM_NEED_TX, EM_NEED_TX_N, "TxPDO (驱动器 -> 主站, 输入镜像)");
 
-   /*
-    * 6060h 单独打印 —— 它**不在**上面那张"本接口需要的字段"表里(故意不列, 理由见
-    * EM_NEED_RX 上面那段), 但它恰恰是最容易出事的一项: 在生效 RxPDO 里就意味着
-    * 主站每周期都在下发它, SDO 写一律被下一帧撤销。所以它的偏移和传输方式必须看得见。
+   /* 6060h 单独打印 —— 它不在上面那张表里, 但它最容易出事: 在生效 RxPDO 里就意味着
+    * 主站每周期都在下发它, SDO 写一律被下一帧撤销, 所以偏移与传输方式必须看得见。
     */
    {
       uint32_t ae[EM_MAP_MAX];
@@ -2527,15 +2194,9 @@ void em_dump_pdo(em_bus_t *bus, int slave)
             printf("    6060h 运行模式: 不在生效 RxPDO %04Xh 里 -> 经 SDO 写\n",
                    (unsigned)rx);
 
-         /*
-          * 表里**每一项**的处置都列出来。
-          *
-          * 这张表的规矩是本工程用两次真机事故换来的: **生效 RxPDO 里的每一项都是主站
-          * 拥有的**, 每周期都在下发 —— 不驱动它就是下发 0, 而且不会有任何报错。
-          *   6060h: 曾经 SDO 写进去 8 而 6061h 一直读回 0;
-          *   6083h: 被下发成 0 之后 PV 的斜坡起不来, "全 PASS 但电机没转"。
-          * 所以这里逐项交代"驱动 / 不驱动", 不驱动的那项还要写出理由。
-          */
+         /* 表里每一项的处置都列出来。生效 RxPDO 里的每一项都是主站拥有的, 每周期都在下发 ——
+          * 不驱动它就是下发 0, 且不会有任何报错 (6060h 曾 SDO 写进 8 而 6061h 读回 0;
+          * 6083h 被下发成 0 之后 PV 斜坡起不来)。所以逐项交代"驱动 / 不驱动"及理由。 */
          printf("    本接口对生效 RxPDO 每一项的处置:\n");
          em_dump_disposition(bus, slave, rx, EM_OID_CONTROLWORD, 0, 16,
                              "6040h 控制字    ", "驱动 (使能状态机)");
@@ -2550,20 +2211,14 @@ void em_dump_pdo(em_bus_t *bus, int slave)
                              "**不驱动** (本接口不做 PP) -> 主站下发 0, "
                              "与驱动器基线一致");
          {
-            /*
-             * 这两项的处置文字要带上**实际会下发的值** —— 它是不是 0, 正是
-             * "PV 到底会不会动"的分水岭。
-             */
+            /* 这两项的处置文字要带上实际会下发的值 —— 它是不是 0 就是"PV 会不会动"的分水岭 */
             em_axis_t *ax = em_axis_by_pos(bus, slave - 1);
             char       b1[128], b2[128];
 
             if (ax == NULL && bus->naxis == 0)
             {
-               /*
-                * em_dump_pdo 在 S2 就会被调用, 而那时 em_setup() 还没跑、一根轴都还没建。
-                * 这里**不能**说成"不驱动" —— 那正好和本次修复相反 (setup 之后是会驱动的),
-                * 也别说成"要下发 0"。如实说"还不知道"。
-                */
+               /* em_dump_pdo 在 S2 就会被调用, 那时 em_setup() 还没跑、一根轴都没建:
+                * 既不能说成"不驱动"也不说成"要下发 0", 如实说"还不知道" */
                snprintf(b1, sizeof(b1), "**未定** (em_setup 还没跑, 尚未建轴)");
                snprintf(b2, sizeof(b2), "**未定** (em_setup 还没跑, 尚未建轴)");
             }

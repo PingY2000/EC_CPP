@@ -1,35 +1,19 @@
 /*
  * slide_verify - 滑台设备导入验证程序 (原生 C + SOEM)
  *
- * 用途:
- *   滑台设备(研控 YKD2205PE EtherCAT 驱动器)上电/接入总线后,扫描 EtherCAT
- *   总线,对每台从站读取身份与关键 CiA402 对象,判定是否为受支持的
- *   YKD2205PE 滑台驱动器,逐项给出 PASS / WARN / FAIL,最后汇总并返回退出码。
+ * 只读工具: 扫 EtherCAT 总线 -> 对每台从站读身份与关键 CiA402 对象 -> 判定是否为受
+ * 支持的 YKD2205PE 滑台驱动器 -> 逐项 PASS/WARN/FAIL -> 汇总并返回退出码。
+ * 不进 OP、不写 6040h 控制字、不做使能序列、不动电机。
+ * 验证深度: 进 PRE_OP (SDO 即可用) 做对象读取; 之后可选尝试进 SAFE_OP, 进不去不致命
+ * (空 TxPDO 是正常诱因)。
  *
- *   只读工具:不进 OP、不写 6040h 控制字、不做使能序列、不动电机。
- *   验证深度:进 PRE_OP(SDO 即可用)做对象读取;之后可选尝试进 SAFE_OP,
- *             进不去不致命(空 TxPDO 是正常诱因)。
+ * 构建: 本文件在独立顶层工程 slide_verify/, 经根目录 CMakeLists 的
+ * add_subdirectory(SOEM) 引用下载的 SOEM 库, 不改动 SOEM 源码。
+ *   cmake -S . -B build && cmake --build build --config Release --target slide_verify
+ *   产物 build/slide_verify/Release/slide_verify.exe
  *
- * 位置/构建:
- *   本文件在本仓库自己的独立顶层工程 (slide_verify/), 通过根目录 CMakeLists
- *   add_subdirectory(SOEM) 引用下载的 SOEM 库, 不改动 SOEM 源码。
- *     cmake -S . -B build                # 在仓库根 (含顶层 CMakeLists)
- *     cmake --build build --config Release --target slide_verify
- *   产物: build/slide_verify/Release/slide_verify.exe
- *   MinGW/Ninja 示例:
- *     cmake -S . -B build-mingw -G Ninja -DCMAKE_BUILD_TYPE=Release \
- *           -DCMAKE_C_COMPILER=C:/msys64/ucrt64/bin/gcc.exe
- *     cmake --build build-mingw --target slide_verify
- *
- * 用法:
- *   slide_verify [ifname]
- *     ifname   网卡名。Windows Npcap 形如  \Device\NPF_{GUID} ,
- *              例如: slide_verify '\Device\NPF_{7C64E0FA-D69A-4C92-A821-E5D341E63575}'
- *                                              809345E5-15B7-4552-B72E-9B9C4722D44C
- *     slide_verify ['\Device\NPF_{809345E5-15B7-4552-B72E-9B9C4722D44C}']
- * build\slide_verify\Release\slide_verify.exe "\Device\NPF_{7C64E0FA-D69A-4C92-A821-E5D341E63575}"
-.\build\slide_verify\slide_verify.exe "\Device\NPF_{7C64E0FA-D69A-4C92-A821-E5D341E63575}"
- *              不带 ifname 时仅列出可用网卡。
+ * 用法: slide_verify [ifname]   (Windows Npcap 网卡名形如 \Device\NPF_{GUID};
+ *                               不带 ifname 时仅列出可用网卡)
  *
  * 退出码:
  *   0 = 通过 (至少 1 台 YKD, 全部 PASS)
@@ -37,7 +21,7 @@
  *   2 = 空总线 (config_init 未发现从站)
  *   3 = 存在 YKD FAIL (必需对象缺失/超时、YKD 未达 PRE_OP)
  *   4 = 无 FAIL 但含 WARN (可选对象缺失、SAFE_OP 未达、未知模式、混挂非 YKD 等)
- *   5 = 总线有从站, 但一台 YKD 都没有 (环境不匹配)
+ *   5 = 总线有从站, 但一台 YKD 都没有
  *
  * 阶段:
  *   P1 发现 + 身份判定      : ecx_init/config_init -> 身份表 + YKD 判定
@@ -137,9 +121,7 @@ static int sv_is_ykd_slave(const struct ec_slave *s)
    return 0;
 }
 
-/* ======================================================================
- * P2A: PRE_OP 对象级验证 (数据驱动对象矩阵 + SDO 读取)
- * ====================================================================== */
+/* P2A: PRE_OP 对象级验证 (数据驱动对象矩阵 + SDO 读取) */
 
 /* 对象数据类型 (决定读取字节数与数值解读) */
 #define SV_DT_U8  0
@@ -162,8 +144,7 @@ typedef struct
 } sv_obj_t;
 
 /* 校验矩阵: 改这里的表即可增删检查对象, 主循环不用动。
- * 必需: 6041h/6060h/6061h/6064h/606Ch (CiA402 轴必备)
- * 可选: 607Ah/6081h/6083h/6084h/60FDh/60FEh */
+ * 必需: 6041h/6060h/6061h/6064h/606Ch; 可选: 607Ah/6081h/6083h/6084h/60FDh/60FEh/6502h */
 static const sv_obj_t sv_objs[] = {
    /*{ 0x0012, 0x00, "0012h A",   SV_DT_U16, SV_ROLE_REQUIRED },
    { 0x0013, 0x00, "0013h B",   SV_DT_U16, SV_ROLE_REQUIRED },*/
@@ -201,12 +182,9 @@ static int sv_dt_size(int dt)
 #define SV_RD_ABORT   1   /* 收到 SDO abort (对象/子索引不存在 或 其它) */
 #define SV_RD_TIMEOUT 2   /* 从站无响应/邮箱超时 */
 
-/*
- * 读一个对象 (≤4 字节 expedited)。
- * 关键: ctx.ecaterror 是粘滞位, SOEM 报错后不会自动清零, 必须在每次
- * SDO 读前手动复位, 否则上一个失败会污染下一次判定。
- * 返回 SV_RD_*; 命中 abort 时在 *abort_code 返回首个匹配本对象的中止码。
- */
+/* 读一个对象 (<=4 字节 expedited)。ctx.ecaterror 是粘滞位, 每次 SDO 读前必须手动复位,
+ * 否则上一个失败会污染下一次判定。
+ * 返回 SV_RD_*; 命中 abort 时在 *abort_code 返回首个匹配本对象的中止码。 */
 static int sv_sdo_read(int slave, const sv_obj_t *obj, uint8_t *buf, int32_t *abort_code)
 {
    int psize = sv_dt_size(obj->dt);
@@ -287,10 +265,8 @@ static const char *sv_mode_name(int8_t mode)
    }
 }
 
-/*
- * 合理性/解码: 对必需对象出现的"读数异常"给出 WARN 提示。
- * 把解码说明追加进 dec[]; 返回 1 表示有 WARN (只对必需对象调用)。
- */
+/* 合理性/解码: 对必需对象的"读数异常"给出 WARN 提示, 解码说明追加进 dec[];
+ * 返回 1 表示有 WARN (只对必需对象调用)。 */
 static int sv_obj_sanity(const sv_obj_t *obj, const uint8_t *buf, char *dec, size_t decsz)
 {
    int warn = 0;
@@ -355,10 +331,7 @@ static int sv_obj_sanity(const sv_obj_t *obj, const uint8_t *buf, char *dec, siz
    return warn;
 }
 
-/*
- * 对一台 YKD 从站做整表对象校验并逐行报告。
- * 更新 g_axis_fail/g_axis_warn。
- */
+/* 对一台 YKD 从站做整表对象校验并逐行报告, 更新 g_axis_fail/g_axis_warn。 */
 static void sv_verify_objects(int slave)
 {
    int pos = slave - 1;
@@ -434,11 +407,9 @@ static void sv_verify_objects(int slave)
                                    : (g_axis_warn[slave] ? SV_V_WARN : SV_V_PASS)));
 }
 
-/* ======================================================================
- * P2B: SAFE_OP 探针 (可选; 失败不致命)
- * 说明: config_map_group 会写 SM/FMMU 并在自动模式下请求 SAFE_OP。本工具
- *       不依赖 PDO 周期数据, 只把"能否进 SAFE_OP"当作一个 WARN 级提示。
- * ====================================================================== */
+/* P2B: SAFE_OP 探针 (可选; 失败不致命)。
+ * config_map_group 会写 SM/FMMU 并在自动模式下请求 SAFE_OP; 本工具不依赖 PDO 周期
+ * 数据, 只把"能否进 SAFE_OP"当作一个 WARN 级提示。 */
 static void sv_probe_safeop(void)
 {
    int ret, slave;
@@ -488,9 +459,7 @@ static void sv_probe_safeop(void)
    }
 }
 
-/* ======================================================================
- * P1: 身份表打印
- * ====================================================================== */
+/* P1: 身份表打印 */
 static void sv_print_identity_header(void)
 {
    printf("%-5s %-5s %-8s %-12s %-11s %-11s %-11s %-11s %-6s %s\n",
@@ -518,9 +487,7 @@ static void sv_print_identity_row(int slave)
           s->name);
 }
 
-/* ======================================================================
- * P3: 汇总与退出码收口
- * ====================================================================== */
+/* P3: 汇总与退出码收口 */
 static int sv_final_exit(void)
 {
    int slave;
@@ -652,7 +619,7 @@ int main(int argc, char *argv[])
    printf("总线状态0: 0x%04X\n", ecx_readstate(&ctx));
    osal_usleep(10000);
    printf("状态1: 0x%02X\n", ctx.slavelist[slave-1].state);
-   /* ---- P2B: 可选 SAFE_OP 探针 (失败不致命, 记 WARN) ---- */
+   /* P2B: 可选 SAFE_OP 探针 (失败不致命, 记 WARN) */
    sv_probe_safeop();
 
    printf("状态2: 0x%02X\n", ctx.slavelist[slave-1].state);

@@ -13,8 +13,6 @@
 
 #include <cmath>
 
-/* ================================================================ 轨道 */
-
 static const int HMI_HALF = 1000000;   /* 2 * HMI_RANGE, 免得到处写 */
 
 SlideCanvas::SlideCanvas(QWidget *parent) : QWidget(parent)
@@ -57,7 +55,7 @@ void SlideCanvas::noteClamped()
 
 void SlideCanvas::pick(const QPoint &pt)
 {
-   /* 未连接 / 未使能时把点击**吞掉**: 让"点了没反应"看起来像功能没开 */
+   /* 未连接 / 未使能时把点击吞掉 */
    if (!m_live || !m_movable)
       return;
 
@@ -81,7 +79,7 @@ void SlideCanvas::mousePressEvent(QMouseEvent *e)
 
 void SlideCanvas::mouseMoveEvent(QMouseEvent *e)
 {
-   /* 按住拖动 = 实时改向。CSP 本来就能随时改目标, 这是它相对 PP 的唯一好处 */
+   /* 按住拖动 = 实时改向 */
    if (e->buttons() & Qt::LeftButton)
       pick(e->pos());
 }
@@ -128,13 +126,11 @@ void SlideCanvas::paintEvent(QPaintEvent *)
    if (width() < 80 || height() < 70)
       return;
 
-   /* ---- 轨道 */
    QRect band(20, yBand, width() - 40, hBand);
    p.setPen(QPen(cEdge, 1));
    p.setBrush(cTrack);
    p.drawRoundedRect(band, 4, 4);
 
-   /* ---- 刻度: 每 100000 一条, 正中那条加粗 */
    QFont f = p.font();
    f.setPointSizeF(8.0);
    p.setFont(f);
@@ -154,14 +150,14 @@ void SlideCanvas::paintEvent(QPaintEvent *)
       p.drawText(tr, Qt::AlignHCenter | Qt::AlignTop, lab);
    }
 
-   /* ---- 插值目标 (每周期真正下发的那一点): 细线 */
+   /* 插值目标 (每周期真正下发的那一点): 细线 */
    {
       int x = xOf(m_tgt);
       p.setPen(QPen(cTgt, 1, Qt::DashLine));
       p.drawLine(x, yBand - 14, x, yBand + hBand + 4);
    }
 
-   /* ---- 点击目标 want: 向下的三角, 画在轨道上方 */
+   /* 点击目标 want: 向下的三角, 画在轨道上方 */
    {
       int x = xOf(m_want);
       QPolygon tri;
@@ -173,7 +169,7 @@ void SlideCanvas::paintEvent(QPaintEvent *)
       p.drawPolygon(tri);
    }
 
-   /* ---- 实际位置 (6064h): 滑块本体 */
+   /* 实际位置 (6064h): 滑块本体 */
    {
       int x = xOf(m_pos);
       QRect car(x - 18, yBand - 20, 36, hBand + 10);
@@ -181,12 +177,10 @@ void SlideCanvas::paintEvent(QPaintEvent *)
       p.setBrush(m_movable ? cCarOn : cCarOff);
       p.drawRoundedRect(car, 5, 5);
 
-      /* 一条竖中线, 精确指着位置 */
       p.setPen(QPen(Qt::white, 1));
       p.drawLine(x, car.top() + 3, x, car.bottom() - 3);
    }
 
-   /* ---- 左上角文字: 读数 */
    {
       p.setPen(cText);
       QFont nf("Consolas");
@@ -200,7 +194,6 @@ void SlideCanvas::paintEvent(QPaintEvent *)
                  Qt::AlignLeft | Qt::AlignVCenter, s);
    }
 
-   /* ---- 状态提示 */
    if (!m_live)
    {
       p.setPen(QColor("#7b8391"));
@@ -221,8 +214,6 @@ void SlideCanvas::paintEvent(QPaintEvent *)
    }
 }
 
-/* ================================================================ 面板 */
-
 AxisPanel::AxisPanel(int axis, QWidget *parent)
    : QWidget(parent), m_axis(axis)
 {
@@ -232,7 +223,6 @@ AxisPanel::AxisPanel(int axis, QWidget *parent)
 
    m_canvas = new SlideCanvas(this);
 
-   /* ---- 速度: 滑块与数字框互相同步, 单位都是 pul/s */
    m_vel = new QSlider(Qt::Horizontal, this);
    m_vel->setRange(HMI_VEL_MIN, HMI_VEL_MAX);
    m_vel->setSingleStep(1000);
@@ -258,7 +248,6 @@ AxisPanel::AxisPanel(int axis, QWidget *parent)
       emit speedChanged(m_axis, (uint32_t)v);
    });
 
-   /* ---- 按钮 */
    m_zero = new QPushButton(QStringLiteral("把当前位置设为 0"), this);
    m_zero->setToolTip(QStringLiteral(
       "只改软件的显示零点, 不写驱动器 607Dh / 不写 EEPROM; 物理目标点一个脉冲都不动"));
@@ -272,7 +261,6 @@ AxisPanel::AxisPanel(int axis, QWidget *parent)
    connect(m_canvas, &SlideCanvas::targetRequested, this,
            [this](int want) { emit targetRequested(m_axis, want); });
 
-   /* ---- 读数 */
    auto mk = [this](const QString &t)
    {
       QLabel *l = new QLabel(t, this);
@@ -285,7 +273,6 @@ AxisPanel::AxisPanel(int axis, QWidget *parent)
    m_lState = mk(QStringLiteral("—"));
    m_lBus   = mk(QStringLiteral("—"));
 
-   /* ---- 布局 */
    QGridLayout *g = new QGridLayout;
    g->addWidget(new QLabel(QStringLiteral("速度"), this), 0, 0);
    g->addWidget(m_vel,                                   0, 1);
@@ -321,7 +308,7 @@ uint32_t AxisPanel::speed() const { return (uint32_t)m_vel->value(); }
 
 void AxisPanel::setSpeed(uint32_t vel)
 {
-   m_vel->setValue((int)vel);   /* 滑块变了会连带发 speedChanged, 与拖动同路 */
+   m_vel->setValue((int)vel);   /* 滑块变了会连带发 speedChanged */
 }
 
 void AxisPanel::refresh(const AxisTelem &t)
@@ -351,8 +338,7 @@ void AxisPanel::refresh(const AxisTelem &t)
    m_lTgt->setText(QString::number(t.tgt));
    m_lWant->setText(QString::number(t.want));
 
-   /* 走没走完用**下发目标**判: CSP 下驱动器没有"到位"信号可等, 6064h 与 607Ah
-    * 的差才是唯一的依据 (容差取 EM_POS_TOL_DEF) */
+   /* 走没走完用下发目标判: CSP 下驱动器没有"到位"信号可等 */
    QString st = t.state;
    if (t.fault)
       st = QStringLiteral("故障: ") + st;

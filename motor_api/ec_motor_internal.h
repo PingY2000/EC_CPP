@@ -1,41 +1,18 @@
 /*
- * ec_motor_internal.h - ec_motor.c 与 ec_motor_motion.c 之间的私有接口
- *
- * 调用方只用 ec_motor.h; 本文件不对外。
- *
- * 为什么要有它: ec_motor.h 里 em_bus_t / em_axis_t 是**不透明**的 (那样调用方
- * 不必看到 SOEM 的 ecx_contextt)。但运动层 ec_motor_motion.c 必须能看到轴结构体
- * 的字段 (镜像偏移、最新采样、容差...)。所以把定义与内部原语放这里, 两个 .c
- * 共享, 而对外仍然只有一个干净的 ec_motor.h。
- *
- * ============================================================================
- * 不变量: ecx_SDOwrite 只允许出现在 ec_motor.c
- * ============================================================================
- * 本文件里的 em__wr_*() 就是那一层的全部写原语 —— 它们**声明**在这里供运动层调用,
- * **定义**全部在 ec_motor.c。所以:
- *
- *     grep -rn ecx_SDOwrite motor_api/    ->    只有 ec_motor.c 一处
- *
- * 与 slide_motion/ 里"只有 sm_guard.c 写"是同一条不变量。
- * 运动层负责"写什么、按什么顺序写、写完等哪个位", 不负责"怎么发出去"。
+ * ec_motor_internal.h - ec_motor.c 与 ec_motor_motion.c 之间的私有接口; 调用方只用 ec_motor.h。
+ * 不变量: ecx_SDOwrite 只允许出现在 ec_motor.c (em__wr_*() 在此声明, 定义全在 ec_motor.c)。
  */
 #ifndef EC_MOTOR_INTERNAL_H
 #define EC_MOTOR_INTERNAL_H
 
 #include "ec_motor.h"
 
-/*
- * 内部返回值 —— 对外的语义在 ec_motor.h 的"运动"一节:
- *   0 = 成功 / -1 = 失败(原因已打印) / 1 = 收到停止请求(已安全停下)
- * 两层共用一份定义, 免得两边各写一套再对不上。
- */
+/* 内部返回值: 0 = 成功 / -1 = 失败(原因已打印) / 1 = 收到停止请求(已安全停下) */
 #define EM_R_OK    0
 #define EM_R_FAIL (-1)
 #define EM_R_STOP  1
 
-/* ======================================================================
- * 结构体定义 (对外不透明)
- * ====================================================================== */
+/* 结构体定义 (对外不透明) */
 
 struct em_axis
 {
@@ -52,41 +29,22 @@ struct em_axis
    uint32_t  Obytes;
    uint32_t  Ibytes;
 
-   /*
-    * 该轴**生效**的 PDO 映射对象索引, 由 setup 时实读 1C12h / 1C13h 得到。
-    *
-    * 不写死 1600h / 1A00h: 真机上 1C12h 分配的是 **1601h**。把 1600h 写死就会去读写
-    * 一张**没有生效**的表 —— 那张表里就算字段齐全, 过程数据也一个字节都不会经过它,
-    * 于是"映射看着没问题"和"控制字根本发不出去"可以同时成立。
-    */
+   /* 生效的 PDO 映射对象索引, 由 setup 时实读 1C12h/1C13h 得到
+    * (真机上 1C12h 分配的是 1601h, 不可写死 1600h/1A00h) */
    uint16_t rx_pdo;
    uint16_t tx_pdo;
 
-   /*
-    * 字段字节偏移, **从该轴自己的映射表实读推出**。-1 = 该字段不在映射里
-    * (此时用得到它的模式会被拒绝, 而不是拿猜测的偏移去写)。
-    */
+   /* 字段字节偏移, 从该轴自己的映射表实读推出; -1 = 该字段不在映射里 */
    int off_cw;          /* 6040h 控制字 (RxPDO) —— 硬要求 */
    int off_target_pos;  /* 607Ah 目标位置 (RxPDO) —— CSP 要 */
    int off_target_vel;  /* 60FFh 目标速度 (RxPDO) —— PV 要 */
    int off_sw;          /* 6041h 状态字 (TxPDO) —— 硬要求 */
 
-   /*
-    * 6060h 运行模式 (RxPDO)。**-1 = 不在生效映射里**。
-    *
-    * 这一项必须和上面几个分开看: 那几项是"没有就拒绝"的硬要求, 而 6060h 是
-    * "在映射里就必须经过程数据驱动、不在映射里才能走 SDO" —— 两种事实两种走法,
-    * 由 setup 时实读决定。详见 em_set_mode() 里的注释。
-    */
+   /* 6060h 运行模式 (RxPDO)。-1 = 不在生效映射里 (在映射里就必须经过程数据驱动) */
    int off_modes;
 
-   /*
-    * 6083h / 6084h 轮廓加减速度 (RxPDO)。**-1 = 不在生效映射里**。
-    *
-    * 和 6060h 同一个类: 在映射里就是主站拥有的, 每周期都在下发 —— 不写就是下发 0。
-    * 而 0 对 6083h 意味着"斜坡永远起不来"(见 em_ramp_acc 那段说明)。这两个是
-    * 本期新增的驱动项, 也是 em__pin_ramp() 存在的理由。
-    */
+   /* 6083h/6084h 轮廓加减速度 (RxPDO)。-1 = 不在生效映射里;
+    * 在映射里就是主站拥有的, 不写即下发 0, 而 0 会让斜坡起不来 */
    int      off_prof_acc;
    int      off_prof_dec;
    uint32_t prof_acc;   /* 每周期经过程数据下发的值 (pul/s²) */
@@ -95,17 +53,8 @@ struct em_axis
    int off_act_pos;     /* 6064h 实际位置 (TxPDO) */
    int off_act_vel;     /* 606Ch 实际速度 (TxPDO) */
 
-   /*
-    * 60FDh 数字输入 (TxPDO)。**只绑不补** —— 在生效映射里就用, 不在就是 -1。
-    *
-    * 为什么不能列进 EM_NEED_TX: 那张表的语义是"缺了就追加进 PDO 映射", 而 QHMI 是带
-    * allow_remap=1 连上来的 (hmi/ecatworker.cpp 的 em_setup 调用) —— 一个只读的监视量
-    * 不该有改写驱动器 1A00h 的副作用, 改完还得在收尾时还原。
-    *
-    * 本机实测生效的 1A00h 只有 6041h/6064h/606Ch 三项 10 字节, **没有 60FDh**
-    * (docs/ykd2205pe_ci402.md 「不要相信任何一份出厂映射」那一节), 所以这里多半是 -1,
-    * 三个限位开关的界面显示"不知道"。要让它绑上见 em_require_dig_in()。
-    */
+   /* 60FDh 数字输入 (TxPDO)。只绑不补: 在生效映射里才用, 否则 -1。
+    * 本机实测生效的 1A00h 只有 6041h/6064h/606Ch 三项 10 字节, 没有 60FDh */
    int      off_dig_in;
    uint32_t dig_in;     /* 最新一帧完整过程数据里的 60FDh */
 
@@ -113,7 +62,7 @@ struct em_axis
    uint16_t sw;
    int32_t  pos;
    int32_t  vel;
-   int      mirror_ok;  /* 是否至少收到过一帧完整的 */
+   int      mirror_ok;  /* 是否收到过至少一帧完整的过程数据 */
    uint32_t frames;     /* 收到过多少个完整帧 */
 
    uint32_t short_frames;  /* 连续短帧计数 (判"过程数据未落地") */
@@ -127,17 +76,14 @@ struct em_axis
 typedef struct
 {
    int      have;     /* 是否取到过 */
-   int      changed;  /* 是否被本程序改过 */
+   int      changed;  /* 是否真写过 */
    uint16_t index;
    int      n;
    uint32_t e[EM_MAP_MAX];
 } em_snap_t;
 
-/*
- * 一个方向 (RxPDO 或 TxPDO) 要还原的东西有**两个对象**:
- * 映射对象本身 (1600h / 1A00h) 和它的分配对象 (1C12h / 1C13h)。
- * 只存其中一个, 还原之后 SM 长度就跟分配对不上了 —— 所以两个一起存。
- */
+/* 一个方向要还原的两份快照: 映射对象 (1600h/1A00h) 与分配对象 (1C12h/1C13h);
+ * 只存其中一个, 还原后 SM 长度会跟分配对不上 */
 typedef struct
 {
    em_snap_t pdo;
@@ -157,10 +103,8 @@ struct em_bus
    int verbose;
    int opened;
    int mapped;      /* 是否真的改写过 PDO 映射 */
-   /*
-    * 是否**主动**把 60FDh 追加进 TxPDO。默认 0 = 只在映射里已经有它时才绑。
-    * 连接期参数, 由 em_require_dig_in() 在 em_setup 之前设 —— 见那个函数的说明。
-    */
+   /* 是否主动把 60FDh 追加进 TxPDO; 默认 0 = 映射里已经有它时才绑。
+    * 连接期参数, 必须由 em_require_dig_in() 在 em_setup 之前设 */
    int want_dig_in;
    int in_op;
    int prev_manualstatechange;
@@ -169,11 +113,9 @@ struct em_bus
    em_dirsnap_t snap_tx[EM_MAX_AXES];
 };
 
-/* ======================================================================
- * 内部原语 —— 实现全在 ec_motor.c
- * ====================================================================== */
+/* 内部原语 —— 实现全在 ec_motor.c */
 
-/* 时钟与睡眠 (头文件顺序原因, 不在公共头上暴露 windows.h) */
+/* 时钟与睡眠 (不在公共头上暴露 windows.h) */
 uint32_t em__now_ms(void);
 void     em__sleep_ms(int ms);
 
@@ -185,14 +127,8 @@ void em__log(em_bus_t *bus, const char *fmt, ...);
 /* 过程数据一帧 (与 em_service 同一件事, 供运动层内部使用) */
 int em__cycle(em_bus_t *bus);
 
-/*
- * 小端读写**过程数据镜像**。用 memcpy 而不是强制转换 —— 不依赖偏移的对齐。
- *
- * 命名上刻意与下面的 em__wr_*() 分开 (put/get 对 wr): em__wr_* 是"经 SDO 写进
- * 驱动器, 并回读确认", em__put_* 是"改写本地那一块镜像缓冲, 下一帧才发出去"。
- * 两者混起来看代码会误判"写成功"的含义 —— 一个是驱动器收下了, 一个只是我们改了
- * 自己的内存。
- */
+/* 小端读写过程数据镜像 (用 memcpy, 不依赖偏移的对齐)。
+ * put/get 只改写本地镜像 (下一帧才发出去), 与经 SDO 写驱动器并回读的 em__wr_*() 不同 */
 void     em__put_u8 (uint8_t *m, int off, uint8_t v);
 void     em__put_u16(uint8_t *m, int off, uint16_t v);
 void     em__put_u32(uint8_t *m, int off, uint32_t v);
@@ -205,48 +141,27 @@ int32_t  em__get_i32(const uint8_t *m, int off);
 /* 写 6040h 到输出镜像 (只写镜像, 下一帧才发出去) */
 void em__set_cw(em_axis_t *ax, uint16_t cw);
 
-/*
- * 把"在生效 RxPDO 里、由主站拥有"的常量项重新写进本地输出镜像: 6083h / 6084h。
- * (6060h 由 em_arm 自己钉, 因为它要用刚读到的 6061h 值。)
- *
- * **纯镜像写 —— 不发帧、不做 SDO。** 这一点是刻意的: 本函数会被放在使能之前,
- * 而进 OP 之后的 SDO 往返正是上一期怀疑会让驱动器掉出 OP (WKC 3->1) 的诱因。
- *
- * 必须在**进 OP 之前**至少调用一次。主站一进 OP 就开始发帧, 而镜像里这两项在不写
- * 的情况下是 0 (calloc 出来的) —— 也就是说, 连"只读观测"那次带 --allow-pdo 的运行
- * 也在往驱动器下发 6083h = 0。
- */
+/* 把在生效 RxPDO 里、由主站拥有的常量项重写进本地输出镜像: 6083h / 6084h。
+ * 纯镜像写 —— 不发帧、不做 SDO。必须在进 OP 之前至少调用一次,
+ * 否则镜像里这两项是 0, 会往驱动器下发 6083h = 0 (斜坡起不来)。 */
 void em__pin_ramp(em_axis_t *ax);
 
-/*
- * 写控制字 -> 每周期打过程数据 -> 等 6041h 满足 (sw & mask) == want。
- * 返回 0 = PASS / -1 = FAIL (已打印期望与实测) / 1 = 收到停止请求
- */
+/* 写控制字 -> 每周期打过程数据 -> 等 6041h 满足 (sw & mask) == want。
+ * 返回 0 = PASS / -1 = FAIL (已打印期望与实测) / 1 = 收到停止请求 */
 int em__cw_step(em_axis_t *ax, const char *name, uint16_t cw,
                 uint16_t mask, uint16_t want, uint32_t tmo_ms);
 
-/*
- * 不动控制字, 只等状态字满足断言。
- * 返回 0 = PASS / -1 = FAIL / 1 = 收到停止请求
- */
+/* 不动控制字, 只等状态字满足断言。返回 0 = PASS / -1 = FAIL / 1 = 收到停止请求 */
 int em__wait_sw(em_axis_t *ax, uint16_t mask, uint16_t want,
                 uint32_t tmo_ms, const char *what);
 
-/*
- * 只读检查一根轴现在能不能动: 必须镜像可信、无 Fault、无硬件限位。
- * 返回 0 = 干净; -1 = 有理由拒绝 (已打印)
- */
+/* 只读检查一根轴现在能不能动: 必须镜像可信、无 Fault、无硬件限位。
+ * 返回 0 = 干净; -1 = 有理由拒绝 (已打印) */
 int em__check_motion_ready(const em_axis_t *ax, const char *stage);
 
-/* ======================================================================
- * 写原语 (唯一出现 ecx_SDOwrite 的那一层, 定义在 ec_motor.c)
- *
- * 全部**写后回读**: 本仓库这份 SOEM 的 ecx_SDOwrite 在加急路径 (psize<=4) 上把
- * 从站回的 SDO abort 帧也当成写成功 (abort 帧的 mbxtype/service/index/subindex
- * 与请求完全一致, 命中它的 "all OK" 分支, 既不压错误栈也不置 ecaterror, wkc 还 > 0)。
- * 这几个对象全是 1/2/4 字节的加急写, 全在这条路径上 —— 所以 wkc > 0 **不代表写进去了**,
- * 回读才是唯一的确认。
- * ====================================================================== */
+/* 写原语 (唯一出现 ecx_SDOwrite 的那一层, 定义在 ec_motor.c)。
+ * 全部写后回读: 本仓库这份 SOEM 在加急路径 (psize<=4) 上把从站回的 SDO abort 帧
+ * 当成写成功, wkc > 0 不代表写进去了 —— 回读才是唯一的确认。 */
 int em__wr_u8 (em_axis_t *ax, uint16_t index, uint8_t sub, uint8_t  v, const char *why);
 int em__wr_i8 (em_axis_t *ax, uint16_t index, uint8_t sub, int8_t   v, const char *why);
 int em__wr_u16(em_axis_t *ax, uint16_t index, uint8_t sub, uint16_t v, const char *why);

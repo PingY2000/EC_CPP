@@ -1,16 +1,7 @@
 /*
  * scan/main.cpp —— 滑台蛇形扫描 + 逐点功率采集
  *
- * 它跟 hmi/main.cpp 是**同一个骨架**: em_console_init 必须第一句, 然后 QApplication +
- * 中文字体 + 夜间配色。差别只在一个: 那边的主窗口是两根一维轨道 (手动调试台),
- * 这边是二维面板 + 一个扫描状态机。
- *
- * 界面侧**完全不碰 SOEM**: 这个文件只 include scanwindow.h 与 ec_motor.h, 而 ec_motor.h
- * 是纯 C 的公开接口 (只有一个 stdint.h)。所有 ecx_* 都在 EcatThread 里 ——
- * 那是 hmi/ecatworker 原样编进来的一份, 一行没改。
- *
- * 默认是只读的: 启动之后一个字节都不写总线。「连接」才进 OP 开始发帧, 「使能」才让电机带电,
- * 「开始扫描」才自己动。
+ * 默认只读: 启动后不写总线; 「连接」进 OP 才发帧, 「使能」才带电, 「开始扫描」才动作。
  */
 
 #include <QApplication>
@@ -21,20 +12,14 @@
 
 int main(int argc, char **argv)
 {
-   /*
-    * 必须是第一句: 它把控制台代码页设成 UTF-8, 而本程序的中文日志既有我们自己打的
-    * (note()), 也有 motor_api 打的 (选轴 / 偏移证明 / 使能阶梯)。晚一步, 那之前的汉字
-    * 就全是乱码 (实测把「多轴」打成「澶氳酱」)。
-    *
-    * 这是界面线程唯一一次调 motor_api —— 它只设代码页, 不碰总线、不碰网卡。
-    */
+   /* 必须是第一句: 把控制台代码页设成 UTF-8, 否则之前的中文日志全成乱码 */
    em_console_init();
 
    QApplication app(argc, argv);
    app.setApplicationName(QStringLiteral("scan"));
    app.setApplicationDisplayName(QStringLiteral("滑台蛇形扫描采集"));
 
-   /* 不显式设字体的话, 中文在默认族里可能落不到有汉字的字体上 -> 方框 */
+   /* 不显式设字体族的话, 中文可能落到无汉字的字体上 -> 方框 */
    QFont f(QStringLiteral("Microsoft YaHei UI"), 9);
    f.setStyleStrategy(QFont::PreferAntialias);
    app.setFont(f);
@@ -66,15 +51,6 @@ int main(int argc, char **argv)
       QToolTip           { background:#20242b; color:#c8ced8; border:1px solid #3c434e; }
    )"));
 
-   /*
-    * **启动时不弹任何对话框, 动作前的确认框也一律没有。** 免责的话写在主窗口里常驻,
-    * 而"这一下点下去会发生什么"由三样东西在**按之前**说清: 按钮自己的文字与 tooltip
-    * (「使能」在已带电时就是灰的「已使能」)、参数栏里那些实时算出来的数、以及扫描栏
-    * 那两行 (网格 / 点数 / 预计全程)。每次都要点掉的确认框只会被条件反射地关掉。
-    *
-    * 剩下的模态只有三个, 全是**出事后必须让人看见**的: 自动中止、收尾未能确认失能
-    * (可能仍带电)、收尾超时。它们不是确认框, 没有"取消"可点。
-    */
    scan::ScanWindow w;
    w.resize(1360, 780);
    w.show();
