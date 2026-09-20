@@ -51,11 +51,12 @@ public:
     *   Ok      = 绿亮: 使能带电 / 原点开关压着    Bad = 红亮: 出事了 */
    enum class Lamp { Unknown, Off, Ok, Bad };
 
-   /* 一块"每根轴一行、每格一盏灯 + 一行字"的网格。两块: 轴信号 (2 列 使能/故障)、
-    * 限位开关 (3 列 原点/正限位/负限位)。ncol = 实际用到的列数, 也是 setColumnStretch 的列号 */
+   /* 一块"每根轴一行、每格一盏灯 + 一行字"的网格。两块, 但**排在同一张表上** (见
+    * buildAxisPanel): 轴信号 (2 列 使能/故障, 问 6041h) 与限位开关 (3 列 原点/正限位/
+    * 负限位, 问 60FDh) —— 列号是各自那组自己的 (AX_ 与 LIM_ 那几个枚举),
+    * 表上占哪几列由 buildAxisPanel 决定, 所以这里没有"列数"这个字段 */
    struct LampGrid
    {
-      int      ncol = 0;
       QLabel  *lamp[2][3] = {};      /* [轴][信号] */
       QLabel  *text[2][3] = {};
       Lamp     lampLast[2][3] = {};  /* 上一次画的是什么 */
@@ -77,10 +78,10 @@ private:
    QWidget *buildScanPanel();
    QWidget *buildMeterPanel();
    QWidget *buildShadePanel();
-   /* 两块: 「轴信号」(使能/故障 + 故障复位按钮) 与「限位开关」(原点/正限位/负限位) */
+   /* 「轴信号」: 一根轴一行, 一行五盏灯 (使能/故障/原点/正限位/负限位) + 最右边那格
+    * 「故障复位」。原先分「轴信号」「限位开关」两个框 (2026-09-20 合成一个) */
    QWidget *buildAxisPanel();
-   QWidget *buildLimitPanel();
-   /* 「回零」(驱动器自带的 HM 模式)。独立的第三个框, 不塞进扫描参数栏 */
+   /* 「原点模式」(驱动器自带的 HM 模式)。独立的一块, 不塞进扫描参数栏 */
    QWidget *buildHomePanel();
 
    /* ---- 操作 ---- */
@@ -284,11 +285,12 @@ private:
    QWidget   *m_devRowRange = nullptr;
    QWidget   *m_devRowMode  = nullptr;
 
-   /* ---- 参数栏的两块信号网格 (见 LampGrid) ---- */
+   /* ---- 「轴信号」那块表的两个网格 (见 LampGrid)。同一张表上左右排开, 前两格归
+    * m_axGrid, 后三格归 m_limGrid ---- */
    LampGrid m_axGrid;    /* 0=使能 1=故障 */
    LampGrid m_limGrid;   /* 0=原点 1=正限位 2=负限位 */
 
-   QPushButton *m_btnFaultRst = nullptr;   /* 「轴信号」第三行, 跨全部列 */
+   QPushButton *m_btnFaultRst = nullptr;   /* 「轴信号」那两行最右边一格, 跨两根轴 */
 
    /* ---- 「高级选项」那三个勾 (见 buildAdvPanel) ---- */
    QCheckBox   *m_cbWantDigIn = nullptr;   /* 让 60FDh 进 TxPDO (连接期参数), 默认开 */

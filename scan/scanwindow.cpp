@@ -747,9 +747,9 @@ void ScanWindow::buildUi()
    QVBoxLayout *sv = new QVBoxLayout(side);
    sv->setContentsMargins(0, 0, 0, 0);
    sv->setSpacing(8);
-   /* 「轴信号」和「限位开关」排在最上面: 它们是状态, 要滚才能看到的状态指示器不算指示器 */
+   /* 「轴信号」排在最上面 (2026-09-20 起它是"轴信号 + 限位开关"合成的那一块: 五个灯一行,
+    * 最右边那格是「故障复位」): 它是状态, 要滚才能看到的状态指示器不算指示器 */
    sv->addWidget(buildAxisPanel());
-   sv->addWidget(buildLimitPanel());
    /* 第三块:「回零」。它是动作不是参数, 但回零找的就是上面那三盏灯说的那几个开关 */
    sv->addWidget(buildHomePanel());
    /* 「高级选项」**必须**排在 buildParamPanel() 之前: loadSettings() 在它里面被调, 而
@@ -890,15 +890,25 @@ QWidget *ScanWindow::buildTopBar()
    return w;
 }
 
-/* 参数栏两块信号网格的列号。列号 = 本组信号数, 这个值同时要交给 setColumnStretch ——
+/* 两组信号的列号。列号 = 本组信号数, 两组相加就是那张表的列数 (SIGN_NCOL) ——
  * 单独写错一次就会凭空多出一个空列, 把前面几列挤成一个字宽。 */
 enum { AX_ENABLED = 0, AX_FAULT = 1, AX_NCOL = 2 };
 enum { LIM_HOME = 0, LIM_POS = 1, LIM_NEG = 2, LIM_NCOL = 3 };
 
-/* 两块网格共用的那一句 kLampRule 定义在本文件顶部 (状态栏那两盏也要用)。 */
+/* 那张表一共五列 = 上面两组信号相加。表头、tooltip、格子都照它建满 */
+enum { SIGN_NCOL = AX_NCOL + LIM_NCOL };
 
-/* 「轴信号」: 每根两个信号 (使能 / 故障), 第三行是跨全部列的「故障复位」按钮。
- * 判据同 kLampRule; 名字写在表头上, 不每格重复。 */
+/* 那一句 kLampRule 定义在本文件顶部 (状态栏那两盏也要用)。 */
+
+/* 「轴信号」: 每根一行, 一行里五盏灯 —— 使能 / 故障 (6041h bit2/bit3) 与 原点 / 正限位 /
+ * 负限位 (60FDh bit2/bit1/bit0), 最右边一格是「故障复位」。判据同 kLampRule; 名字写在表头上,
+ * 不每格重复。
+ *
+ * 原先「轴信号」与「限位开关」是两个框 (2026-09-20 合成一个): 分开时同一个侧栏里要滚才
+ * 看得全, 而它们说的都是"这一根现在什么状态"。**分组没有丢, 只是不再各占一个框**:
+ * 表头上前两个是 6041h 的两盏, 后三个是 60FDh 那三个开关; 每一格的 tooltip 里写着它问的是
+ * 哪一个字、哪一位。判据也仍然分开算 (见 refreshAxisSignals: 前两格与后三格的 known 不是
+ * 同一个条件), 这不是一次"数据合并"。 */
 QWidget *ScanWindow::buildAxisPanel()
 {
    QGroupBox *box = new QGroupBox(QStringLiteral("轴信号"), this);
@@ -907,68 +917,15 @@ QWidget *ScanWindow::buildAxisPanel()
    g->setHorizontalSpacing(12);
    g->setVerticalSpacing(5);
 
-   m_axGrid.ncol = AX_NCOL;
-
-   static const char *kHead[AX_NCOL] = { "使能", "故障" };
-   static const char *kTip[AX_NCOL] = {
+   /* 表头 与 tooltip 一列一个, 次序就是格子的次序: 使能/故障/原点/正限位/负限位 */
+   static const char *kHead[SIGN_NCOL] = { "使能", "故障", "原点", "正限位", "负限位" };
+   static const char *kTip[SIGN_NCOL] = {
       "6041h bit2 —— 电机带电。\n"
       "未使能时点画布不会动: 这是「这个轴现在能不能走」的答案。",
 
       "6041h bit3 —— 驱动器故障位。\n"
-      "**扫描中置起会自动中止**; 用下面的「故障复位」清掉它再启扫。"
-   };
+      "**扫描中置起会自动中止**; 用右边那格「故障复位」清掉它再启扫。",
 
-   for (int s = 0; s < AX_NCOL; s++)
-   {
-      QLabel *h = new QLabel(QString::fromUtf8(kHead[s]), box);
-      h->setStyleSheet(QStringLiteral("color:#6b7480;"));
-      g->addWidget(h, 0, s + 1);
-   }
-
-   for (int i = 0; i < 2; i++)
-   {
-      QLabel *nm = new QLabel(QStringLiteral("轴%1").arg(i == 0 ? 'X' : 'Y'), box);
-      nm->setStyleSheet(QStringLiteral("color:#9aa3ae;"));
-      g->addWidget(nm, i + 1, 0);
-
-      for (int s = 0; s < AX_NCOL; s++)
-      {
-         m_axGrid.lamp[i][s] = makeLamp(box, QString::fromUtf8(kTip[s])
-                                             + QString::fromUtf8(kLampRule));
-         m_axGrid.text[i][s] = new QLabel(box);
-         g->addWidget(lampUnit(box, m_axGrid.lamp[i][s], m_axGrid.text[i][s], 0),
-                      i + 1, s + 1);
-      }
-   }
-
-   /* 第三行: 「故障复位」跨满全部列。它不按故障灯决定可用性 —— 那盏灯是遥测推的, 永远
-    * 滞后于驱动器; 这里只拦界面自己才知道的两件事: 没连接、扫描在跑 (工作线程另有闸)。 */
-   m_btnFaultRst = new QPushButton(QStringLiteral("故障复位"), box);
-   m_btnFaultRst->setToolTip(QStringLiteral("清故障 (先写 6040h=0 卸力、再抬 bit7)。只对 6041h bit3 = 故障的轴做, 没故障时**一个字节都不写**。复位后停**未使能**; 每轴最多 1 秒且不可中断。"));
-   connect(m_btnFaultRst, &QPushButton::clicked, this, &ScanWindow::onFaultResetClicked);
-   g->addWidget(m_btnFaultRst, 3, 0, 1, AX_NCOL + 1);
-
-   /* 多出来的宽度全给本组最后一列 (不是写死 3), 让灯和字靠左排成一条; 写死会多出一个空列 */
-   g->setColumnStretch(AX_NCOL, 1);
-   return box;
-}
-
-/* 「限位开关」: 每根三个信号 (原点 / 正限位 / 负限位)。
- * 与「轴信号」分开两个框: 这一组问开关本身压着没有, 状态栏那盏问会不会中止扫描。
- * 三个灯纯显示, 不新增中止判据: 会中止的仍然只有 6041h bit11 (勾了上位机侧取反才换判据)。
- * 这是**纯状态显示**, 一个参数控件都没有 -> 不进编辑门控。 */
-QWidget *ScanWindow::buildLimitPanel()
-{
-   QGroupBox *box = new QGroupBox(QStringLiteral("限位开关"), this);
-   QGridLayout *g = new QGridLayout(box);
-   g->setContentsMargins(6, 4, 6, 6);
-   g->setHorizontalSpacing(12);
-   g->setVerticalSpacing(5);
-
-   m_limGrid.ncol = LIM_NCOL;
-
-   static const char *kHead[LIM_NCOL] = { "原点", "正限位", "负限位" };
-   static const char *kTip[LIM_NCOL] = {
       /* 原点灯是绿的, 所以要说出声来 */
       "60FDh bit2 —— 原点开关现在压着没有 (2310h X0 = 原点)。\n"
       "**绿亮 = 正压着, 这是位置信息不是故障** —— 回零时压到原点是正常动作,\n"
@@ -988,7 +945,7 @@ QWidget *ScanWindow::buildLimitPanel()
       "但勾了「高级选项」里的「上位机侧取反」之后改以反相后的开关为准。"
    };
 
-   for (int s = 0; s < LIM_NCOL; s++)
+   for (int s = 0; s < SIGN_NCOL; s++)
    {
       QLabel *h = new QLabel(QString::fromUtf8(kHead[s]), box);
       h->setStyleSheet(QStringLiteral("color:#6b7480;"));
@@ -1001,21 +958,30 @@ QWidget *ScanWindow::buildLimitPanel()
       nm->setStyleSheet(QStringLiteral("color:#9aa3ae;"));
       g->addWidget(nm, i + 1, 0);
 
-      for (int s = 0; s < LIM_NCOL; s++)
+      for (int s = 0; s < SIGN_NCOL; s++)
       {
-         m_limGrid.lamp[i][s] = makeLamp(box, QString::fromUtf8(kTip[s])
-                                              + QString::fromUtf8(kLampRule));
-         m_limGrid.text[i][s] = new QLabel(box);
-         g->addWidget(lampUnit(box, m_limGrid.lamp[i][s], m_limGrid.text[i][s], 0),
-                      i + 1, s + 1);
+         /* 前两格归 m_axGrid, 后三格归 m_limGrid —— 两块网格仍在, 只是排在同一张表上。
+          * refreshAxisSignals 照旧分两次填, 各用各的 known */
+         LampGrid &gr = (s < AX_NCOL) ? m_axGrid : m_limGrid;
+         const int c  = (s < AX_NCOL) ? s : (s - AX_NCOL);
+
+         gr.lamp[i][c] = makeLamp(box, QString::fromUtf8(kTip[s])
+                                       + QString::fromUtf8(kLampRule));
+         gr.text[i][c] = new QLabel(box);
+         g->addWidget(lampUnit(box, gr.lamp[i][c], gr.text[i][c], 0), i + 1, s + 1);
       }
    }
 
-   /* 那两个勾搬去了「高级选项」框 (见 buildAdvPanel): 它们是驱动器侧的设置, 不属于
-    * "开关现在压着没有"这一组状态显示 */
+   /* 「故障复位」在两行最右边那一格, 跨两根轴。它**不按故障灯决定可用性** —— 那盏灯是遥测
+    * 推的, 永远滞后于驱动器; 这里只拦界面自己才知道的两件事: 没连接、扫描在跑 (工作线程另
+    * 有闸)。它也不是"一根轴一个": 命令是全总线的, 只对 6041h bit3 置起的那几根动手 */
+   m_btnFaultRst = new QPushButton(QStringLiteral("故障复位"), box);
+   m_btnFaultRst->setToolTip(QStringLiteral("清故障 (先写 6040h=0 卸力、再抬 bit7)。**只对 6041h bit3 = 故障的轴做**, 没故障时**一个字节都不写**。复位后停**未使能**; 每轴最多 1 秒且不可中断。"));
+   connect(m_btnFaultRst, &QPushButton::clicked, this, &ScanWindow::onFaultResetClicked);
+   g->addWidget(m_btnFaultRst, 1, SIGN_NCOL + 1, 2, 1);
 
-   /* 最后一列 = 本组信号数。理由同上一块 */
-   g->setColumnStretch(LIM_NCOL, 1);
+   /* 多出来的宽度全给最后一列 (复位按钮那一格): 灯和字靠左排成一条。写死会多出一个空列 */
+   g->setColumnStretch(SIGN_NCOL + 1, 1);
    return box;
 }
 
@@ -1115,7 +1081,7 @@ QWidget *ScanWindow::buildHomePanel()
            /* 只有「速度」是参数; 八个按钮是动作, 不进表 (它们不归编辑态管, 归连接态管) */
            QList<GateItem>{ GateItem{ m_edHomeVel, false, false } });
 
-   /* 一行一根轴: 行首一个轴名 (同「轴信号」「限位开关」两块的行标签), 右边四个按钮。
+   /* 一行一根轴: 行首一个轴名 (同上面「轴信号」那块表的行标签), 右边四个按钮。
     * 轴名放在行首而不是按钮文字里 —— 四个按钮挤在一行, 每个再带个 "X " 就排不下了,
     * 而"这行是哪根轴"正是错点一下的代价最大的那件事。
     * 四个按钮的文字是唯一的事前标识, 所以 tooltip 里把那句话留着: 会带电移动 / 先失能 /
