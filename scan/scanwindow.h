@@ -171,11 +171,6 @@ private:
    void saveSettings();
 
    void pushManualSpeed(const BusTelem &t, bool running);
-   /* 回零框里那行数 (照现在这个速度能找多远)。随「回零速度」实时变 */
-   void pushHomeNote();
-   /* 回零框里另一行: 两根轴的实际运行模式 6061h (手册 §3.7 把"读回 6"当 HM 的前提)。
-    * 只在工作线程真读过之后才有值 —— 没读过与读到 0 是两句不同的话 */
-   void pushHomeMode(const BusTelem &t);
    void refreshAxisSignals(const BusTelem &t);   /* 限位/使能/故障: 状态栏 + 参数栏, 一份遥测 */
    void setSignalCell(LampGrid &g, int i, int s, bool known, bool on, Lamp lit,
                       const QString &litTxt, const QString &offTxt);
@@ -236,17 +231,13 @@ private:
    QLabel *m_lEst  = nullptr;
    QLabel *m_lWarn = nullptr;      /* 参数不合法 / 超量程 的那行红字 */
 
-   /* ---- 回零 ---- */
-   /* 6099h:01 找原点速度。上限 = 与工作线程夹取共用的宏 HMI_HOME_VEL_MAX (2000); 不进 scan.ini */
+   /* ---- 原点模式 ---- */
+   /* 6099h:01 找原点速度 (八个按钮共用)。上下限 = 与工作线程夹取共用的那一对宏; 正文在 tooltip */
    QSpinBox    *m_edHomeVel = nullptr;
-   QPushButton *m_btnHome[2][2] = {};   /* [轴][方向] 0 = 正向, 1 = 反向 (方式 24/29, 找原点开关) */
-   QPushButton *m_btnLim[2][2] = {};    /* [轴][侧] 0 = 正限位, 1 = 负限位 (方式 18/17, 找限位) */
-   /* 回零框里那行说明: 照现在这个速度, 一次回零最多走多远 / 多久判超时。随速度实时变 */
-   QLabel      *m_lHomeNote = nullptr;
-   QString      m_homeNoteLast;
-   /* 6061h 那一行。只在工作线程读到新值、且文字真变了才 setText */
-   QLabel      *m_lHomeMode = nullptr;
-   QString      m_homeModeLast;
+   /* 「原点模式」框里就是这两组按钮, 一行一根轴: [轴][0/1] 找原点开关 (方式 24/29),
+    * 左边两个按钮; 右边两个找限位开关 (方式 18/17)。文字见 kHomeBtnText */
+   QPushButton *m_btnHome[2][2] = {};   /* [轴][方向] 0 = 正向回零, 1 = 反向回零 */
+   QPushButton *m_btnLim[2][2] = {};    /* [轴][侧] 0 = 找正限位, 1 = 找负限位 */
    /* 我们发出去的那条"正在回零"横幅的原文, 下降沿靠它认现在挂着的是不是我们自己那条 */
    QString      m_homeBanner;
 

@@ -1071,12 +1071,23 @@ QWidget *ScanWindow::buildAdvPanel()
    return box;
 }
 
-/* 「回零」—— 驱动器自带的正/反向找原点 (6060h = 6)。单开一个框: 它是动作不是参数,
+/* 八个回零按钮的文字。下标: 0/1 = 找原点开关那两列 (正向 / 反向回零),
+ * 2/3 = 找限位开关那两列 (找正限位 / 找负限位)。**建面板与 refresh 都读这一份**: 两处
+ * 各写一遍就会出现"按下去了按钮还写着另一个动作"。轴名不在里面 —— 它写在行首那个标签上,
+ * 写进按钮文字里这一行就宽得放不下四个。 */
+static const char *kHomeBtnText[4] = { "正向回零", "反向回零", "找正限位", "找负限位" };
+
+/* 「原点模式」—— 驱动器自带的正/反向找原点 (6060h = 6)。单开一个框: 它是动作不是参数,
  * 且是本程序里唯一"按下之后滑台会带电自己走"的按钮。回零会先失能再走 (6098h 只能在未
- * 使能时写), 竖直轴在这期间失去保持力矩, 所以"只回我这一根"必须点得出来。 */
+ * 使能时写), 竖直轴在这期间失去保持力矩, 所以"只回我这一根"必须点得出来。
+ *
+ * 版面 = 一个速度值 + 两行按钮。**一行一根轴, 四个按钮**: 第 0/1 列找原点开关 X0 (方式
+ * 24/29), 第 2/3 列找限位开关 (方式 18/17)。八个按钮**共用上面那个速度值** —— 6099h:01/:02
+ * 与 609Ah 是同一对参数, 两个速度框会出现"哪个在生效"这种看不出来的组合。
+ * 出处只有两处, 都在 tooltip 与顶部那条横幅里 (事前 / 事中), 框里不再写说明文字。 */
 QWidget *ScanWindow::buildHomePanel()
 {
-   QGroupBox *box = new QGroupBox(QStringLiteral("回零 (驱动器自己找原点)"), this);
+   QGroupBox *box = new QGroupBox(QStringLiteral("原点模式"), this);
    QGridLayout *g = new QGridLayout(box);
    g->setContentsMargins(6, 4, 6, 6);
    g->setHorizontalSpacing(8);
@@ -1090,85 +1101,72 @@ QWidget *ScanWindow::buildHomePanel()
     * 显示的就成了 100 而不是 HMI_HOME_VEL_DEF。
     * 放这里而不是 applyDefaults(): 后者会被「恢复默认」再跑一遍, 那是给扫描几何用的 */
    m_edHomeVel->setValue(HMI_HOME_VEL_DEF);
-   m_edHomeVel->setToolTip(QStringLiteral("找原点速度 6099h:01 (返回速度是它的 1/4, 加减速由它派生)。**它同时是「能找多远」的上限**: 速度 × 30 秒。第一次在陌生的机器上试方向, 压到下限 100。"));
+   /* 「够不着开关请先把滑台挪近, 不要为了够得着去调高速度」原本写在框里那行小字上, 那行
+    * 删了之后搬到这里 —— 它是这个值唯一的一句事后提醒 */
+   m_edHomeVel->setToolTip(QStringLiteral("八个按钮共用的找原点速度 6099h:01 (返回速度是它的 1/4, 加减速由它派生)。**它同时是「能找多远」的上限**: 速度 × 30 秒。够不着开关请先把滑台挪近, **不要**为了够得着去调高速度。第一次在陌生的机器上试方向, 压到下限 100。"));
 
-   g->addWidget(new QLabel(QStringLiteral("回零速度"), box), 0, 0);
-   g->addWidget(m_edHomeVel, 0, 1, 1, 2);
+   g->addWidget(new QLabel(QStringLiteral("速度"), box), 0, 0);
+   g->addWidget(m_edHomeVel, 0, 1, 1, 4);
 
-   /* 门控行 [编辑][保存][取消]。QGridLayout 没有 insertRow, 追加到末行 (第 8 行, 上面占到 7) */
-   g->addWidget(gateBar(GI_HOME, box), 8, 0, 1, 3);
+   /* 门控行 [编辑][保存][取消]。QGridLayout 没有 insertRow, 追加到末行 (第 3 行:
+    * 速度 0 / 轴X 1 / 轴Y 2) */
+   g->addWidget(gateBar(GI_HOME, box), 3, 0, 1, 5);
    addGate(GI_HOME, box,
-           /* 只有「回零速度」是参数; 八个回零按钮是动作, 不进表 (它们不归编辑态管, 归连接态管) */
+           /* 只有「速度」是参数; 八个按钮是动作, 不进表 (它们不归编辑态管, 归连接态管) */
            QList<GateItem>{ GateItem{ m_edHomeVel, false, false } });
 
-   /* 按钮文字自带轴与方向 ("X 正向回零"), 不做"表头 + 四个短标签": 布局一挤短标签会归错列,
-    * 而错点它的代价是滑台朝反方向去找开关。下面那段 tooltip 是唯一的"事前"防线 */
+   /* 一行一根轴: 行首一个轴名 (同「轴信号」「限位开关」两块的行标签), 右边四个按钮。
+    * 轴名放在行首而不是按钮文字里 —— 四个按钮挤在一行, 每个再带个 "X " 就排不下了,
+    * 而"这行是哪根轴"正是错点一下的代价最大的那件事。
+    * 四个按钮的文字是唯一的事前标识, 所以 tooltip 里把那句话留着: 会带电移动 / 先失能 /
+    * 方向对不对只有试一次才知道 */
    for (int i = 0; i < 2; i++)
+   {
+      QLabel *nm = new QLabel(QStringLiteral("轴%1").arg(i == 0 ? 'X' : 'Y'), box);
+      nm->setStyleSheet(QStringLiteral("color:#9aa3ae;"));
+      g->addWidget(nm, i + 1, 0);
+
       for (int d = 0; d < 2; d++)
       {
-         const bool neg  = (d == 1);
-         const int  meth = ecatcmd::home_method_for(neg);
+         const bool neg = (d == 1);
 
-         m_btnHome[i][d] = new QPushButton(
-            QStringLiteral("%1 %2回零")
-               .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"),
-                    QString::fromUtf8(ecatcmd::home_dir_text(neg))), box);
-         m_btnHome[i][d]->setObjectName(QStringLiteral("danger"));
-         m_btnHome[i][d]->setToolTip(QStringLiteral("6098h = %1 —— 原点开关 (X0) 为原点, 先朝**%2**高速找。驱动器自己带电移动, **软件拦不住它撞开关**, 只有「停止」能立即中止。该轴会**先失能** (竖直轴失去保持力矩)。方向对不对只有试一次才知道。").arg(meth).arg(QString::fromUtf8(ecatcmd::home_dir_text(neg))));
+         /* ---- 找原点开关 X0 (方式 24 / 29) ---- */
+         {
+            const int meth = ecatcmd::home_method_for(neg);
 
-         connect(m_btnHome[i][d], &QPushButton::clicked, this,
-                  [this, i, d] { onHomeClicked(i, d, false); });
+            m_btnHome[i][d] = new QPushButton(
+               QString::fromUtf8(kHomeBtnText[d]), box);
+            m_btnHome[i][d]->setObjectName(QStringLiteral("danger"));
+            m_btnHome[i][d]->setToolTip(QStringLiteral("轴%1: 6098h = %2 —— 原点开关 (X0) 为原点, 先朝**%3**高速找。驱动器自己带电移动, **软件拦不住它撞开关**, 只有「停止」能立即中止。该轴会**先失能** (竖直轴失去保持力矩)。方向对不对只有试一次才知道。").arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y")).arg(meth).arg(QString::fromUtf8(ecatcmd::home_dir_text(neg))));
 
-         g->addWidget(m_btnHome[i][d], 1 + i, d);
+            connect(m_btnHome[i][d], &QPushButton::clicked, this,
+                     [this, i, d] { onHomeClicked(i, d, false); });
+
+            g->addWidget(m_btnHome[i][d], i + 1, 1 + d);
+         }
+
+         /* ---- 找限位开关 (方式 18 / 17, 手册叫"以限位开关为原点") ----
+          * 与上面那两列**共用同一个速度**: 6099h:01/:02 是同一对参数。 */
+         {
+            const int meth = ecatcmd::home_lim_method_for(neg);
+
+            m_btnLim[i][d] = new QPushButton(
+               QString::fromUtf8(kHomeBtnText[2 + d]), box);
+            m_btnLim[i][d]->setObjectName(QStringLiteral("danger"));
+            m_btnLim[i][d]->setToolTip(QStringLiteral("轴%1: 6098h = %2 —— %3开关为原点。驱动器按发起那一刻那个开关压着没有选分支:\n  a) 没压着: 先**%4高速**去找它, 碰到后减速停止, 再反向低速退开\n  b) 已经压着: 直接**%5低速**退开 (首段方向与 a) 相反 —— 不是点错了)\n两条都停在**开关的释放点**; 控制台会先打出这一趟走哪条。\n\n**碰到限位是这一趟的目的, 不是故障**。找完之后显示坐标的 0 就在那个释放点上, 那一侧几乎没有行程 —— 先按实测行程重算扫描区域。\n\n该轴会**先失能** (竖直轴失去保持力矩)。").arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y")).arg(meth).arg(QString::fromUtf8(ecatcmd::home_method_short(meth))).arg(QString::fromUtf8(ecatcmd::home_method_first_dir(meth, false))).arg(QString::fromUtf8(ecatcmd::home_method_first_dir(meth, true))));
+
+            connect(m_btnLim[i][d], &QPushButton::clicked, this,
+                     [this, i, d] { onHomeClicked(i, d, true); });
+
+            g->addWidget(m_btnLim[i][d], i + 1, 3 + d);
+         }
       }
-
-   /* ---- 「以限位开关为原点」(方式 18 / 17, 手册叫"找限位") ----
-    * 与上面那两行**共用同一个回零速度**: 6099h:01/:02 是同一对参数, 手册 a)/b) 两条分支的
-    * "高速/低速"就是它派生的那两个。所以这里不再放第二个速度框 —— 两个速度框会出现
-    * "哪个在生效"这种看不出来的组合。 */
-   {
-      QLabel *cap = new QLabel(
-         QStringLiteral("── 以限位开关为原点 (共用上面那个回零速度) ──"), box);
-      cap->setStyleSheet(QStringLiteral("color:#6b7480;"));
-      cap->setToolTip(QStringLiteral("以限位开关为原点: 方式 18 = 正限位 / 17 = 负限位 (手册 p46~p48)。驱动器按发起那一刻那个开关压着没有选分支 —— a) 没压着: 先高速去找它, 碰到再退开; b) 已压着: 直接反向低速退开 (首段方向与 a) 相反)。落点都是**开关的释放点**, 那一侧几乎没有行程, 跑完请重算区域。"));
-      g->addWidget(cap, 3, 0, 1, 3);
    }
 
-   for (int i = 0; i < 2; i++)
-      for (int d = 0; d < 2; d++)
-      {
-         const bool neg  = (d == 1);
-         const int  meth = ecatcmd::home_lim_method_for(neg);
+   /* 四列按钮等分本行宽度 (行首那列只放轴名, 不参与拉伸) */
+   for (int c = 1; c <= 4; c++)
+      g->setColumnStretch(c, 1);
 
-         m_btnLim[i][d] = new QPushButton(
-            QStringLiteral("%1 %2")
-               .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"),
-                    QString::fromUtf8(ecatcmd::home_method_short(meth))), box);
-         m_btnLim[i][d]->setObjectName(QStringLiteral("danger"));
-         m_btnLim[i][d]->setToolTip(QStringLiteral("6098h = %1 —— %2开关为原点。驱动器按发起那一刻那个开关压着没有选分支:\n  a) 没压着: 先**%3高速**去找它, 碰到后减速停止, 再反向低速退开\n  b) 已经压着: 直接**%4低速**退开 (首段方向与 a) 相反 —— 不是点错了)\n两条都停在**开关的释放点**; 控制台会先打出这一趟走哪条。\n\n**碰到限位是这一趟的目的, 不是故障**。找完之后显示坐标的 0 就在那个释放点上, 那一侧几乎没有行程 —— 先按实测行程重算扫描区域。\n\n该轴会**先失能** (竖直轴失去保持力矩)。").arg(meth).arg(QString::fromUtf8(ecatcmd::home_method_short(meth))).arg(QString::fromUtf8(ecatcmd::home_method_first_dir(meth, false))).arg(QString::fromUtf8(ecatcmd::home_method_first_dir(meth, true))));
-
-         connect(m_btnLim[i][d], &QPushButton::clicked, this,
-                  [this, i, d] { onHomeClicked(i, d, true); });
-
-         g->addWidget(m_btnLim[i][d], 4 + i, d);
-      }
-
-   /* 这一行随「回零速度」实时变 (见 refresh): "这一趟能找多远"唯一看得见的地方。
-    * 碰不到开关时该先把滑台挪近, 不要为了够得着去调高速度 */
-   m_lHomeNote = new QLabel(box);
-   m_lHomeNote->setWordWrap(true);
-   m_lHomeNote->setStyleSheet(QStringLiteral("color:#6b7480;"));
-   g->addWidget(m_lHomeNote, 6, 0, 1, 2);
-
-   /* 6061h 那一行 (见 pushHomeMode)。与上面那行更新时机不同: 它只在工作线程真读过之后
-    * 才变 (连接 / 使能 / 回零收尾各读一次) —— 它是"驱动器当时认的模式", 不是现在的猜测 */
-   m_lHomeMode = new QLabel(box);
-   m_lHomeMode->setWordWrap(true);
-   m_lHomeMode->setStyleSheet(QStringLiteral("color:#6b7480;"));
-   m_lHomeMode->setToolTip(QStringLiteral("6061h = 驱动器自报的**实际**模式 (回零要求它是 6)。它不在过程数据里, 只在连接 / 使能 / 回零收尾各读一次 —— 显示的是**上一次读到**的值。"));
-   g->addWidget(m_lHomeMode, 7, 0, 1, 2);
-
-   g->setColumnStretch(1, 1);
    return box;
 }
 
@@ -1940,10 +1938,10 @@ void ScanWindow::onStopClicked()
    m_thr->postStop();
 }
 
-/* 「X/Y 正/反向回零」与「X/Y 找正/负限位」—— 全程序最危险的八个按钮: 按下之后滑台自己
+/* 「正向/反向回零」与「找正/负限位」—— 全程序最危险的八个按钮: 按下之后滑台自己
  * 带电朝开关走, 朝哪走、什么时候停、撞不撞开关全由驱动器按 6098h 决定, 软件拦不住它撞开关。
- * 不弹确认框, 事前的话分两处常驻: 按钮 tooltip (轴 / 方向 / 方式号 / 该轴会先失能) 与
- * 回零框里随速度实时变的那行 (见 pushHomeNote)。限位判据已成立由 refresh 挂红横幅说。
+ * 不弹确认框, 事前的话常驻在按钮 tooltip 里 (轴 / 方向 / 方式号 / 该轴会先失能)。
+ * 限位判据已成立由 refresh 挂红横幅说, 回零中按「停止」= 立即中止由顶部横幅说。
  *
  * 找限位 (17/18) 与找原点共用这一条路, 差别只有方式号与文案 —— 两道否决 (60FDh 读不到 /
  * 两侧同时有效) 与"这一趟走 a 还是 b"的预告都在工作线程里做, 因为判据要读驱动器自己那两位。 */
@@ -2386,81 +2384,10 @@ void ScanWindow::pushManualSpeed(const BusTelem &t, bool running)
          m_thr->setSpeed(i, v);
 }
 
-/* 回零框里那行说明: 照现在这个速度, 一次回零最多走多远、多久判超时。随速度实时变。
- * 三个数必须问工作线程那几个函数 (home_vel_slow / home_accel_for / 那个超时宏), 不能在这里
- * 另写一遍斜坡与超时的算法。一圈多少脉冲取「分辨率」框 (默认 50000, 为 0 时退回它以免出 inf)。
- * 只在文字真变了才 setText (30Hz 调的)。 */
-void ScanWindow::pushHomeNote()
-{
-   /* refresh() 可能在 buildUi 还没走完时就被叫到 (构造里那几个 connect 里就有会转调
-    * refresh 的)。回零框和「分辨率」框不是同一块建的, 所以这里认一遍指针 */
-   if (m_lHomeNote == nullptr || m_edHomeVel == nullptr || m_edPpu == nullptr)
-      return;
-
-   const uint32_t vel   = ecatcmd::home_vel_clamp(m_edHomeVel->value());
-   const uint32_t slow  = ecatcmd::home_vel_slow(vel);
-   const uint32_t acc   = ecatcmd::home_accel_for(vel);
-   const double   ppu   = (m_edPpu->value() > 0.0) ? m_edPpu->value() : 50000.0;
-   const double   reach = (double)vel * (HMI_HOME_TMO_MS / 1000.0) / ppu;
-
-   const QString s = QStringLiteral(
-      "回零与找限位 = 让驱动器自己带电朝开关走, **软件拦不住它撞开关**; 该轴会先失能 "
-      "(竖直轴此时失去保持力矩, 可能下滑)。\n"
-      "本速度: 找段 %1 / 返回段 %2 pul/s (6099h), 加减速 %3 (609Ah), "
-      "一次最多走 **%4 圈**, %5 秒后判超时 —— 够不着开关请先把滑台挪近, "
-      "**不要**为了够得着去调高速度。\n"
-      "两排按钮共用这个速度 (它们写的是同一对参数 6099h:01/:02 与 609Ah): "
-      "上面那排找**原点开关** X0, 下面那排找**限位开关**。")
-      .arg(vel).arg(slow).arg(acc)
-      .arg(QString::number(reach, 'f', 1))
-      .arg(HMI_HOME_TMO_MS / 1000);
-
-   if (m_homeNoteLast == s)
-      return;
-
-   m_homeNoteLast = s;
-   m_lHomeNote->setText(s);
-}
-
-/* 6061h 那一行, 两根轴各一格 (面板是整机的, "哪根轴认的模式不对"必须看得出来)。
- * 三种"没有值"要分开说: 还没连接 / 连上了但工作线程还没读过 (HMI_MODE_DISP_UNREAD) /
- * 读过但读失败 (-1) —— 措辞取自 mode_text, 不写 "?" 也不写 "0"。只在文字真变了才 setText。 */
-void ScanWindow::pushHomeMode(const BusTelem &t)
-{
-   if (m_lHomeMode == nullptr)
-      return;
-
-   QString cells[2];
-   for (int i = 0; i < 2; i++)
-   {
-      const char *nm = (i == 0) ? "X" : "Y";
-
-      if (!t.connected || i >= t.naxis)
-      {
-         cells[i] = QStringLiteral("%1 = — (未连接)").arg(QString::fromUtf8(nm));
-         continue;
-      }
-
-      const int m = t.ax[i].mode_disp;
-
-      if (m == HMI_MODE_DISP_UNREAD)
-         cells[i] = QStringLiteral("%1 = — (还没读过)").arg(QString::fromUtf8(nm));
-      else
-         cells[i] = QStringLiteral("%1 = %2 (%3)")
-                       .arg(QString::fromUtf8(nm)).arg(m)
-                       .arg(QString::fromUtf8(ecatcmd::mode_text(m)));
-   }
-
-   const QString s = QStringLiteral("驱动器实际模式 (6061h): %1 / %2 —— 回零要求它 = 6 (HM), "
-                                    "回零收尾后应当是 8 (CSP)。")
-                        .arg(cells[0], cells[1]);
-
-   if (m_homeModeLast == s)
-      return;
-
-   m_homeModeLast = s;
-   m_lHomeMode->setText(s);
-}
+/* 6061h 那条不再进界面 (2026-09-20 起「原点模式」框里只有速度与八个按钮): 它现在只在
+ * 回零收尾那条控制台结论句里打 (见 EcatThread::doHome 的 note)。**遥测字段与工作线程
+ * 那次读留着** —— 那条结论句就是它的消费者, 且它说的是"驱动器此刻按哪种模式解释 607Ah",
+ * 是回零出问题时唯一能回看的证据。 */
 
 /* 一根轴的五盏灯 + 状态栏那对。参数栏与状态栏都从这里出 (分开算就会两边说的不一样)。
  * 撞限位的判定只有一处定义: ecatcmd::limit_hit, 在 EcatThread::publish() 里算好,
@@ -2724,35 +2651,26 @@ void ScanWindow::refresh()
       const bool    ok   = can_home && t.ax[i].valid && t.ax[i].mirror_ok && !t.ax[i].fault;
       const bool    mine = t.homing && (t.homing_axis == i);
       const bool    mine_lim = mine && ecatcmd::home_method_is_limit(t.homing_method);
-      const QString nm   = (i == 0) ? QStringLiteral("X") : QStringLiteral("Y");
 
       for (int d = 0; d < 2; d++)
       {
          m_btnHome[i][d]->setEnabled(ok);
          m_btnLim[i][d]->setEnabled(ok);
 
-         /* 回零中只改正在动的那一根的名字, 否则回 X 时 Y 的按钮也写着"回零中…"。
-          * 而且**两排各自认自己那一趟**: 找限位时上面那排不改字 (那一趟不是找原点),
-          * 找原点时下面那排不改字 —— 说反了人会以为"找完还要再找一次"。 */
-         m_btnHome[i][d]->setText(
-            (mine && !mine_lim) ? QStringLiteral("%1 回零中…").arg(nm)
-                                : QStringLiteral("%1 %2回零")
-                                     .arg(nm, QString::fromUtf8(
-                                                 ecatcmd::home_dir_text(d == 1))));
-         m_btnLim[i][d]->setText(
-            mine_lim ? QStringLiteral("%1 找限位中…").arg(nm)
-                     : QStringLiteral("%1 %2")
-                          .arg(nm, QString::fromUtf8(ecatcmd::home_method_short(
-                                      ecatcmd::home_lim_method_for(d == 1)))));
+         /* 回零中只改正在动的那一根的按钮, 否则回 X 时 Y 那两个也写着"回零中…"。
+          * 而且**两排各自认自己那一趟**: 找限位时左边两列不改字 (那一趟不是找原点),
+          * 找原点时右边两列不改字 —— 说反了人会以为"找完还要再找一次"。
+          * 文字里不再带轴名 (行首那个标签已经说了), 按下后变短也不会把列宽撑开。 */
+         m_btnHome[i][d]->setText((mine && !mine_lim)
+                                     ? QStringLiteral("回零中…")
+                                     : QString::fromUtf8(kHomeBtnText[d]));
+         m_btnLim[i][d]->setText(mine_lim ? QStringLiteral("找限位中…")
+                                          : QString::fromUtf8(kHomeBtnText[2 + d]));
       }
    }
 
-   /* 「回零速度」不进上面那张 locked 表, 扫描期间也可改 (它是个值不是动作)。
-    * 但它是回零框里那行数的来源, 所以下面顺手把那行字刷出来。 */
-   pushHomeNote();
-
-   /* 6061h 那一行同一处刷 —— 它读的是同一份电文, 分开刷就会有一天两行说的不是同一时刻 */
-   pushHomeMode(t);
+   /* 「回零速度」不进上面那张 locked 表, 扫描期间也可改 (它是个值不是动作)。框里那两行
+    * 小字 (能找多远 / 6061h) 随它一起删了, 现在这个框里没有按速度重算的文字。 */
 
    /* 回零横幅: 上升沿起一条, 下降沿只清我们自己写的那条 (原文比对, 同 m_limBanner) */
    if (t.homing)
