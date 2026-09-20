@@ -11,7 +11,7 @@
  * 三种角色各管各的, 不要混:
  *   EcatThread      —— 总线与运动 (2ms 插补), 唯一碰 em_bus_t 的线程
  *   ScanController  —— 扫描时序 (到点 → 停留 → 采样 → 落盘), 活在 GUI 线程, 只经 BusView 说话
- *   ScanWindow      —— 界面与安全护栏 (确认弹窗 / 收尾 / 断连时的自动中止)
+ *   ScanWindow      —— 界面与安全护栏 (按钮形态 / 收尾 / 断连时的自动中止)
  *
  * 时钟是**单调钟** (QElapsedTimer): 状态机所有的时间判断都用它。墙上时间会被 NTP 和对时
  * 往回拨, 那样"停留了 200ms"可能永远不成立 —— 扫描会卡在那一点上不动。
@@ -103,9 +103,12 @@ private:
    QWidget *buildHomePanel();
 
    /* ---- 操作 ---- */
+   /* 「连接」。**不弹确认框**, 它写什么由按钮 tooltip 一直说着, 见 .cpp 里那个函数的注释 */
    void onConnectClicked();
+   /* 「使能」。**不弹确认框** —— "现在带不带电"由这颗按钮自己的文字与灰/亮来说
+    * (已使能时是灰的「已使能」, 见 refresh)。见 .cpp 里那个函数的注释 */
    void onEnableClicked();
-   /* 清驱动器的故障位。**每次点击都弹模态确认**, 见 .cpp 里那个函数的注释 */
+   /* 清驱动器的故障位。**不弹确认框**, 但"它以为哪根轴报了故障"会用横幅说出来 */
    void onFaultResetClicked();
    /* 「让 60FDh 进 TxPDO」。转发给工作线程之外, **已经连上了还要说明白它下次才生效** ——
     * 这一条只能说出来, 界面上看不出来, 见 .cpp 里那个函数的注释 */
@@ -136,8 +139,9 @@ private:
    void onReadOnceFailed(const QString &err);
 
    /* 「X/Y 正/反向回零」。dir: 0 = 正向 (6098h = 24), 1 = 反向 (29)。
-    * **每次点击都弹模态** —— 这个动作会让滑台带电自己朝开关走, 见 .cpp 里那段。
-    * 它同时 +1 零点世代: 回零会把物理位置整个搬走, 与「设为区域中心」同一个理由。 */
+    * **不弹确认框** —— 这个动作会让滑台带电自己朝开关走, 事前的说明在按钮 tooltip 上,
+    * 当次的数在回零框那行字里, 出事后的出路是「停止」(回零中按它 = 立即中止)。
+    * 见 .cpp 里那段。它同时 +1 零点世代: 回零会把物理位置整个搬走, 同「设为区域中心」。 */
    void onHomeClicked(int axis, int dir);
    /* 「停止」。回零期间它必须变成**立即中止** —— 见 .cpp 里那段 (队列救不了回零) */
    void onStopClicked();
@@ -151,6 +155,8 @@ private:
    void loadSettings();
    void saveSettings();
    void pushManualSpeed(const BusTelem &t, bool running);
+   /* 回零框里那行数 (照现在这个速度能找多远)。随「回零速度」实时变, 见 .cpp 里那段 */
+   void pushHomeNote();
    void refreshAxisSignals(const BusTelem &t);   /* 限位/使能/故障: 状态栏 + 参数栏, 一份遥测 */
    void setSignalCell(LampGrid &g, int i, int s, bool known, bool on, Lamp lit,
                       const QString &litTxt, const QString &offTxt);
@@ -217,9 +223,13 @@ private:
    /* ---- 回零 ---- */
    /* 6099h:01 找原点速度。上限夹在 HMI_HOME_VEL_MAX (2000) —— 与工作线程那道夹取
     * **同一个宏**, 所以界面上显示的数就是线上发的数。
-    * **不进 scan.ini**: 它是运动参数, 而每次点击的模态都会把当次数值念一遍 */
+    * **不进 scan.ini**: 它是运动参数, 每按一次回零就当场念一遍的东西不该被继承下来 */
    QSpinBox    *m_edHomeVel = nullptr;
    QPushButton *m_btnHome[2][2] = {};   /* [轴][方向] 0 = 正向, 1 = 反向 */
+   /* 回零框里那行说明。**随速度实时变** —— 念的是"照现在这个速度, 一次回零最多走
+    * 多远 / 多久判超时" (见 refresh), 因为从前念这些数的那个模态没有了 */
+   QLabel      *m_lHomeNote = nullptr;
+   QString      m_homeNoteLast;
    /* 我们发出去的那条"正在回零"横幅的原文。下降沿靠它认"现在挂着的是不是我们自己
     * 那条" —— 同 m_limBanner 那套 */
    QString      m_homeBanner;

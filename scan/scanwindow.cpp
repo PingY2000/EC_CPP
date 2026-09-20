@@ -875,7 +875,8 @@ QWidget *ScanWindow::buildHomePanel()
       "缺省 50000 时是 30 圈 (够走完缺省区域的一头到另一头); 调低会跟着缩小 ——\n"
       "2000 pul/s 只有 1.2 圈, 那时碰不到开关该做的是**先把滑台手动挪到开关附近**。\n"
       "第一次在陌生的机器上试方向, 把它压到下限 100。\n\n"
-      "它不会被记住 —— 每次回零的确认弹窗都会把当次数值念一遍。"));
+      "它不会被记住 —— 每改一次, 回零框里那行字就会把当次的数 (返回速度 / 加减速 /\n"
+      "最多走多远 / 多久判超时) 跟着改一遍, 那是「这一趟」的事, 不该从 ini 里继承。"));
 
    g->addWidget(new QLabel(QStringLiteral("回零速度"), box), 0, 0);
    g->addWidget(m_edHomeVel, 0, 1, 1, 2);
@@ -883,7 +884,8 @@ QWidget *ScanWindow::buildHomePanel()
    /*
     * 按钮文字自带轴与方向 ("X 正向回零"), 不做"一个表头 + 四个短标签"——
     * 布局一挤, 短标签就归错了列, 而错点这个按钮的代价是滑台朝**反方向**去找开关。
-    * 模态里还会把轴、方向、方式号再念一遍, 但那不该是唯一一道防线。
+    * 下面那段 tooltip 把轴、方向、方式号与"软件拦不住它撞开关"再念一遍 —— 确认框
+    * 没有了之后, **它和按钮上那三个字就是唯一的"事前"防线**, 别把它删了。
     */
    for (int i = 0; i < 2; i++)
       for (int d = 0; d < 2; d++)
@@ -914,11 +916,17 @@ QWidget *ScanWindow::buildHomePanel()
          g->addWidget(m_btnHome[i][d], 1 + i, d);
       }
 
-   QLabel *note = new QLabel(QStringLiteral(
-      "回零 = 让驱动器自己带电朝开关走。方向与开关位置只有现场知道。"), box);
-   note->setWordWrap(true);
-   note->setStyleSheet(QStringLiteral("color:#6b7480;"));
-   g->addWidget(note, 3, 0, 1, 2);
+   /*
+    * 这一行**随「回零速度」实时变** (见 refresh): 它是"这一趟能找多远"唯一看得见的地方。
+    *
+    * ⚠️ 从前这些数在一个"每次点击都要点掉"的模态里。那个模态去掉了(改由按钮 tooltip
+    * 说方向与方式的道理), 于是**数**必须有个常驻的去处 —— 否则"碰不到开关时先把滑台
+    * 挪近, 别为了够得着去调高速度"这句话就没地方说了, 而它正是防超时硬顶的那一句。
+    */
+   m_lHomeNote = new QLabel(box);
+   m_lHomeNote->setWordWrap(true);
+   m_lHomeNote->setStyleSheet(QStringLiteral("color:#6b7480;"));
+   g->addWidget(m_lHomeNote, 3, 0, 1, 2);
 
    g->setColumnStretch(1, 1);
    return box;
@@ -1575,23 +1583,8 @@ void ScanWindow::onConnectClicked()
       return;
    }
 
-   QMessageBox box(QMessageBox::Question,
-                   QStringLiteral("连接并进 OP"),
-                   QStringLiteral(
-                      "接下来会:\n"
-                      "  · 打开网卡 (Npcap 单进程独占 —— 别的工具此刻不能同时用这张卡)\n"
-                      "  · 按总线上的实际从站建立过程数据, 必要时补 607Ah/6064h 映射\n"
-                      "  · 进 OP, **开始每 2ms 发帧**\n"
-                      "  · 把**当前位置**设为显示坐标 0 (零点世代 +1)\n\n"
-                      "生效映射里主站拥有的项 (6040h/6060h/607Ah/60FFh/6081h/6083h/6084h)\n"
-                      "会被每周期覆盖 —— **但这一步不发使能, 电机不带电**。\n\n"
-                      "收尾时 (断开 / 关窗) 会还原 PDO 映射并降回 PRE_OP。\n"
-                      "只改 RAM, 断电自然恢复。"),
-                   QMessageBox::Ok | QMessageBox::Cancel, this);
-   box.setDefaultButton(QMessageBox::Cancel);
-   if (box.exec() != QMessageBox::Ok)
-      return;
-
+   /* **不弹确认框** —— 进来就发。它写什么由按钮上的 tooltip 一直写着:
+    * 进 OP 开始发帧、覆盖生效映射里主站拥有的项、**但不发使能, 电机不带电**。 */
    hint(QStringLiteral("正在连接... (选轴 / 补映射 / 进 OP 都要做 SDO, 慢是正常的)"), false);
 
    /* **连上之前先记住这张卡** —— "上次用的网卡"说的是真连过的这张。
@@ -1603,21 +1596,11 @@ void ScanWindow::onConnectClicked()
 
 void ScanWindow::onEnableClicked()
 {
-   /* 「使能」= CLI 的 --allow-motion。**每次都问**, 不做持久勾选、不自动使能 */
-   QMessageBox box(QMessageBox::Warning,
-                   QStringLiteral("使能 —— 电机会带电"),
-                   QStringLiteral(
-                      "确认:\n"
-                      "  · 人已经在设备旁边\n"
-                      "  · 手放在物理急停上\n"
-                      "  · 滑台行程里没有手、工具、线\n\n"
-                      "使能后轴进入 CSP 并带保持力矩。使能那一帧不会动作\n"
-                      "(目标被钉在当前位置), 之后点画布 / 开始扫描才会走。"),
-                   QMessageBox::Ok | QMessageBox::Cancel, this);
-   box.setDefaultButton(QMessageBox::Cancel);
-   if (box.exec() != QMessageBox::Ok)
-      return;
-
+   /* 「使能」= CLI 的 --allow-motion。**不弹确认框**, 点一下就发。
+    *
+    * 「现在带不带电」不靠一个每次都要点掉的框来传达 —— 靠按钮自己的形态:
+    * 已经使能时它是灰的、写着「已使能」; 点得动就说明还有轴没使能 (见 refresh)。
+    * 这一条比弹窗更难被条件反射地关掉。 */
    m_thr->postEnable();
 }
 
@@ -1641,11 +1624,13 @@ void ScanWindow::onFaultResetClicked()
    }
 
    /*
-    * **每次点击都弹模态确认**, 不做持久勾选 —— 与「使能」「连接」同一个先例。
+    * **不弹确认框**, 点了就发。
     *
-    * 弹窗里写的是**它以为**哪根轴报了故障: 遥测最多滞后 ~33ms, 而真正的判据在工作
-    * 线程里 (它读的是**刚读到的** 6041h bit3)。所以措辞用"看起来", 并明确说出
-    * "一个字节都没写"那种情况 —— 操作员按下去之前该知道最坏也就是白按一下。
+    * 但"它以为哪根轴报了故障"这句必须留下来, 只是改成用横幅说 —— 遥测最多滞后 ~33ms,
+    * 而真正的判据在工作线程里 (它读的是**刚读到的** 6041h bit3)。所以措辞用"看起来",
+    * 并明确说出"一个字节都没写"那种情况: 按下去之后最坏也就是白按一下, 而人该知道
+    * 自己刚才点的是什么。复位那一步是**先写 6040h = 0x0000 (卸力) 再抬 bit7** ——
+    * bit7 是上升沿触发, 不先把 0 压下去就构不成沿; 所以只对报了故障的轴做。
     */
    const BusTelem t = m_thr->telemetry();
    int todo[EM_MAX_AXES];
@@ -1654,35 +1639,20 @@ void ScanWindow::onFaultResetClicked()
    QString who;
    if (ntodo == 0)
    {
-      who = QStringLiteral("**现在看起来没有轴报故障 (6041h bit3 都是 0)** —— "
-                           "按下去大概率**一个字节都不会写**。\n"
-                           "(如果故障是刚刚起来的, 工作线程会看到它并照常复位。)");
+      who = QStringLiteral("看起来没有轴报故障 (6041h bit3 都是 0) —— "
+                           "这一下大概率**一个字节都不会写**。"
+                           "(故障要真是刚起来的, 工作线程会看到它并照常复位。)");
    }
    else
    {
       QStringList names;
       for (int k = 0; k < ntodo && k < EM_MAX_AXES; k++)
          names << QStringLiteral("轴%1").arg(todo[k] == 0 ? 'X' : 'Y');
-      who = QStringLiteral("看起来报故障的是: %1。").arg(names.join(QStringLiteral("、")));
+      who = QStringLiteral("复位看起来报故障的: %1。复位成功后该轴停在**未使能**, "
+                           "要接着走请重新点「使能」。").arg(names.join(QStringLiteral("、")));
    }
 
-   QMessageBox box(QMessageBox::Warning,
-                   QStringLiteral("故障复位"),
-                   QStringLiteral(
-                      "%1\n\n"
-                      "确认:\n"
-                      "  · 人已经在设备旁边\n"
-                      "  · 手放在物理急停上\n"
-                      "  · **竖直轴下面没有人**\n\n"
-                      "复位的动作是**先写 6040h = 0x0000 (卸力) 再抬 bit7** ——\n"
-                      "bit7 是上升沿触发, 不先把 0 压下去就构不成沿。\n"
-                      "所以只对报了故障的轴做; 对一根健康的保持轴做这件事会松开它的保持力矩。\n\n"
-                      "复位成功后该轴停在**未使能**, 要接着走请重新点「使能」。\n"
-                      "每根轴最多 1 秒, 这段时间不可中断。").arg(who),
-                   QMessageBox::Ok | QMessageBox::Cancel, this);
-   box.setDefaultButton(QMessageBox::Cancel);
-   if (box.exec() != QMessageBox::Ok)
-      return;
+   hint(who, false);
 
    m_thr->postFaultReset();
 }
@@ -1814,11 +1784,15 @@ void ScanWindow::onStopClicked()
  *
  * ⚠️ 这是全程序**最危险的一个按钮**: 按下之后滑台会自己带电朝开关走, 朝哪走、什么时候
  * 停、撞不撞开关, 全由驱动器按 6098h 决定。本程序只发一条"开始回零", 软件**拦不住它
- * 撞开关** —— 能做的只有: 慢速缺省、每次点击都要人当面确认方向与速度、以及一个真能
- * 生效的中止。这三条就是下面这个模态的全部内容。
+ * 撞开关** —— 能做的只有: 慢速缺省、一个真能生效的中止、以及**把它的数一直摆在眼前**。
  *
- * 与 onEnableClicked / onFaultResetClicked 同一套写法: **每次都问**, 不做持久勾选,
- * 默认按钮是 Cancel, 不抽公共 helper (三处的清单各说各的, 抽出去反而看不清少了哪一条)。
+ * **不弹确认框**, 那句话分成两处常驻的说:
+ *   · 按钮 tooltip (事前, 一直挂着): 轴 / 方向 / 方式号、"软件拦不住它撞开关"、
+ *     该轴会先失能、"方向不对就换另一个按钮";
+ *   · 回零框里那行随速度实时变的字 (见 pushHomeNote): 本次的速度 / 返回速度 / 加减速 /
+ *     最多走几圈 / 几秒判超时, 以及"够不着就把滑台挪近, 别去调高速度"。
+ * 至于"这一根此刻限位判据已经成立", 不用在这里再说一遍 —— refresh 早就在
+ * limit_active 时挂出一条不自动消失的红横幅 (m_limBanner), 同一件事只说一处。
  */
 void ScanWindow::onHomeClicked(int axis, int dir)
 {
@@ -1826,7 +1800,7 @@ void ScanWindow::onHomeClicked(int axis, int dir)
       return;
 
    /* 扫描中一律拦住。这一条其实是**第二道** —— 按钮本身在扫描期间就是灰的
-    * (见 refresh 里的 can_home), 但模态前面这道闸留着, 因为"灰掉的按钮"不是
+    * (见 refresh 里的 can_home), 但派发前这道闸留着, 因为"灰掉的按钮"不是
     * 一个能读的理由 */
    if (m_ctl->running())
    {
@@ -1834,83 +1808,11 @@ void ScanWindow::onHomeClicked(int axis, int dir)
       return;
    }
 
-   const bool        neg  = (dir == 1);
-   const int         meth = ecatcmd::home_method_for(neg);
-   const uint32_t    vel  = ecatcmd::home_vel_clamp(m_edHomeVel->value());
-   const uint32_t    slow = ecatcmd::home_vel_slow(vel);
-   const uint32_t    acc  = ecatcmd::home_accel_for(vel);
-   const QString     ax   = (axis == 0) ? QStringLiteral("X") : QStringLiteral("Y");
-   const QString     dtxt = QString::fromUtf8(ecatcmd::home_dir_text(neg));
-
-   /*
-    * "能找多远"。**必须用工作线程那三个函数算, 不能在这里另写一遍** —— 抄一遍的话,
-    * 哪天 home_accel_for 改了斜坡时间或超时改了, 弹窗还在念旧的数, 而操作员正是照
-    * 这三个数决定按不按下去。
-    *
-    * 一圈多少脉冲取界面上那个「分辨率」框 (它本来就是 2400h 的实测值, 默认 50000);
-    * 框里是 0 的时候退回 50000, 免得除出 inf。
-    */
-   const double ppu   = (m_edPpu->value() > 0.0) ? m_edPpu->value() : 50000.0;
-   const double reach = (double)vel * (HMI_HOME_TMO_MS / 1000.0) / ppu;
-
-   /* 遥测只用来**读一遍现场**, 用来把该说的话说全 —— 它不参与"能不能做"的判断,
-    * 那一条在工作线程的那道闸里 (doHome), 用的是刚读到的值。 */
-   const BusTelem t = m_thr->telemetry();
-
-   QString warn;
-   if (t.ax[axis].valid && t.ax[axis].limit_active)
-   {
-      /* 复用限位那三句**唯一的定义** (它们放在头文件里正是为了这个): 此刻判据成立,
-       * 而回零是朝开关走 —— 操作员必须知道现在这一路已经是"有效"的。
-       * 顺带把 NPN 极性那件事摆出来: 极性配反时 bit11 恒为 1, 回零会找不到跳变。 */
-      const AxisTelem &a = t.ax[axis];
-      warn = QStringLiteral("\n"
-         "⚠️ **这一根现在的限位判据就是成立的** —— 回零是朝开关走, 这一点要看清楚:\n"
-         "  %1\n"
-         "  %2\n"
-         "  %3\n")
-         .arg(QString::fromUtf8(ecatcmd::limit_hit_headline(t.di_invert)),
-              QString::fromUtf8(ecatcmd::limit_switch_text(a.dig_known, a.dig_pos,
-                                                           a.dig_neg, t.di_invert)),
-              QString::fromUtf8(ecatcmd::limit_hit_advice(a.dig_known, a.dig_pos,
-                                                           a.dig_neg, a.dig_home,
-                                                           t.di_invert)));
-   }
-
-   QMessageBox box(QMessageBox::Warning,
-                   QStringLiteral("回零 —— 滑台会自己带电去找开关"),
-                   QStringLiteral(
-                      "轴 %1, **%2**找原点 (6098h = %3)。\n\n"
-                      "确认:\n"
-                      "  · 人已经在设备旁边\n"
-                      "  · 手放在物理急停上\n"
-                      "  · 滑台行程里没有手、工具、线\n"
-                      "  · **竖直轴下面没有人**\n\n"
-                      "**驱动器会自己带电并移动。** 本程序只发一条「开始回零」—— 之后朝哪个\n"
-                      "方向走、什么时候停、撞不撞开关, 全由驱动器按上面那个方式自己决定。\n"
-                      "**软件拦不住它撞开关**, 能做的只有「停止」立即中止。\n\n"
-                      "该轴会**先失能** (6098h/6099h/609Ah/607Ch 只能在未使能时写) ——\n"
-                      "竖直轴会在这时候失去保持力矩, 可能下滑。\n\n"
-                      "%4\n"
-                      "回零结束后会自动切回 CSP 并**保持使能** (停在落点带保持力矩),\n"
-                      "显示坐标会把回零点当做 0 (**零点世代 +1**)。\n\n"
-                      "**按「停止」可立即中止** (不用等那 %5 秒)。\n\n"
-                      "**「%2」说的是电机轴的正反向** —— 与画布上 +%6 是不是同一个方向,\n"
-                      "只有现场试一次才知道。方向不对就换另一个按钮, 别硬顶。%7")
-                      .arg(ax, dtxt).arg(meth)
-                      .arg(QStringLiteral(
-                         "本次: 找原点速度 %1 pul/s (6099h:01), 返回速度 %2 pul/s (6099h:02),\n"
-                         "加减速 %3 pul/s² (609Ah), 原点偏移 0 (607Ch), 上限 %4 秒后判超时。\n"
-                         "速度 × %4 秒 = 一次回零最多走过的距离 (%5 圈) —— 碰不到开关时请\n"
-                         "先把滑台手动挪近, **不要**为了够得着去调高速度。\n")
-                         .arg(vel).arg(slow).arg(acc)
-                         .arg(HMI_HOME_TMO_MS / 1000)
-                         .arg(QString::number(reach, 'f', 1)))
-                      .arg(HMI_HOME_TMO_MS / 1000).arg(ax, warn),
-                   QMessageBox::Ok | QMessageBox::Cancel, this);
-   box.setDefaultButton(QMessageBox::Cancel);
-   if (box.exec() != QMessageBox::Ok)
-      return;
+   const bool     neg  = (dir == 1);
+   const int      meth = ecatcmd::home_method_for(neg);
+   const uint32_t vel  = ecatcmd::home_vel_clamp(m_edHomeVel->value());
+   const QString  ax   = (axis == 0) ? QStringLiteral("X") : QStringLiteral("Y");
+   const QString  dtxt = QString::fromUtf8(ecatcmd::home_dir_text(neg));
 
    /*
     * 零点世代 +1。**在 postHome 之前**, 而且**无条件**。
@@ -1928,6 +1830,8 @@ void ScanWindow::onHomeClicked(int axis, int dir)
 
    m_thr->postHome(axis, meth, vel);
 
+   /* 这一句只在**命令没被那道闸接住**时才留得住 (真开始回零的话, 最多 33ms 之后
+    * refresh 就会用"轴X 正在回零…"那条**状态**横幅把它盖掉 —— 那是设计如此)。 */
    hint(QStringLiteral("轴 %1 的 %2回零已发出 (方式 %3, 速度 %4 pul/s)。"
                        "**按「停止」可立即中止** —— 收尾要几秒, 请等状态栏里那句结果")
            .arg(ax, dtxt).arg(meth).arg(vel), false);
@@ -2204,33 +2108,14 @@ void ScanWindow::onStartClicked()
       return;
    }
 
-   /* 开始前把这一趟的范围再说一遍。区域填错一个数字, 结果就是一头撞上硬件限位 ——
-    * 而这一趟是一两个小时, 值得多问一句 */
+   /*
+    * **不弹确认框** —— 这一趟的范围在按之前就已经全在眼前了: 参数栏里是填的数,
+    * 扫描栏那两行写着**网格 × 点数 / ±范围 / 预计全程**, 旁边的「开不了」红字是
+    * Preflight 的否决。再拿一个模态把同样的数念一遍, 只会训练人闭眼按确定。
+    *
+    * 所以这里只留一句"出发了": 区域、点数、时长、数据写到哪。
+    */
    const Params p = currentParams();
-   QMessageBox box(QMessageBox::Question,
-                   QStringLiteral("开始扫描"),
-                   QStringLiteral(
-                      "区域 %1 × %2 单位 (**以原点为中心**, 即 ±%3 单位)\n"
-                      "网格 %4 × %5 = **%6 点**, 分辨率 %7 单位\n"
-                      "速度 %8 pul/s, 停留 %9 ms, 稳定窗口 %10 ms\n"
-                      "预计全程 **%11** (线性估计, 实际更长)\n\n"
-                      "取样源: %12\n"
-                      "数据写入: %13\n\n"
-                      "确认行程里没有手、工具、线, 手放在物理急停上。")
-                      .arg(p.area_x_unit, 0, 'f', 3).arg(p.area_y_unit, 0, 'f', 3)
-                      .arg(p.area_x_unit / 2.0, 0, 'f', 3)
-                      .arg(m_ctl->gridNx()).arg(m_ctl->gridNy())
-                      .arg(m_ctl->totalPoints())
-                      .arg(p.res_unit, 0, 'f', 3)
-                      .arg(p.speed_pul_s)
-                      .arg(p.dwell_ms).arg(p.settle_ms)
-                      .arg(fmtDur(m_ctl->estimateTotalMs()))
-                      .arg(m_meter->kind())
-                      .arg(QDir::toNativeSeparators(path)),
-                   QMessageBox::Ok | QMessageBox::Cancel, this);
-   box.setDefaultButton(QMessageBox::Cancel);
-   if (box.exec() != QMessageBox::Ok)
-      return;
 
    QString err;
    if (!m_ctl->start(path, &err))
@@ -2251,7 +2136,19 @@ void ScanWindow::onStartClicked()
       m_meter->open(nullptr);
    }
 
-   m_banner->setVisible(false);
+   /* 出发那一句**必须在 m_ctl->start 之后** —— 它念的是控制器真建出来的网格
+    * (gridNx/totalPoints), 不是参数说的那个数 */
+   hint(QStringLiteral("扫描开始: 区域 %1 × %2 单位 (±%3) 共 %4 × %5 = **%6 点**, "
+                       "预计全程 %7; 取样源 %8, 数据写入 %9")
+           .arg(p.area_x_unit, 0, 'f', 3).arg(p.area_y_unit, 0, 'f', 3)
+           .arg(p.area_x_unit / 2.0, 0, 'f', 3)
+           .arg(m_ctl->gridNx()).arg(m_ctl->gridNy())
+           .arg(m_ctl->totalPoints())
+           .arg(fmtDur(m_ctl->estimateTotalMs()))
+           .arg(m_meter->kind())
+           .arg(QDir::toNativeSeparators(path)), false);
+
+   m_bannerTimer->stop();    /* 这一句别自己消失: 它说清的是"现在在跑什么" */
    refresh();
 }
 
@@ -2288,17 +2185,15 @@ void ScanWindow::onOpenCsvClicked()
       return;
    }
 
-   /* why 非空 = 只是"要你确认一下", 不是错误。零点世代对不上意味着中途重连过,
-    * 下半场和上半场可能不在同一个物理位置上 —— 这种事必须让人自己拍板 */
-   QMessageBox box(QMessageBox::Warning,
-                   QStringLiteral("续扫前确认"),
-                   QStringLiteral("这一轮有个地方对不上, 继续之前请确认:\n\n%1\n\n"
-                                  "确认无误再继续。")
-                      .arg(why),
-                   QMessageBox::Ok | QMessageBox::Cancel, this);
-   box.setDefaultButton(QMessageBox::Cancel);
-   if (box.exec() != QMessageBox::Ok)
-      return;
+   /*
+    * why 非空 = 只是"有个地方对不上, 要你知道", 不是错误: 零点世代不一致意味着中途
+    * 重连过, 下半场和上半场可能不在同一个物理位置上。
+    *
+    * **不弹确认框** —— 直接按"允许世代差异"续下去, 但把那句 why **留在红横幅上**。
+    * 这件事必须有人看见, 而一条不自动消失的横幅比一个会被条件反射按掉的模态可靠得多;
+    * 真觉得接得不对, 「中止」随时可按, 已经采到的点都在 CSV 里。
+    */
+   const QString mismatch = why;   /* resume 会把 why 重新写一遍, 先留住这一句 */
 
    err.clear();
    why.clear();
@@ -2308,8 +2203,8 @@ void ScanWindow::onOpenCsvClicked()
       return;
    }
 
-   m_banner->setVisible(false);
-   hint(QStringLiteral("续扫 (已确认零点世代差异): %1").arg(QDir::toNativeSeparators(f)), false);
+   hint(QStringLiteral("续扫 (已按「允许零点世代不同」继续): %1\n%2")
+           .arg(QDir::toNativeSeparators(f), mismatch), true);
    refresh();
 }
 
@@ -2381,6 +2276,50 @@ void ScanWindow::pushManualSpeed(const BusTelem &t, bool running)
    for (int i = 0; i < t.naxis && i < EM_MAX_AXES; i++)
       if (t.ax[i].vel != v)
          m_thr->setSpeed(i, v);
+}
+
+/*
+ * 回零框里那行说明: **照现在这个速度**, 一次回零最多走多远、多久判超时。
+ *
+ * 这些数从前在一个"每次点击都要点掉"的模态里。模态去掉了, 但它们不能在界面上消失 ——
+ * "碰不到开关时先把滑台挪近, **不要**为了够得着去调高速度"这句是防超时硬顶的唯一一句,
+ * 而操作员最可能的反应恰恰就是去调高速度。所以留一个常驻的、随速度实时变的地方。
+ *
+ * 三个数**必须问工作线程那几个函数** (home_vel_slow / home_accel_for / 那个超时宏),
+ * 不能在这里另写一遍斜坡与超时的算法 —— 抄一遍就会有一天界面念的数和线上发的不是一套。
+ * 一圈多少脉冲取界面上那个「分辨率」框 (它本来就是 2400h 的实测值, 默认 50000);
+ * 框里是 0 的时候退回 50000, 免得除出 inf。
+ *
+ * 只在文字真变了才 setText: 这是 30Hz 调的, 同 refreshAxisSignals 的习惯。
+ */
+void ScanWindow::pushHomeNote()
+{
+   /* refresh() 可能在 buildUi 还没走完时就被叫到 (构造里那几个 connect 里就有会转调
+    * refresh 的)。回零框和「分辨率」框不是同一块建的, 所以这里认一遍指针 */
+   if (m_lHomeNote == nullptr || m_edHomeVel == nullptr || m_edPpu == nullptr)
+      return;
+
+   const uint32_t vel   = ecatcmd::home_vel_clamp(m_edHomeVel->value());
+   const uint32_t slow  = ecatcmd::home_vel_slow(vel);
+   const uint32_t acc   = ecatcmd::home_accel_for(vel);
+   const double   ppu   = (m_edPpu->value() > 0.0) ? m_edPpu->value() : 50000.0;
+   const double   reach = (double)vel * (HMI_HOME_TMO_MS / 1000.0) / ppu;
+
+   const QString s = QStringLiteral(
+      "回零 = 让驱动器自己带电朝开关走, **软件拦不住它撞开关**; 该轴会先失能 "
+      "(竖直轴此时失去保持力矩, 可能下滑)。\n"
+      "本速度: 找原点 %1 / 返回 %2 pul/s (6099h), 加减速 %3 (609Ah), "
+      "一次最多走 **%4 圈**, %5 秒后判超时 —— 够不着开关请先把滑台挪近, "
+      "**不要**为了够得着去调高速度。")
+      .arg(vel).arg(slow).arg(acc)
+      .arg(QString::number(reach, 'f', 1))
+      .arg(HMI_HOME_TMO_MS / 1000);
+
+   if (m_homeNoteLast == s)
+      return;
+
+   m_homeNoteLast = s;
+   m_lHomeNote->setText(s);
 }
 
 /*
@@ -2656,7 +2595,33 @@ void ScanWindow::refresh()
     * 投进去的命令也不会丢 —— 它们排着队, 等回零退出来才执行, 那正是"点了没反应" */
    const bool can_home = can_move && t.in_op && !t.homing && !t.resetting;
 
-   m_btnEnable->setEnabled(can_move && !t.homing && !t.ax[0].enabled);
+   /*
+    * 「使能」按钮:**已经使能就灰掉并把字改成「已使能」**。
+    *
+    * 它从前是"点一次弹一个确认框", 现在那个框没有了 —— 于是"现在到底带不带电"这件事
+    * 必须由按钮自己说。灰 + 改字是**一件事的两半, 必须同时做**: 只灰不改字看起来像
+    * "忙, 等会儿再点"; 只改字不灰则看起来像"还能再点一次"。文案用「已使能」而不是
+    * 「使能中」, 与「轴信号」那盏灯的词一致 (见 refreshAxisSignals)。
+    *
+    * 判据看**每一根**, 不是只看轴0:
+    *   · 还有轴没使能 -> 按钮仍可按, 按下去使能剩下的那些 (故障复位会把某一根单独
+    *     打回未使能, 那时这根按钮还有事要做);
+    *   · 全都不带电   -> 灰 + 「已使能」。
+    * 从前那句 `!t.ax[0].enabled` 在"轴0 已使能、轴1 没使能"时会把按钮灰掉 —— 轴1 就
+    * 再也使不上能了, 而两根轴恰恰各自有独立的故障复位。
+    */
+   bool any_enabled = false, any_off = false;
+   for (int i = 0; i < t.naxis && i < EM_MAX_AXES; i++)
+   {
+      if (t.ax[i].enabled)
+         any_enabled = true;
+      else
+         any_off = true;
+   }
+
+   m_btnEnable->setEnabled(can_move && !t.homing && any_off);
+   m_btnEnable->setText(any_enabled && !any_off ? QStringLiteral("已使能")
+                                                : QStringLiteral("使能"));
    /* 「停止」在回零中也**必须可按** —— 它现在兼任"立即中止回零" (见 onStopClicked)。
     * 这一条刻意不加 !t.homing: 加了就等于把唯一那根救命绳藏起来 */
    m_btnStop->setEnabled(m_connected);
@@ -2674,7 +2639,7 @@ void ScanWindow::refresh()
     * 而且它**要求**未使能才能写 6098h)。把"已使能"当成不许回零, 会挡住最常见的那条路。
     *
     * fault / mirror_ok 这两条要在这里再判一次 —— 工作线程那道闸才是权威, 但让按钮
-    * 先按不动, 比让人点开模态、读完一屏清单、按了确认才被告知"有故障"要好。
+    * 先按不动, 比让人按下去、等来一句"有故障 -> 拒绝"要好。
     */
    for (int i = 0; i < 2; i++)
    {
@@ -2699,7 +2664,10 @@ void ScanWindow::refresh()
     * 「回零速度」**不进上面那张 locked 表**, 所以这里不用管它: 它在扫描期间也可改。
     * 它是个**值**不是动作, 灰掉只会让人以为"现在改它有用" —— 同「让 60FDh 进 TxPDO」
     * 与「输入电平反转」那两条的先例。
+    *
+    * 但它是**回零框里那行数的来源**, 所以下面顺手把那行字刷出来。
     */
+   pushHomeNote();
 
    /*
     * 回零的横幅: 上升沿起一条, 下降沿**只清我们自己写的那条** (原文比对, 同
@@ -3003,21 +2971,12 @@ void ScanWindow::disconnectAndStop()
 
 void ScanWindow::closeEvent(QCloseEvent *e)
 {
-   if (m_ctl->running())
-   {
-      QMessageBox box(QMessageBox::Warning,
-         QStringLiteral("扫描还在跑"),
-         QStringLiteral("扫描正在跑, 关窗会**先中止它**。\n\n"
-                        "已经采到的数据在 CSV 里, 不会丢 —— 之后可以「打开 CSV 续扫」接着跑。\n\n"
-                        "确定关吗?"),
-         QMessageBox::Ok | QMessageBox::Cancel, this);
-      box.setDefaultButton(QMessageBox::Cancel);
-      if (box.exec() != QMessageBox::Ok)
-      {
-         e->ignore();
-         return;
-      }
-   }
+   /*
+    * 扫描在跑也**不弹确认框**: 关窗 = 中止 + 断开 (下面 disconnectAndStop 里那句
+    * m_ctl->abort 就是中止), 已经采到的点都已经落在 CSV 里, 之后「打开 CSV 续扫」
+    * 能接着跑。要留住这一趟就别关窗 —— 这个动作从此只有一个意思, 不再有"点了确定
+    * 才发现它中止了"那一步。
+    */
 
    if (m_thr->isRunning())
    {
