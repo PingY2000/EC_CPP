@@ -16,6 +16,7 @@
 #include <QString>
 
 #include "busview.h"
+#include "editgate.h"
 #include "ophirmeter.h"
 #include "powermeter.h"
 #include "scancontroller.h"
@@ -26,6 +27,8 @@ class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
 class QLabel;
+class QGroupBox;
+class QLayout;
 class QLineEdit;
 class QPushButton;
 class QSpinBox;
@@ -87,9 +90,9 @@ private:
    void onEnableClicked();
    /* 清驱动器的故障位 */
    void onFaultResetClicked();
-   /* 「让 60FDh 进 TxPDO」。已连接时改动下次才生效, 界面看不出来, 须由提示说明 */
-   void onWantDigInToggled(bool on);
-   /* 「输入电平反转 (NPN)」。运行期参数: 勾一下就生效, 不重连、不写驱动器、不进 ini。安全相关 */
+   /* 「高级选项」那三个勾里任意一个动了 (前两个连接期, 第三个运行期) */
+   void onAdvToggled();
+   /* 「上位机侧取反」。运行期参数: 勾一下就生效, 不重连、不写驱动器。安全相关 */
    void onDiInvertToggled(bool on);
    void onRestoreDefaults();          /* 「恢复默认」: 扫描参数回 Params 缺省 */
    void onCenterAllClicked();
@@ -112,11 +115,53 @@ private:
    void onReadOnceReady(double watts);
    void onReadOnceFailed(const QString &err);
 
-   /* 「X/Y 正/反向回零」。dir: 0 = 正向 (6098h = 24), 1 = 反向 (29)。不弹确认框,
-    * 说明在按钮 tooltip 上; 回零中按「停止」= 立即中止。它同时 +1 零点世代。 */
-   void onHomeClicked(int axis, int dir);
+   /* 「X/Y 正/反向回零」与「X/Y 找正/负限位」共用的槽。
+    * dir: 0 = 正那侧, 1 = 负那侧; find_limit: false -> 6098h = 24/29 (找**原点开关** X0),
+    * true -> 18/17 (找**限位开关**, 手册叫"找限位")。不弹确认框, 说明在按钮 tooltip 上;
+    * 回零中按「停止」= 立即中止。它同时 +1 零点世代 (两者都重定义零点, 续扫必须换世代)。 */
+   void onHomeClicked(int axis, int dir, bool find_limit);
    /* 「停止」。回零期间它必须变成立即中止 (队列救不了回零) */
    void onStopClicked();
+
+   /* ---- 参数框的编辑门控 ----
+    * 一块框平时只读, 点这块框的「编辑」才能改, 改完「保存」(固化进 ini) 或「取消」(退回
+    * 上次保存的值并重新下推)。状态机在 scan/editgate.h, 这里只管控件。
+    *
+    * **控件的可用性只由 refreshEditability() 一处写** —— 它在 30Hz 的 refresh() 末尾被调,
+    * 别处再 setEnabled 会被下一拍覆盖 (写按钮槽里更是当场就被盖掉)。 */
+   struct GateItem
+   {
+      QWidget *w = nullptr;
+      bool     lock_running = false;  /* 运行中也锁住 (几何 / 输出路径这类) */
+      bool     need_dev = false;      /* 还要求真机功率计就绪 (那三个下拉框) */
+   };
+   struct PanelGate
+   {
+      editgate::Gate  gate;
+      QGroupBox      *box = nullptr;
+      QPushButton    *btnEdit = nullptr;
+      QPushButton    *btnSave = nullptr;
+      QPushButton    *btnCancel = nullptr;
+      QString         title_base;
+      QList<GateItem> items;
+      QList<QVariant> snapshot;       /* 进编辑态那一刻的控件值 */
+   };
+
+   QWidget *buildAdvPanel();
+   /* 登记一块框: 造 [编辑][保存][取消] 那一行并记住成员。members 里**不放**这三个按钮 */
+   void addGate(int gi, QGroupBox *box, const QList<GateItem> &items);
+   QWidget *gateBar(int gi, QWidget *parent);
+   void gateSnapshot(int gi);       /* 拍快照 (进编辑态时) */
+   void gateRollback(int gi);       /* 控件 ← 快照, 不拦信号: 回滚要顺带重新下推 */
+   void gateRebase(int gi, QWidget *w);  /* 程序自己改了这个控件 -> 快照跟上 + 重算标记 */
+   void gateDirty(int gi);          /* 重算"有没有改动" (逐项与快照比对, 只影响标题标记) */
+   void refreshEditability();
+   void gateTitle(int gi);          /* 框标题 = 标题 + 标记 */
+   bool meterDevOk() const;         /* 真机三项的可用判据, 一处共用 */
+   void onGateEdit(int gi);
+   void onGateSave(int gi);
+   void onGateCancel(int gi);
+   void refreshAdvWarn();           /* 双反相那行红字 */
 
    /* ---- 内部 ---- */
    void pushParams();                 /* 控件 → Params → 控制器 + 量程 */
@@ -124,6 +169,7 @@ private:
    /* 记忆 (exe 旁边的 scan.ini)。loadSettings 必须在 applyDefaults 之后调, 反了会被缺省值盖掉 */
    void loadSettings();
    void saveSettings();
+
    void pushManualSpeed(const BusTelem &t, bool running);
    /* 回零框里那行数 (照现在这个速度能找多远)。随「回零速度」实时变 */
    void pushHomeNote();
@@ -142,6 +188,7 @@ private:
    void disconnectAndStop();
    void syncShadeEdits();
    void applyCsvDefaultName();
+   bool pushScriptPath();   /* 脚本框的文本 -> 功率计那一路 (文本与状态是两份东西) */
 
    /* ---- 三件套 ---- */
    EcatThread       *m_thr  = nullptr;
@@ -192,7 +239,8 @@ private:
    /* ---- 回零 ---- */
    /* 6099h:01 找原点速度。上限 = 与工作线程夹取共用的宏 HMI_HOME_VEL_MAX (2000); 不进 scan.ini */
    QSpinBox    *m_edHomeVel = nullptr;
-   QPushButton *m_btnHome[2][2] = {};   /* [轴][方向] 0 = 正向, 1 = 反向 */
+   QPushButton *m_btnHome[2][2] = {};   /* [轴][方向] 0 = 正向, 1 = 反向 (方式 24/29, 找原点开关) */
+   QPushButton *m_btnLim[2][2] = {};    /* [轴][侧] 0 = 正限位, 1 = 负限位 (方式 18/17, 找限位) */
    /* 回零框里那行说明: 照现在这个速度, 一次回零最多走多远 / 多久判超时。随速度实时变 */
    QLabel      *m_lHomeNote = nullptr;
    QString      m_homeNoteLast;
@@ -250,9 +298,21 @@ private:
    LampGrid m_limGrid;   /* 0=原点 1=正限位 2=负限位 */
 
    QPushButton *m_btnFaultRst = nullptr;   /* 「轴信号」第三行, 跨全部列 */
-   QCheckBox   *m_cbWantDigIn = nullptr;   /* 「限位开关」第三行, 连接期参数 */
-   /* 「限位开关」第四行。安全相关: 开着时限位判据整个换掉 (limit_rule_for), 不随 onair 变灰, 也不持久化 */
+
+   /* ---- 「高级选项」那三个勾 (见 buildAdvPanel) ---- */
+   QCheckBox   *m_cbWantDigIn = nullptr;   /* 让 60FDh 进 TxPDO (连接期参数), 默认开 */
+   QCheckBox   *m_cbNpnWrite = nullptr;    /* 写驱动器 2300h = 0x0007 (连接期参数), 默认开 */
+   /* 上位机侧取反。安全相关: 开着时限位判据整个换掉 (limit_rule_for), 默认关 */
    QCheckBox   *m_cbDiInvert = nullptr;
+   QLabel      *m_lAdvWarn = nullptr;      /* 双反相那行红字 (见 refreshAdvWarn) */
+
+   /* ---- 编辑门控 ---- */
+   QList<PanelGate> m_gates;               /* 下标 = gate 号, 见 scanwindow.cpp 顶上那几个 GI_ */
+   QPushButton     *m_btnCsv = nullptr;    /* 「扫描参数」的 CSV「…」(进成员表, 故不能是局部量) */
+   /* 上一次推给工作线程的两个连接期参数: 只用来认出"勾了但本次连接不生效"这个情形 */
+   bool m_advLastWantDig  = true;
+   bool m_advLastNpnWrite = true;
+
 
    /* ---- 状态栏 ---- */
    QLabel *m_banner = nullptr;

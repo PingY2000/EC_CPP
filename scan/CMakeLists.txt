@@ -41,6 +41,7 @@ set(SCAN_COMMON_SRC
   scanlog.cpp       scanlog.h
   scanprefs.cpp     scanprefs.h
   busview.h
+  editgate.h
 )
 
 # ---------------------------------------------------------------- GUI 程序

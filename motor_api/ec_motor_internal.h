@@ -106,6 +106,18 @@ struct em_bus
    /* 是否主动把 60FDh 追加进 TxPDO; 默认 0 = 映射里已经有它时才绑。
     * 连接期参数, 必须由 em_require_dig_in() 在 em_setup 之前设 */
    int want_dig_in;
+
+   /* 是否授权改驱动器参数 (目前只有 2300h); 默认 0 = 一个字节都不写。
+    * 与 want_dig_in 分开两道门: 改 PDO 映射是通信配置 (掉电即回), 改参数是驱动器行为 */
+   int allow_param;
+
+   /* 2300h 快照, 下标 = 轴序号。sz 是驱动器自报的宽度 —— 手册写 U16 而 slide_motion 的
+    * 基线表记成 U8, 两处对不上, 所以读到几字节就按几字节写回, 不猜 */
+   int      di_logic_have[EM_MAX_AXES];
+   int      di_logic_changed[EM_MAX_AXES];
+   int      di_logic_sz[EM_MAX_AXES];
+   uint16_t di_logic_orig[EM_MAX_AXES];
+
    int in_op;
    int prev_manualstatechange;
 

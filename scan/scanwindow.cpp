@@ -81,6 +81,406 @@ static const QString &readOnceTip()
    return s;
 }
 
+/* ---------------------------------------------------------------- 编辑门控 */
+
+/* 框号。**顺序就是 buildUi 里 addGate 的顺序**, 一块框只在这里出现一次 */
+enum GateIdx
+{
+   GI_PARAM = 0,   /* 扫描参数 */
+   GI_METER,       /* 功率计 */
+   GI_SHADE,       /* 色标 */
+   GI_HOME,        /* 回零 */
+   GI_ADV,         /* 高级选项 */
+   GI_N
+};
+
+/* 控件的值 <-> QVariant。按钮没有"值" (它触发动作, 不回滚), 返回无效 QVariant */
+static QVariant gateValue(const QWidget *w)
+{
+   if (const auto *s = qobject_cast<const QSpinBox *>(w))
+      return s->value();
+   if (const auto *d = qobject_cast<const QDoubleSpinBox *>(w))
+      return d->value();
+   if (const auto *c = qobject_cast<const QComboBox *>(w))
+      return c->currentIndex();
+   if (const auto *b = qobject_cast<const QCheckBox *>(w))
+      return b->isChecked();
+   if (const auto *e = qobject_cast<const QLineEdit *>(w))
+      return e->text();
+   return QVariant();
+}
+
+/* 回滚一个控件。**刻意不挂 QSignalBlocker**: 「改动当场生效」就是靠 valueChanged /
+ * currentIndexChanged 把值重新推给控制器与参数, 拦了信号就成了"界面回到旧值, 控制器还拿着
+ * 新值"。每 set 一下都会经 markDirty, 所以调用方必须**先**退出编辑态 (见 onGateCancel)。 */
+static void gateSetValue(QWidget *w, const QVariant &v)
+{
+   if (!v.isValid())
+      return;
+   if (auto *s = qobject_cast<QSpinBox *>(w))
+      s->setValue(v.toInt());
+   else if (auto *d = qobject_cast<QDoubleSpinBox *>(w))
+      d->setValue(v.toDouble());
+   else if (auto *c = qobject_cast<QComboBox *>(w))
+      c->setCurrentIndex(v.toInt());
+   else if (auto *b = qobject_cast<QCheckBox *>(w))
+      b->setChecked(v.toBool());
+   else if (auto *e = qobject_cast<QLineEdit *>(w))
+      e->setText(v.toString());
+}
+
+void ScanWindow::addGate(int gi, QGroupBox *box, const QList<GateItem> &items)
+{
+   if (gi < 0 || gi >= m_gates.size())
+      return;
+
+   PanelGate &g = m_gates[gi];
+   g.box        = box;
+   g.items      = items;
+   g.title_base = box->title();
+   gateTitle(gi);
+
+   /* 改一下就重算标记 (只影响标题, 不拦「保存」)。在登记处一次性接上, 免得每个槽各记一次
+    * —— 漏一个的症状是"改了却没有未保存标记"。
+    *
+    * QLineEdit 用 textEdited 而不是 textChanged: 只有操作员敲字才算改。其余控件没有
+    * "只由用户触发"的版本 —— setValue/setCurrentIndex/setChecked 一样发信号, 而程序自己
+    * 也会改它们 (按数据定标 / 真机三项 / CSV 缺省名)。两件事挡住这种假标记: 标记本身是
+    * 逐项与快照比对算出来的 (gateDirty), 而程序改过的那一项会先经 gateRebase 把快照跟上。 */
+
+   for (const GateItem &it : g.items)
+   {
+      if (auto *s = qobject_cast<QSpinBox *>(it.w))
+         connect(s, &QSpinBox::valueChanged, this, [this, gi] { gateDirty(gi); });
+      else if (auto *d = qobject_cast<QDoubleSpinBox *>(it.w))
+         connect(d, &QDoubleSpinBox::valueChanged, this, [this, gi] { gateDirty(gi); });
+      else if (auto *c = qobject_cast<QComboBox *>(it.w))
+         connect(c, &QComboBox::currentIndexChanged, this, [this, gi] { gateDirty(gi); });
+      else if (auto *b = qobject_cast<QCheckBox *>(it.w))
+         connect(b, &QCheckBox::toggled, this, [this, gi] { gateDirty(gi); });
+      else if (auto *e = qobject_cast<QLineEdit *>(it.w))
+         connect(e, &QLineEdit::textEdited, this, [this, gi] { gateDirty(gi); });
+   }
+}
+
+/* "有没有改动"= 逐项与快照比出来的, 不是一个"改过没有"的布尔标记 —— 程序自己也会改控件值
+ * (按数据定标 / 真机三项 / CSV 缺省名), 布尔标记分不出是谁改的, 而且改回原值也不会自己消失。
+ * 比对是幂等的: 改回原值, 标记自己落下去。 */
+void ScanWindow::gateDirty(int gi)
+{
+   if (gi < 0 || gi >= m_gates.size())
+      return;
+   PanelGate &g = m_gates[gi];
+   if (!g.gate.editing)     /* 「未保存」是编辑态里的东西, 非编辑态不碰标题 */
+      return;
+
+   bool diff = false;
+   for (int i = 0; i < g.items.size() && i < g.snapshot.size(); i++)
+      if (gateValue(g.items[i].w) != g.snapshot[i])
+      {
+         diff = true;
+         break;
+      }
+
+   if (diff)
+      editgate::markDirty(&g.gate);
+   else
+      editgate::undirty(&g.gate);
+   gateTitle(gi);
+}
+
+/* 框标题 = 原标题 + 标记。「未保存」只在这块框编辑态里出现 —— 别的框看不到别的框的标记 */
+void ScanWindow::gateTitle(int gi)
+{
+   if (gi < 0 || gi >= m_gates.size() || m_gates[gi].box == nullptr)
+      return;
+   PanelGate &g = m_gates[gi];
+   g.box->setTitle(g.title_base + QString::fromUtf8(editgate::titleMark(g.gate)));
+}
+
+QWidget *ScanWindow::gateBar(int gi, QWidget *parent)
+{
+   PanelGate &g = m_gates[gi];
+   QWidget *bar = new QWidget(parent);
+   QHBoxLayout *h = new QHBoxLayout(bar);
+   h->setContentsMargins(0, 0, 0, 0);
+   h->setSpacing(6);
+
+   g.btnEdit   = new QPushButton(QStringLiteral("编辑"), bar);
+   g.btnSave   = new QPushButton(QStringLiteral("保存"), bar);
+   g.btnCancel = new QPushButton(QStringLiteral("取消"), bar);
+   for (QPushButton *b : { g.btnEdit, g.btnSave, g.btnCancel })
+      b->setFixedHeight(22);
+
+   g.btnEdit->setToolTip(QStringLiteral(
+      "这一框平时**只读** —— 点它才进可编辑状态。\n\n"
+      "改动**当场生效** (不用等保存): 参数立刻推给控制器, 驱动器参数下次「连接」时生效。\n\n"
+      "「保存」把它记进 exe 旁边的 scan.ini; 「取消」退回**上次保存**的值 (不是程序缺省值)。\n"
+      "「连接」与关窗会顺手把当前值也记一遍 —— 那之后「取消」能退回去的就是那一刻的值。\n"
+      "正在编辑别的一框时点这里, 那一框的改动会被**丢弃** (它会留下「已丢弃」标记)。\n\n"
+      "跑着的时候 (扫描/回零/点动) 也能进编辑态并当场生效, 但**几何类** (区域 X/Y、分辨率、"
+      "ppu、方向、方式、输出路径) 会一直灰着 —— 它们改到一半, 落进 CSV 的格子就与实际位置"
+      "对不上了。"));
+   g.btnSave->setToolTip(QStringLiteral(
+      "把这一框现在的值记进 scan.ini, 下次开程序就是这些值。\n\n"
+      "值在改的那一刻就已经生效了 —— 保存只是把它记住。\n"
+      "例外: 「功率计」的取样源/手填值/噪声/脚本路径 与「色标」的上下限 **不进 ini**\n"
+      "(这几项每次开程序都要重设)。对它们点「保存」只是结束编辑态, 改动本身已经生效了。"));
+   g.btnCancel->setToolTip(QStringLiteral(
+      "退回**上次保存**的值 (不是程序缺省值), 并立刻重新推给控制器。\n\n"
+      "程序自己改过的项 (按数据定标 / 真机三项 / CSV 缺省名) 以程序改的为准。"));
+   connect(g.btnEdit,   &QPushButton::clicked, this, [this, gi] { onGateEdit(gi); });
+   connect(g.btnSave,   &QPushButton::clicked, this, [this, gi] { onGateSave(gi); });
+   connect(g.btnCancel, &QPushButton::clicked, this, [this, gi] { onGateCancel(gi); });
+
+   h->addWidget(g.btnEdit);
+   h->addWidget(g.btnSave);
+   h->addWidget(g.btnCancel);
+   h->addStretch(1);
+
+   /* 可见性只由 refreshEditability 一处改; 这里先摆成"没在编辑"的样子 */
+   g.btnSave->setVisible(false);
+   g.btnCancel->setVisible(false);
+   return bar;
+}
+
+void ScanWindow::gateSnapshot(int gi)
+{
+   PanelGate &g = m_gates[gi];
+   g.snapshot.clear();
+   for (const GateItem &it : g.items)
+      g.snapshot.append(gateValue(it.w));
+}
+
+void ScanWindow::gateRollback(int gi)
+{
+   PanelGate &g = m_gates[gi];
+   for (int i = 0; i < g.items.size() && i < g.snapshot.size(); i++)
+      gateSetValue(g.items[i].w, g.snapshot[i]);
+}
+
+/* 程序自己改了某个成员的值 -> 把快照里那一项跟上, 否则「取消」会把它滚回一份陈值 (而且
+ * 滚完还会被程序再改一次, 两边打架)。只动这一个: 整框重拍会把同一框里别处的未保存改动
+ * 一起"原谅"掉。快照跟上之后这一项就不算改动了 —— 顺手把标记重算一遍。 */
+void ScanWindow::gateRebase(int gi, QWidget *w)
+{
+   if (gi < 0 || gi >= m_gates.size())
+      return;
+   PanelGate &g = m_gates[gi];
+   if (!g.gate.editing)
+      return;
+   for (int i = 0; i < g.items.size(); i++)
+      if (g.items[i].w == w)
+      {
+         if (i < g.snapshot.size())
+            g.snapshot[i] = gateValue(w);
+         gateDirty(gi);
+         return;
+      }
+}
+
+/* 真机那三项 (波长/量程/测量模式) 的可用判据。**一处共用**: 门控与 onMeterInfoChanged
+ * 都读它 —— 两处各写一遍的话, 漏掉的那处会在选模拟源时放进一个空的下拉框 */
+bool ScanWindow::meterDevOk() const
+{
+   return m_ophir != nullptr && m_meter == m_ophir && m_ophir->isOpen();
+}
+
+/* 全部参数控件 setEnabled 的**唯一写点**。由 refresh() 每拍调用。
+ * enabled = 这块框在编辑态 && 这一项在运行期没被锁住。 */
+void ScanWindow::refreshEditability()
+{
+   const bool running = m_ctl->running();
+   const bool dev_ok  = meterDevOk();
+
+   for (int gi = 0; gi < m_gates.size(); gi++)
+   {
+      PanelGate &g = m_gates[gi];
+      const bool editing = g.gate.editing;
+
+      for (const GateItem &it : g.items)
+      {
+         bool ok = editing && !(running && it.lock_running);
+         /* 空的下拉框打不开: 真机那三项在设备没报这一项时是空的 */
+         if (ok)
+            if (const auto *cb = qobject_cast<const QComboBox *>(it.w))
+               ok = cb->count() > 0;
+         if (ok && it.need_dev)
+            ok = dev_ok;
+         it.w->setEnabled(ok);
+      }
+
+      /* 「保存 / 取消」不在成员表里 (进了编辑态它们反而必须按得动), 所以单独定。
+       * 「编辑」在编辑态里藏起来 —— 再点一次没有意义 (重复点 begin 是 no-op) */
+      if (g.btnEdit != nullptr)
+      {
+         g.btnEdit->setVisible(!editing);
+         g.btnSave->setVisible(editing);
+         g.btnCancel->setVisible(editing);
+         g.btnSave->setEnabled(editing);
+         g.btnCancel->setEnabled(editing);
+      }
+   }
+
+   /* 不是参数、但也只能在运行外按的动作按钮 (原先是跟着那张"扫描中锁住"的表走的) */
+   if (m_btnOpen != nullptr)
+      m_btnOpen->setEnabled(!running);
+}
+
+void ScanWindow::onGateEdit(int gi)
+{
+   if (gi < 0 || gi >= m_gates.size())
+      return;
+
+   /* 同一时刻只允许一块框在编辑态。已经在编辑别块框 -> **静默丢弃**它: 不弹框拦人,
+   * 只把改动滚回去并在它的标题上留一个「已丢弃」。 */
+   for (int k = 0; k < m_gates.size(); k++)
+   {
+      if (k == gi)
+         continue;
+      PanelGate &o = m_gates[k];
+      if (!o.gate.editing)
+         continue;
+      const bool had = editgate::drop(&o.gate);
+      if (had)
+      {
+         gateRollback(k);
+         /* 说一声但**不弹框**: 改动没了却不吭声是更坏的做法。横幅会自己消失, 而那块框
+          * 标题上的「未保存 (已丢弃)」会一直留到它下次进编辑态 */
+         hint(QStringLiteral("「%1」那一框的改动已丢弃 (没保存) —— 现在编辑「%2」")
+                 .arg(o.title_base, m_gates[gi].title_base),
+              false);
+      }
+      gateTitle(k);
+   }
+
+   PanelGate &g = m_gates[gi];
+   if (!editgate::begin(&g.gate))
+      return;
+
+   gateSnapshot(gi);      /* 快照 = 「取消」要退回的那一份 */
+   gateTitle(gi);
+   refreshEditability();
+}
+
+void ScanWindow::onGateSave(int gi)
+{
+   if (gi < 0 || gi >= m_gates.size())
+      return;
+   PanelGate &g = m_gates[gi];
+   if (!g.gate.editing)
+      return;
+
+   /* 直接走现成那条路就够: 同一时刻最多一块框在编辑态, 别框此刻持有的必然是上次保存的值,
+    * 所以重写整份 ini 不丢东西。**静默丢弃因此不是界面上的客气, 是这条正确性的前提。** */
+   saveSettings();
+
+   editgate::save(&g.gate);
+   gateSnapshot(gi);      /* 刚保存的值就是新的"上次保存" */
+   gateTitle(gi);
+   hint(QStringLiteral("「%1」已保存 (exe 旁边的 scan.ini)").arg(g.title_base), false);
+   refreshEditability();
+}
+
+void ScanWindow::onGateCancel(int gi)
+{
+   if (gi < 0 || gi >= m_gates.size())
+      return;
+   PanelGate &g = m_gates[gi];
+   if (!g.gate.editing)
+      return;
+
+   /* 顺序不能反: 先退出编辑态, 再回灌。回灌的每一个信号都会经 gateDirty, 那时 editing
+    * 已经是 false -> 不会把框重新点脏 (反了的话「取消」永远清不干净那个标记) */
+   editgate::cancel(&g.gate);
+   gateRollback(gi);
+
+   /* 回灌 QLineEdit 只改文本, 不发 textEdited (其余控件的 setValue/setCurrentIndex/
+    * setChecked 都会发信号, 各自的槽已经把值重新推下去了)。脚本路径背后那一份状态
+    * 因此得自己补推, 否则"取消"只退回了屏幕上那行字。 */
+   if (gi == GI_METER)
+      pushScriptPath();
+
+   gateTitle(gi);
+   hint(QStringLiteral("「%1」已取消 —— 退回上次保存的值, 并已重新推给控制器")
+           .arg(g.title_base),
+        false);
+   refreshEditability();
+}
+
+void ScanWindow::refreshAdvWarn()
+{
+   const char *w = editgate::doubleInvertWarning(m_cbNpnWrite->isChecked(),
+                                                 m_cbDiInvert->isChecked());
+   m_lAdvWarn->setText(w == nullptr ? QString() : QString::fromUtf8(w));
+   m_lAdvWarn->setVisible(w != nullptr);
+}
+
+/* 高级选项那三个勾。它们各自是连接期参数 (前两个) 或运行期参数 (第三个):
+ * 前两个要重新「连接」才生效, 第三个下一帧就生效 —— 由 hmi/ecatworker 那边决定, 这里只推。 */
+void ScanWindow::onAdvToggled()
+{
+   const bool dig = m_cbWantDigIn->isChecked();
+   const bool wr  = m_cbNpnWrite->isChecked();
+   const bool sw  = m_cbDiInvert->isChecked();
+
+   m_thr->setWantDigIn(dig);
+   m_thr->setNpnWriteDrive(wr);
+   m_thr->setDiInvert(sw);
+
+   refreshAdvWarn();
+
+   if (m_connected && (dig != m_advLastWantDig || wr != m_advLastNpnWrite))
+      hint(QStringLiteral("已记下: 这两个是**连接期参数**, 下次「连接」时才生效。"
+                          "**本次连接不受影响**。"),
+           false);
+
+   m_advLastWantDig  = dig;
+   m_advLastNpnWrite = wr;
+}
+
+/* 运行期那一个: 勾一下立刻生效, 且它整个换掉限位判据 —— 读不到 60FDh 就等于一条判据都没有
+ * (限位一律按「有效」中止 -> 扫描永远开不了), 所以要在勾的一瞬间就说。 */
+void ScanWindow::onDiInvertToggled(bool on)
+{
+   m_thr->setDiInvert(on);
+
+   if (!on)
+   {
+      hint(QStringLiteral("已关掉上位机侧取反: 限位判据退回 6041h bit11 单独判定。"), false);
+      return;
+   }
+
+   const BusTelem t = m_thr->telemetry();
+
+   if (!t.connected)
+   {
+      hint(QStringLiteral(
+         "已打开上位机侧取反 (连上之后生效)。**它只治本程序这一侧** —— "
+         "驱动器自己的 6041h bit11 与限位保护不受影响。"), false);
+      return;
+   }
+
+   if (!t.ax[0].dig_known)
+   {
+      hint(QStringLiteral(
+         "已打开上位机侧取反, 但**读不到 60FDh** —— 取反生效时 bit11 不参与判定, "
+         "所以现在一条判据都没有: 扫描会因为「限位信号有效」永远开不了。\n"
+         "两条出路: 先把 60FDh 弄进 TxPDO (上面那个框, 再重新「连接」), "
+         "或者把这个取反关掉、退回只看 bit11。"), true);
+      return;
+   }
+
+   const AxisTelem &a = t.ax[0];
+   hint(QStringLiteral(
+      "已打开上位机侧取反 (轴0 反相后: 正限位 %1 / 负限位 %2)。\n"
+      "**它只治本程序这一侧** —— 驱动器自己的 bit11 与限位保护不受影响; "
+      "能改 2300h 还是去改它 (勾上面那个「写驱动器 2300h」), 那个修的才是根。")
+         .arg(a.dig_pos ? QStringLiteral("压着") : QStringLiteral("松开"),
+              a.dig_neg ? QStringLiteral("压着") : QStringLiteral("松开")),
+      false);
+}
+
 /* ---------------------------------------------------------------- 信号灯 */
 
 /* 信号灯: 一个 12px 的圆点, 四种样子 (ScanWindow::Lamp)。判据只一条: 灯亮 = 这件事正在发生。
@@ -368,6 +768,9 @@ void ScanWindow::buildUi()
    QWidget *side = new QWidget;
    side->setMinimumWidth(340);
 
+   /* 门控表按 gate 号建满, 后面每块框自己往里填 (下标 = .cpp 顶上那几个 GI_) */
+   m_gates.resize(GI_N);
+
    QVBoxLayout *sv = new QVBoxLayout(side);
    sv->setContentsMargins(0, 0, 0, 0);
    sv->setSpacing(8);
@@ -376,10 +779,15 @@ void ScanWindow::buildUi()
    sv->addWidget(buildLimitPanel());
    /* 第三块:「回零」。它是动作不是参数, 但回零找的就是上面那三盏灯说的那几个开关 */
    sv->addWidget(buildHomePanel());
+   /* 「高级选项」**必须**排在 buildParamPanel() 之前: loadSettings() 在它里面被调, 而
+    * loadSettings 要把存下来的值写进那三个勾 —— 勾还没建出来就会被读空 */
+   QWidget *advPanel = buildAdvPanel();
    sv->addWidget(buildParamPanel());
    sv->addWidget(buildScanPanel());
    sv->addWidget(buildMeterPanel());
    sv->addWidget(buildShadePanel());
+   /* 高级选项摆在最底下: 它是"设好了就别再动"的东西, 平时不该占视线 */
+   sv->addWidget(advPanel);
    sv->addStretch(1);
 
    QScrollArea *sideScroll = new QScrollArea(central);
@@ -441,8 +849,8 @@ void ScanWindow::buildUi()
       "极性配反 (NPN 传感器 + 2300h 按常开配) 会让它一直亮着。\n\n"
       "它**不**等同于参数栏「限位开关」那六盏: 那一组说的是**开关本身压着没有** (60FDh)。\n"
       "两者可能不一致 —— 不一致时**以这一盏为准**。扫描经过原点开关不会中止。\n\n"
-      "勾上「输入电平反转」之后这一盏换了判据: 那时它看的是**反相之后的**两个限位开关, "
-      "与 6041h bit11 无关 (「以这一盏为准」仍然成立 —— 只是它背后的来源换了)。")
+      "勾上「高级选项」里的「上位机侧取反」之后这一盏换了判据: 那时它看的是**反相之后的**"
+      "两个限位开关, 与 6041h bit11 无关 (「以这一盏为准」仍然成立 —— 只是来源换了)。")
       + QString::fromUtf8(kLampRule);
 
    m_lampX = makeLamp(this, limTip);
@@ -593,9 +1001,10 @@ QWidget *ScanWindow::buildAxisPanel()
    return box;
 }
 
-/* 「限位开关」: 每根三个信号 (原点 / 正限位 / 负限位), 第三行是可选的 60FDh 重映射。
+/* 「限位开关」: 每根三个信号 (原点 / 正限位 / 负限位)。
  * 与「轴信号」分开两个框: 这一组问开关本身压着没有, 状态栏那盏问会不会中止扫描。
- * 三个灯纯显示, 不新增中止判据: 会中止的仍然只有 6041h bit11。 */
+ * 三个灯纯显示, 不新增中止判据: 会中止的仍然只有 6041h bit11 (勾了上位机侧取反才换判据)。
+ * 这是**纯状态显示**, 一个参数控件都没有 -> 不进编辑门控。 */
 QWidget *ScanWindow::buildLimitPanel()
 {
    QGroupBox *box = new QGroupBox(QStringLiteral("限位开关"), this);
@@ -618,13 +1027,13 @@ QWidget *ScanWindow::buildLimitPanel()
       "**红亮 = 正压着, 要立刻处理** —— 先手动把滑台走离限位。\n"
       "这一格说的是**开关本身**; 会不会中止扫描看状态栏那盏 (6041h bit11)。\n"
       "两者本该同源 (都经 2300h + 2310h 出来), 不一致时**默认以 bit11 为准**;\n"
-      "但勾了「输入电平反转 (NPN)」之后改以反相后的开关为准 (见那个框的说明)。",
+      "但勾了「高级选项」里的「上位机侧取反」之后改以反相后的开关为准。",
 
       "60FDh bit0 —— 负限位开关现在压着没有 (2312h X2 = 负限位)。\n"
       "**红亮 = 正压着, 要立刻处理** —— 先手动把滑台走离限位。\n"
       "这一格说的是**开关本身**; 会不会中止扫描看状态栏那盏 (6041h bit11)。\n"
       "两者本该同源 (都经 2300h + 2310h 出来), 不一致时**默认以 bit11 为准**;\n"
-      "但勾了「输入电平反转 (NPN)」之后改以反相后的开关为准 (见那个框的说明)。"
+      "但勾了「高级选项」里的「上位机侧取反」之后改以反相后的开关为准。"
    };
 
    for (int s = 0; s < LIM_NCOL; s++)
@@ -650,41 +1059,86 @@ QWidget *ScanWindow::buildLimitPanel()
       }
    }
 
-   /* 第三行: 可选的 60FDh 重映射, 默认关。本机实测生效的 1A00h 只有 6041h/6064h/606Ch,
-    * 60FDh 不在里面 —— 不勾这个, 上面三个灯一直是"灰 + --"。优先用厂家上位机改一次
-    * 驱动器的 1A00h; 勾这个框让主站连接时补一次 (仅写 RAM, 收尾还原)。改了不重连不生效。 */
-   m_cbWantDigIn = new QCheckBox(QStringLiteral("让 60FDh 进 TxPDO"), box);
-   m_cbWantDigIn->setToolTip(QStringLiteral(
-      "连接时把 60FDh (数字输入) 追加进 TxPDO —— 不勾这个, 上面三个灯就一直是灰的。\n\n"
-      "**改了不重连不生效**, 所以只能在未连接时改。\n\n"
-      "本机实测生效的映射里没有 60FDh。推荐先用**厂家上位机**改一次驱动器的 1A00h\n"
-      "(不用改代码, 而且断电也在), 那样这个框永远不必勾。\n\n"
-      "勾上之后的代价: 过程数据从 10 字节变 14 字节; 只写 RAM, 收尾 (断开/关窗) 时还原;\n"
-      "但**崩在收尾之前**那次改写会留在驱动器里, 直到断电为止。"));
-   connect(m_cbWantDigIn, &QCheckBox::toggled, this, &ScanWindow::onWantDigInToggled);
-   g->addWidget(m_cbWantDigIn, 3, 0, 1, LIM_NCOL + 1);
-
-   /* 第四行: 「输入电平反转 (NPN)」, 默认关。治的是 NPN 传感器 (高电平 = 未触发) 配
-    * 2300h 常开时 60FDh 那三位整排反相。立即生效 (不用重连), 不持久化, 且只治本程序
-    * 这一侧 —— 驱动器自己的限位保护仍按原极性算。 */
-   m_cbDiInvert = new QCheckBox(QStringLiteral("输入电平反转 (NPN)"), box);
-   m_cbDiInvert->setToolTip(QStringLiteral(
-      "X0~X3 接的是 NPN 传感器 (高电平 = **未**触发), 而驱动器的 2300h (输入有效电平\n"
-      "逻辑) 按常开配着 —— 此时 60FDh 的原点/正限位/负限位三位**整排反相**, 两个限位\n"
-      "常年都报「压着」。勾上这个, 把三个一起翻回来。\n\n"
-      "**它只治本程序这一侧。** 60FDh 与 6041h bit11 都是驱动器给的, 勾这个框不会让\n"
-      "驱动器改变主意 —— 它自己的限位保护仍然按那套错的极性算。**能改 2300h 就去改它**\n"
-      "(那个才是修根, 改完这个框就不必勾了)。\n\n"
-      "勾上之后限位判据**整个换掉**: 不再看 bit11 (那台机器上它恒为 1, 已经不携带\n"
-      "信息了), 改看反相之后的正/负限位开关; 读不到 60FDh 时一律中止。\n\n"
-      "它**立即生效**, 不用重新连接, 不写驱动器一个字节, 也**不会被记住** ——\n"
-      "反转是「这台机器的线就是这么接的」的一条断言, 而断言错了的后果不是灯显示不对,\n"
-      "是**保护反过来** (真压着限位时它说没压着)。所以每次都要人当面确认。"));
-   connect(m_cbDiInvert, &QCheckBox::toggled, this, &ScanWindow::onDiInvertToggled);
-   g->addWidget(m_cbDiInvert, 4, 0, 1, LIM_NCOL + 1);
+   /* 那两个勾搬去了「高级选项」框 (见 buildAdvPanel): 它们是驱动器侧的设置, 不属于
+    * "开关现在压着没有"这一组状态显示 */
 
    /* 最后一列 = 本组信号数。理由同上一块 */
    g->setColumnStretch(LIM_NCOL, 1);
+   return box;
+}
+
+/* 「高级选项」: 让三个灯与三个信号"对得上"的那两件事, 再加一个只改本程序判据的退路。
+ *
+ * 现场那台机器的根子在 2300h: 传感器是 NPN (高电平 = 未触发) 而驱动器配着常开, 于是
+ * 60FDh 的 bit1/bit2 恒同时置起 -> 6041h bit11 恒为 1 -> 2204h = 0 (超程停车) 把两个方向
+ * 都挡死 -> 回零进得去、一动不动。前两项默认开, 就是照这个来的:
+ *   ① 让 60FDh 进 TxPDO —— 三个灯才有得看 (连接时补写 1A00h, 收尾还原, 仅 RAM);
+ *   ② 写驱动器 2300h = 0x0007 —— 修根: 驱动器自己的限位保护 / 60FDh / bit11 一次全对;
+ *   ③ 上位机侧取反 (默认关) —— 不写驱动器, 只换本程序的判据。②③ 同时开 = 判据恒成立。 */
+QWidget *ScanWindow::buildAdvPanel()
+{
+   QGroupBox *box = new QGroupBox(QStringLiteral("高级选项"), this);
+   QVBoxLayout *v = new QVBoxLayout(box);
+   v->setContentsMargins(6, 4, 6, 6);
+   v->setSpacing(4);
+
+   m_cbWantDigIn = new QCheckBox(QStringLiteral("让 60FDh 进 TxPDO (连接时补写 1A00h)"), box);
+   m_cbWantDigIn->setToolTip(QStringLiteral(
+      "连接时把 60FDh (数字输入) 追加进 TxPDO —— 不补这一项, 上面三个限位灯一直是灰的。\n\n"
+      "本机生效的 1A00h 实测只有 6041h/6064h/606Ch 三项, 没有 60FDh。\n"
+      "代价: 过程数据从 10 字节变 14 字节。**只写 RAM**, 收尾 (断开 / 关窗) 时还原。\n\n"
+      "**连接期参数**: 改了要重新「连接」才生效。\n"
+      "（崩在收尾之前会把这次改写留在驱动器里 —— 掉电前那三个灯的状态与出厂值不同。）"));
+
+   m_cbNpnWrite = new QCheckBox(QStringLiteral("写驱动器 2300h = 0x0007 (输入常闭 / NPN)"), box);
+   m_cbNpnWrite->setToolTip(QStringLiteral(
+      "连接时读各轴的 2300h (输入端子有效电平逻辑), 把 bit0~bit2 写成 1 = 常闭 ——\n"
+      "NPN 传感器 (高电平 = 未触发) 要的就是这个极性。收尾时写回原值。\n\n"
+      "**这是修根的那一项**: 改完之后驱动器自己的限位保护、60FDh 的三个位、\n"
+      "6041h bit11 一次全对, 回零也才走得动 (极性配反时 bit11 恒为 1, 2204h = 0\n"
+      "会把两个方向都挡死)。上面「上位机侧取反」只治本程序这一侧, 治不了这个。\n\n"
+      "安全: 本程序**从不写 2102h** (不进 EEPROM), 收尾一定写回原值; 但 2300h 会不会被\n"
+      "驱动器自己落盘手册没写, 所以别把「收尾还原」当成「驱动器一定回到了出厂状态」。\n\n"
+      "**连接期参数**: 改了要重新「连接」才生效。"));
+
+   m_cbDiInvert = new QCheckBox(QStringLiteral("上位机侧取反 (只改本程序的判据)"), box);
+   m_cbDiInvert->setToolTip(QStringLiteral(
+      "X0~X3 接的是 NPN 传感器而驱动器按常开配着时, 60FDh 的原点/正限位/负限位三位\n"
+      "整排反相, 两个限位常年都报「压着」。勾上这个把三位一起翻回来。\n\n"
+      "**它只治本程序这一侧**: 60FDh 与 6041h bit11 都是驱动器给的, 勾这个不会让驱动器\n"
+      "改变主意 —— 它自己的限位保护仍按那套错的极性算。**能改 2300h 就改它** (上面那一项), \n"
+      "那个才是根。\n\n"
+      "勾上之后限位判据**整个换掉**: 不再看 bit11 (那台机器上它恒为 1, 已经不携带信息了), \n"
+      "改看反相之后的正/负限位开关; 读不到 60FDh 时一律中止。\n\n"
+      "**与「写驱动器 2300h」同时勾 = 双反相**: 驱动器被改成常闭, 上位机又翻回去,\n"
+      "判据变成「两个限位开关取或」-> 恒为真 -> **扫描永远开不了** (只多报, 不漏报)。\n\n"
+      "**运行期参数**: 勾一下立刻生效, 不用重新连接。"));
+
+   m_lAdvWarn = new QLabel(box);
+   m_lAdvWarn->setWordWrap(true);
+   m_lAdvWarn->setStyleSheet(QStringLiteral("color:#ff8f8f;"));
+   m_lAdvWarn->setVisible(false);
+
+   v->addWidget(gateBar(GI_ADV, box));
+   v->addWidget(m_cbWantDigIn);
+   v->addWidget(m_cbNpnWrite);
+   v->addWidget(m_cbDiInvert);
+   v->addWidget(m_lAdvWarn);
+
+   /* 三个都在成员表里 (不含按钮行)。运行中也可以改: 前两个要重连才生效, 第三个立刻生效,
+    * 都不影响已经跑起来的那一趟扫描的几何 */
+   addGate(GI_ADV, box,
+           QList<GateItem>{ GateItem{ m_cbWantDigIn, false, false },
+                            GateItem{ m_cbNpnWrite,  false, false },
+                            GateItem{ m_cbDiInvert,  false, false } });
+
+   connect(m_cbWantDigIn, &QCheckBox::toggled, this, &ScanWindow::onAdvToggled);
+   connect(m_cbNpnWrite,  &QCheckBox::toggled, this, &ScanWindow::onAdvToggled);
+   connect(m_cbDiInvert,  &QCheckBox::toggled, this, [this] {
+      onAdvToggled();
+      onDiInvertToggled(m_cbDiInvert->isChecked());
+   });
+
    return box;
 }
 
@@ -716,11 +1170,18 @@ QWidget *ScanWindow::buildHomePanel()
       "缺省 50000 时是 30 圈 (够走完缺省区域的一头到另一头); 调低会跟着缩小 ——\n"
       "2000 pul/s 只有 1.2 圈, 那时碰不到开关该做的是**先把滑台手动挪到开关附近**。\n"
       "第一次在陌生的机器上试方向, 把它压到下限 100。\n\n"
-      "它不会被记住 —— 每改一次, 回零框里那行字就会把当次的数 (返回速度 / 加减速 /\n"
-      "最多走多远 / 多久判超时) 跟着改一遍, 那是「这一趟」的事, 不该从 ini 里继承。"));
+      "它会被记住 (scan.ini 的 ui/home_vel) —— 点「保存」才固化, 点「取消」退回上次\n"
+      "保存的值。每改一次, 回零框里那行字 (返回速度 / 加减速 / 最多走多远 / 多久判超时)\n"
+      "都会跟着变, 那几行永远说的是**这一趟**。"));
 
    g->addWidget(new QLabel(QStringLiteral("回零速度"), box), 0, 0);
    g->addWidget(m_edHomeVel, 0, 1, 1, 2);
+
+   /* 门控行 [编辑][保存][取消]。QGridLayout 没有 insertRow, 追加到末行 (第 8 行, 上面占到 7) */
+   g->addWidget(gateBar(GI_HOME, box), 8, 0, 1, 3);
+   addGate(GI_HOME, box,
+           /* 只有「回零速度」是参数; 八个回零按钮是动作, 不进表 (它们不归编辑态管, 归连接态管) */
+           QList<GateItem>{ GateItem{ m_edHomeVel, false, false } });
 
    /* 按钮文字自带轴与方向 ("X 正向回零"), 不做"表头 + 四个短标签": 布局一挤短标签会归错列,
     * 而错点它的代价是滑台朝反方向去找开关。下面那段 tooltip 是唯一的"事前"防线 */
@@ -748,9 +1209,65 @@ QWidget *ScanWindow::buildHomePanel()
                .arg(meth).arg(QString::fromUtf8(ecatcmd::home_dir_text(neg))));
 
          connect(m_btnHome[i][d], &QPushButton::clicked, this,
-                 [this, i, d] { onHomeClicked(i, d); });
+                  [this, i, d] { onHomeClicked(i, d, false); });
 
          g->addWidget(m_btnHome[i][d], 1 + i, d);
+      }
+
+   /* ---- 「以限位开关为原点」(方式 18 / 17, 手册叫"找限位") ----
+    * 与上面那两行**共用同一个回零速度**: 6099h:01/:02 是同一对参数, 手册 a)/b) 两条分支的
+    * "高速/低速"就是它派生的那两个。所以这里不再放第二个速度框 —— 两个速度框会出现
+    * "哪个在生效"这种看不出来的组合。 */
+   {
+      QLabel *cap = new QLabel(
+         QStringLiteral("── 以限位开关为原点 (共用上面那个回零速度) ──"), box);
+      cap->setStyleSheet(QStringLiteral("color:#6b7480;"));
+      cap->setToolTip(QStringLiteral(
+         "手册 V2.4 p46~p48: 方式 18 = 以**正限位**开关为原点, 方式 17 = 以**负限位**开关为原点。\n"
+         "与「回零」的区别只是基准不同 —— 回零找的是原点开关 X0, 这两行找的是那一侧的限位开关。\n\n"
+         "驱动器按启动那一刻**目标开关压着没有**自己选分支:\n"
+         "  a) 没压着 -> 先朝它高速去, 碰到后减速停止, 再反向低速退开 (碰到限位是这一趟的目的)\n"
+         "  b) 已经压着 -> 直接朝反方向低速退开 (首段方向与 a) 相反, 那不是点错了)\n"
+         "两条的落点都是**开关的释放点**。碰到限位**不是故障** —— 这一趟就是要去撞它。"));
+      g->addWidget(cap, 3, 0, 1, 3);
+   }
+
+   for (int i = 0; i < 2; i++)
+      for (int d = 0; d < 2; d++)
+      {
+         const bool neg  = (d == 1);
+         const int  meth = ecatcmd::home_lim_method_for(neg);
+
+         m_btnLim[i][d] = new QPushButton(
+            QStringLiteral("%1 %2")
+               .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"),
+                    QString::fromUtf8(ecatcmd::home_method_short(meth))), box);
+         m_btnLim[i][d]->setObjectName(QStringLiteral("danger"));
+         m_btnLim[i][d]->setToolTip(
+            QStringLiteral("6098h = %1 —— %2开关为原点 (手册 p46~p48)。\n\n"
+                           "驱动器自己选分支, 按发起那一刻那个开关压着没有:\n"
+                           "  a) 没压着: 先**%3高速**去找它 -> 碰到后减速停止 -> 再反向低速退开\n"
+                           "  b) 已经压着: 直接**%4低速**退开 (首段方向与 a) 相反 —— "
+                           "看到它先往反方向走不是点错了)\n"
+                           "两条都停在**开关的释放点**上。控制台与状态栏会先打出这一趟走哪条。\n\n"
+                           "**碰到限位是这一趟的目的, 不是故障** —— 找限位期间那条红色的\n"
+                           "「撞限位」横幅会被按住, 但限位灯与状态栏照常变红。\n\n"
+                           "⚠ 找完之后**显示坐标的 0 就落在这个释放点上**, 那一侧几乎没有行程。\n"
+                           "继续用旧区域跑扫描会一路撞限位 —— 先按实测行程重算扫描区域。\n"
+                           "想自己定 0 在哪, 用「设为区域中心」旁边那个「零点」。\n\n"
+                           "两道否决会拦住这一次 (一个字节都不写): 60FDh 读不到 (分不出 a/b),\n"
+                           "以及正/负限位**同时**报有效 (滑台不可能同时在两头 —— 多半是 2300h\n"
+                           "的极性配反了)。\n\n"
+                           "该轴会**先失能**, 竖直轴会在这时失去保持力矩。")
+               .arg(meth)
+               .arg(QString::fromUtf8(ecatcmd::home_method_short(meth)))
+               .arg(QString::fromUtf8(ecatcmd::home_method_first_dir(meth, false)))
+               .arg(QString::fromUtf8(ecatcmd::home_method_first_dir(meth, true))));
+
+         connect(m_btnLim[i][d], &QPushButton::clicked, this,
+                  [this, i, d] { onHomeClicked(i, d, true); });
+
+         g->addWidget(m_btnLim[i][d], 4 + i, d);
       }
 
    /* 这一行随「回零速度」实时变 (见 refresh): "这一趟能找多远"唯一看得见的地方。
@@ -758,7 +1275,7 @@ QWidget *ScanWindow::buildHomePanel()
    m_lHomeNote = new QLabel(box);
    m_lHomeNote->setWordWrap(true);
    m_lHomeNote->setStyleSheet(QStringLiteral("color:#6b7480;"));
-   g->addWidget(m_lHomeNote, 3, 0, 1, 2);
+   g->addWidget(m_lHomeNote, 6, 0, 1, 2);
 
    /* 6061h 那一行 (见 pushHomeMode)。与上面那行更新时机不同: 它只在工作线程真读过之后
     * 才变 (连接 / 使能 / 回零收尾各读一次) —— 它是"驱动器当时认的模式", 不是现在的猜测 */
@@ -772,7 +1289,7 @@ QWidget *ScanWindow::buildHomePanel()
       "这一行不是每周期刷新的: 6061h 不在过程数据里, 只能 SDO 读。工作线程只在\n"
       "连接、使能、回零收尾这三处各读一次, 所以它显示的是**上一次读到**的值 ——\n"
       "「— (还没读过)」和「0 (未定义)」是两件不同的事, 前者是不知道, 后者是驱动器说的。"));
-   g->addWidget(m_lHomeMode, 4, 0, 1, 2);
+   g->addWidget(m_lHomeMode, 7, 0, 1, 2);
 
    g->setColumnStretch(1, 1);
    return box;
@@ -861,13 +1378,17 @@ QWidget *ScanWindow::buildParamPanel()
 
    m_edCsv = new QLineEdit(box);
    m_edCsv->setPlaceholderText(QStringLiteral("scan_out/scan_YYYYmmdd_HHMMSS.csv"));
-   QPushButton *btnCsv = new QPushButton(QStringLiteral("…"), box);
-   btnCsv->setFixedWidth(28);
-   connect(btnCsv, &QPushButton::clicked, this, &ScanWindow::onBrowseCsv);
+   /* 成员而非局部量: 门控表要按它算可用性 (见 GateItem) */
+   m_btnCsv = new QPushButton(QStringLiteral("…"), box);
+   m_btnCsv->setFixedWidth(28);
+   connect(m_btnCsv, &QPushButton::clicked, this, &ScanWindow::onBrowseCsv);
    QHBoxLayout *csvRow = new QHBoxLayout;
    csvRow->setContentsMargins(0, 0, 0, 0);
    csvRow->addWidget(m_edCsv, 1);
-   csvRow->addWidget(btnCsv);
+   csvRow->addWidget(m_btnCsv);
+
+   /* 门控行。QFormLayout 有 insertRow, 插到第 0 行 */
+   f->insertRow(0, gateBar(GI_PARAM, box));
 
    f->addRow(QStringLiteral("区域 X"), m_edAreaX);
    f->addRow(QStringLiteral("区域 Y"), m_edAreaY);
@@ -934,6 +1455,27 @@ QWidget *ScanWindow::buildParamPanel()
    connect(m_edManSpeed, &QSpinBox::valueChanged, this, &ScanWindow::refresh);
    connect(m_cbDir,  &QComboBox::currentIndexChanged, this, &ScanWindow::pushParams);
    connect(m_cbMode, &QComboBox::currentIndexChanged, this, &ScanWindow::pushParams);
+
+   /* 门控成员表 (不含上面那行三个按钮)。
+    * lock_running = true 的都是"这一趟怎么走 / 往哪写": 跑到一半改掉, 落进 CSV 的 (ix,iy)
+    * 就跟滑台实际站的地方对不上了 —— 那张表是按扫描开始时定的几何算出来的 */
+   addGate(GI_PARAM, box,
+           QList<GateItem>{
+              GateItem{ m_edAreaX,    true,  false },   /* 区域 X */
+              GateItem{ m_edAreaY,    true,  false },   /* 区域 Y */
+              GateItem{ m_edRes,      true,  false },   /* 分辨率 */
+              GateItem{ m_edPpu,      true,  false },   /* 1 单位 = N 脉冲 */
+              GateItem{ m_edSpeed,    false, false },   /* 扫描速度: 下一次 start 才下发 */
+              GateItem{ m_edManSpeed, false, false },   /* 手动速度: 手工对位用, 与这趟无关 */
+              GateItem{ m_edDwell,    false, false },
+              GateItem{ m_edSettle,   false, false },
+              GateItem{ m_edSamples,  false, false },
+              GateItem{ m_cbDir,      true,  false },   /* 起始方向: 改的是轨迹 */
+              GateItem{ m_cbMode,     true,  false },   /* 扫描方式: 同上 */
+              GateItem{ m_edCsv,      true,  false },   /* 输出路径: 跑着的时候换文件没意义 */
+              GateItem{ m_btnCsv,     true,  false },
+              GateItem{ m_btnDef,     true,  false },   /* 恢复默认: 一按就是几何全变 */
+           });
 
    return box;
 }
@@ -1058,7 +1600,7 @@ QWidget *ScanWindow::buildMeterPanel()
       (*lb)->setMinimumWidth(28);
       *cb = new QComboBox(w);
       (*cb)->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-      (*cb)->setEnabled(false);
+      /* 不在这里 setEnabled(false): 灰不灰归 refreshEditability() 一处管 (它每拍重算) */
       connect(*cb, &QComboBox::currentIndexChanged, this, &ScanWindow::onMeterCfgChanged);
       h->addWidget(*lb);
       h->addWidget(*cb, 1);
@@ -1067,6 +1609,9 @@ QWidget *ScanWindow::buildMeterPanel()
    m_devRowWl    = makeDevRow(QStringLiteral("波长"), &m_cbWl,    &m_lWl);
    m_devRowRange = makeDevRow(QStringLiteral("量程"), &m_cbRange, &m_lRange);
    m_devRowMode  = makeDevRow(QStringLiteral("模式"), &m_cbMeasMode, &m_lMeasMode);
+
+   /* 门控行。QFormLayout 有 insertRow, 插到第 0 行 */
+   f->insertRow(0, gateBar(GI_METER, box));
 
    f->addRow(QStringLiteral("取样源"), m_cbMeter);
    f->addRow(QStringLiteral("手填值"), m_edManualV);
@@ -1114,6 +1659,21 @@ QWidget *ScanWindow::buildMeterPanel()
    m_lMeter->setTextFormat(Qt::PlainText);
    f->addRow(m_lMeter);
 
+   /* 门控成员表 (不含上面那行三个按钮)。这一框**运行中也可以改**: 换源 / 改手填值都不会把
+    * 已经跑起来的那一趟几何弄歪。真机那三项多一个条件 —— 设备得真开着, 见 need_dev */
+   addGate(GI_METER, box,
+           QList<GateItem>{
+              GateItem{ m_cbMeter,   false, false },
+              GateItem{ m_edManualV, false, false },
+              GateItem{ m_edRandomN, false, false },
+              GateItem{ m_edScript,  false, false },
+              GateItem{ m_btnScript, false, false },
+              /* 小标签也进表: 否则会出现"框灰着、标签亮着"这种半截样子 */
+              GateItem{ m_cbWl,       false, true }, GateItem{ m_lWl,       false, true },
+              GateItem{ m_cbRange,    false, true }, GateItem{ m_lRange,    false, true },
+              GateItem{ m_cbMeasMode, false, true }, GateItem{ m_lMeasMode, false, true },
+           });
+
    onMeterInfoChanged();      /* 一开始选的是模拟源 -> 把真机那三行藏起来 */
    return box;
 }
@@ -1159,10 +1719,19 @@ QWidget *ScanWindow::buildShadePanel()
    note->setWordWrap(true);
    note->setStyleSheet(QStringLiteral("color:#6b7480;"));
 
+   /* 门控行。QFormLayout 有 insertRow, 插到第 0 行 */
+   f->insertRow(0, gateBar(GI_SHADE, box));
+
    f->addRow(QStringLiteral("最小"), m_edShadeLo);
    f->addRow(QStringLiteral("最大"), m_edShadeHi);
    f->addRow(m_btnFit);
    f->addRow(note);
+
+   /* 这一框只有画法, 与滑台怎么走无关 -> 运行中也放开 (今天本来就没锁) */
+   addGate(GI_SHADE, box,
+           QList<GateItem>{ GateItem{ m_edShadeLo, false, false },
+                            GateItem{ m_edShadeHi, false, false },
+                            GateItem{ m_btnFit,    false, false } });
    return box;
 }
 
@@ -1187,8 +1756,16 @@ void ScanWindow::applyDefaults()
    /* 手动速度不在 Params 里 (与扫描几何无关), 缺省就是 HMI_VEL_DEF */
    m_edManSpeed->setValue(HMI_VEL_DEF);
 
+   /* 「高级选项」那三个勾的缺省。Prefs 那几个字段的初值是缺省的唯一定义处 (scanprefs.h),
+    * 这里照它填 —— 「恢复默认」必须把它们也带回来, 否则那个按钮对这三个勾就是句空话。
+    * 触发的是 onAdvToggled: 此刻工作线程还没连接, 推过去只是记着。 */
+   const Prefs pd;
+   m_cbWantDigIn->setChecked(pd.want_dig_in);
+   m_cbNpnWrite ->setChecked(pd.npn_write_drive);
+   m_cbDiInvert ->setChecked(pd.npn_sw_invert);
+
    /* 回零速度刻意不在这里: 「恢复默认」会把 applyDefaults 再跑一遍, 会把为试回零特意
-    * 压小的速度抬回去。它的缺省设在 buildHomePanel 里, 只走一次。 */
+    * 压小的速度抬回去。它的缺省设在 buildHomePanel 里, 之后由 loadSettings 覆盖。 */
 }
 
 /* 记忆: 读回上次的参数 (见 scanprefs.h)。只覆盖 ini 里真有的项, 缺的留在 applyDefaults
@@ -1213,6 +1790,17 @@ void ScanWindow::loadSettings()
    if (pf.manual_speed > 0)
       m_edManSpeed->setValue(pf.manual_speed);
 
+   /* 「高级选项」三个勾。prefsLoad 是**显式带缺省**读的 (见 scanprefs.h): QSettings 对缺项
+    * 给无效 QVariant, toBool() 一律 false —— 不这样, 一个旧的 scan.ini 会把"默认开"读成
+    * "用户关掉了", 于是 2300h 不再被修、60FDh 也不补, 而界面上那两个勾看着还像没动过。 */
+   m_cbWantDigIn->setChecked(pf.want_dig_in);
+   m_cbNpnWrite ->setChecked(pf.npn_write_drive);
+   m_cbDiInvert ->setChecked(pf.npn_sw_invert);
+
+   /* 回零速度: -1 = 没记过, 越界的夹回量程内 —— 一个被手改坏的 ini 不该让回零用一个
+    * 没验过的速度 (夹取规则在 ecatcmd::home_vel_from_pref, 被自检钉着) */
+   m_edHomeVel->setValue((int)ecatcmd::home_vel_from_pref(pf.home_vel));
+
    /* 网卡此刻还选不了 (适配器清单是异步到的), 先存着, 到了再选 */
    m_savedNic = pf.nic;
 }
@@ -1228,9 +1816,25 @@ void ScanWindow::saveSettings()
    const QString nic = m_nic->currentData().toString();
    pf.nic = nic.isEmpty() ? m_savedNic : nic;   /* 清单还没到 / 卡被拔了: 别把记住的抹掉 */
    pf.manual_speed = m_edManSpeed->value();
+   pf.home_vel     = m_edHomeVel->value();
+   pf.want_dig_in     = m_cbWantDigIn->isChecked();
+   pf.npn_write_drive = m_cbNpnWrite->isChecked();
+   pf.npn_sw_invert   = m_cbDiInvert->isChecked();
 
    prefsSave(prefsPath(), pf);
    m_savedNic = pf.nic;
+
+   /* 这一次落盘是「连接」/ 关窗顺手做的, 不是操作员点的「保存」—— 正在编辑、还没点保存的
+    * 那一框, 它的当前值刚刚被一起写进去了。快照跟上、标记清掉: 否则「取消」会退回一份已经
+    * 不在 ini 里的"上次保存值", 而那个按钮承诺的就是 ini 里那一份。 */
+   for (int gi = 0; gi < m_gates.size(); gi++)
+   {
+      if (!m_gates[gi].gate.editing)
+         continue;
+      gateSnapshot(gi);
+      m_gates[gi].gate.dirty = false;
+      gateTitle(gi);
+   }
 }
 
 void ScanWindow::onRestoreDefaults()
@@ -1330,6 +1934,11 @@ void ScanWindow::syncShadeEdits()
    /* setValue 会触发 valueChanged → setShadeRange, 那是幂等的, 不必屏蔽信号 */
    m_edShadeLo->setValue(m_canvas->shadeLo());
    m_edShadeHi->setValue(m_canvas->shadeHi());
+
+   /* 这是**程序自己**按数据定的标, 不是操作员改的。快照得跟上: 不然正在编辑时按一下
+    * 「按数据定标」, 再按「取消」, 会把色阶滚回定标之前那一份 (那时候的图已经不是那张了) */
+   gateRebase(GI_SHADE, m_edShadeLo);
+   gateRebase(GI_SHADE, m_edShadeHi);
 }
 
 void ScanWindow::applyCsvDefaultName()
@@ -1342,6 +1951,10 @@ void ScanWindow::applyCsvDefaultName()
                            .arg(QDateTime::currentDateTime().toString(
                                    QStringLiteral("yyyyMMdd_HHmmss")));
    m_edCsv->setText(QDir(dir).filePath(name));
+
+   /* 这是程序自己起的名, 不是操作员改的 (同 syncShadeEdits 的理由): 快照跟上, 否则正在
+    * 编辑「扫描参数」时按一下「开始扫描」, 再按「取消」, 会把路径退成空的 */
+   gateRebase(GI_PARAM, m_edCsv);
 }
 
 void ScanWindow::onBrowseCsv()
@@ -1364,6 +1977,10 @@ void ScanWindow::onBrowseCsv()
 
    m_edCsv->setText(QDir::toNativeSeparators(f));
    m_last_dir = QFileInfo(f).absolutePath();
+
+   /* setText 不发 textEdited (那是"程序改的"), 所以手动补一次点脏 —— 否则从这里换的输出
+    * 路径不会在标题上留「未保存」, 点「取消」时也看不出它会被退回去 */
+   gateDirty(GI_PARAM);
 }
 
 /* ---------------------------------------------------------------- 总线操作 */
@@ -1441,70 +2058,6 @@ void ScanWindow::onFaultResetClicked()
    m_thr->postFaultReset();
 }
 
-void ScanWindow::onWantDigInToggled(bool on)
-{
-   m_thr->setWantDigIn(on);
-
-   /* 这个框永远可以勾 (人恰恰是在连上、看见三个灯全是"灰 + --"之后才知道要勾它)。
-    * 但它是连接期参数: em_require_dig_in() 只在 em_setup 里被读一次, 勾了对当前这次连接
-    * 没有影响 —— 已经连上了就说清"下次连接才生效"。 */
-   if (m_connected)
-   {
-      hint(on ? QStringLiteral(
-                       "已记下: 下次「连接」时把 60FDh 追加进 TxPDO。"
-                       "**本次连接不受影响** —— 三个限位灯要等重新连接之后才会亮。")
-              : QStringLiteral("已记下: 下次「连接」不再动 TxPDO 映射。**本次连接不受影响**。"),
-           false);
-   }
-}
-
-/* 「输入电平反转 (NPN)」。运行期参数: 不写驱动器、不进 ini、不用重连, 且只治上位机这一侧
- * —— 驱动器自己的 bit11 与限位保护不受影响。
- *
- * 不做持久化: 反转是「这台机器的 X0~X3 就是这么接的」一条断言, 断言错了的后果是保护反过来
- * (真压着限位时它说没压着), 必须每次由人当面确认。
- * 反转生效时判据是 LIMIT_RULE_INVERT (不看 bit11), 读不到 60FDh 就等于一条判据都没有
- * -> 限位一律按「有效」中止 -> 扫描永远开不了, 所以要在勾的一瞬间就说。 */
-void ScanWindow::onDiInvertToggled(bool on)
-{
-   m_thr->setDiInvert(on);
-
-   if (!on)
-   {
-      hint(QStringLiteral("已关掉输入反转: 限位判据退回 6041h bit11 单独判定。"), false);
-      return;
-   }
-
-   const BusTelem t = m_thr->telemetry();
-
-   if (!t.connected)
-   {
-      hint(QStringLiteral(
-         "已打开输入反转 (连上之后生效)。**它只治本程序这一侧** —— "
-         "驱动器自己的 6041h bit11 与限位保护不受影响。"), false);
-      return;
-   }
-
-   if (!t.ax[0].dig_known)
-   {
-      hint(QStringLiteral(
-         "已打开输入反转, 但**读不到 60FDh** —— 反转生效时 bit11 不参与判定, "
-         "所以现在一条判据都没有: 扫描会因为「限位信号有效」永远开不了。\n"
-         "两条出路: 先把 60FDh 弄进 TxPDO (勾上一行那个框, 再重新「连接」), "
-         "或者把这个反转关掉、退回只看 bit11。"), true);
-      return;
-   }
-
-   const AxisTelem &a = t.ax[0];
-   hint(QStringLiteral(
-      "已打开输入反转 (轴0 反相后: 正限位 %1 / 负限位 %2)。\n"
-      "**它只治本程序这一侧** —— 驱动器自己的 bit11 与限位保护不受影响; "
-      "能改 2300h 还是去改它, 那个修的才是根。")
-         .arg(a.dig_pos ? QStringLiteral("压着") : QStringLiteral("松开"),
-              a.dig_neg ? QStringLiteral("压着") : QStringLiteral("松开")),
-      false);
-}
-
 void ScanWindow::onCenterAllClicked()
 {
    m_thr->postCenterAll();
@@ -1532,11 +2085,14 @@ void ScanWindow::onStopClicked()
    m_thr->postStop();
 }
 
-/* 「X/Y 正/反向回零」—— 全程序最危险的一个按钮: 按下之后滑台自己带电朝开关走, 朝哪走、
- * 什么时候停、撞不撞开关全由驱动器按 6098h 决定, 软件拦不住它撞开关。
+/* 「X/Y 正/反向回零」与「X/Y 找正/负限位」—— 全程序最危险的八个按钮: 按下之后滑台自己
+ * 带电朝开关走, 朝哪走、什么时候停、撞不撞开关全由驱动器按 6098h 决定, 软件拦不住它撞开关。
  * 不弹确认框, 事前的话分两处常驻: 按钮 tooltip (轴 / 方向 / 方式号 / 该轴会先失能) 与
- * 回零框里随速度实时变的那行 (见 pushHomeNote)。限位判据已成立由 refresh 挂红横幅说。 */
-void ScanWindow::onHomeClicked(int axis, int dir)
+ * 回零框里随速度实时变的那行 (见 pushHomeNote)。限位判据已成立由 refresh 挂红横幅说。
+ *
+ * 找限位 (17/18) 与找原点共用这一条路, 差别只有方式号与文案 —— 两道否决 (60FDh 读不到 /
+ * 两侧同时有效) 与"这一趟走 a 还是 b"的预告都在工作线程里做, 因为判据要读驱动器自己那两位。 */
+void ScanWindow::onHomeClicked(int axis, int dir, bool find_limit)
 {
    if (axis < 0 || axis > 1 || dir < 0 || dir > 1)
       return;
@@ -1549,15 +2105,20 @@ void ScanWindow::onHomeClicked(int axis, int dir)
    }
 
    const bool     neg  = (dir == 1);
-   const int      meth = ecatcmd::home_method_for(neg);
+   const int      meth = find_limit ? ecatcmd::home_lim_method_for(neg)
+                                    : ecatcmd::home_method_for(neg);
    const uint32_t vel  = ecatcmd::home_vel_clamp(m_edHomeVel->value());
    const QString  ax   = (axis == 0) ? QStringLiteral("X") : QStringLiteral("Y");
-   const QString  dtxt = QString::fromUtf8(ecatcmd::home_dir_text(neg));
+   /* 动作名: 找限位那两个方式号本身就带方向, 找原点要把方向补进去才分得清 */
+   const QString  act  = find_limit
+      ? QString::fromUtf8(ecatcmd::home_method_short(meth))
+      : QStringLiteral("%1回零").arg(QString::fromUtf8(ecatcmd::home_dir_text(neg)));
 
    /* 零点世代 +1, 在 postHome 之前且无条件。放 GUI 是因为它无法知道工作线程那道闸是拦还是
     * 放, 而两个方向的代价不对称: 多发一代最多让续扫多问一次 (无害); 漏发一代则续扫把回零
     * 前后的两半坐标静默拼在一起 —— 那正是这套机制存在的全部理由。
-    * 所以往保守那边偏: GUI 每次派发都 +1。 */
+    * 所以往保守那边偏: GUI 每次派发都 +1。找限位同样重定义零点 (0 落在开关释放点上),
+    * 所以这里一个字都不用改。 */
    m_epoch++;
    m_ctl->setZeroEpoch(m_epoch);
 
@@ -1565,9 +2126,9 @@ void ScanWindow::onHomeClicked(int axis, int dir)
 
    /* 这一句只在**命令没被那道闸接住**时才留得住 (真开始回零的话, 最多 33ms 之后
     * refresh 就会用"轴X 正在回零…"那条**状态**横幅把它盖掉 —— 那是设计如此)。 */
-   hint(QStringLiteral("轴 %1 的 %2回零已发出 (方式 %3, 速度 %4 pul/s)。"
+   hint(QStringLiteral("轴 %1 的 %2已发出 (方式 %3, 速度 %4 pul/s)。"
                        "**按「停止」可立即中止** —— 收尾要几秒, 请等状态栏里那句结果")
-           .arg(ax, dtxt).arg(meth).arg(vel), false);
+           .arg(ax, act).arg(meth).arg(vel), false);
 }
 
 void ScanWindow::onZeroHereClicked()
@@ -1648,9 +2209,10 @@ void ScanWindow::onMeterChanged(int idx)
    refresh();
 }
 
-/* 设备信息回来了: 真机那三行露不露出来 / 三个下拉框装设备的选项表 / 当前选中项 / 没选上或
- * 没这一项的框灰掉。只在 infoChanged 时跑, 不放进 30Hz 的 refresh(): 那个频率下重填下拉框
- * 会跟操作员正在点的那一下抢, 而且每帧重建选项是白烧 CPU。 */
+/* 设备信息回来了: 真机那三行露不露出来 / 三个下拉框装设备的选项表 / 当前选中项。
+ * 灰不灰不归这里管 —— 那是 refreshEditability() 每拍算的 (空选项表也在那边判)。
+ * 只在 infoChanged 时跑, 不放进 30Hz 的 refresh(): 那个频率下重填下拉框会跟操作员正在点的
+ * 那一下抢, 而且每帧重建选项是白烧 CPU。 */
 void ScanWindow::onMeterInfoChanged()
 {
    const bool is_ophir = (m_meter == m_ophir);
@@ -1662,26 +2224,28 @@ void ScanWindow::onMeterInfoChanged()
       return;
 
    const OphirInfo i = m_ophir->info();
-   const bool open = m_ophir->isOpen();
 
    /* 填的时候挡掉信号, 否则每 addItem 一次都会被当成操作员改配置 (一连串 stop/set/start) */
    m_meterCfgQuiet = true;
 
-   auto fill = [&](QComboBox *cb, QLabel *lb, const QStringList &opts, int cur) {
+   auto fill = [&](QComboBox *cb, const QStringList &opts, int cur) {
       cb->clear();
       cb->addItems(opts);
       if (cur >= 0 && cur < cb->count())
          cb->setCurrentIndex(cur);
-      /* 探头没有这一项 (手册: options 为空 / index 为 -1) 是正常的, 灰掉就是 */
-      const bool usable = open && !opts.isEmpty();
-      cb->setEnabled(usable);
-      lb->setEnabled(usable);
+      /* 探头没有这一项 (手册: options 为空 / index 为 -1) 是正常的 -> refreshEditability
+       * 那边看到空表就不会放开这个框 (它每拍重算, 这里是"重新填了表就报一声") */
    };
-   fill(m_cbWl,    m_lWl,    i.wavelengths, i.wl_index);
-   fill(m_cbRange, m_lRange, i.ranges,      i.range_index);
-   fill(m_cbMeasMode, m_lMeasMode, i.modes, i.mode_index);
+   fill(m_cbWl,    i.wavelengths, i.wl_index);
+   fill(m_cbRange, i.ranges,      i.range_index);
+   fill(m_cbMeasMode, i.modes,    i.mode_index);
 
    m_meterCfgQuiet = false;
+
+   /* 重填下拉框 = 程序自己改了控件值。快照得跟上, 否则「取消」会滚回一份已不存在的选项表 */
+   gateRebase(GI_METER, m_cbWl);
+   gateRebase(GI_METER, m_cbRange);
+   gateRebase(GI_METER, m_cbMeasMode);
 }
 
 /* 操作员改了波长/量程/模式。异步 —— 工作线程收到后是 停流 → 改 → 重新开流, 改完再发一次
@@ -1772,12 +2336,26 @@ void ScanWindow::onBrowseScript()
 
    m_edScript->setText(QDir::toNativeSeparators(f));
    m_last_dir = QFileInfo(f).absolutePath();
+   gateDirty(GI_METER);      /* 理由同 onBrowseCsv: setText 不发 textEdited */
+
+   pushScriptPath();
+   refresh();
+}
+
+/* 框里的文本和实际用的脚本是两份东西: 文本是给眼睛看的, 真正读数是 m_script 里那份。
+ * 两者唯一的同步点就在这里 —— 所以「取消」回灌完文本必须再调一次, 否则文本退回去了而
+ * 实际用的还是被丢弃的那份脚本。 */
+bool ScanWindow::pushScriptPath()
+{
+   const QString f = m_edScript->text().trimmed();
+   if (f == m_script->path())
+      return true;           /* 没变就不重读文件 */
 
    QString err;
    if (!m_script->setPath(f, &err))
    {
       hint(QStringLiteral("脚本读不了: ") + err, true);
-      return;
+      return false;
    }
 
    if (m_meter == m_script)
@@ -1787,8 +2365,7 @@ void ScanWindow::onBrowseScript()
       if (!err.isEmpty())
          hint(QStringLiteral("脚本源打不开: ") + err, true);
    }
-
-   refresh();
+   return true;
 }
 
 /* ---------------------------------------------------------------- 扫描 */
@@ -1975,11 +2552,13 @@ void ScanWindow::pushHomeNote()
    const double   reach = (double)vel * (HMI_HOME_TMO_MS / 1000.0) / ppu;
 
    const QString s = QStringLiteral(
-      "回零 = 让驱动器自己带电朝开关走, **软件拦不住它撞开关**; 该轴会先失能 "
+      "回零与找限位 = 让驱动器自己带电朝开关走, **软件拦不住它撞开关**; 该轴会先失能 "
       "(竖直轴此时失去保持力矩, 可能下滑)。\n"
-      "本速度: 找原点 %1 / 返回 %2 pul/s (6099h), 加减速 %3 (609Ah), "
+      "本速度: 找段 %1 / 返回段 %2 pul/s (6099h), 加减速 %3 (609Ah), "
       "一次最多走 **%4 圈**, %5 秒后判超时 —— 够不着开关请先把滑台挪近, "
-      "**不要**为了够得着去调高速度。")
+      "**不要**为了够得着去调高速度。\n"
+      "两排按钮共用这个速度 (它们写的是同一对参数 6099h:01/:02 与 609Ah): "
+      "上面那排找**原点开关** X0, 下面那排找**限位开关**。")
       .arg(vel).arg(slow).arg(acc)
       .arg(QString::number(reach, 'f', 1))
       .arg(HMI_HOME_TMO_MS / 1000);
@@ -2036,6 +2615,11 @@ void ScanWindow::pushHomeMode(const BusTelem &t)
  * 这里只读 a.limit_active。 */
 void ScanWindow::refreshAxisSignals(const BusTelem &t)
 {
+   /* 正在这一根上找限位 (方式 17/18)。**这一位会让下面那条红横幅闭嘴** —— 找限位就是要去
+    * 撞那个开关, 限位信号置起是这一趟的**目的**而不是出了事; 而且那条红横幅与"正在找限位"
+    * 那条状态横幅争同一个 m_banner, 争赢的结果是唯一一句"按「停止」可立即中止"被顶掉。 */
+   const bool finding_limit = t.homing && ecatcmd::home_method_is_limit(t.homing_method);
+
    for (int i = 0; i < 2; i++)
    {
       const AxisTelem &a = t.ax[i];
@@ -2126,6 +2710,14 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
                         "60FDh 不在生效映射里 (三个开关的状态无从得知)\n",
                         i, t.di_invert ? 1 : 0, (unsigned)a.sw);
          std::fflush(stdout);
+
+         /* ★ 找限位期间**只压横幅**, 上面那行 stdout 证据与限位灯/状态栏那格照旧 ——
+          * 它们说的是"这个信号此刻有效", 是事实; "这是个故障"才是这里不让说的话。
+          * m_limShown[i] 上面已经置 true 了, 所以这一趟不会反复重算;
+          * m_limBanner[i] 刻意**不写** —— 下面那个清理分支是按"这一位掉下去"清的,
+          * 掉下去时 m_limShown 归 false, 于是找完限位之后压着限位启扫, 该响的还是响。 */
+         if (finding_limit && i == t.homing_axis)
+            continue;
 
          /* 「是什么状态」与「接下来查哪儿」两句都从 ecatcmd 里取 —— 那里是唯一一处定义,
           * 拒绝启扫与自动中止用的也是同一对函数。
@@ -2237,20 +2829,10 @@ void ScanWindow::refresh()
 
    pushManualSpeed(t, running);
 
-   /* 扫描中锁住参数与取样源: 几何改到一半, 落进 CSV 的 (ix,iy) 就和实际位置对不上了 */
-   const QList<QWidget *> locked{
-      m_edAreaX, m_edAreaY, m_edRes, m_edPpu, m_edSpeed, m_edManSpeed, m_edDwell,
-      m_edSettle, m_edSamples, m_cbDir, m_cbMode, m_edCsv, m_cbMeter,
-      m_edManualV, m_edRandomN, m_edScript, m_btnScript, m_btnOpen, m_btnDef
-   };
-   for (QWidget *w : locked)
-      w->setEnabled(!running);
-
-   /* 真机那三项不进上面那张表: 可用性还取决于设备有没有这一项 (选项表可能是空的) */
-   const bool dev_ok = !running && (m_meter == m_ophir) && m_ophir->isOpen();
-   m_cbWl->setEnabled(dev_ok && m_cbWl->count() > 0);
-   m_cbRange->setEnabled(dev_ok && m_cbRange->count() > 0);
-   m_cbMeasMode->setEnabled(dev_ok && m_cbMeasMode->count() > 0);
+   /* 参数控件的可用性**全部**归 refreshEditability(): 平时只读, 点了这一框的「编辑」才
+    * 放开; 几何那几项运行中仍然锁住 (改到一半, 落进 CSV 的 (ix,iy) 就和实际位置对不上)。
+    * 原来那张"扫描中锁住"的表已经搬进各框的 GateItem.lock_running。 */
+   refreshEditability();
 
    refreshAxisSignals(t);
 
@@ -2280,24 +2862,36 @@ void ScanWindow::refresh()
    m_btnCenter->setEnabled(can_move);
    m_btnZero->setEnabled(can_move && !t.homing);
 
-   /* 四个回零按钮逐轴判, 只看这一根; 另一根带不带电、有没有故障都与它无关。
+   /* 八个回零按钮逐轴判, 只看这一根; 另一根带不带电、有没有故障都与它无关。
     * 刻意不看 enabled: 未使能也能回零 (em_home 要求未使能才能写 6098h)。
-    * fault / mirror_ok 这里再判一次: 工作线程那道闸才是权威, 但让按钮先按不动更好。 */
+    * fault / mirror_ok 这里再判一次: 工作线程那道闸才是权威, 但让按钮先按不动更好。
+    * 找限位那四个与这四个**同一判据** —— 归"连接态 + 不在运行 + 不在回零"管, 不进编辑门控
+    * (它们是动作不是参数)。 */
    for (int i = 0; i < 2; i++)
    {
-      const bool ok = can_home && t.ax[i].valid && t.ax[i].mirror_ok && !t.ax[i].fault;
+      const bool    ok   = can_home && t.ax[i].valid && t.ax[i].mirror_ok && !t.ax[i].fault;
+      const bool    mine = t.homing && (t.homing_axis == i);
+      const bool    mine_lim = mine && ecatcmd::home_method_is_limit(t.homing_method);
+      const QString nm   = (i == 0) ? QStringLiteral("X") : QStringLiteral("Y");
 
       for (int d = 0; d < 2; d++)
       {
          m_btnHome[i][d]->setEnabled(ok);
-         /* 回零中只改正在动的那一根的名字, 否则回 X 时 Y 的按钮也写着"回零中…" */
-         const bool mine = t.homing && (t.homing_axis == i);
+         m_btnLim[i][d]->setEnabled(ok);
+
+         /* 回零中只改正在动的那一根的名字, 否则回 X 时 Y 的按钮也写着"回零中…"。
+          * 而且**两排各自认自己那一趟**: 找限位时上面那排不改字 (那一趟不是找原点),
+          * 找原点时下面那排不改字 —— 说反了人会以为"找完还要再找一次"。 */
          m_btnHome[i][d]->setText(
-            mine ? QStringLiteral("%1 回零中…")
-                      .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"))
-                 : QStringLiteral("%1 %2回零")
-                      .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"),
-                           QString::fromUtf8(ecatcmd::home_dir_text(d == 1))));
+            (mine && !mine_lim) ? QStringLiteral("%1 回零中…").arg(nm)
+                                : QStringLiteral("%1 %2回零")
+                                     .arg(nm, QString::fromUtf8(
+                                                 ecatcmd::home_dir_text(d == 1))));
+         m_btnLim[i][d]->setText(
+            mine_lim ? QStringLiteral("%1 找限位中…").arg(nm)
+                     : QStringLiteral("%1 %2")
+                          .arg(nm, QString::fromUtf8(ecatcmd::home_method_short(
+                                      ecatcmd::home_lim_method_for(d == 1)))));
       }
    }
 
@@ -2311,13 +2905,35 @@ void ScanWindow::refresh()
    /* 回零横幅: 上升沿起一条, 下降沿只清我们自己写的那条 (原文比对, 同 m_limBanner) */
    if (t.homing)
    {
-      const QString s = QStringLiteral("轴%1 正在回零 (方式 %2, %3高速先找) —— "
-                                       "**按「停止」可立即中止**")
-                           .arg(t.homing_axis == 0 ? QStringLiteral("X")
-                                                   : QStringLiteral("Y"))
-                           .arg(t.homing_method)
-                           .arg(QString::fromUtf8(
-                                   ecatcmd::home_dir_text(t.homing_method == 29)));
+      const int     m      = t.homing_method;
+      const bool    is_lim = ecatcmd::home_method_is_limit(m);
+      const QString nm     = (t.homing_axis == 0) ? QStringLiteral("X") : QStringLiteral("Y");
+      const int     ai     = (t.homing_axis >= 0 && t.homing_axis < 2) ? t.homing_axis : 0;
+
+      QString s;
+      if (is_lim)
+      {
+         /* 找限位: **不在这句里声称它现在朝哪走**。"这一趟走 a) 还是 b)"是发起那一刻按
+          * 驱动器自己那两位定下来的, 而这里手上只有界面反相之后的值 —— 「上位机侧取反」
+          * 开着时两者正好相反, 说成"正在反向退开"会恰好说反。分支预告在控制台里 (那句
+          * 是工作线程按驱动器自己的读数打的); 这里只报**信号此刻有效**这件事实, 与限位灯
+          * 同一份量、同一个措辞。 */
+         s = QStringLiteral("轴%1 正在%2 (方式 %3) —— **按「停止」可立即中止**")
+                .arg(nm, QString::fromUtf8(ecatcmd::home_method_short(m)))
+                .arg(m);
+
+         if (t.ax[ai].dig_known &&
+             ecatcmd::home_lim_target_active(m, t.ax[ai].dig_pos, t.ax[ai].dig_neg))
+            s += QStringLiteral(" [%1信号此刻有效 —— 碰到它是这一趟的目的, 不是故障]")
+                    .arg(QString::fromUtf8(ecatcmd::home_lim_switch_name(m)));
+      }
+      else
+      {
+         s = QStringLiteral("轴%1 正在回零 (方式 %2, %3高速先找) —— **按「停止」可立即中止**")
+                .arg(nm).arg(m)
+                .arg(QString::fromUtf8(ecatcmd::home_method_first_dir(m, false)));
+      }
+
       if (m_homeBanner != s)
       {
          m_homeBanner = s;
@@ -2344,16 +2960,10 @@ void ScanWindow::refresh()
    m_btnFaultRst->setText(t.resetting ? QStringLiteral("正在复位…")
                                       : QStringLiteral("故障复位"));
 
-   /* 「让 60FDh 进 TxPDO」不跟着 onair 变灰: 它确是连接期参数 (改了不重连不生效),
-    * 但人正是连上之后看见三个灯全灰才想到要勾它。改成永远可勾, 由提示说明"下次连接
-    * 才生效"。勾错代价为零: em_require_dig_in 只在 em_setup 里读一次。 */
-   m_cbWantDigIn->setEnabled(true);
-
-   /* 「输入电平反转 (NPN)」同理不跟着 onair 变灰, 理由更强: 它是运行期参数, 勾一下就
-    * 立刻生效。安全相关, 按不了只会把人挡在一个正当的修法外面。
-    * 但不从遥测回灌它的勾选状态: setDiInvert 立刻写而 publish 每周期才拷一次, 中间那一拍
-    * 回灌会让它自己跳回去。措辞那边走 BusTelem::di_invert (那是真值)。 */
-   m_cbDiInvert->setEnabled(true);
+   /* 高级选项那三个勾的可用性归 refreshEditability(), 它不跟 onair 走 (理由在
+    * buildAdvPanel 的注释里)。这里只重申那条**不能回灌勾选状态**的规矩:
+    * setNpnWriteDrive / setDiInvert 是立刻写, 而 publish 每周期才拷一次 —— 中间那一拍
+    * 回灌会让勾自己跳回去。措辞那边走 BusTelem::di_invert (那是真值)。 */
 
    const bool meter_ok = (m_meter != nullptr) && m_meter->isOpen();
    const bool params_ok = m_ctl->paramsError().isEmpty();

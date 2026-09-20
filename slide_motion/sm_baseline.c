@@ -34,8 +34,8 @@ static const sm_spec_t sm_spec_table[] = {
    { 0x2204, 0x00, SM_DT_U8, SM_CMP_EXACT, 1, 0, "2204h 超程停车方式 (0停止/1急停)" },
 
    /* ---- IO 电平逻辑与滤波 (错了不致命, 但会让 60FDh 反相, 记 WARN) ---- */
-   { 0x2300, 0x00, SM_DT_U8, SM_CMP_EXACT, 0, 0, "2300h 输入有效电平逻辑" },
-   { 0x2301, 0x00, SM_DT_U8, SM_CMP_EXACT, 0, 0, "2301h 输出有效电平逻辑" },
+   { 0x2300, 0x00, SM_DT_U16, SM_CMP_EXACT, 0, 0, "2300h 输入有效电平逻辑 (bit0~2 X0~X2, 0常开/1常闭)" },
+   { 0x2301, 0x00, SM_DT_U16, SM_CMP_EXACT, 0, 0, "2301h 输出有效电平逻辑" },
    { 0x2320, 0x00, SM_DT_U8, SM_CMP_EXACT, 0, 0, "2320h Y0 功能" },
    { 0x2321, 0x00, SM_DT_U8, SM_CMP_EXACT, 0, 0, "2321h Y1 功能" },
    { 0x2330, 0x00, SM_DT_U16, SM_CMP_PCT, 0, 50, "2330h X0 滤波时间" },

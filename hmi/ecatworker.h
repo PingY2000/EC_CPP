@@ -91,7 +91,7 @@ struct BusTelem
     * 再由 publish() 从 m_homing 拷一份, 两处都要。 */
    bool     homing    = false;
    int      homing_axis   = -1;   /* -1 = 没在回零 */
-   int      homing_method = 0;    /* 6098h 的方式号 (24/29), 只为显示给人看 */
+   int      homing_method = 0;    /* 6098h 的方式号 (24/29/18/17), 只为显示给人看 */
    int      naxis     = 0;
    int      wkc       = 0;
    int      expected_wkc = 0;
@@ -99,7 +99,7 @@ struct BusTelem
    int32_t  range     = HMI_RANGE;
    QString  note;                /* 最后一条给操作员看的话 */
 
-   /* 「输入电平反转 (NPN)」当前是否真的生效。**总线级**: 接线方式是整台机器的性质。
+   /* 「上位机侧取反」当前是否真的生效。**总线级**: 接线方式是整台机器的性质。
     * 放进电文是因为措辞必须说当前真正生效的那一种, 说错了会把人支到错的地方去。 */
    bool     di_invert = false;
 
@@ -200,8 +200,8 @@ inline const char *limit_switch_text(bool dig_known, bool dig_pos, bool dig_neg,
 {
    if (!dig_known)
       return di_invert
-         ? "60FDh 不在生效映射里, 开关状态**无从得知** —— 而「输入电平反转」开着, "
-           "反相拿到的是一堆 0, 等于一条判据都没有"
+         ? "60FDh 不在生效映射里, 开关状态**无从得知** —— 而「高级选项」里的"
+           "「上位机侧取反」开着, 反相拿到的是一堆 0, 等于一条判据都没有"
          : "60FDh 不在生效映射里, 三个开关的状态**无从得知**";
 
    /* 正负限位同时读成压着, 物理上不成立 —— 现场是 X0~X3 接 NPN 传感器 (高电平表示
@@ -216,7 +216,7 @@ inline const char *limit_switch_text(bool dig_known, bool dig_pos, bool dig_neg,
            "所以这一条多半不是真的。最可能的原因是 2300h (输入有效电平逻辑) "
            "与接线不符: NPN 传感器高电平表示**未**触发, 驱动器就得按常闭认 "
            "(2300h 里对应的位置 1), 按常开配 (0) 会把「没触发」读成「触发」, "
-           "两个限位于是常年都报压着 (本程序里的「输入电平反转」也能治同一个病, "
+           "两个限位于是常年都报压着 (本程序里的「上位机侧取反」也能治同一个病, "
            "但它只治上位机这一侧, 驱动器的 bit11 与它自己的限位保护不受影响)";
 
    if (dig_pos)
@@ -238,7 +238,7 @@ inline const char *limit_hit_advice(bool dig_known, bool dig_pos, bool dig_neg,
 {
    if (!dig_known)
       return di_invert
-         ? "「输入电平反转」开着, 而 60FDh 读不到。反转生效时 bit11 **不参与判定**, "
+         ? "「上位机侧取反」开着, 而 60FDh 读不到。反转生效时 bit11 **不参与判定**, "
            "所以此时一条判据都没有 —— 限位信号一律按「有效」中止, 扫描**永远开不了**。"
            "两条路挑一条: "
            "把 60FDh 弄进映射 (勾「让 60FDh 进 TxPDO」再重新「连接」, 或用厂家上位机改一次 "
@@ -254,7 +254,7 @@ inline const char *limit_hit_advice(bool dig_known, bool dig_pos, bool dig_neg,
          : "先别去走离限位 —— 正负限位**同时**压着, 那个限位不存在。查 2300h 的输入"
            "有效电平逻辑与 X0~X3 接线是否一致 (NPN 传感器高电平表示未触发, 该按常闭认), "
            "再顺手看一眼 607Dh:01/:02 软限位是不是 0/0 —— 这两个都只读, 不改任何东西。"
-           "界面上的「输入电平反转」也能立刻解开上位机这一侧, 但它**只治软件**: "
+           "界面上的「上位机侧取反」也能立刻解开上位机这一侧, 但它**只治软件**: "
            "驱动器自己的 bit11 与限位保护不受影响, 所以能改 2300h 还是先改它";
 
    if (dig_pos || dig_neg)
@@ -286,7 +286,7 @@ inline const char *limit_hit_advice(bool dig_known, bool dig_pos, bool dig_neg,
 inline const char *limit_hit_headline(bool di_invert)
 {
    return di_invert
-      ? "轴%1 的限位判据成立 —— 「输入电平反转」开着, 此刻的判据是**反相之后的**"
+      ? "轴%1 的限位判据成立 —— 「上位机侧取反」开着, 此刻的判据是**反相之后的**"
         "正/负限位开关, 与 6041h bit11 无关"
       : "轴%1 的 6041h bit11 置起 —— 手册对这一位的定义是「**硬件限位信号有效**」";
 }
@@ -302,10 +302,128 @@ inline const char *axis_label(int i)
 
 /* 方向 -> 6098h 方式: 24 = 原点开关 (X0) 为原点、正向高速先找, 29 = 反向; 不用 35
  * (以当前位置为机械原点, 不是"去找")。"正/反"是**电机轴的正反向**, 与画布 +X/+Y 是否同向
- * 只有现场试一次才知道, 所以界面措辞不能写成"+X 方向"。 */
-inline int home_method_for(bool negative) { return negative ? 29 : 24; }
+ * 只有现场试一次才知道, 所以界面措辞不能写成"+X 方向"。
+ * 这是"找原点"的两条; "以限位开关为原点"的两条是 home_lim_method_for, 见下。 */
+inline int home_method_for(bool negative)
+{
+   return negative ? EM_HOME_MODE_ORIGIN_NEG : EM_HOME_MODE_ORIGIN_POS;
+}
 
 inline const char *home_dir_text(bool negative) { return negative ? "反向" : "正向"; }
+
+/* ---- 「找限位」: 把限位开关本身当机械基准 (6098h = 18 正限位 / 17 负限位) ----
+ * 与 24/29 的区别是**基准不同**: 24/29 找的是原点开关 X0, 17/18 找的是那一侧的限位开关。
+ * 手册 V2.4 p46~p48 给 17/18 各写了两条分支 —— a) 启动时目标开关没压着 (先朝它高速去,
+ * 碰到再退开), b) 启动时已经压着 (直接朝反方向低速退开)。**两条分支的终点都是开关的
+ * 释放点**, 也就是刚退开一点的那个位置。 */
+inline int home_lim_method_for(bool negative)
+{
+   return negative ? EM_HOME_MODE_LIMIT_NEG : EM_HOME_MODE_LIMIT_POS;
+}
+
+inline bool home_method_allowed(int m)
+{
+   return m == EM_HOME_MODE_ORIGIN_POS || m == EM_HOME_MODE_ORIGIN_NEG ||
+          m == EM_HOME_MODE_LIMIT_POS  || m == EM_HOME_MODE_LIMIT_NEG;
+}
+
+inline bool home_method_is_limit(int m)
+{
+   return m == EM_HOME_MODE_LIMIT_POS || m == EM_HOME_MODE_LIMIT_NEG;
+}
+
+/* 方式号的简称。进日志 / 横幅 / 结论句 */
+inline const char *home_method_short(int m)
+{
+   if (m == EM_HOME_MODE_LIMIT_POS) return "找正限位";
+   if (m == EM_HOME_MODE_LIMIT_NEG) return "找负限位";
+   return "找原点";
+}
+
+/* 目标那个**开关**的名字 (18 -> "正限位")。与 home_method_short 是两样东西: 那个是**动作**
+ * 的名字 "找正限位", 差一个"找"字 —— 拿它 .mid(1) 切会看不见地依赖那个字的长度。 */
+inline const char *home_lim_switch_name(int m)
+{
+   if (m == EM_HOME_MODE_LIMIT_POS) return "正限位";
+   if (m == EM_HOME_MODE_LIMIT_NEG) return "负限位";
+   return "限位开关";
+}
+
+/* 目标开关此刻压着没有 (只有 17/18 有"目标开关"; 24/29 的基准是原点开关, 不在这里判)。
+ * "哪一位是目标"由 EM_HOME_LIM_TARGET_BIT 定义 (在 ec_motor.h 里, motor_test 也读同一份)。 */
+inline bool home_lim_target_active(int m, bool dig_pos, bool dig_neg)
+{
+   const uint32_t mask = EM_HOME_LIM_TARGET_BIT(m);
+
+   if (mask == 0u)
+      return false;
+   return (mask & EM_DI_POS_LIMIT) ? dig_pos : dig_neg;
+}
+
+/* 另外那一侧的限位开关 (与目标相对)。与 target 同时压着 = 读数里至少有一个不是真的 */
+inline bool home_lim_other_active(int m, bool dig_pos, bool dig_neg)
+{
+   const uint32_t mask = EM_HOME_LIM_OTHER_BIT(m);
+
+   if (mask == 0u)
+      return false;
+   return (mask & EM_DI_POS_LIMIT) ? dig_pos : dig_neg;
+}
+
+/* 这一趟回零的**首段方向**。tgt_active = "启动时目标那个开关已经压着" (手册的 b) 分支)。
+ * 原来的写法是从"方式号等不等于 29"推方向 (scanwindow.cpp / ecatworker.cpp 各一处),
+ * 那套对 24/29 够用, 对 17/18 会把 a) 说成 b) —— 而且 17 与 18 的首段方向本身就是反的。
+ * 四个方式 × a/b 是一张真值表, 被 scan/selftest.cpp 钉死。 */
+inline const char *home_method_first_dir(int m, bool tgt_active)
+{
+   switch (m)
+   {
+   case EM_HOME_MODE_ORIGIN_POS: return "正向";                       /* 原点开关, 正向高速先找 */
+   case EM_HOME_MODE_ORIGIN_NEG: return "反向";
+   case EM_HOME_MODE_LIMIT_POS:  return tgt_active ? "反向" : "正向";  /* 18: b) 反向低速退开 */
+   case EM_HOME_MODE_LIMIT_NEG:  return tgt_active ? "正向" : "反向";  /* 17: b) 正向低速退开 */
+   }
+   return "?";
+}
+
+/* 找限位之前的第二道闸 (第一道是 home_refusal)。nullptr = 可以发起。
+ * **必须在任何写动作之前** —— doHome() 的第一件事是 em_disable(), 它真的会撤掉保持力矩。
+ * 传入的必须是**驱动器自己**那两位 (em_di_poslim / em_di_neglim, 即 2300h + 2310h 之后的
+ * 结果), 不是界面反相后的值 —— 驱动器按它自己的读数决定怎么走。
+ * 文案里的「拒绝」两个字是界面着红色的判据 (见 scanwindow.cpp 的 hint 排布)。 */
+inline const char *home_lim_refusal(bool dig_known, bool tgt_active, bool other_active)
+{
+   if (!dig_known)
+      return "60FDh 读不到 (不在生效 TxPDO 里, 或还没收到过完整帧) -> 分不出这一趟该走"
+             "手册的 a) 还是 b) 分支, **拒绝找限位**。出路: 在「高级选项」里勾上"
+             "「让 60FDh 进 TxPDO」再重新「连接」";
+   if (tgt_active && other_active)
+      return "正限位与负限位**同时**报有效 -> 滑台不可能同时在两头, 这一对读数里至少有一个"
+             "不是真的, **拒绝找限位**。最可能的原因是 2300h (输入有效电平逻辑) 与接线"
+             "不符: NPN 传感器高电平表示**未**触发, 驱动器就得按常闭认 (2300h 对应位置 1), "
+             "按常开配 (0) 会把「没触发」读成「触发」。查 2300h 与 2310h~2312h、"
+             "以及 X0~X3 的接线之后再试";
+   return nullptr;
+}
+
+/* 发起前那一句预告: 这一趟走手册的 a) 还是 b)。**这是防止"看到它先往反方向走, 以为点错了"
+ * 的唯一提示** —— b) 的首段方向与 a) 相反, 两句话里都必须写明方向与快慢。 */
+inline const char *home_lim_branch_text(int m, bool tgt_active)
+{
+   if (m == EM_HOME_MODE_LIMIT_POS)
+      return tgt_active
+         ? "轴%1 找正限位 (方式 18): 正限位现在压着, 走手册 b) 分支 —— 先**反向低速**退开, "
+           "遇到限位释放后停机 (落点 = 开关的释放点)"
+         : "轴%1 找正限位 (方式 18): 正限位现在没压着, 走手册 a) 分支 —— 先**正向高速**"
+           "去找它, 碰到后减速停止, 再反向低速退开, 停在开关的释放点";
+   if (m == EM_HOME_MODE_LIMIT_NEG)
+      return tgt_active
+         ? "轴%1 找负限位 (方式 17): 负限位现在压着, 走手册 b) 分支 —— 先**正向低速**退开, "
+           "遇到限位释放后停机 (落点 = 开关的释放点)"
+         : "轴%1 找负限位 (方式 17): 负限位现在没压着, 走手册 a) 分支 —— 先**反向高速**"
+           "去找它, 碰到后减速停止, 再正向低速退开, 停在开关的释放点";
+   return "轴%1 找原点 (方式 %2)";
+}
 
 /* 6099h:02 由 6099h:01 派生: vel_slow = vel_fast / 4 (与 motor_test 收紧 --vel 同式);
  * 下限 1 —— 写 0 的语义手册没写, 而"返回速度是 0"绝不该是它的意思。 */
@@ -331,6 +449,16 @@ inline uint32_t home_vel_clamp(int32_t v)
    if (v < HMI_HOME_VEL_MIN) return HMI_HOME_VEL_MIN;
    if (v > HMI_HOME_VEL_MAX) return HMI_HOME_VEL_MAX;
    return (uint32_t)v;
+}
+
+/* 从 scan.ini 读回来的 6099h:01: <= 0 = 没记过 (用 HMI_HOME_VEL_DEF), 其余夹进 [MIN, MAX]。
+ * 夹取放在这里而不是界面里: 被手改坏的 ini (写成 0 或 1e9) 不该让回零用一个没验过的速度,
+ * 而回零是软件唯一兜不住的动作。 */
+inline uint32_t home_vel_from_pref(int v)
+{
+   if (v <= 0)
+      return HMI_HOME_VEL_DEF;
+   return home_vel_clamp(v);
 }
 
 /* 回零之前那道闸: nullptr = 可以发起, 否则是一句给操作员看的话。
@@ -391,7 +519,10 @@ inline const char *home_cause_text(int rc)
    /* 这一格里至少混着四种原因: 方式越界 / 6098h~607Ch 写不进去 / 驱动器没接受 HM 模式
     * (6061h 没读回 6) / 等 bit12 超时 / bit3 或 bit13 报上来。它们要人做的事不一样。 */
    return "失败 —— 方向不对就换另一个方向按钮试试; 找不到原点开关, 就先手动把滑台挪到"
-          "开关附近再回零 (别硬顶)。**具体是哪一步失败看控制台**: 回零方式超范围 / "
+          "开关附近再回零 (别硬顶)。找限位还多两条: 一是走反 (手册 a)/b) 两条分支的首段"
+          "方向相反, 发起前控制台会预告这一趟走哪条), 二是撞上限位之后驱动器自己按 2204h "
+          "(超程停车方式) 停住 —— 手册没写 HM 期间它与 a)/b) 谁优先, 那种情况下 bit11 "
+          "全程举着而位置一步没变。**具体是哪一步失败看控制台**: 回零方式超范围 / "
           "6098h~607Ch 写不进去 / 驱动器没接受 HM 模式 (6061h 没读回 6) / 等 bit12 超时 / "
           "6041h 报了 bit3 或 bit13 —— 这几种在这里是同一句话, 在控制台里是五行不同的字";
 }
@@ -457,8 +588,9 @@ public:
     * 事实 (6041h bit3), 不是操作员的选择。 */
    void postFaultReset();
 
-   /* 回零 —— 驱动器自带的正/反向找原点。method 只收 24/29 (用 home_method_for 算);
-    * vel_fast: 6099h:01, 内部还夹一道。本程序里最长的阻塞命令。
+   /* 回零 —— 驱动器自带的 HM 模式。method 只收这四个 (用 home_method_for /
+    * home_lim_method_for 算): 24/29 = 找原点 (原点开关 X0), 18/17 = 找限位 (以正/负限位
+    * 开关为原点)。vel_fast: 6099h:01, 内部还夹一道。本程序里最长的阻塞命令。
     * ⚠️ 它会**先失能**: 6098h/6099h/609Ah/607Ch 只能在未使能时写, 竖直轴失去保持力矩。 */
    void postHome(int axis, int method, uint32_t vel_fast);
 
@@ -477,9 +609,17 @@ public:
    void setWantDigIn(bool on);
    bool wantDigIn() const;
 
+   /* ---- GUI 线程调用: 连接期参数 ----
+    * 「写驱动器 2300h」(输入有效电平逻辑 -> NPN 要的常闭): 连接时读各轴原值 -> 写 bit0~bit2
+    * = 1 -> 收尾由 em_shutdown 写回原值。**默认关**: hmi.exe 那一侧没有界面解释这个动作,
+    * 默认开着会去改驱动器参数。改在下次连接时生效。 */
+   void setNpnWriteDrive(bool on);
+   bool npnWriteDrive() const;
+
    /* ---- GUI 线程调用: 运行期参数 ----
-    * 「输入电平反转 (NPN)」: X0~X3 接的是 NPN 传感器 (高电平 = **未**触发)。**默认关,
-    * 不持久化** —— 断言错了的后果是保护反过来。下一帧 publish() 生效, 并换掉限位判据。 */
+    * 「上位机侧取反」: X0~X3 接的是 NPN 传感器 (高电平 = **未**触发)。下一帧 publish()
+    * 生效, 并整个换掉限位判据 (bit11 不再参与)。这里的成员初值是 false —— hmi.exe 没有
+    * 这个开关的界面, 它不该自作主张; scan 那边由 ScanWindow 按 scan.ini 推过来。 */
    void setDiInvert(bool on);
    bool diInvert() const;
 
@@ -512,7 +652,7 @@ private:
    {
       CmdType type   = CMD_STOP;
       int     axis   = -1;
-      int     method = 0;     /* CMD_HOME 用: 6098h 方式号 (24/29) */
+      int     method = 0;     /* CMD_HOME 用: 6098h 方式号 (24/29/18/17) */
       int32_t value  = 0;     /* CMD_RANGE 用; CMD_HOME 用它装 6099h:01 */
       QString text;
    };
@@ -576,8 +716,9 @@ private:
    std::atomic<bool> m_quit{false};
    bool       m_maybe_live = false;
 
-   /* 连接期参数 (见 setWantDigIn)。只在未连接时可改, 所以普通成员 + 一把锁就够 */
+   /* 连接期参数 (见 setWantDigIn / setNpnWriteDrive)。只在未连接时可改, 所以普通成员 + 一把锁就够 */
    bool       m_want_dig_in = false;
+   bool       m_npn_write_drive = false;
 
    /* 运行期参数 (见 setDiInvert)。UI 线程随时可改、工作线程每帧读, 所以是原子量 */
    std::atomic<bool> m_di_invert{false};

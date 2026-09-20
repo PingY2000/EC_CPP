@@ -10,8 +10,10 @@
  *
  * 偏移只许现场实读: 一律实读 1C12h/1C13h/1600h/1A00h 推字节偏移, 推不出就拒绝 (返回 -1);
  * 缺失的映射项只追加不替换。写入口唯一: 本目录只有 ec_motor.c 出现 ecx_SDOwrite, 会写的
- * 只有 6060h、6098h/6099h/609Ah/607Ch、经镜像写的 6040h、1C12h/1C13h/1600h/1A00h (仅 RAM);
+ * 只有 6060h、6098h/6099h/609Ah/607Ch、经镜像写的 6040h、1C12h/1C13h/1600h/1A00h (仅 RAM),
+ * 以及 2300h 的 bit0~bit2 (需 em_allow_param_write, 收尾由 em_shutdown 还原原值);
  * 从不写 2102h (EEPROM) / 607Dh 软限位 / 2400h/2408h/2409h。
+ * 2300h 会不会被驱动器自己落 EEPROM 手册没写 -> 对外文案不许说"断电即回"。
  *
  * 安全: em_enable 之后电机通电、有保持力矩, CSP/PV/回零都会真的移动滑台。收尾必须无条件走
  * em_shutdown(); *motor_maybe_live = 1 表示写了失能但 6041h 仍报 Operation enabled。
@@ -83,6 +85,29 @@ extern "C" {
 #define EM_OID_DIG_IN        0x60FD
 #define EM_OID_TARGET_VEL    0x60FF
 #define EM_OID_HOMING_AUX    0x2214  /* 回零辅助: 决定回零后 6064h 显示什么 */
+#define EM_OID_DI_LOGIC      0x2300  /* 输入端子有效电平逻辑 (U16 RW, 手册 V2.4 p84) */
+
+/* 6098h 回零方式号 —— 本仓库用到的那四个。手册 V2.4 p46~p48 那张表里还有别的,
+ * em_home() 自己只查 [1,14] ∪ [17,30] ∪ {33,34,35}; 这四个是**上位机放行**的那一组。
+ *   24/29 = 找**原点开关** (X0), 一正一反;
+ *   18/17 = 找**限位开关** (手册叫"找限位"): 18 = 以正限位为原点, 17 = 以负限位为原点。
+ * 后两个各带 a)/b) 两条分支 (启动时那个开关没压着 / 已经压着), 落点都是**开关的释放点**。 */
+#define EM_HOME_MODE_ORIGIN_POS  24
+#define EM_HOME_MODE_ORIGIN_NEG  29
+#define EM_HOME_MODE_LIMIT_POS   18
+#define EM_HOME_MODE_LIMIT_NEG   17
+
+/* 找限位时"目标那个开关"与"另外那一侧"分别对应 60FDh 的哪一位 —— **只此一处**。
+ * 两个使用者: 界面侧 (hmi/ecatworker.h 的 home_lim_target_active, 判 a)/b) 分支与那道否决)
+ * 与 motor_test 的发起前预检。两边各写一份就会各错一份, 而且错了正好是"方向反了", 现场
+ * 看着就是"按找正限位它朝负限位冲"。非 17/18 返回 0 (没有目标开关) —— 调用方照 0 处理。 */
+#define EM_HOME_LIM_TARGET_BIT(m) \
+   (((m) == EM_HOME_MODE_LIMIT_POS) ? EM_DI_POS_LIMIT \
+    : (((m) == EM_HOME_MODE_LIMIT_NEG) ? EM_DI_NEG_LIMIT : 0u))
+
+#define EM_HOME_LIM_OTHER_BIT(m) \
+   (((m) == EM_HOME_MODE_LIMIT_POS) ? EM_DI_NEG_LIMIT \
+    : (((m) == EM_HOME_MODE_LIMIT_NEG) ? EM_DI_POS_LIMIT : 0u))
 
 /* PDO 配置对象 (CiA301 通信区) */
 #define EM_OID_RXPDO_ASSIGN  0x1C12
@@ -99,6 +124,19 @@ extern "C" {
 #define EM_DI_POS_LIMIT  0x00000002u  /* bit1 正限位 */
 #define EM_DI_HOME       0x00000004u  /* bit2 原点开关 */
 #define EM_DI_X3         0x00000008u  /* bit3 X3 (本机未接线, 2313h = 0) */
+
+/* 2300h 输入端子有效电平逻辑: bit0~bit2 = X0~X2, 每位 0 = 常开 / 1 = 常闭 (手册 V2.4 p84)。
+ * 现场是 NPN 传感器 (高电平 = 未触发), 而本机 2300h = 0 (常开 = 高电平算触发) —— 两者正好
+ * 反着, 于是"没触发"被读成"触发": 60FDh 的 bit1/bit2 同时置起、6041h bit11 恒为 1、
+ * 2204h = 0 (超程停车 = 停止) 把两个方向都挡死 -> 回零进得去但一动不动。
+ * 置 0x0007 才是 NPN 该有的极性 (驱动器自己的限位保护也跟着一起对)。
+ * 高几位 (bit3 以上) 不属于本掩码, 一旦某台机器 2300h 里写了别的位, 比对时不该管它。 */
+#define EM_DI_LOGIC_MASK     0x0007u
+#define EM_DI_LOGIC_NPN      0x0007u
+
+/* 三位已经等于想要的值就不用写 —— 写 = 改驱动器, 能不写就不写, 也不留还原负担 */
+#define EM_DI_LOGIC_EQ(cur, want) \
+   ((((uint32_t)(cur) ^ (uint32_t)(want)) & EM_DI_LOGIC_MASK) == 0u)
 
 /* 控制字 6040h —— 推送过的值只有下面这几个, 不试探厂商私有控制字 */
 #define EM_CW_DISABLE_V  0x0000  /* Disable voltage */
@@ -354,6 +392,20 @@ int      em_dig_in_offset(const em_axis_t *ax); /* 字节偏移; -1 = 不在生�
  * 代价: SM3 从 10 字节变 14 字节; 只写 RAM, 崩在收尾之前会把改动留在驱动器里直到断电重启;
  * 需要 allow_remap 授权。连接期参数, 必须在 em_setup 之前调。 */
 void em_require_dig_in(em_bus_t *bus, int on);
+
+/* 授权改驱动器参数 (目前只有 2300h 输入端子有效电平逻辑)。默认不授权。
+ * 与 em_setup 的 allow_remap 是**分开**的两道门: 改 PDO 映射是通信配置 (掉电即回),
+ * 改参数是驱动器行为 —— 代价不同, 一次授权不该管两件事。连接期参数。 */
+void em_allow_param_write(em_bus_t *bus, int on);
+
+/* 把每根轴的 2300h bit0~bit2 写成 want & EM_DI_LOGIC_MASK 的极性
+ * (want 只收 EM_DI_LOGIC_NPN = 0x0007 这一个意图, 见上面的常量块)。返回 0 / -1。
+ * 需要 em_allow_param_write 授权, 否则一个字节都不写。
+ * 三步: ① 先逐轴读原值 (宽度按驱动器自报的来), **任一根读不到就整体拒绝** ——
+ *      没读到原值就写, 收尾无从还原; ② 已经等于 want 的轴跳过 (写 = 改驱动器);
+ *      ③ 写后逐轴回读 memcmp 确认 (本仓库这份 SOEM 在加急路径上把 SDO abort 当写成功)。
+ * bit3 以上的位原样保留。收尾由 em_shutdown 按快照还原。 */
+int em_di_set_logic(em_bus_t *bus, uint16_t want);
 
 /* 该轴生效的 PDO 映射对象索引 (setup 时实读 1C12h/1C13h 得到), setup 之前为 0;
  * 真机上 1C12h 指的是 1601h, 不是默认的 1600h。 */

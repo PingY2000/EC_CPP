@@ -37,6 +37,14 @@ void EcatThread::note(const QString &s)
    emit notify(s);
 }
 
+/* 只进控制台的一条: 不进状态栏、不发通知。连接那一次要说的事实有好几行 (每根轴一条),
+ * 状态栏只留得下一句结论 —— 逐轴的读数走这里。工作线程调 */
+static void consoleNote(const QString &s)
+{
+   std::printf("[hmi] %s\n", s.toUtf8().constData());
+   std::fflush(stdout);
+}
+
 void EcatThread::postListAdapters()
 {
    QMutexLocker lk(&m_mtx);
@@ -114,7 +122,19 @@ bool EcatThread::wantDigIn() const
    return m_want_dig_in;
 }
 
-/* 「输入电平反转 (NPN)」—— 运行期参数, 所以不加锁、不进命令队列: 界面勾一下,
+void EcatThread::setNpnWriteDrive(bool on)
+{
+   QMutexLocker lk(&m_mtx);
+   m_npn_write_drive = on;
+}
+
+bool EcatThread::npnWriteDrive() const
+{
+   QMutexLocker lk(&m_mtx);
+   return m_npn_write_drive;
+}
+
+/* 「上位机侧取反」—— 运行期参数, 所以不加锁、不进命令队列: 界面勾一下,
  * 下一帧 publish() 就用上了。 */
 void EcatThread::setDiInvert(bool on)
 {
@@ -386,6 +406,58 @@ void EcatThread::doConnectInner(const QString &ifname)
       return;
    }
 
+   /* 2300h 输入有效电平逻辑 (输入端子 X0~X2 的常开/常闭)。这件事在进 OP 之前做:
+    * 极性配反的机器上 6041h bit11 恒为 1, 一进 OP 就是"两个限位都压着"的样子。
+    *
+    * 无论勾没勾都**先只读探一遍**: 不探就不知道这台机器的原值, 事后说"还原了"没有依据。
+    * 失败要等进 OP 之后才报 —— 那条 note() 要覆盖掉"已进 OP"那一句 (见文件末尾)。 */
+   QString di_fail;
+   {
+      bool want_npn;
+
+      {
+         QMutexLocker lk(&m_mtx);
+         want_npn = m_npn_write_drive;
+      }
+
+      for (int i = 0; i < em_axis_count(m_bus); i++)
+      {
+         em_axis_t *ax = em_axis(m_bus, i);
+         uint32_t   v  = 0;
+         int        sz = 0;
+
+         if (em_rd_any(m_bus, em_axis_slave(ax), EM_OID_DI_LOGIC, 0, &v, &sz) != 0)
+         {
+            consoleNote(QStringLiteral("%1: 2300h 读不到 (输入有效电平逻辑)"
+                                       " —— 极性未知, 三个灯的含义不可判")
+                           .arg(QString::fromUtf8(em_axis_label(ax))));
+            continue;
+         }
+
+         consoleNote(QStringLiteral("%1: 2300h = 0x%2 (%3 字节)  X0~X2 = %4/%5/%6%s")
+                        .arg(QString::fromUtf8(em_axis_label(ax)))
+                        .arg(v, 4, 16, QLatin1Char('0'))
+                        .arg(sz)
+                        .arg((v & 1u) ? QStringLiteral("常闭") : QStringLiteral("常开"))
+                        .arg((v & 2u) ? QStringLiteral("常闭") : QStringLiteral("常开"))
+                        .arg((v & 4u) ? QStringLiteral("常闭") : QStringLiteral("常开"))
+                        .arg(EM_DI_LOGIC_EQ(v, EM_DI_LOGIC_NPN)
+                                ? QStringLiteral("   <- NPN 传感器该有的极性")
+                                : QStringLiteral("   <- NPN 传感器要的是 0x0007")));
+      }
+
+      if (want_npn)
+      {
+         em_allow_param_write(m_bus, 1);
+         if (em_di_set_logic(m_bus, EM_DI_LOGIC_NPN) != 0)
+            di_fail = QStringLiteral(
+               "2300h 写入失败 (原因见控制台): 有轴仍是原极性 -> 驱动器照旧把「没触发」"
+               "读成「触发」, 定位与限位一起错, 扫描可能开不了。"
+               "退路: 勾上「高级选项」里的「上位机侧取反」");
+         em_allow_param_write(m_bus, 0);
+      }
+   }
+
    if (em_enter_op(m_bus, /*use_dc=*/0, HMI_CYCLE_US) != 0)
    {
       note(QStringLiteral("进 OP 失败 —— 见控制台。不要反复点「连接」, 先看原因"));
@@ -418,6 +490,10 @@ void EcatThread::doConnectInner(const QString &ifname)
    /* 这里**不写 m_busy** —— 它是外面那个壳一个人的事 (见 doConnect 上面那段) */
    note(QStringLiteral("已进 OP, %1 根轴。电机仍未带电 —— 点「使能」才会带电")
            .arg(m_naxis));
+
+   /* 2300h 没写成就覆盖掉上面那一句: 状态栏只留得下一条, 而这条更要紧 */
+   if (!di_fail.isEmpty())
+      note(di_fail);
 }
 
 void EcatThread::doEnable()
@@ -552,9 +628,11 @@ void EcatThread::doFaultReset()
    note(s);
 }
 
-/* 回零 —— 驱动器自带的 HM 模式 (6060h = 6)。正/反向就是方式 24 / 29。
+/* 回零 —— 驱动器自带的 HM 模式 (6060h = 6)。四个方式: 24/29 = 正/反向找**原点开关**,
+ * 18/17 = 找**正/负限位开关** (手册 V2.4 p46~p48, 每个各带 a)/b) 两条分支)。
  * 三段顺序不能动: **闸 (一个字节都不写) -> 宣告 -> 动作 + 无条件收尾**, 因为 em_home() 的
- * 五条返回路径留下的状态没有一条可以不管 (后三条举着 bit4 返回, 驱动器那一刻还在找)。 */
+ * 五条返回路径留下的状态没有一条可以不管 (后三条举着 bit4 返回, 驱动器那一刻还在找)。
+ * 17/18 多一道闸 (两道否决) 与一句分支预告, 位置在两道现有闸之后、宣告之前。 */
 void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
 {
    if (axis < 0 || axis >= EM_MAX_AXES)
@@ -577,11 +655,12 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
    const bool mirror_ok = (ax != nullptr) && em_mirror_ok(ax) != 0;
    const bool fault     = (ax != nullptr) && (em_sw(ax) & EM_SW_FAULT) != 0;
 
-   /* 只放行 24/29 (em_home() 自己只查 [1,35], 其它方式的方向语义没验过, 放进来是拿滑台去试) */
-   const bool negative = (method == ecatcmd::home_method_for(true));
-   if (method != ecatcmd::home_method_for(false) && !negative)
+   /* 只放行四个 (24/29 找原点, 18/17 找限位)。em_home() 自己只查 [1,35], 别的方式的方向
+    * 语义没验过, 放进来是拿滑台去试 —— 而回零是**软件兜不住**的动作。 */
+   if (!ecatcmd::home_method_allowed(method))
    {
-      note(QStringLiteral("回零方式 %1 不在允许的范围内 (只用 24/29) -> **一个字节都没写**")
+      note(QStringLiteral("回零方式 %1 不在允许的范围内 (只用 24/29 找原点、18/17 找限位) "
+                          "-> **一个字节都没写**")
               .arg(method));
       return;
    }
@@ -597,6 +676,34 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
    }
 
    const QString nm = QString::fromUtf8(ecatcmd::axis_label(axis));
+
+   /* ---- 找限位 (17/18) 的第二道闸 + 分支预告 ----
+    * 位置在这里是量出来的: 早了没状态 (上面那道闸刚放行), 晚了已经卸力 (下面就是
+    * em_disable)。判据用**驱动器自己**那两位 (em_di_poslim / em_di_neglim, 即 2300h +
+    * 2310h 之后的结果), 不用遥测里反相后的 dig_pos/dig_neg —— 驱动器按它自己的读数
+    * 决定怎么走, 上位机反相只改显示。
+    *
+    * 预告必须打: 手册 a) 与 b) 两条分支的**首段方向是相反的**, 不说一句, 操作员会以为
+    * 自己点错了按钮, 而那时电机已经在动。 */
+   if (ecatcmd::home_method_is_limit(method))
+   {
+      const bool dig_known = em_dig_in_known(ax) != 0;
+      const bool pos_lim   = em_di_poslim(ax) != 0;
+      const bool neg_lim   = em_di_neglim(ax) != 0;
+      const bool tgt       = ecatcmd::home_lim_target_active(method, pos_lim, neg_lim);
+      const bool other     = ecatcmd::home_lim_other_active(method, pos_lim, neg_lim);
+
+      const char *no = ecatcmd::home_lim_refusal(dig_known, tgt, other);
+      if (no != nullptr)
+      {
+         note(QStringLiteral("%1 %2没有发起: %3 -> **一个字节都没写**")
+                 .arg(nm, QString::fromUtf8(ecatcmd::home_method_short(method)),
+                      QString::fromUtf8(no)));
+         return;
+      }
+
+      note(QString::fromUtf8(ecatcmd::home_lim_branch_text(method, tgt)));
+   }
 
    /* ---- 宣告"正在回零"。**必须在第一个阻塞调用之前** ----
     * 下面那两次加锁直写是"阻塞期间界面还看得见"的唯一原因, 界面靠它把「停止」换成立即中止。 */
@@ -687,9 +794,19 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
    if (end == ecatcmd::HOME_END_STRANDED)
       m_maybe_live = true;
 
+   /* 中段那个动作名。找限位的两个方式号**本身就带方向** (正限位/负限位), 再叠一个
+    * "正向/反向"是重复的; 找原点的两个方式号同名, 方向必须补进去才分得清。 */
+   const QString what =
+      ecatcmd::home_method_is_limit(method)
+         ? QString::fromUtf8(ecatcmd::home_method_short(method))
+         : QStringLiteral("%1%2")
+              .arg(QString::fromUtf8(ecatcmd::home_dir_text(
+                      method == ecatcmd::home_method_for(true))),
+                   QString::fromUtf8(ecatcmd::home_method_short(method)));
+
    /* note() 是**覆盖写**, 所以这里一次说完 */
-   QString s = QStringLiteral("%1 %2找原点 (方式 %3): %4 (rc = %5)。\n%6")
-                  .arg(nm, QString::fromUtf8(ecatcmd::home_dir_text(negative)),
+   QString s = QStringLiteral("%1 %2 (方式 %3): %4 (rc = %5)。\n%6")
+                  .arg(nm, what,
                        QString::number(method),
                        QString::fromUtf8(ecatcmd::home_cause_text(rc_home)),
                        QString::number(rc_home),
@@ -957,7 +1074,7 @@ void EcatThread::publish(int wkc)
       a.dig_pos   = em_di_poslim(ax) != 0;
       a.dig_neg   = em_di_neglim(ax) != 0;
 
-      /* 「输入电平反转 (NPN)」。**三个一起翻, 不能只翻一个** —— 2300h 配反了是整排一起
+      /* 「上位机侧取反」。**三个一起翻, 不能只翻一个** —— 2300h 配反了是整排一起
        * 反相。读不到 60FDh 时那三个都是 0, 翻完变成"三个都压着", **这个方向是故意的**:
        * 万一有人在别处漏判了 dig_known, 看到的是"压着"(会拦下来)而不是"松开"(会放过去)。 */
       if (di_invert)

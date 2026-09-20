@@ -6,7 +6,9 @@
  *
  * 阶段 S0~S8 见正文, 每步独立判定, 失败即停; 授权门: S2 为止无需授权 (先跑它们: 一个字节
  * 都不写, 实读值与推导偏移是后面所有动作的事实依据), S3/S4 需 --allow-pdo, S5/S6 需
- * --allow-motion, S7 再加 --home, S8 无条件跑。
+ * --allow-motion, S7 再加 --home, S8 无条件跑。--npn 是例外: 写 2300h 与收尾还原都按轴走,
+ * 而轴对象是 em_setup 建的, 所以没给 --allow-pdo 也会走 S3 (那时 allow_remap=0, 不写映射),
+ * 改参数发生在 S3.5。
  *
  * 安全边界: 默认一个字节都不写; --allow-motion 本身就是那句确认, 运行时不再问 y/N; 上限只能
  * 收紧 (--force-caps 才放宽); PDO 映射收尾默认还原 (只写 RAM, 从不写 2102h); 6040h 只推
@@ -61,8 +63,11 @@ typedef struct
 {
    const char *ifname;
    int  allow_pdo;
+   int  allow_param;
+   int  npn;
    int  allow_motion;
    int  allow_home;
+   int  home_lim;                 /* 0 = 没给 (找原点, 方式 24); 18/17 = 找正/负限位 */
    int  keep_mapping;
    int  force_caps;
    int  use_dc;
@@ -87,11 +92,28 @@ static void usage(const char *prog)
       "\n"
       "不带 --allow-pdo 时本程序是**只读**的: 跑完 S0~S2 打印实读映射后退出 0。\n"
       "**先跑这一步** —— 它打印的 1600h/1A00h 实读值与推导偏移, 是后面所有动作的依据。\n"
+      "(唯一的例外是 --npn: 改 2300h 与收尾还原都按轴走, 轴对象得由 S3 先建出来, 所以那时\n"
+      " 会多走到 S3.5 —— S3 用 allow_remap=0, 一个映射字节都不写。)\n"
       "\n"
       "授权(缺省全关):\n"
       "  --allow-pdo       允许写 PDO 映射 (1C12h/1C13h/1600h/1A00h, 仅 RAM)\n"
+      "  --allow-param     允许写驱动器参数 (目前只有 2300h, 收尾还原)。与 --allow-pdo\n"
+      "                      分开授权: 改映射是通信配置, 改参数是驱动器行为\n"
+      "  --npn             把 2300h 的 bit0~bit2 置 1 (= 0x0007, 常闭): NPN 传感器要的极性。\n"
+      "                      必须同时给 --allow-param。修的是「三灯反相 -> bit11 恒为 1 ->\n"
+      "                      超程停车把两个方向都挡死」那个根。会顺带走到 S3/S3.5 (见上)\n"
       "  --allow-motion    允许使能 / CSP / PV。需要同时有 --allow-pdo\n"
-      "  --home            允许回零 (方式 24: 原点开关 X0, 正向先找)\n"
+      "  --home            允许回零 (缺省方式 24: 原点开关 X0, 正向先找)\n"
+      "  --home-lim pos|neg\n"
+      "                    回零改成**找限位**: pos -> 方式 18 (以正限位开关为原点),\n"
+      "                      neg -> 方式 17 (以负限位开关为原点)。必须同时给 --home。\n"
+      "                      手册 V2.4 p46~p48 给这两个方式各写了两条分支:\n"
+      "                        a) 启动时那个开关没压着 -> 先朝它高速去, 碰到再退开\n"
+      "                        b) 启动时已经压着     -> 直接朝反方向低速退开\n"
+      "                      两条的落点都是**开关的释放点**。本程序在发起之前读 60FDh\n"
+      "                      判断走哪条并打印出来 —— 不先说, 你会以为按错了按钮。\n"
+      "                      驱动器的 2300h 与接线不符时正/负限位会**同时**报有效,\n"
+      "                      那种读数分不出 a)/b), 这里会拒绝 (一个字节都不写)\n"
       "  --keep-mapping    收尾不还原 PDO 映射 (缺省还原)\n"
       "\n"
       "参数(只能收紧, 放宽要 --force-caps):\n"
@@ -151,8 +173,33 @@ static int parse_args(int argc, char *argv[], opts_t *o)
          exit(EM_EXIT_OK);
       }
       else if (strcmp(a, "--allow-pdo") == 0)    o->allow_pdo = 1;
+      else if (strcmp(a, "--allow-param") == 0)  o->allow_param = 1;
+      else if (strcmp(a, "--npn") == 0)          o->npn = 1;
       else if (strcmp(a, "--allow-motion") == 0) o->allow_motion = 1;
       else if (strcmp(a, "--home") == 0)         o->allow_home = 1;
+      else if (strcmp(a, "--home-lim") == 0)
+      {
+         if (i + 1 >= argc)
+         {
+            printf("--home-lim 后面要跟 pos 或 neg (试 --help)\n");
+            return EM_EXIT_USAGE;
+         }
+         {
+            const char *w = argv[++i];
+
+            if (strcmp(w, "pos") == 0)
+               o->home_lim = EM_HOME_MODE_LIMIT_POS;
+            else if (strcmp(w, "neg") == 0)
+               o->home_lim = EM_HOME_MODE_LIMIT_NEG;
+            else
+            {
+               /* 只认这两个词, 不收数字 —— 收数字就等于"随便给个方式号都能发起回零",
+                * 而回零是软件兜不住的动作 (em_home() 自己只查 [1,35]) */
+               printf("--home-lim 只认 pos 或 neg, 不认「%s」(试 --help)\n", w);
+               return EM_EXIT_USAGE;
+            }
+         }
+      }
       else if (strcmp(a, "--keep-mapping") == 0) o->keep_mapping = 1;
       else if (strcmp(a, "--force-caps") == 0)   o->force_caps = 1;
       else if (strcmp(a, "--pv-opposite") == 0)  o->pv_opposite = 1;
@@ -270,6 +317,13 @@ static int parse_args(int argc, char *argv[], opts_t *o)
          printf("未知参数: %s (试 --help)\n", a);
          return EM_EXIT_USAGE;
       }
+   }
+
+   /* ---- --npn 是"意图", 授权是"许可": 只有意图不算数 ---- */
+   if (o->npn && !o->allow_param)
+   {
+      printf("--npn 要同时给 --allow-param (--allow-param 授权, --npn 表达意图)\n");
+      return EM_EXIT_USAGE;
    }
 
    /* ---- 上限: 只能收紧, 放宽要 --force-caps ---- */
@@ -435,6 +489,32 @@ static void print_dig_in_now(em_bus_t *bus, int slave)
    printf("  <- 2004h 经 2300h + 2310h 之后\n");
 }
 
+/* 2300h 输入端子有效电平逻辑 (RW, 手册 V2.4 p84): bit0~bit2 = X0~X2, 0 = 常开 / 1 = 常闭。
+ * 与 2004h (反转之前的物理电平) / 60FDh (反转 + 2310h 映射之后) 对成一组, 三者不一致时
+ * 先看这一行。宽度自报读: 手册写 U16, 而 slide_motion 的基线表把它记成 U8, 两处对不上 ——
+ * 顺便把实报宽度打出来。本行只读, 写它要 --allow-param --npn */
+static void print_di_logic(em_bus_t *bus, int slave)
+{
+   uint32_t v = 0;
+   int      size = 0;
+   int      b;
+
+   if (em_rd_any(bus, slave, EM_OID_DI_LOGIC, 0, &v, &size) != 0)
+   {
+      printf("    %-22s = (读失败 / 该对象不存在)\n", "2300h 输入有效电平逻辑");
+      return;
+   }
+
+   printf("    %-22s = 0x%X (%d 字节)  ", "2300h 输入有效电平逻辑", (unsigned)v, size);
+   for (b = 0; b < 3; b++)
+      printf("X%d=%s ", b, (v & (1u << b)) ? "常闭" : "常开");
+   if (EM_DI_LOGIC_EQ(v, EM_DI_LOGIC_NPN))
+      printf(" <- NPN 传感器该有的极性\n");
+   else
+      printf(" <- NPN 传感器要的是 0x%X (bit0~bit2 全 1); 配错会让 60FDh 三灯同时反相\n",
+             (unsigned)EM_DI_LOGIC_NPN);
+}
+
 /* 6041h 状态字当下这一帧 (SDO 读, 打这一排时还没建过程数据镜像)。自己拼而不用
  * em_sw_describe: 后者不报按模式解释的三位 —— bit10 Target reached / bit12 (HM 下 =
  * Homing attained) / bit13 (HM 下 = Homing error) */
@@ -479,10 +559,17 @@ int main(int argc, char *argv[])
 
    printf("test motor_test - 多轴 CiA402 接口验收 (%s)\n", em_version());
    printf("网卡: %s\n", opt.ifname);
-   printf("授权: --allow-pdo=%s --allow-motion=%s --home=%s%s\n",
-          opt.allow_pdo ? "是" : "否", opt.allow_motion ? "是" : "否",
-          opt.allow_home ? "是" : "否",
-          opt.keep_mapping ? " (收尾保留映射)" : " (收尾还原映射)");
+   printf("授权: --allow-pdo=%s --allow-param=%s --allow-motion=%s --home=%s%s%s\n",
+          opt.allow_pdo ? "是" : "否", opt.allow_param ? "是" : "否",
+          opt.allow_motion ? "是" : "否", opt.allow_home ? "是" : "否",
+          opt.home_lim ? " --home-lim=" : "",
+          opt.home_lim ? (opt.home_lim == 18 ? "pos(18)" : "neg(17)") : "");
+   if (opt.npn)
+      printf("  --npn: 会把 2300h 的 bit0~bit2 置 1 (0x%X), 收尾写回原值; 会顺带走 S3/S3.5\n",
+             (unsigned)EM_DI_LOGIC_NPN);
+   if (opt.home_lim)
+      printf("  --home-lim: S7 用方式 %d (%s), 发起前读 60FDh 判 a)/b) 分支\n",
+             opt.home_lim, (opt.home_lim == 18) ? "以正限位开关为原点" : "以负限位开关为原点");
 
    /* 运动必须要能补映射 —— 607Ah/60FFh 不在映射里就发不出去 */
    if (opt.allow_motion && !opt.allow_pdo)
@@ -490,6 +577,15 @@ int main(int argc, char *argv[])
       printf("\n--allow-motion 必须同时给 --allow-pdo: CSP/PV 的目标值(607Ah/60FFh)\n"
              "必须走过程数据, 而它们要能被发出去就得先补进 RxPDO 映射。\n"
              "本程序**不会**为了让参数看起来合理而自动替你开这个授权。\n");
+      return EM_EXIT_REFUSED;
+   }
+
+   /* --home-lim 与 --home 是同一类风险 (都是让轴自己去找开关), 所以走同一道授权。
+    * 分开授权在这里没有意义: 找限位比找原点更容易撞上东西 (它的目的就是撞限位) */
+   if (opt.home_lim && !opt.allow_home)
+   {
+      printf("\n--home-lim 必须同时给 --home: 两者是同一个动作的两个方式, 要的是同一句授权。\n"
+             "不给 --home 就等于「用 --home-lim 绕开它」, 本程序不做这件事。\n");
       return EM_EXIT_REFUSED;
    }
 
@@ -623,6 +719,7 @@ int main(int argc, char *argv[])
       print_ro_i32(bus, slave, EM_OID_ACT_POS, 0, "6064h 当前位置");
       print_ro_num(bus, slave, 0x6502, 0, "6502h 支持的模式",
                    "  (位图; 本驱动器 = 0x00A5 = PP+PV+HM+CSP, **无 CSV**)");
+      print_di_logic(bus, slave);
 
       /* 与上面那组分开: 2201h/2400h/607Dh 是配置, 静止时不该变, 能当基线比; 下面这几行是
        * 此刻的状态, 每时每刻都在变, 拿它们比基线必然天天 FAIL —— 但"轴为什么不动"最先要看
@@ -637,15 +734,22 @@ int main(int argc, char *argv[])
    printf("\n  >>> 上面这些是**实读**值。若某个需要的字段不在映射里, S3 会尝试追加它\n"
           "      (只追加缺项, 只写 RAM); 追加不了就拒绝, 不猜偏移、不改走 SDO 硬凑。\n");
 
-   if (!opt.allow_pdo)
+   if (opt.allow_param && !opt.npn)
+      printf("\n  给了 --allow-param 但没给 --npn: 2300h 一个字节都不写。\n");
+
+   /* --npn 要写 2300h, 而写与还原都**挂在轴对象上**: em_di_set_logic 走 bus->axis[],
+    * em_shutdown 也按轴还原, 而轴对象是 em_setup 建出来的。所以给了 --npn 就必须走到 S3,
+    * 哪怕没给 --allow-pdo —— 那时 allow_remap=0, S3 只建过程数据, 一个映射字节都不写。 */
+   if (!opt.allow_pdo && !opt.npn)
    {
-      printf("\n==== 到此为止 (未给 --allow-pdo, 一个字节都没写) ====\n");
-      exit_code = EM_EXIT_OK;
+      printf("\n==== 到此为止 (未给 --allow-pdo) (一个字节都没写) ====\n");
       goto out;
    }
 
-   /* S3 补映射 + 建过程数据 + 逐轴证明偏移 + SAFE_OP */
-   printf("\n==== S3 补 PDO 映射 + 建过程数据 + 上 SAFE_OP ====\n");
+   /* S3 建过程数据 + 逐轴证明偏移 (给 --allow-pdo 时才允许补映射) */
+   printf("\n==== S3 %s ====\n",
+          opt.allow_pdo ? "补 PDO 映射 + 建过程数据 + 上 SAFE_OP"
+                        : "只建过程数据 (不追加映射) + 上 SAFE_OP");
 
    rc = em_setup(bus, cfg, naxis, opt.allow_pdo);
    if (rc != EM_EXIT_OK)
@@ -690,6 +794,30 @@ int main(int argc, char *argv[])
        * em_dump_pdo 的处置表逐项列出, 这里不重算) */
       printf("      6081h 轮廓速度: 本接口不做 PP -> **不驱动**, 主站下发 0 "
              "(驱动器基线本来就是 0)\n");
+   }
+
+   /* S3.5 写 2300h —— 只跟 --allow-param 走 (改参数不依赖 PDO 映射)。
+    * **位置在 S3 之后、S4 之前**: 轴对象是 em_setup 建的 (写与还原都按轴走), 而极性不修
+    * 就去进 OP / 使能的话, bit11 恒为 1 会把 S5/S6 的动作挡死, 排查时看到的是"限位压着"
+    * 而不是"极性配反"。 */
+   if (opt.npn)
+   {
+      printf("\n==== S3.5 写 2300h = 0x%X (输入有效电平逻辑, 收尾写回原值) ====\n",
+             (unsigned)EM_DI_LOGIC_NPN);
+      em_allow_param_write(bus, 1);
+      if (em_di_set_logic(bus, EM_DI_LOGIC_NPN) != 0)
+      {
+         printf("  >>> 2300h 没改成 (原因见上): 驱动器仍按原极性判限位。\n");
+         exit_code = EM_EXIT_REFUSED;
+      }
+      em_allow_param_write(bus, 0);
+   }
+
+   if (!opt.allow_pdo)
+   {
+      printf("\n==== 到此为止 (未给 --allow-pdo) %s ====\n",
+             opt.npn ? "(2300h 改过, 收尾写回原值)" : "(一个字节都没写)");
+      goto out;
    }
 
    /* S4 进 OP + 确认过程数据落地 */
@@ -763,7 +891,11 @@ int main(int argc, char *argv[])
       printf("PV 各跑 %ums%s", opt.pv_hold,
              opt.pv_opposite ? " (第 2 根反向)" : "");
    if (opt.allow_home)
-      printf(" -> 回零(方式 24, 会去找原点开关、可能撞限位)");
+      printf(" -> 回零(方式 %d: %s, 会一路找到开关、可能撞限位)",
+             opt.home_lim ? opt.home_lim : 24,
+             opt.home_lim
+                ? ((opt.home_lim == 18) ? "找正限位" : "找负限位")
+                : "原点开关 X0");
    printf("\n");
 
    rc = em_enable_all(bus);
@@ -923,22 +1055,97 @@ int main(int argc, char *argv[])
 
    if (!opt.allow_home)
    {
-      printf("  未给 --home -> 跳过 (回零会去找原点开关、可能撞限位)\n");
+      printf("  未给 --home -> 跳过 (回零会去找开关、可能撞限位)\n");
    }
    else
    {
       em_home_cfg_t hc;
 
       em_home_cfg_default(&hc);
+      if (opt.home_lim)
+         hc.method = opt.home_lim;
       /* 回零速度跟着 --vel 收紧, 但不超过默认的保守值 —— 首次回零务必慢 */
       hc.vel_fast = ((uint32_t)opt.vel < 2000u) ? (uint32_t)opt.vel : 2000u;
       hc.vel_slow = hc.vel_fast / 4u;
       if (hc.vel_slow == 0)
          hc.vel_slow = 1;
 
-      printf("  方式 %d (原点开关 X0, 正向先找), 找原点速度 %u, 返回速度 %u pul/s\n",
-             hc.method, (unsigned)hc.vel_fast, (unsigned)hc.vel_slow);
-      printf("  >>> 方向不对就停下来换方式 29 或 35, 别硬顶。\n");
+      if (!opt.home_lim)
+      {
+         printf("  方式 %d (原点开关 X0, 正向先找), 找原点速度 %u, 返回速度 %u pul/s\n",
+                hc.method, (unsigned)hc.vel_fast, (unsigned)hc.vel_slow);
+         printf("  >>> 方向不对就停下来换方式 29 或 35, 别硬顶。\n");
+      }
+      else
+      {
+         /* ---- 找限位 (17/18): 发起前的预检, **全部轴一起先判完** ----
+          * 分开判会让"第 1 根已经找完了、第 2 根才被拒"变成一种半途状态。
+          * 判据用驱动器自己那两位 (2300h + 2310h 之后的结果), 与界面侧同源; "哪一位是目标"
+          * 读的是 em_home.h 那个 EM_HOME_LIM_TARGET_BIT 宏, 界面侧读同一份。
+          * 这里比界面多一条退路: 镜像里没有就 SDO 直读一次 60FDh —— CLI 是诊断工具,
+          * 而"读不到"本身就是要查的那件事, 只报一句读不到等于什么都没查。
+          * **这一段在 em_disable 之前** —— 被拒时一个字节都没写。 */
+         int refused = 0;
+
+         printf("  方式 %d (%s为原点), 手册 a)/b) 两条分支, 落点 = 开关的释放点\n",
+                hc.method,
+                (hc.method == EM_HOME_MODE_LIMIT_POS) ? "正限位" : "负限位");
+
+         for (i = 0; i < naxis; i++)
+         {
+            em_axis_t *a    = em_axis(bus, i);
+            const uint32_t tgt_bit = EM_HOME_LIM_TARGET_BIT(hc.method);
+            const uint32_t oth_bit = EM_HOME_LIM_OTHER_BIT(hc.method);
+            uint32_t v      = em_dig_in_raw(a);
+            int      known  = em_dig_in_known(a);
+            int      size   = 0;
+            int      tgt, oth;
+
+            if (!known && em_rd_any(bus, i, 0x60FD, 0, &v, &size) == 0)
+            {
+               printf("    %s: 过程数据镜像里没有 60FDh (没勾「让 60FDh 进 TxPDO」或还没收到"
+                      "完整帧), 改用 SDO 直读 = 0x%X (%d 字节)\n",
+                      em_axis_label(a), (unsigned)v, size);
+               known = 1;
+            }
+
+            if (!known)
+            {
+               printf("    %s: 60FDh **镜像里没有, SDO 直读也没成功** -> 分不出这一趟该走"
+                      "手册的 a) 还是 b) 分支\n", em_axis_label(a));
+               refused = 1;
+               continue;
+            }
+
+            tgt = (v & tgt_bit) ? 1 : 0;
+            oth = (v & oth_bit) ? 1 : 0;
+
+            printf("    %s: 60FDh = 0x%X, %s = %s, 另一侧 = %s -> 走手册 %s 分支\n",
+                   em_axis_label(a), (unsigned)v,
+                   (hc.method == EM_HOME_MODE_LIMIT_POS) ? "正限位" : "负限位",
+                   tgt ? "压着" : "没压着", oth ? "压着" : "没压着",
+                   tgt ? "b)（直接反向低速退开）" : "a)（先朝它高速去, 碰到再退开）");
+
+            if (tgt && oth)
+            {
+               printf("      **正限位与负限位同时报有效** -> 滑台不可能同时在两头, 至少有一个"
+                      "不是真的。查 2300h (输入有效电平逻辑) 与 X0~X3 的接线: NPN 传感器"
+                      "高电平表示**未**触发, 驱动器该按常闭认 (2300h = 0x%X)\n",
+                      (unsigned)EM_DI_LOGIC_NPN);
+               refused = 1;
+            }
+         }
+
+         if (refused)
+         {
+            printf("  找限位被拒 -> **一个字节都没写, S7 一个动作都没发**\n");
+            exit_code = EM_EXIT_REFUSED;
+            goto out;
+         }
+
+         printf("  >>> 这两条分支的**首段方向是相反的**: b) 会先朝反方向低速退开, "
+                "那是正常的, 不是点错了。碰到限位是这一趟的目的, 不是故障。\n");
+      }
 
       for (i = 0; i < naxis; i++)
       {

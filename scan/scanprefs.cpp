@@ -21,6 +21,10 @@ static const char *serp       = "scan/serpentine";
 static const char *start_pos  = "scan/start_positive";
 static const char *nic        = "bus/nic";
 static const char *manspeed   = "ui/manual_speed";
+static const char *homevel    = "ui/home_vel";
+static const char *want_dig   = "adv/want_dig_in";
+static const char *npn_wr     = "adv/npn_write_drive";
+static const char *npn_sw     = "adv/npn_sw_invert";
 }
 
 QString prefsPath()
@@ -56,6 +60,13 @@ Prefs prefsLoad(const QString &path)
 
    p.nic          = s.value(QLatin1String(k::nic)).toString();
    p.manual_speed = s.value(QLatin1String(k::manspeed), -1).toInt();
+   p.home_vel     = s.value(QLatin1String(k::homevel),  -1).toInt();
+
+   /* 这三项**必须显式带缺省值**: 缺项时 QSettings 给的是无效 QVariant, toBool() 一律返回
+    * false —— 不写缺省的话, 旧 ini 会把"默认开"静默读成"用户把它关了" */
+   p.want_dig_in     = s.value(QLatin1String(k::want_dig), p.want_dig_in).toBool();
+   p.npn_write_drive = s.value(QLatin1String(k::npn_wr),   p.npn_write_drive).toBool();
+   p.npn_sw_invert   = s.value(QLatin1String(k::npn_sw),   p.npn_sw_invert).toBool();
 
    return p;
 }
@@ -93,6 +104,11 @@ void prefsSave(const QString &path, const Prefs &p)
 
    s.setValue(QLatin1String(k::nic),       p.nic);
    s.setValue(QLatin1String(k::manspeed),  p.manual_speed);
+   s.setValue(QLatin1String(k::homevel),   p.home_vel);
+
+   s.setValue(QLatin1String(k::want_dig),  p.want_dig_in);
+   s.setValue(QLatin1String(k::npn_wr),    p.npn_write_drive);
+   s.setValue(QLatin1String(k::npn_sw),    p.npn_sw_invert);
 
    /* 显式 sync: 不靠析构时机保证写盘 */
    s.sync();

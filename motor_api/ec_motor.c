@@ -370,6 +370,43 @@ int em__wr_i32(em_axis_t *ax, uint16_t index, uint8_t sub, int32_t v, const char
    return em__verified_write(ax, index, sub, 4, &v, why);
 }
 
+/* ---- 2300h 输入端子有效电平逻辑 (唯一一处改驱动器行为参数的写) ----
+ * 现场是 NPN 传感器 (高电平 = 未触发) 而驱动器配着常开, 两者反着: 60FDh 的 bit1/bit2 恒
+ * 同时置起 -> 6041h bit11 恒为 1 -> 2204h = 0 把两个方向都挡死 (回零进得去、一动不动)。
+ * 置 0x0007 (bit0~bit2 全 1 = 常闭) 是修根: 驱动器自己的限位保护与回零一起跟着对。
+ * 宽度按驱动器自报的来 (手册 V2.4 p84 写 U16, slide_motion 的基线表记成 U8 —— 不猜),
+ * bit3 以上的位原样保留。 */
+
+static int em__di_read(em_bus_t *bus, int slave, uint16_t *val, int *sz)
+{
+   uint32_t v = 0;
+   int      n = 0;
+
+   if (em_rd_any(bus, slave, EM_OID_DI_LOGIC, 0, &v, &n) != EM_R_OK)
+   {
+      em__err("读 2300h (输入有效电平逻辑) 失败");
+      return EM_R_FAIL;
+   }
+   if (n != 1 && n != 2)
+   {
+      em__err("2300h 自报 %d 字节, 本接口只认 1 / 2 字节 -> 不猜, 不写", n);
+      return EM_R_FAIL;
+   }
+   *val = (uint16_t)v;
+   *sz  = n;
+   return EM_R_OK;
+}
+
+static int em__di_write(em_axis_t *ax, uint16_t v, int sz, const char *why)
+{
+   if (sz == 1)
+   {
+      uint8_t b = (uint8_t)(v & 0xFFu);
+      return em__verified_write(ax, EM_OID_DI_LOGIC, 0, 1, &b, why);
+   }
+   return em__verified_write(ax, EM_OID_DI_LOGIC, 0, 2, &v, why);
+}
+
 /* 映射项编码: index<<16 | sub<<8 | 位宽 */
 #define EM_MAP_ENTRY(index, sub, bits) \
    (((uint32_t)(index) << 16) | ((uint32_t)(sub) << 8) | (uint32_t)(bits))
@@ -1584,6 +1621,45 @@ void em_shutdown(em_bus_t *bus, int restore_mapping, int *motor_maybe_live)
       }
    }
 
+   /* ---- 2.5 还原 2300h (只还原**真改过**的轴; 这一步不查授权) ----
+    * 授权管"改"; 还原是把这一趟改掉的撤掉 —— 再要一次授权会落成"没授权时收尾反而留下改动"。
+    * 不绑在 bus->mapped 上: 改 2300h 与有没有补 PDO 映射是两件事。 */
+   {
+      int any_di = 0;
+
+      for (i = 0; i < bus->naxis; i++)
+         if (bus->di_logic_changed[i])
+            any_di = 1;
+
+      if (any_di)
+      {
+         if (restore_mapping)
+         {
+            for (i = 0; i < bus->naxis; i++)
+            {
+               em_axis_t *ax = bus->axis[i];
+
+               if (!bus->di_logic_changed[i])
+                  continue;
+
+               if (em__di_write(ax, bus->di_logic_orig[i], bus->di_logic_sz[i],
+                                "收尾还原 2300h") != EM_R_OK)
+                  em__warn("%s: 2300h 还原失败 —— 驱动器里仍是这一趟写进去的值", ax->label);
+               else
+               {
+                  bus->di_logic_changed[i] = 0;
+                  printf("  %s: 2300h 已还原 0x%04X\n",
+                         ax->label, (unsigned)bus->di_logic_orig[i]);
+               }
+            }
+         }
+         else
+         {
+            printf("  按 --keep-mapping: 保留改过的 2300h (顺带也保留 PDO 映射)\n");
+         }
+      }
+   }
+
    /* ---- 3. 还原 PDO 映射 (默认; 这些对象只写 RAM, 失败只记 WARN) ---- */
    if (bus->mapped)
    {
@@ -1698,6 +1774,82 @@ void em_require_dig_in(em_bus_t *bus, int on)
 {
    if (bus != NULL)
       bus->want_dig_in = on ? 1 : 0;
+}
+
+void em_allow_param_write(em_bus_t *bus, int on)
+{
+   if (bus != NULL)
+      bus->allow_param = on ? 1 : 0;
+}
+
+int em_di_set_logic(em_bus_t *bus, uint16_t want)
+{
+   int i, any_fail = 0, nwrite = 0;
+
+   if (bus == NULL || !bus->opened || bus->naxis <= 0)
+      return EM_R_FAIL;
+
+   if (!bus->allow_param)
+   {
+      em__err("改 2300h 需要授权 (em_allow_param_write / --allow-param)"
+              " -> 拒绝, 一个字节都没写");
+      return EM_R_FAIL;
+   }
+
+   /* ---- 1. 先把每根轴的原值读齐。任一根读不到就整体拒绝: 没读到原值就写, 收尾无从还原
+    *         (这才是"一个字节都不写"的意义) ---- */
+   for (i = 0; i < bus->naxis; i++)
+   {
+      em_axis_t *ax = bus->axis[i];
+
+      if (em__di_read(bus, ax->slave, &bus->di_logic_orig[i], &bus->di_logic_sz[i]) != EM_R_OK)
+      {
+         em__err("%s: 读不到 2300h 原值 -> 整体拒绝, 一个字节都不写", ax->label);
+         return EM_R_FAIL;
+      }
+      bus->di_logic_have[i] = 1;
+   }
+
+   /* ---- 2. 逐轴写; 已经等于 want 的跳过 (写 = 改驱动器, 能不写就不写) ---- */
+   for (i = 0; i < bus->naxis; i++)
+   {
+      em_axis_t *ax = bus->axis[i];
+      uint16_t   v;
+
+      if (EM_DI_LOGIC_EQ(bus->di_logic_orig[i], want))
+      {
+         printf("  %s: 2300h = 0x%04X, 已经是想要的极性 -> 不写\n",
+                ax->label, (unsigned)bus->di_logic_orig[i]);
+         continue;
+      }
+
+      v = (uint16_t)((bus->di_logic_orig[i] & (uint16_t)~EM_DI_LOGIC_MASK) |
+                     (want & (uint16_t)EM_DI_LOGIC_MASK));
+
+      if (em__di_write(ax, v, bus->di_logic_sz[i], "2300h 输入有效电平逻辑") != EM_R_OK)
+      {
+         em__err("%s: 写 2300h = 0x%04X 失败 -> 该轴仍是原极性 0x%04X",
+                 ax->label, (unsigned)v, (unsigned)bus->di_logic_orig[i]);
+         any_fail = 1;
+         continue;
+      }
+
+      /* 写成功就立刻记下来: 后面某根轴失败也必须能把这根还原回去 */
+      bus->di_logic_changed[i] = 1;
+      nwrite++;
+      printf("  %s: 2300h 0x%04X -> 0x%04X (%d 字节, 收尾写回原值)\n",
+             ax->label, (unsigned)bus->di_logic_orig[i], (unsigned)v, bus->di_logic_sz[i]);
+   }
+
+   if (nwrite > 0)
+      printf("  2300h 改了 %d 根轴: 60FDh 的三个开关与 6041h bit11 一起跟着变。\n", nwrite);
+   if (any_fail)
+   {
+      printf("  >>> 有轴没改成: 那一根仍按原极性判限位 -> 扫描可能开不了。"
+             "退路是改用上位机侧取反 (scan 界面的「高级选项」)。\n");
+      return EM_R_FAIL;
+   }
+   return EM_R_OK;
 }
 
 int em_modes_via_pdo(const em_axis_t *ax)

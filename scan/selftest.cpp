@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 
+#include "editgate.h"
 #include "scanarrive.h"
 #include "scancontroller.h"
 #include "scanlog.h"
@@ -201,7 +202,7 @@ public:
       recomputeLimit(i);
    }
 
-   /* 「输入电平反转 (NPN)」。总线级: 一次改全部轴。 */
+   /* 「上位机侧取反」。总线级: 一次改全部轴。 */
    void setDiInvert(bool on)
    {
       t_.di_invert = on;
@@ -1201,6 +1202,185 @@ static void test_prefs()
    }
 }
 
+/* ---------------------------------------------------------------- 编辑门控 */
+
+/* 状态机本身没有 Qt 依赖, 但下面每条判据对应的都是界面上看得见的行为 */
+static void test_editgate()
+{
+   /* 本地小工具: 判"这句话里有这个词" */
+   auto has = [](const char *p, const char *w) {
+      return p != nullptr && std::string(p).find(w) != std::string::npos;
+   };
+
+   caseBegin("editgate: 不在编辑态 — 没有标记, 也点不脏");
+   {
+      editgate::Gate g;
+      check(!g.editing, "新框不在编辑态");
+      check(std::string(editgate::titleMark(g)).empty(), "标题不拼任何后缀");
+
+      editgate::markDirty(&g);   /* 载入 ini / 恢复默认时顺手碰控件 */
+      check(!g.dirty, "非编辑态下 markDirty 无效");
+      check(std::string(editgate::titleMark(g)).empty(), "于是标记也没冒出来");
+   }
+
+   caseBegin("editgate: 进了编辑态但没改 -> 有编辑权, 没有未保存的东西");
+   {
+      editgate::Gate g;
+      check(editgate::begin(&g), "第一次 begin 成功");
+      check(!editgate::begin(&g), "重复点「编辑」是 no-op (绝不重拍快照)");
+      check(std::string(editgate::titleMark(g)).empty(), "没改过就不说「未保存」");
+
+      editgate::markDirty(&g);
+      check(has(editgate::titleMark(g), "未保存"), "改一下就出现「未保存」");
+   }
+
+   caseBegin("editgate: 改回原值 -> 标记自己消失");
+   {
+      editgate::Gate g;
+      editgate::begin(&g);
+      editgate::markDirty(&g);
+      check(has(editgate::titleMark(g), "未保存"), "改一下就有标记");
+
+      editgate::undirty(&g);
+      check(!g.dirty, "界面侧逐项比对发现与快照一致 -> 标记落下");
+      check(std::string(editgate::titleMark(g)).empty(), "标题回到干净的那一份");
+      check(g.editing, "但还在编辑态: 清标记不等于退出编辑");
+
+      editgate::save(&g);
+      g.dirty = true;      /* 直接置位, 绕过 markDirty 的编辑态守卫 */
+      editgate::undirty(&g);
+      check(g.dirty, "非编辑态下 undirty 不动手 —— 标记只在编辑态里有意义");
+      check(!g.editing && !g.discarded, "别的标志一个不动");
+   }
+
+   caseBegin("editgate: 保存与取消都清干净");
+   {
+      editgate::Gate g;
+      editgate::begin(&g);
+      editgate::markDirty(&g);
+      editgate::save(&g);
+      check(!g.editing && !g.dirty && !g.discarded, "save 之后三个标志全清");
+      check(std::string(editgate::titleMark(g)).empty(), "标记也清掉");
+
+      editgate::begin(&g);
+      editgate::markDirty(&g);
+      editgate::cancel(&g);
+      check(!g.editing && !g.dirty && !g.discarded,
+            "cancel 与 save 的区别只在调用方要不要回滚控件");
+   }
+
+   caseBegin("editgate: 静默丢弃 — 真有改动才留痕");
+   {
+      editgate::Gate g;
+      editgate::begin(&g);
+      check(!editgate::drop(&g), "进了编辑态又没改 -> 调用方什么都不用做");
+      check(!has(editgate::titleMark(g), "已丢弃"), "没改过就不留「已丢弃」");
+
+      editgate::begin(&g);
+      editgate::markDirty(&g);
+      check(editgate::drop(&g), "有改动 -> 调用方必须回滚控件并重新下推");
+      check(!g.editing, "丢弃也退出编辑态");
+      check(has(editgate::titleMark(g), "未保存"), "痕迹说清「未保存」");
+      check(has(editgate::titleMark(g), "已丢弃"), "并说清它已经被丢掉");
+
+      editgate::begin(&g);
+      check(!has(editgate::titleMark(g), "已丢弃"),
+            "「已丢弃」留到这块框下次进编辑态为止");
+   }
+
+   caseBegin("editgate: 双反相警告 — 不是「等于没反」, 是判据恒成立");
+   {
+      check(editgate::doubleInvertWarning(true,  false) == nullptr, "只勾写驱动器: 无事");
+      check(editgate::doubleInvertWarning(false, true)  == nullptr, "只勾上位机侧取反: 无事");
+      check(editgate::doubleInvertWarning(false, false) == nullptr, "两个都不勾: 无事");
+
+      const char *w = editgate::doubleInvertWarning(true, true);
+      check(w != nullptr, "两个都勾 -> 必须给警告");
+      check(has(w, "恒成立"), "措辞必须点明判据恒成立", w ? w : "");
+      check(has(w, "上位机侧取反"), "并指出该关掉哪一个", w ? w : "");
+   }
+
+   caseBegin("editgate: 2300h 的掩码比较 — 高几位无关");
+   {
+      check(!EM_DI_LOGIC_EQ(0x0000u, EM_DI_LOGIC_NPN), "常开 -> 要写");
+      check( EM_DI_LOGIC_EQ(0x0007u, EM_DI_LOGIC_NPN), "已经是 NPN -> 一个字节都不写");
+      check( EM_DI_LOGIC_EQ(0xF007u, EM_DI_LOGIC_NPN), "高位有别的位不关这三位的事");
+      check(!EM_DI_LOGIC_EQ(0x0006u, EM_DI_LOGIC_NPN), "只对两位 -> 还要写");
+      check( EM_DI_LOGIC_EQ(EM_DI_LOGIC_MASK, EM_DI_LOGIC_NPN), "掩码就是 0x0007");
+   }
+}
+
+/* ------------------------------------------------------------ 高级选项的记忆 */
+
+static void test_advprefs()
+{
+   caseBegin("advprefs: 缺省就是「开 / 开 / 关」");
+   {
+      const Prefs p;
+      check(p.want_dig_in,      "默认让 60FDh 进 TxPDO");
+      check(p.npn_write_drive,  "默认写驱动器 2300h");
+      check(!p.npn_sw_invert,   "上位机侧取反默认关");
+      checkEq(p.home_vel, -1,   "回零速度: 还没记过");
+
+      QTemporaryDir dir;
+      const Prefs fresh = prefsLoad(dir.filePath(QStringLiteral("scan.ini")));
+      check(fresh.want_dig_in && fresh.npn_write_drive && !fresh.npn_sw_invert,
+            "文件压根不存在时也走同一份缺省");
+   }
+
+   caseBegin("advprefs: 旧 ini (没有这三个键) 读回来仍是开 / 开 / 关");
+   {
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      QFile f(ini);
+      check(f.open(QIODevice::WriteOnly | QIODevice::Text), "手写一份只有老键的 ini");
+      f.write("[scan]\narea_x_unit=12.5\nspeed_pul_s=33333\n"
+              "[ui]\nmanual_speed=12345\n");
+      f.close();
+
+      const Prefs p = prefsLoad(ini);
+      checkNear(p.params.area_x_unit, 12.5, "老键照旧读回来");
+      checkEq(p.manual_speed, 12345, "老键照旧读回来 (2)");
+
+      /* 本用例的正题: QSettings 对缺项给的是无效 QVariant, toBool() 一律 false ——
+       * 不显式带缺省的话, 升级前的 ini 会把"默认开"静默读成"用户把它关了" */
+      check(p.want_dig_in,     "缺 adv/want_dig_in 必须回落到默认开");
+      check(p.npn_write_drive, "缺 adv/npn_write_drive 必须回落到默认开");
+      check(!p.npn_sw_invert,  "缺 adv/npn_sw_invert 回落到默认关");
+      checkEq(p.home_vel, -1,  "缺 ui/home_vel 回落到「没记过」");
+   }
+
+   caseBegin("advprefs: 四项反着设, 存进去再读回来逐项相等");
+   {
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      Prefs p;
+      p.want_dig_in     = false;
+      p.npn_write_drive = false;
+      p.npn_sw_invert   = true;
+      p.home_vel        = 30000;
+      prefsSave(ini, p);
+
+      const Prefs b = prefsLoad(ini);
+      check(!b.want_dig_in,     "want_dig_in=false 存得住");
+      check(!b.npn_write_drive, "npn_write_drive=false 存得住");
+      check(b.npn_sw_invert,    "npn_sw_invert=true 存得住");
+      checkEq(b.home_vel, 30000, "回零速度存得住");
+   }
+
+   caseBegin("advprefs: 被手改坏的 ini 不许直接把速度拿去用");
+   {
+      checkEq(ecatcmd::home_vel_from_pref(-1), HMI_HOME_VEL_DEF,
+              "-1 = 没记过 -> 用驱动器实测值");
+      checkEq(ecatcmd::home_vel_from_pref(0),  HMI_HOME_VEL_DEF, "0 也算没记过");
+      checkEq(ecatcmd::home_vel_from_pref(30000), 30000, "正常值原样用");
+      checkEq(ecatcmd::home_vel_from_pref(1), HMI_HOME_VEL_MIN, "太小 -> 夹到下限");
+      checkEq(ecatcmd::home_vel_from_pref(999999999), HMI_HOME_VEL_MAX, "太大 -> 夹到上限");
+   }
+}
+
 /* ------------------------------------------------- 故障复位 (6040h bit7 上升沿) */
 
 /* 这些判据全在 ecatcmd 里 (头文件, inline) —— 故意放在头文件: scan_selftest 不编
@@ -1340,9 +1520,9 @@ static void test_limitsw()
       const char *unk = limit_switch_text(false, false, false, false);
       check(std::strstr(unk, "无从得知") != nullptr,
             "unknown is reported as unknown, not as 'nothing pressed'", unk);
-      /* 反转开着而读不到 60FDh: 比"不知道"还严重一层, 那句话得说出来 */
+      /* 取反开着而读不到 60FDh: 比"不知道"还严重一层, 那句话得说出来 */
       const char *unk_inv = limit_switch_text(false, false, false, true);
-      check(std::strstr(unk_inv, "反转") != nullptr,
+      check(std::strstr(unk_inv, "取反") != nullptr,
             "unknown + invert is called out as one judge short", unk_inv);
       check(std::strcmp(unk, unk_inv) != 0, "...and it is not the same sentence");
 
@@ -1374,8 +1554,8 @@ static void test_limitsw()
       /* 这一句是这次要根治的东西: 不许再叫人去走离一个不存在的限位 */
       check(std::strstr(adv, "先手动把它走离") == nullptr,
             "and it does NOT tell the operator to walk off a limit that is not there", adv);
-      /* 反转这个新出路也要点一下, 但必须连带说清它只治软件那一侧 */
-      check(std::strstr(adv, "输入电平反转") != nullptr, "the advice mentions the new way out",
+      /* 取反这个新出路也要点一下, 但必须连带说清它只治软件那一侧 */
+      check(std::strstr(adv, "上位机侧取反") != nullptr, "the advice mentions the new way out",
             adv);
       check(std::strstr(adv, "只治软件") != nullptr,
             "...and says plainly that it only fixes this side", adv);
@@ -1598,6 +1778,242 @@ static void test_homing()
          const int m = ecatcmd::home_method_for(neg != 0);
          check(m >= 4 && m <= 30 && m != 35, "方式号落在手册的 HM 表里, 且不是 35");
       }
+   }
+
+   /* ---- 找限位: 方式号与白名单 ---------------------------------- */
+   caseBegin("找限位: 正/负 -> 6098h（18 / 17）, 以及四方式的白名单");
+   {
+      checkEq(ecatcmd::home_lim_method_for(false), 18, "正限位 = 方式 18");
+      checkEq(ecatcmd::home_lim_method_for(true),  17, "负限位 = 方式 17");
+
+      /* 找限位与找原点**必须是四个不同的数** —— 17/18 里任意一个与 24/29 撞上, 就是
+       * "按找限位结果去找了原点开关", 而这个错误在界面上看不出来 (两边都叫"回零") */
+      const int lim[2] = { ecatcmd::home_lim_method_for(false),
+                           ecatcmd::home_lim_method_for(true) };
+      for (int i = 0; i < 2; i++)
+      {
+         check(lim[i] != ecatcmd::home_method_for(false) &&
+               lim[i] != ecatcmd::home_method_for(true),
+               "找限位的方式号不与找原点的方式号重合");
+      }
+      check(lim[0] != lim[1], "正/负限位是两个不同的方式号");
+
+      /* 白名单 = 恰好这四个。**多一个都不许** —— 白名单宽一格, 就是一个"没验过的
+       * 回零方式能被发起"的口子, 而回零是软件唯一兜不住的动作 */
+      check(ecatcmd::home_method_allowed(24), "24 放行");
+      check(ecatcmd::home_method_allowed(29), "29 放行");
+      check(ecatcmd::home_method_allowed(18), "18 放行");
+      check(ecatcmd::home_method_allowed(17), "17 放行");
+      check(!ecatcmd::home_method_allowed(35),
+            "35 不放行 —— 它是「以当前位置为机械原点」, 根本不去找");
+      check(!ecatcmd::home_method_allowed(0),  "0 不放行");
+      check(!ecatcmd::home_method_allowed(19), "19 不放行");
+      check(!ecatcmd::home_method_allowed(30), "30 不放行");
+
+      /* 白名单与两个构造函数**对得上**: 这四个数必须正好是那两条函数能算出来的全集。
+       * 否则会出现"界面给得出、worker 不认"或者反过来的死格 */
+      int n_allowed = 0;
+      for (int m = 0; m <= 40; m++)
+         if (ecatcmd::home_method_allowed(m))
+            n_allowed++;
+      checkEq(n_allowed, 4, "0..40 里放行的恰好四个");
+
+      check(ecatcmd::home_method_is_limit(17), "17 是找限位");
+      check(ecatcmd::home_method_is_limit(18), "18 是找限位");
+      check(!ecatcmd::home_method_is_limit(24), "24 不是找限位");
+      check(!ecatcmd::home_method_is_limit(29), "29 不是找限位");
+      check(!ecatcmd::home_method_is_limit(0),  "0 不是找限位");
+
+      check(std::string(ecatcmd::home_method_short(18)) == "找正限位", "18 的叫法");
+      check(std::string(ecatcmd::home_method_short(17)) == "找负限位", "17 的叫法");
+      check(std::string(ecatcmd::home_method_short(24)) == "找原点",   "24 的叫法");
+      check(std::string(ecatcmd::home_method_short(29)) == "找原点",   "29 的叫法");
+
+      /* **动作**的名字与**开关**的名字是两样东西: "找正限位" / "正限位", 差一个"找"字。
+       * 横幅要用后者 ("正限位信号此刻有效"), 而拿前者 .mid(1) 去切是看不见地依赖那个字的
+       * 长度 —— 哪天动作名改成"回零到正限位", 切出来就成了"零到正限位"。 */
+      check(std::string(ecatcmd::home_lim_switch_name(18)) == "正限位", "18 的开关名");
+      check(std::string(ecatcmd::home_lim_switch_name(17)) == "负限位", "17 的开关名");
+      check(std::string(ecatcmd::home_lim_switch_name(18)) !=
+               std::string(ecatcmd::home_method_short(18)),
+            "开关名与动作名不是同一个字符串");
+   }
+
+   /* ---- 找限位: 首段方向 (手册 V2.4 p46~p48 的 a)/b) 两条分支) ---- */
+   caseBegin("找限位: 首段方向真值表（a) 没压着 / b) 已压着）");
+   {
+      /* 手册原文那四条:
+       *   17 a) 反向高速 → 遇上升沿减速停止 → 正向低速 → 遇下降沿后停机
+       *   17 b) 正向低速运行, 遇下降沿后停机
+       *   18 a) 正向高速 → 遇上升沿减速停止 → 反向低速 → 遇下降沿后停机
+       *   18 b) 反向低速运行, 遇下降沿后停机
+       * **17 与 18 的首段方向是反的, 而 a) 与 b) 之间又各反一次** —— 这一格单独看
+       * 任何一条都说得通, 只有摆成整张表才看得出哪条是错的。 */
+      check(has(ecatcmd::home_method_first_dir(18, false), "正"), "18(a) 首段正向高速");
+      check(has(ecatcmd::home_method_first_dir(18, true),  "反"), "18(b) 首段反向低速");
+      check(has(ecatcmd::home_method_first_dir(17, false), "反"), "17(a) 首段反向高速");
+      check(has(ecatcmd::home_method_first_dir(17, true),  "正"), "17(b) 首段正向低速");
+
+      /* a) 与 b) 的方向**必须相反**: b) 的全部意义就是"从压着的开关上退开", 方向与
+       * "朝它去"相反。哪天有人把 b) 也写成朝开关走, 那条路会一直顶着开关跑到超时 */
+      check(std::string(ecatcmd::home_method_first_dir(18, false)) !=
+               std::string(ecatcmd::home_method_first_dir(18, true)),
+            "18 的 a) 与 b) 方向相反");
+      check(std::string(ecatcmd::home_method_first_dir(17, false)) !=
+               std::string(ecatcmd::home_method_first_dir(17, true)),
+            "17 的 a) 与 b) 方向相反");
+
+      /* 找原点这两条与 tgt_active 无关 (24/29 只有一条分支, 手册没给它写 b) ——
+       * 原点开关在启动时压着不改变它的走法)。**挡住"顺手把 17/18 那套套到 24/29 上"** */
+      check(std::string(ecatcmd::home_method_first_dir(24, false)) ==
+            std::string(ecatcmd::home_method_first_dir(24, true)),
+            "24 的方向不随「启动时压着」变");
+      check(std::string(ecatcmd::home_method_first_dir(29, false)) ==
+            std::string(ecatcmd::home_method_first_dir(29, true)),
+            "29 的方向不随「启动时压着」变");
+
+      /* 与老那两条对得上: 24 就是 home_dir_text(false), 29 就是 home_dir_text(true) */
+      for (int neg = 0; neg < 2; neg++)
+      {
+         const int m = ecatcmd::home_method_for(neg != 0);
+         check(std::string(ecatcmd::home_method_first_dir(m, false)) ==
+               std::string(ecatcmd::home_dir_text(neg != 0)),
+               "24/29 的首段方向与 home_dir_text 一致（不许出现两套说法）");
+      }
+
+      /* 四个方式**每个都得有名有姓**, 不许落到那个 "?" 兜底里 —— 兜底是给非法方式号的 */
+      const int all[4] = { 24, 29, 18, 17 };
+      for (int i = 0; i < 4; i++)
+      {
+         check(std::string(ecatcmd::home_method_first_dir(all[i], false)) != "?",
+               "合法方式号都有首段方向");
+         check(std::string(ecatcmd::home_method_first_dir(all[i], true)) != "?",
+               "合法方式号都有首段方向（含 b) 那一格）");
+      }
+   }
+
+   /* ---- 找限位: 目标/另一侧是哪两位 ----------------------------- */
+   caseBegin("找限位: 目标开关 -> 60FDh 的哪一位（只此一处）");
+   {
+      /* 这两条是"哪一位是目标"的唯一定义。允否、分支预告、横幅都读它, 所以它错了
+       * 就是三处一起错, 而且**方向会正好反过来** */
+      check(ecatcmd::home_lim_target_active(18, true, false),  "18 看正限位位");
+      check(!ecatcmd::home_lim_target_active(18, false, true), "18 不看负限位位");
+      check(ecatcmd::home_lim_target_active(17, false, true),  "17 看负限位位");
+      check(!ecatcmd::home_lim_target_active(17, true, false), "17 不看正限位位");
+
+      check(ecatcmd::home_lim_other_active(18, false, true),   "18 的另一侧是负限位");
+      check(ecatcmd::home_lim_other_active(17, true, false),   "17 的另一侧是正限位");
+
+      /* 上面四条是逐格举的例子, 容易被"恰好举到那两格"蒙过去。这一组把**两位的四种
+       * 组合全走一遍**, 钉的是"哪一位进哪个角色"本身 —— 写反 (18 去看 dig_neg) 在单看
+       * 一格时说得通 (都叫"限位位"), 只有三个组合一起看才认得出。 */
+      for (int p = 0; p < 2; p++)
+      {
+         for (int n = 0; n < 2; n++)
+         {
+            const bool pos = (p != 0), neg = (n != 0);
+            check(ecatcmd::home_lim_target_active(18, pos, neg) == pos,
+                  "18 的目标就是正限位位本身");
+            check(ecatcmd::home_lim_other_active(18, pos, neg) == neg,
+                  "18 的另一侧就是负限位位本身");
+            check(ecatcmd::home_lim_target_active(17, pos, neg) == neg,
+                  "17 的目标就是负限位位本身");
+            check(ecatcmd::home_lim_other_active(17, pos, neg) == pos,
+                  "17 的另一侧就是正限位位本身");
+         }
+      }
+
+      /* 两位**同时**压着 = 那道否决要拦的形状, 此时两者确实同时为真 —— 写死下来,
+       * 免得哪天有人把"互斥"当成不变式, 顺手把这道否决的条件改成恒假 */
+      check(ecatcmd::home_lim_target_active(18, true, true) &&
+            ecatcmd::home_lim_other_active(18, true, true),
+            "两位都压着时 18 的目标与另一侧同时为真（这正是被拦的那种形状）");
+
+      /* 24/29 没有"目标限位" —— 它们的基准是原点开关 X0。这里是挡住"顺手也给它算一个" */
+      check(!ecatcmd::home_lim_target_active(24, true, true), "24 没有目标限位");
+      check(!ecatcmd::home_lim_other_active(24, true, true),  "24 没有另一侧限位");
+   }
+
+   /* ---- 找限位: 两道否决 ---------------------------------------- */
+   caseBegin("找限位闸: 只否决「60FDh 读不到」与「两侧同时有效」");
+   {
+      check(ecatcmd::home_lim_refusal(true, false, false) == nullptr,
+            "读得到 + 两侧都没压着 -> 放行 (a) 分支)");
+      check(ecatcmd::home_lim_refusal(true, true, false) == nullptr,
+            "读得到 + 目标压着 -> 放行 (b) 分支) —— b) 是正规做法, 不是要拦的情形");
+      check(ecatcmd::home_lim_refusal(true, false, true) == nullptr,
+            "读得到 + **另一侧**压着 -> 放行 (朝目标去正好是远离那一侧)");
+
+      const char *r = ecatcmd::home_lim_refusal(false, false, false);
+      check(r != nullptr, "60FDh 读不到 -> 不放行");
+      check(has(r, "60FDh"), "说清楚是 60FDh 的事");
+      check(has(r, "TxPDO"), "指到「让 60FDh 进 TxPDO」这条路");
+      check(has(r, "拒绝"), "**必须有「拒绝」两个字** —— 界面横幅就是照它上红色的");
+
+      r = ecatcmd::home_lim_refusal(true, true, true);
+      check(r != nullptr, "两侧同时有效 -> 不放行");
+      check(has(r, "2300h"), "指到 2300h（极性配反是本机实测过的那个原因）");
+      check(has(r, "同时"), "说清楚「同时」才是问题");
+      check(has(r, "拒绝"), "**必须有「拒绝」两个字**");
+
+      /* 读不到与两侧同时有效**是两句不同的话**。同一句话会让操作员去查错的东西:
+       * 前者是"没打开一个勾", 后者是"接线/极性与读数不符" */
+      check(std::string(ecatcmd::home_lim_refusal(false, false, false)) !=
+               std::string(ecatcmd::home_lim_refusal(true, true, true)),
+            "两道否决不是同一句话");
+
+      /* 两条否决的文案都要点名「拒绝找限位」—— 让人一眼看出拦的是哪一个动作 */
+      check(has(r, "拒绝找限位"), "否决文案点名「拒绝找限位」");
+      check(has(ecatcmd::home_lim_refusal(false, false, false), "拒绝找限位"),
+            "读不到那一条也点名「拒绝找限位」");
+   }
+
+   /* ---- 找限位: 发起前的分支预告 -------------------------------- */
+   caseBegin("找限位预告: 说清这一趟走 a) 还是 b), 且方向与快慢都对得上");
+   {
+      /* 四句话两两不同 —— 四格必须可分辨。都在说"正在回零"就等于没说 */
+      const char *txt[4] = {
+         ecatcmd::home_lim_branch_text(18, false),
+         ecatcmd::home_lim_branch_text(18, true),
+         ecatcmd::home_lim_branch_text(17, false),
+         ecatcmd::home_lim_branch_text(17, true),
+      };
+      for (int i = 0; i < 4; i++)
+         for (int j = i + 1; j < 4; j++)
+            check(std::string(txt[i]) != std::string(txt[j]), "四格预告两两不同");
+
+      /* 逐格对手册: 方向 + 快慢 + 走哪条分支, 三样缺一不可 */
+      check(has(txt[0], "a)") && has(txt[0], "正向高速"), "18(a): a) + 正向高速");
+      check(has(txt[1], "b)") && has(txt[1], "反向低速"), "18(b): b) + 反向低速");
+      check(has(txt[2], "a)") && has(txt[2], "反向高速"), "17(a): a) + 反向高速");
+      check(has(txt[3], "b)") && has(txt[3], "正向低速"), "17(b): b) + 正向低速");
+
+      /* 预告里的**方向与快慢分开说** —— 光说"反向"不够: b) 是"反向**低速**退开",
+       * 而 a) 的第二段也是反向低速, 操作员要靠"低速"认出现在是退开那一段 */
+      for (int i = 0; i < 4; i++)
+      {
+         check(has(txt[i], "高速") || has(txt[i], "低速"), "每格都写了快慢");
+         check(has(txt[i], "释放点"),
+               "每格都写明**落点 = 开关的释放点** —— 那就是这趟结束之后坐标 0 的位置, "
+               "不写清楚, 操作员会以为 0 在开关的中心上");
+      }
+
+      /* 预告的方向与真值表**同源**: 谁要是改了 home_method_first_dir 而没改文案,
+       * 这一条会响。这是这组断言里最值钱的一条 —— 两处说法不一致比说错更难查 */
+      const int ms[4] = { 18, 18, 17, 17 };
+      const bool tas[4] = { false, true, false, true };
+      for (int i = 0; i < 4; i++)
+      {
+         const std::string d = ecatcmd::home_method_first_dir(ms[i], tas[i]);
+         check(std::string(txt[i]).find(d) != std::string::npos,
+               "预告里的首段方向与 home_method_first_dir 一致");
+      }
+
+      /* 找原点那两格不走这条预告 (doHome 只对 17/18 调它), 但函数得是**全的** ——
+       * 调用点写错时不许打出半句话 */
+      check(has(ecatcmd::home_lim_branch_text(24, false), "找原点"),
+            "24 落到兜底那句上, 而且不是半句话");
    }
 
    /* ---- 返回速度派生 -------------------------------------------- */
@@ -2161,6 +2577,8 @@ int main(int argc, char **argv)
    test_preflight();
    test_plancap();
    test_prefs();
+   test_editgate();
+   test_advprefs();
    test_faultreset();
    test_limitsw();
    test_homing();
