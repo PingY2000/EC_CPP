@@ -23,6 +23,7 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSet>
@@ -49,6 +50,9 @@ static const char *kBannerFault =
    "QLabel#banner { background:#5a1f1f; color:#ffb3b3; padding:6px; border-radius:4px; }";
 static const char *kBannerInfo =
    "QLabel#banner { background:#1d3346; color:#a9cfe8; padding:6px; border-radius:4px; }";
+
+/* 横幅浮在画布顶上时离画布左边/上边留的空。贴着边也行, 但画布那圈边框会把它的圆角吃掉 */
+static const int kBannerInset = 6;
 
 /* 默认 CSV 目录, 相对当前工作目录 (从仓库根敲 ./bin/scan.exe 时就落在 scan_out/) */
 static const char *kOutDir = "scan_out";
@@ -717,11 +721,17 @@ void ScanWindow::buildUi()
 {
    QWidget *central = new QWidget(this);
 
+   /* 横幅**不进布局**, 它是浮在画布顶上的一层 (位置见 placeBanner)。进了布局就会这样:
+    * 它一出现, 下面那根分隔条连同右边的参数栏被整体往下推一行高; 一消失又弹回去 ——
+    * 而这条横幅会来回闪 (连上/断开/每次提示), 于是参数栏一直上下跳, 点偏一格就是点到
+    * 别的按钮。它本来就只是"说一句话", 不该占体积。 */
    m_banner = new QLabel(central);
    m_banner->setObjectName(QStringLiteral("banner"));
    m_banner->setWordWrap(true);
    m_banner->setStyleSheet(kBannerInfo);
    m_banner->setVisible(false);
+   /* 它纯是信息, 点在它身上要能穿过去落到画布上 —— 否则"点了画布没反应"会看起来像卡了 */
+   m_banner->setAttribute(Qt::WA_TransparentForMouseEvents, true);
 
    m_canvas = new MapCanvas(central);
    m_canvas->setController(m_ctl);
@@ -786,9 +796,13 @@ void ScanWindow::buildUi()
 
    QVBoxLayout *v = new QVBoxLayout(central);
    v->addWidget(buildTopBar());
-   v->addWidget(m_banner);
+   /* 横幅不在这里 (见上面 m_banner 那段): 它浮在画布顶上, 不占这一列的高度 */
    v->addWidget(split, 1);
    setCentralWidget(central);
+
+   /* 分隔条一拖, 画布宽度就变了 —— 横幅那一层的宽度与折行高度都得跟着重算 */
+   connect(split, &QSplitter::splitterMoved, this, [this](int, int) { placeBanner(); });
+   placeBanner();
 
    /* 滚轮闸: 名单是找出来的, 不是手写的表 (漏一个只是那个框还在被滚轮改, 不报错)。
     * 挂在最后 —— 这里才保证上面那六组框全都建出来了。
@@ -835,6 +849,41 @@ void ScanWindow::buildUi()
    statusBar()->addPermanentWidget(lampUnit(this, m_lampX, m_lLimX));
    statusBar()->addPermanentWidget(lampUnit(this, m_lampY, m_lLimY));
    statusBar()->addPermanentWidget(m_lWkc);
+}
+
+/* 把横幅摆到"画布顶上那一层"去。它不在任何布局里 (见 buildUi 里 m_banner 那段),
+ * 所以位置与折行高度都得自己算, 三处要调: 窗口缩放 (resizeEvent)、分隔条拖动
+ * (splitterMoved)、换了一句话 (hint 里 setText 之后)。
+ *
+ * 宽度取**画布**那一栏而不是整窗: 横幅盖住画布顶部是可以的 (它盖的是图, 不是控件),
+ * 盖住右边参数栏就不行 —— 那正是要让它别动、别被挡的那一栏。
+ * raise() 每次都要: 横幅与分隔条是兄弟控件, 而分隔条是后建的, 默认压在它上面。 */
+void ScanWindow::placeBanner()
+{
+   if (m_banner == nullptr || m_canvas == nullptr || centralWidget() == nullptr
+       || !m_banner->isVisible())
+      return;
+
+   const int w = m_canvas->width() - 2 * kBannerInset;
+
+   if (w <= 0)
+      return;
+
+   /* 折行之后的真实高度: wordWrap 开着时 heightForWidth 才给得出; 直接拿 sizeHint 是按
+    * "整句不折行"算的, 长句会只露出第一行 */
+   const int h = m_banner->heightForWidth(w);
+
+   /* 横幅是 central 的孩子, 画布是分隔条的孩子 —— 坐标要换算一次, 不能用 m_canvas->x() */
+   const QPoint at = m_canvas->mapTo(centralWidget(), QPoint(kBannerInset, kBannerInset));
+
+   m_banner->setGeometry(at.x(), at.y(), w, (h > 0) ? h : m_banner->sizeHint().height());
+   m_banner->raise();
+}
+
+void ScanWindow::resizeEvent(QResizeEvent *e)
+{
+   QMainWindow::resizeEvent(e);
+   placeBanner();          /* 画布跟着变了宽, 横幅要重算 (它不在布局里, 不会自己跟) */
 }
 
 QWidget *ScanWindow::buildTopBar()
@@ -2832,6 +2881,9 @@ void ScanWindow::hint(const QString &s, bool fault)
    m_banner->setText(s);
    m_banner->setStyleSheet(fault ? kBannerFault : kBannerWarn);
    m_banner->setVisible(true);
+   /* 换了句话 -> 折行高度可能变了, 而它不在布局里, 大小得自己重算 (顺带 raise: 它一直是
+    * 从隐藏的状态回来的, 不抬一次会被后建的分隔条盖住) */
+   placeBanner();
 
    /* 故障不自动消失: 无人值守的一趟扫下来, 一闪而过的提示等于没提示 */
    if (!fault)

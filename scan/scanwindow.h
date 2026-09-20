@@ -69,6 +69,8 @@ public:
 protected:
    /* 关窗 = 中止扫描 + 断开: 失能 → 还原映射 → 降 PRE_OP → 关网卡, 必要时弹"可能仍带电" */
    void closeEvent(QCloseEvent *e) override;
+   /* 横幅不在布局里 (见 placeBanner): 窗口一变宽就得自己重算位置与折行高度 */
+   void resizeEvent(QResizeEvent *e) override;
 
 private:
    /* ---- 界面 ---- */
@@ -179,6 +181,8 @@ private:
    void refresh();                    /* 30Hz: tick 状态机 + 刷遥测 + 刷按钮可用性 */
    void setConnected(bool on);
    void hint(const QString &s, bool fault);
+   /* 把横幅摆到画布顶上那一层 (它不在布局里, 所以位置与折行高度都得自己算) */
+   void placeBanner();
    void showFault(const QString &why);   /* 自动中止: 红色横幅 + 模态 (无人值守时不会错过) */
    void warnMaybeLive();
    void disconnectAndStop();
