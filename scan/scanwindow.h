@@ -51,16 +51,20 @@ public:
     *   Ok      = 绿亮: 使能带电 / 原点开关压着    Bad = 红亮: 出事了 */
    enum class Lamp { Unknown, Off, Ok, Bad };
 
-   /* 一块"每根轴一行、每格一盏灯 + 一行字"的网格。两块, 但**排在同一张表上** (见
+   /* 一块"每根轴一行、每格一盏灯"的网格。两块, 但**排在同一张表上** (见
     * buildAxisPanel): 轴信号 (2 列 使能/故障, 问 6041h) 与限位开关 (3 列 原点/正限位/
     * 负限位, 问 60FDh) —— 列号是各自那组自己的 (AX_ 与 LIM_ 那几个枚举),
-    * 表上占哪几列由 buildAxisPanel 决定, 所以这里没有"列数"这个字段 */
+    * 表上占哪几列由 buildAxisPanel 决定, 所以这里没有"列数"这个字段。
+    *
+    * **每格只有灯, 没有字** (2026-09-21 起): 状态由亮暗一位说清 —— 绿亮 = 使能带电 /
+    * 原点压着, 红亮 = 故障 / 撞限位, 灭 = 这件事没发生, 灰 = 不知道。原先灯旁边那行
+    * "已使能/未使能" 是把同一件事说了两遍, 五列并排时反倒把灯挤得难认。名字仍在表头上,
+    * 判据仍在 tooltip 里 (kTip + kLampRule)。状态栏那一对是另一回事: 那里地方宽, 且
+    * "有效!"那种话要能一眼扫到 (见 refreshAxisSignals 的最后一节) */
    struct LampGrid
    {
       QLabel  *lamp[2][3] = {};      /* [轴][信号] */
-      QLabel  *text[2][3] = {};
       Lamp     lampLast[2][3] = {};  /* 上一次画的是什么 */
-      QString  textLast[2][3];
    };
 
    explicit ScanWindow(QWidget *parent = nullptr);
@@ -175,8 +179,7 @@ private:
 
    void pushManualSpeed(const BusTelem &t, bool running);
    void refreshAxisSignals(const BusTelem &t);   /* 限位/使能/故障: 状态栏 + 参数栏, 一份遥测 */
-   void setSignalCell(LampGrid &g, int i, int s, bool known, bool on, Lamp lit,
-                      const QString &litTxt, const QString &offTxt);
+   void setSignalCell(LampGrid &g, int i, int s, bool known, bool on, Lamp lit);
    Params currentParams() const;
    void refresh();                    /* 30Hz: tick 状态机 + 刷遥测 + 刷按钮可用性 */
    void setConnected(bool on);

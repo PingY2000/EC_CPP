@@ -489,7 +489,8 @@ static QLabel *makeLamp(QWidget *parent, const QString &tip)
    return l;
 }
 
-/* 灯 + 字 = 一条信息。装在一起, 免得布局把它们排散了 */
+/* 灯 + 字 = 一条信息。装在一起, 免得布局把它们排散了。
+ * 只有状态栏那两盏用 (2026-09-21 起「轴信号」那块表每格只有灯, 没有字) */
 static QWidget *lampUnit(QWidget *parent, QLabel *lamp, QLabel *text, int left = 10)
 {
    QWidget *w = new QWidget(parent);
@@ -955,6 +956,12 @@ enum { SIGN_NCOL = AX_NCOL + LIM_NCOL };
  * 负限位 (60FDh bit2/bit1/bit0), 最右边一格是「故障复位」。判据同 kLampRule; 名字写在表头上,
  * 不每格重复。
  *
+ * **每格只有灯** (2026-09-21 起, 原先灯旁边还有一行"已使能/未使能"这样的字): 同一件事不必
+ * 写两遍 —— 亮/灭就是那句话, 而五列并排时那行字占的宽度反而把灯挤小、整块表看着像一张表
+ * 而不是五个信号。要知道某盏灯亮了算什么事, 鼠标停在灯上 (tooltip 里写着它问的是哪个字、
+ * 哪一位, 以及绿亮/红亮各是什么意思)。**灰 = 不知道这件事没有别的表达方式了**, 所以灯本身
+ * 必须一眼能分出四种样子: 灰(浅底) / 灭(暗底) / 绿亮 / 红亮。
+ *
  * 原先「轴信号」与「限位开关」是两个框 (2026-09-20 合成一个): 分开时同一个侧栏里要滚才
  * 看得全, 而它们说的都是"这一根现在什么状态"。**分组没有丢, 只是不再各占一个框**:
  * 表头上前两个是 6041h 的两盏, 后三个是 60FDh 那三个开关; 每一格的 tooltip 里写着它问的是
@@ -968,29 +975,31 @@ QWidget *ScanWindow::buildAxisPanel()
    g->setHorizontalSpacing(12);
    g->setVerticalSpacing(5);
 
-   /* 表头 与 tooltip 一列一个, 次序就是格子的次序: 使能/故障/原点/正限位/负限位 */
+   /* 表头 与 tooltip 一列一个, 次序就是格子的次序: 使能/故障/原点/正限位/负限位。
+    * 每格只有一盏灯, 所以 tooltip 要自己说清"这一列亮/灭各是什么意思" —— 表头只有个名字,
+    * 灯只会亮灭, 而"亮"在五列里不是同一件事 (绿亮 = 使能带电, 红亮 = 撞限位) */
    static const char *kHead[SIGN_NCOL] = { "使能", "故障", "原点", "正限位", "负限位" };
    static const char *kTip[SIGN_NCOL] = {
-      "6041h bit2 —— 电机带电。\n"
+      "6041h bit2 —— 电机带电。绿亮 = 已使能, 灭 = 未使能。\n"
       "未使能时点画布不会动: 这是「这个轴现在能不能走」的答案。",
 
-      "6041h bit3 —— 驱动器故障位。\n"
+      "6041h bit3 —— 驱动器故障位。红亮 = 有故障, 灭 = 无故障。\n"
       "**扫描中置起会自动中止**; 用右边那格「故障复位」清掉它再启扫。",
 
       /* 原点灯是绿的, 所以要说出声来 */
       "60FDh bit2 —— 原点开关现在压着没有 (2310h X0 = 原点)。\n"
-      "**绿亮 = 正压着, 这是位置信息不是故障** —— 回零时压到原点是正常动作,\n"
-      "扫描经过原点开关**不会**中止。\n"
+      "**绿亮 = 正压着, 灭 = 松开。压着是位置信息不是故障** ——\n"
+      "回零时压到原点是正常动作, 扫描经过原点开关**不会**中止。\n"
       "这一格说的是**开关本身**, 与「会不会中止扫描」是两个问题: 后者看 6041h bit11。",
 
       "60FDh bit1 —— 正限位开关现在压着没有 (2311h X1 = 正限位)。\n"
-      "**红亮 = 正压着, 要立刻处理** —— 先手动把滑台走离限位。\n"
+      "**红亮 = 正压着, 要立刻处理; 灭 = 松开** —— 压着时先手动把滑台走离限位。\n"
       "这一格说的是**开关本身**; 会不会中止扫描看状态栏那盏 (6041h bit11)。\n"
       "两者本该同源 (都经 2300h + 2310h 出来), 不一致时**默认以 bit11 为准**;\n"
       "但勾了「高级选项」里的「上位机侧取反」之后改以反相后的开关为准。",
 
       "60FDh bit0 —— 负限位开关现在压着没有 (2312h X2 = 负限位)。\n"
-      "**红亮 = 正压着, 要立刻处理** —— 先手动把滑台走离限位。\n"
+      "**红亮 = 正压着, 要立刻处理; 灭 = 松开** —— 压着时先手动把滑台走离限位。\n"
       "这一格说的是**开关本身**; 会不会中止扫描看状态栏那盏 (6041h bit11)。\n"
       "两者本该同源 (都经 2300h + 2310h 出来), 不一致时**默认以 bit11 为准**;\n"
       "但勾了「高级选项」里的「上位机侧取反」之后改以反相后的开关为准。"
@@ -1018,8 +1027,8 @@ QWidget *ScanWindow::buildAxisPanel()
 
          gr.lamp[i][c] = makeLamp(box, QString::fromUtf8(kTip[s])
                                        + QString::fromUtf8(kLampRule));
-         gr.text[i][c] = new QLabel(box);
-         g->addWidget(lampUnit(box, gr.lamp[i][c], gr.text[i][c], 0), i + 1, s + 1);
+         /* 靠左排, 不靠网格拉伸: 灯是 12px 定尺, 居中的话五列会各对各不齐 */
+         g->addWidget(gr.lamp[i][c], i + 1, s + 1, Qt::AlignLeft | Qt::AlignVCenter);
       }
    }
 
@@ -1031,7 +1040,8 @@ QWidget *ScanWindow::buildAxisPanel()
    connect(m_btnFaultRst, &QPushButton::clicked, this, &ScanWindow::onFaultResetClicked);
    g->addWidget(m_btnFaultRst, 1, SIGN_NCOL + 1, 2, 1);
 
-   /* 多出来的宽度全给最后一列 (复位按钮那一格): 灯和字靠左排成一条。写死会多出一个空列 */
+   /* 多出来的宽度全给最后一列 (复位按钮那一格): 五盏灯靠左排成一条, 表不会被拉散。
+    * 写死会多出一个空列 */
    g->setColumnStretch(SIGN_NCOL + 1, 1);
    return box;
 }
@@ -2431,23 +2441,20 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
       const bool known = m_connected && a.valid && a.mirror_ok;
       const bool lim   = known && a.limit_active;
 
-      /* ---- 「轴信号」那四个 ---- */
-      setSignalCell(m_axGrid, i, AX_ENABLED, known, a.enabled, Lamp::Ok,
-                    QStringLiteral("已使能"), QStringLiteral("未使能"));
-      setSignalCell(m_axGrid, i, AX_FAULT, known, a.fault, Lamp::Bad,
-                    QStringLiteral("有故障"), QStringLiteral("无故障"));
+      /* ---- 「轴信号」那两盏: 只有一个"亮成什么样", 没有字 ----
+       * 想知道灯亮说的是什么, 挂在灯上的 tooltip 里写着 (kTip + kLampRule),
+       * 以及表头上那一列的名字 */
+      setSignalCell(m_axGrid, i, AX_ENABLED, known, a.enabled, Lamp::Ok);
+      setSignalCell(m_axGrid, i, AX_FAULT, known, a.fault, Lamp::Bad);
 
-      /* ---- 「限位开关」那六个: 三个开关本身压着没有 (60FDh) ----
+      /* ---- 「限位开关」那三盏: 三个开关本身压着没有 (60FDh) ----
        * known 要再与 a.dig_known: 少了它, 读不到 60FDh 时那三位是 0, 界面会显示"三个都没
        * 压住" —— 一个看起来完全正常的结论。原点用 Ok (绿亮 = 正在压着, 位置信息), 正负限位
        * 用 Bad; 绿色在这里不是"没事", 灯亮一律表示这件事正在发生。 */
       const bool dk = known && a.dig_known;
-      setSignalCell(m_limGrid, i, LIM_HOME, dk, a.dig_home, Lamp::Ok,
-                    QStringLiteral("压住"), QStringLiteral("松开"));
-      setSignalCell(m_limGrid, i, LIM_POS, dk, a.dig_pos, Lamp::Bad,
-                    QStringLiteral("压住"), QStringLiteral("松开"));
-      setSignalCell(m_limGrid, i, LIM_NEG, dk, a.dig_neg, Lamp::Bad,
-                    QStringLiteral("压住"), QStringLiteral("松开"));
+      setSignalCell(m_limGrid, i, LIM_HOME, dk, a.dig_home, Lamp::Ok);
+      setSignalCell(m_limGrid, i, LIM_POS, dk, a.dig_pos, Lamp::Bad);
+      setSignalCell(m_limGrid, i, LIM_NEG, dk, a.dig_neg, Lamp::Bad);
 
       /* ---- 状态栏那一对: 用的是上面同一个 lim ---- */
       QLabel *lb   = (i == 0) ? m_lLimX : m_lLimY;
@@ -2557,42 +2564,26 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
    }
 }
 
-void ScanWindow::setSignalCell(LampGrid &g, int i, int s, bool known, bool on, Lamp lit,
-                               const QString &litTxt, const QString &offTxt)
+/* 一格 = 一盏灯, 状态全在这四种样子里 (一列一个 lit 颜色: 使能/原点用 Ok 绿, 故障/限位
+ * 用 Bad 红)。**没有字** —— "已使能"那类说明原来写在灯旁边, 是同一件事说两遍;
+ * 现在只有灰/灭/绿亮/红亮四种样子, 灰 = 不知道 (连不上 / 遥测丢了)。 */
+void ScanWindow::setSignalCell(LampGrid &g, int i, int s, bool known, bool on, Lamp lit)
 {
-   QString txt;
-   QString col;
-   Lamp    l = Lamp::Unknown;
+   Lamp l = Lamp::Unknown;
 
    if (!known)
-   {
-      txt = QStringLiteral("--");
-      col = QStringLiteral("#5a6270");            /* 灰字: 连灯一起暗下去 */
-   }
+      l = Lamp::Unknown;
    else if (on)
-   {
-      txt = litTxt;
-      col = (lit == Lamp::Ok) ? QStringLiteral("#5fd693") : QStringLiteral("#ff8f8f");
-      l   = lit;
-   }
+      l = lit;
    else
-   {
-      txt = offTxt;
-      col = QStringLiteral("#7b8391");
-      l   = Lamp::Off;
-   }
+      l = Lamp::Off;
 
-   /* 只在真变了才动控件。灯和字一起变: 文字决定颜色, 字没变颜色就没变 */
+   /* 只在真变了才动控件: 30Hz 每帧重设一遍 styleSheet 会把重绘刷爆。
+    * 一张表上五盏灯各自记着自己上一次画的是什么, 就是为这一句 */
    if (g.lampLast[i][s] != l)
    {
       g.lampLast[i][s] = l;
       paintLamp(g.lamp[i][s], l);
-   }
-   if (g.textLast[i][s] != txt)
-   {
-      g.textLast[i][s] = txt;
-      g.text[i][s]->setText(txt);
-      g.text[i][s]->setStyleSheet(QStringLiteral("color:") + col);
    }
 }
 
