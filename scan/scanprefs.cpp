@@ -25,6 +25,7 @@ static const char *homevel    = "ui/home_vel";
 static const char *want_dig   = "adv/want_dig_in";
 static const char *npn_wr     = "adv/npn_write_drive";
 static const char *npn_sw     = "adv/npn_sw_invert";
+static const char *shade_auto = "shade/auto_fit";
 }
 
 QString prefsPath()
@@ -68,6 +69,9 @@ Prefs prefsLoad(const QString &path)
    p.npn_write_drive = s.value(QLatin1String(k::npn_wr),   p.npn_write_drive).toBool();
    p.npn_sw_invert   = s.value(QLatin1String(k::npn_sw),   p.npn_sw_invert).toBool();
 
+   /* 同样显式带缺省值: ini 里没这一项时要回落到"关", 而不是当成读过 */
+   p.shade_auto = s.value(QLatin1String(k::shade_auto), p.shade_auto).toBool();
+
    return p;
 }
 
@@ -109,6 +113,8 @@ void prefsSave(const QString &path, const Prefs &p)
    s.setValue(QLatin1String(k::want_dig),  p.want_dig_in);
    s.setValue(QLatin1String(k::npn_wr),    p.npn_write_drive);
    s.setValue(QLatin1String(k::npn_sw),    p.npn_sw_invert);
+
+   s.setValue(QLatin1String(k::shade_auto), p.shade_auto);
 
    /* 显式 sync: 不靠析构时机保证写盘 */
    s.sync();

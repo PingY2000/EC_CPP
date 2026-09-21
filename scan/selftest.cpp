@@ -1416,6 +1416,35 @@ static void test_advprefs()
       checkEq(b.home_vel, 30000, "回零速度存得住");
    }
 
+   /* 「色标上下限不记, 但『是不是自动跟随』要记」—— 前者是一个数 (套到下一趟数据上就是错的),
+    * 后者是一个模式 (记不住就得每次开程序重新勾一遍)。上下限压根不在 Prefs 里, 所以这里只钉
+    * 得住模式那一半。 */
+   caseBegin("advprefs: 色标「自动跟随数据」是个模式 —— 缺省关、缺项回落到关、存得住");
+   {
+      const Prefs p;
+      check(!p.shade_auto, "缺省关 (锁定的色阶才是能拿两张图对比的那一种)");
+
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+      check(!prefsLoad(ini).shade_auto, "文件压根不存在时也走同一份缺省");
+
+      /* 手写一份老 ini: 没有 shade/auto_fit 这一节。QSettings 对缺项给无效 QVariant,
+       * toBool() 一律 false —— 不显式带缺省的话, 升级前的 ini 会把"默认关"读成别的 */
+      QFile f(ini);
+      check(f.open(QIODevice::WriteOnly | QIODevice::Text), "手写一份只有老键的 ini");
+      f.write("[scan]\narea_x_unit=12.5\n");
+      f.close();
+      const Prefs old = prefsLoad(ini);
+      check(!old.shade_auto, "缺 shade/auto_fit 回落到默认关");
+      checkNear(old.params.area_x_unit, 12.5, "老键照旧读回来");
+
+      Prefs q;
+      q.shade_auto = true;
+      prefsSave(ini, q);
+      const Prefs b = prefsLoad(ini);
+      check(b.shade_auto, "shade_auto=true 存得住");
+   }
+
    caseBegin("advprefs: 被手改坏的 ini 不许直接把速度拿去用");
    {
       checkEq(ecatcmd::home_vel_from_pref(-1), HMI_HOME_VEL_DEF,

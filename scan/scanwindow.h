@@ -141,6 +141,7 @@ private:
       QWidget *w = nullptr;
       bool     lock_running = false;  /* 运行中也锁住 (几何 / 输出路径这类) */
       bool     need_dev = false;      /* 还要求真机功率计就绪 (那三个下拉框) */
+      bool     need_manual = false;   /* 只在"色阶手动定标"时才可用 (自动跟随时它是多余的) */
    };
    struct PanelGate
    {
@@ -190,6 +191,11 @@ private:
    void warnMaybeLive();
    void disconnectAndStop();
    void syncShadeEdits();
+   void syncShadeAuto();                   /* 自动跟随: 画布的色阶 -> 两个输入框 (屏蔽信号) */
+   void applyShadeAutoUi(bool on);         /* 自动跟随开着时两个框是"显示"不是"输入" */
+   /* 「最小」「最大」是一对: 改一个顶到另一个头上时把另一个推过去 (跨度保留), 见实现 */
+   void onShadeLoChanged(double lo);
+   void onShadeHiChanged(double hi);
    void applyCsvDefaultName();
    bool pushScriptPath();   /* 脚本框的文本 -> 功率计那一路 (文本与状态是两份东西) */
 
@@ -259,10 +265,19 @@ private:
    QLabel      *m_lProg     = nullptr;
    QLabel      *m_lTime     = nullptr;
 
-   /* ---- 色标 ---- */
-   QDoubleSpinBox *m_edShadeLo = nullptr;
-   QDoubleSpinBox *m_edShadeHi = nullptr;
-   QPushButton    *m_btnFit    = nullptr;
+   /* ---- 色标 ----
+    * 这一框**在编辑门控里** (GI_SHADE)。曾经有段时间把它摘出去过, 理由是"纯显示设置, 不必先点
+    * 编辑" —— 但那样「保存 / 取消」就没东西可存可退, 跟旁边几块框长得不一样, 反而别扭。
+    * 「保存」在这一框是做事的: 色标是不是自动跟随**记进 scan.ini** (上下限那两个数不记)。
+    *
+    * 两个数是一对, 得一起保证 min < max, 规则是**推着走**: 改一个顶到另一个头上, 就把另一个
+    * 一起推过去并保留原来的跨度 (见 onShadeLoChanged / onShadeHiChanged)。 */
+   QDoubleSpinBox *m_edShadeLo   = nullptr;
+   QDoubleSpinBox *m_edShadeHi   = nullptr;
+   QPushButton    *m_btnFit      = nullptr;
+   QCheckBox      *m_cbShadeAuto = nullptr;
+   QLabel         *m_lblLocked   = nullptr;   /* 锁定模式那两句说明 (两行, 按模式显隐) */
+   QLabel         *m_lblAuto     = nullptr;
 
    /* ---- 功率计 ---- */
    QComboBox      *m_cbMeter   = nullptr;

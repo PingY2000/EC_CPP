@@ -7,6 +7,7 @@
 #include <QPainter>
 #include <QPolygon>
 #include <QRadialGradient>
+#include <QVector>
 
 #include <algorithm>
 #include <cmath>
@@ -25,9 +26,13 @@ static const QColor C_MUTED  ("#6b7480");
 static const QColor C_WANT   ("#ffb020");   /* 点击目标 (与 hmi 同义) */
 static const QColor C_TGT    ("#33d17a");   /* 本周期下发的插值目标 (与 hmi 同义) */
 static const QColor C_CUR    ("#ffffff");   /* 实测位置: 见下 */
-static const QColor C_FAIL   ("#d03b3b");   /* 采失败的那一格 */
+static const QColor C_FAIL   ("#d03b3b");   /* 出错的红: 超量程的框 + 那行字 */
+/* 「扫了但没采到数」的那一格。**故意不用上面那个红**: 色标最高档就是红的, 再来一块纯红
+ * 就分不出"这一格没采到数"和"这一格功率最大"了。紫红在整个色带之外, 一眼能分。 */
+static const QColor C_NODATA ("#c026d3");
 static const QColor C_SEL    ("#c8ced8");   /* 左键查看选中的格 */
-/* 撞限位。故意不复用 C_FAIL: 那个红的意思是"这一格没采到数", 这个是机械压在开关上 */
+/* 撞限位。故意不复用 C_NODATA: 那个紫红的意思是"这一格没采到数", 这个是机械压在开关上。
+ * (2026-09-21 之前这里写的是 C_FAIL —— 那时"没采到数"就是那个红; 现在那件事归 C_NODATA 了) */
 static const QColor C_LIMIT  ("#ff5f5f");
 
 /* 实测位置用白色 (hmi 里是蓝色): 这块画布上蓝色已是热力图的数据色, 位置标记再用蓝会分不清 */
@@ -88,12 +93,17 @@ static QColor fromLab(const Lab &v)
 /* ---------------------------------------------------------------- 顺序色标 */
 
 /*
- * 蓝色的 13 级 (100 -> 700): 明度严格单调、色相跨度 4°。顺序由暗到亮 (第 0 项最暗),
- * 因为底色是暗的 —— 近零要退回底色。
+ * 冷到暖的 13 级: 蓝 -> 青 -> 绿 -> 黄 -> 红, 值越大越红 (第 0 项最冷 = 最小)。
+ *
+ * 第 0 项特意压得很暗, 因为底色也是暗的 —— 近零要退回底色。
+ * 换成彩虹色带之后明度不再单调 (黄色最亮, 红色反而比黄色暗), 这是彩虹色带的代价,
+ * 换来的是"一眼能读出冷热"; 数值本身一直有数字兜底, 见 drawScaleBar 那行说明。
+ *
+ * 相邻两级色相只差十几度, 再在 OKLab 里插值, 于是色带是连续的 —— 不分成几块色卡。
  */
 static const char *RAMP_HEX[] = {
-   "#0d366b", "#104281", "#184f95", "#1c5cab", "#256abf", "#2a78d6", "#3987e5",
-   "#5598e7", "#6da7ec", "#86b6ef", "#9ec5f4", "#b7d3f6", "#cde2fb"
+   "#0b2a5c", "#124a94", "#1668c4", "#1a86d6", "#1ba3cf", "#17b894", "#22b95c",
+   "#5cc02c", "#9cc71a", "#d4c913", "#f0a80d", "#ef7109", "#e42b12"
 };
 static const int RAMP_N = (int)(sizeof(RAMP_HEX) / sizeof(RAMP_HEX[0]));
 
@@ -152,24 +162,73 @@ void MapCanvas::setShadeRange(double lo, double hi)
    update();
 }
 
+bool MapCanvas::dataShadeRange(double *lo, double *hi) const
+{
+   if (m_ctl == nullptr || lo == nullptr || hi == nullptr)
+      return false;
+
+   if (!m_ctl->wattsRange(lo, hi))
+      return false;
+
+   if (*hi <= *lo)
+   {
+      /* 全都一样 (含"只采到一个点") —— 给一个以它为中心的小窗口,
+       * 免得整片都是同一个颜色看不出结构 */
+      const double pad = (std::fabs(*lo) > 1e-9) ? std::fabs(*lo) * 0.05 : 0.5;
+      *lo -= pad;
+      *hi += pad;
+   }
+
+   /* 色阶下限非负 —— 与 ScanWindow 那两个输入框同一条规矩 (下限钉在 0)。**两处必须一致**:
+    * 自动跟随开着时那两个框显示的就是这里的数, 这里放一个负数出来, 框里会被夹成 0,
+    * 于是"界面上的量程"和"画图用的量程"对不上。
+    * 真采到全为负的数据: 加宽之后仍是负的, 那就退成 [0, 0.5] —— 那些格子一律显示成最冷
+    * 那一档 (它们确实"低于量程"), 数值本身在悬停里照样读得到。 */
+   if (*lo < 0.0)
+   {
+      *lo = 0.0;
+      if (!(*hi > *lo))
+         *hi = 0.5;
+   }
+   return true;
+}
+
 bool MapCanvas::fitShadeToData()
 {
-   if (m_ctl == nullptr)
-      return false;
-
    double lo = 0.0, hi = 0.0;
-   if (!m_ctl->wattsRange(&lo, &hi))
+   if (!dataShadeRange(&lo, &hi))
       return false;
 
-   if (hi <= lo)
-   {
-      /* 全都一样 —— 给一个以它为中心的小窗口, 免得整片都是同一个颜色看不出结构 */
-      const double pad = (std::fabs(lo) > 1e-9) ? std::fabs(lo) * 0.05 : 0.5;
-      lo -= pad;
-      hi += pad;
-   }
    setShadeRange(lo, hi);
    return true;
+}
+
+void MapCanvas::setAutoFit(bool on)
+{
+   if (m_auto == on)
+      return;
+
+   m_auto = on;
+   applyAutoFit();      /* 打开就立刻跟一次, 不等下一帧 */
+   update();
+}
+
+void MapCanvas::applyAutoFit()
+{
+   if (!m_auto)
+      return;
+
+   double lo = 0.0, hi = 0.0;
+   if (!dataShadeRange(&lo, &hi))
+      return;           /* 一点数据都没有: 保持现有色阶 (也是不除零的那条路) */
+
+   /* 值没变就不动。**这条不能省**: setShadeRange 里是 update(), 而本函数在 paintEvent
+    * 里被调 —— 每帧都调一次 update() 就成了画布自己给自己排重画, 一直空转。 */
+   const double eps = 1e-12 * std::max(1.0, std::fabs(hi));
+   if (std::fabs(lo - m_shade_lo) <= eps && std::fabs(hi - m_shade_hi) <= eps)
+      return;
+
+   setShadeRange(lo, hi);
 }
 
 QColor MapCanvas::shadeOf(double watts) const
@@ -278,7 +337,7 @@ void MapCanvas::rebuildImage()
          if (m_ctl->cellHasValue(ix, iy))
             m_img.setPixelColor(ix, row, shadeOf(m_ctl->cellValue(ix, iy)));
          else
-            m_img.setPixelColor(ix, row, C_FAIL);   /* 扫了但没采到数 */
+            m_img.setPixelColor(ix, row, C_NODATA);   /* 扫了但没采到数 */
       }
    }
 }
@@ -316,6 +375,9 @@ void MapCanvas::paintEvent(QPaintEvent *)
       p.drawText(rect(), Qt::AlignCenter, QStringLiteral("没有扫描控制器"));
       return;
    }
+
+   /* 色阶: 自动跟随模式下先把它拉到已采数据的范围, 再画 —— 一帧里图和色标条用的是同一个 */
+   applyAutoFit();
 
    /* 路径只在几何变时才重建 —— 它跟数据无关 */
    if (!m_geo_done
@@ -646,15 +708,39 @@ void MapCanvas::drawMarkers(QPainter &p)
    }
 }
 
+/*
+ * 刻度数字的步长: 从 1 / 2 / 5 × 10^k 里挑一个, 让色阶大约分成 want 段。
+ * 挑"整数"是为了让人一眼读到 0.2 / 0.5 / 100 这种数 —— 按 span/5 直接切会得出
+ * 0.037 之类读不出来的值, 数字一多反而更看不懂。
+ */
+static double niceStep(double span, int want)
+{
+   if (!(span > 0.0) || want < 1)
+      return 0.0;
+
+   const double raw = span / (double)want;
+   const double p   = std::pow(10.0, std::floor(std::log10(raw)));
+   const double m   = raw / p;             /* 落在 [1, 10) */
+
+   const double f = (m <= 1.0) ? 1.0 : (m <= 2.0) ? 2.0 : (m <= 5.0) ? 5.0 : 10.0;
+   return f * p;
+}
+
 void MapCanvas::drawScaleBar(QPainter &p)
 {
    const QRectF r = plotRect();
    const int x0 = (int)r.right() + 14;
-   const int h  = std::min((int)r.height(), 240);
-   const int y0 = (int)(r.center().y() - h / 2.0);
+   /* 高度封在 320: 比原来的 240 高, 但**不必**跟画图区一样高 —— 图很高的时候整条拉满,
+    * 色标反而长过了头。画布矮了就跟着矮, 上下居中。
+    * 两头各留出一点: 两端那两个数字要写在条子外面, 顶格写会伸进画布顶上那条**横幅带**里。
+    * 画布还没成型时 plotRect() 是空矩形, 直接不画 —— 数字没地方放, 条子也会是负高。 */
+   const int h  = std::min((int)r.height() - 16, 320);
+   const int y0 = (int)r.top() + ((int)r.height() - h) / 2;
    const int w  = 14;
+   if (h < 20)
+      return;
 
-   /* 从亮到暗往下排 —— 上面是大的值 */
+   /* 从红到蓝往下排 —— 上面是大的值 */
    for (int i = 0; i < h; i++)
    {
       const double t = 1.0 - (double)i / (double)(h - 1);
@@ -666,19 +752,58 @@ void MapCanvas::drawScaleBar(QPainter &p)
    p.setPen(QPen(C_AREA, 1));
    p.drawRect(QRectF(x0, y0, w, h));
 
-   /* 数字必须有: 色标暗端跟底色只有 1.5:1, 光看颜色分不出"最小"和"没数据" */
+   /* 数字必须有: 色标最冷那一端跟底色只有 1.3:1, 光看颜色分不出"最小"和"没数据"。
+    * 两端必标 (它们就是锁定的色阶), 中间按整数步长补 —— 于是 0..1 会出 6 个数,
+    * 而不是原来那 3 个 (两端 + 中点)。 */
+   const double span = m_shade_hi - m_shade_lo;
+
+   QVector<double> marks;
+   marks.append(m_shade_hi);      /* [0] 高值端 */
+   marks.append(m_shade_lo);      /* [1] 低值端 —— 前两个固定是两端, 见下面的 i < 2 */
+   if (span > 0.0)
+   {
+      const double step = niceStep(span, 5);
+
+      bool any = false;
+      /* 条子太矮就不补了: 数字会挤成一团, 那时只留两端 + 中点 (见下面的 !any) */
+      if (h >= 140 && step > 0.0)
+      {
+         const long long k0 = (long long)std::ceil(m_shade_lo / step);
+         const long long k1 = (long long)std::floor(m_shade_hi / step);
+         if (k1 - k0 <= 24)
+            for (long long k = k0; k <= k1; k++)
+            {
+               const double v = (double)k * step;
+               if (v <= m_shade_lo || v >= m_shade_hi)
+                  continue;            /* 两端由上面那两条管, 别画两遍 */
+               marks.append(v);
+               any = true;
+            }
+      }
+      /* 一个整数刻度都落不进来 (量程特别偏/特别窄), 退回标中点 —— 有总比没有强 */
+      if (!any)
+         marks.append((m_shade_lo + m_shade_hi) / 2.0);
+   }
+
    QFont f = p.font();
    f.setPointSizeF(7.5);
    p.setFont(f);
-   p.setPen(C_TEXT);
 
-   const QString hi_s = QStringLiteral("%1").arg(m_shade_hi, 0, 'g', 4);
-   const QString lo_s = QStringLiteral("%1").arg(m_shade_lo, 0, 'g', 4);
-   const QString mid  = QStringLiteral("%1").arg((m_shade_lo + m_shade_hi) / 2.0, 0, 'g', 4);
+   for (int i = 0; i < marks.size(); i++)
+   {
+      const bool end = (i < 2);
+      double t = (span > 0.0) ? (marks[i] - m_shade_lo) / span : 1.0;
+      t = std::max(0.0, std::min(1.0, t));
+      const int y = y0 + (int)std::lround((1.0 - t) * (double)h);
 
-   p.drawText(QRect(x0 + w + 3, y0 - 8, 60, 14), Qt::AlignLeft | Qt::AlignVCenter, hi_s);
-   p.drawText(QRect(x0 + w + 3, y0 + h / 2 - 7, 60, 14), Qt::AlignLeft | Qt::AlignVCenter, mid);
-   p.drawText(QRect(x0 + w + 3, y0 + h - 6, 60, 14), Qt::AlignLeft | Qt::AlignVCenter, lo_s);
+      /* 端点写得显眼 (它们是锁定色阶的那两个数), 中间刻度淡一档, 免得抢了数据本身 */
+      p.setPen(end ? C_TEXT : C_MUTED);
+      if (!end)
+         p.drawLine(x0 + w + 1, y, x0 + w + 4, y);
+      p.drawText(QRect(x0 + w + 5, y - 7, 62, 14), Qt::AlignLeft | Qt::AlignVCenter,
+                 QStringLiteral("%1").arg(marks[i], 0, 'g', 4));
+   }
+
    p.setPen(C_MUTED);
    p.drawText(QRect(x0 - 20, y0 + h + 6, 70, 14), Qt::AlignLeft | Qt::AlignTop,
               QStringLiteral("功率(锁定)"));

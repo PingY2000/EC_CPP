@@ -89,14 +89,18 @@ static const QString &readOnceTip()
 
 /* ---------------------------------------------------------------- 编辑门控 */
 
-/* 框号。**顺序就是 buildUi 里 addGate 的顺序**, 一块框只在这里出现一次 */
+/* 框号。**顺序就是 buildUi 里 addGate 的顺序**, 一块框只在这里出现一次。
+ *
+ * 「色标 (功率)」也在这张表里, 虽然它是纯显示设置 —— 一度把它摘出去过, 理由是"改它不碰滑台
+ * 也不碰总线, 何必先点「编辑」"。结果是: 那一框没有「保存 / 取消」, 屏幕上一块框跟旁边几块
+ * 长得不一样, 而且「自动跟随」这个要记进 ini 的模式没有一处该按"保存"。 */
 enum GateIdx
 {
    GI_PARAM = 0,   /* 扫描参数 */
    GI_METER,       /* 功率计 */
-   GI_SHADE,       /* 色标 */
    GI_HOME,        /* 回零 */
    GI_ADV,         /* 高级选项 */
+   GI_SHADE,       /* 色标 (功率) */
    GI_N
 };
 
@@ -219,7 +223,7 @@ QWidget *ScanWindow::gateBar(int gi, QWidget *parent)
       b->setFixedHeight(22);
 
    g.btnEdit->setToolTip(QStringLiteral("平时**只读** —— 点它才能改。改动当场生效; 「保存」记进 scan.ini, 「取消」退回上次保存的值。扫描/回零中几何类参数仍锁着。"));
-   g.btnSave->setToolTip(QStringLiteral("把这一框的值记进 scan.ini (改动早就生效了, 保存只是记住它)。功率计与色标那几项不进 ini。"));
+   g.btnSave->setToolTip(QStringLiteral("把这一框的值记进 scan.ini (改动早就生效了, 保存只是记住它)。功率计那几项与色标上下限不进 ini; 色标是不是自动跟随会记。"));
    g.btnCancel->setToolTip(QStringLiteral("退回**上次保存**的值 (不是程序缺省值), 并立刻重新下推。"));
    connect(g.btnEdit,   &QPushButton::clicked, this, [this, gi] { onGateEdit(gi); });
    connect(g.btnSave,   &QPushButton::clicked, this, [this, gi] { onGateSave(gi); });
@@ -299,6 +303,10 @@ void ScanWindow::refreshEditability()
                ok = cb->count() > 0;
          if (ok && it.need_dev)
             ok = dev_ok;
+         /* 「按数据定标」在自动跟随时是多余的 (它做的事每帧都在做), 灰掉。
+          * 判据跟勾选框的状态走而不是"模式", 所以它跟着勾一起变, 不用另外记一份 */
+         if (ok && it.need_manual)
+            ok = (m_cbShadeAuto == nullptr) || !m_cbShadeAuto->isChecked();
          it.w->setEnabled(ok);
       }
 
@@ -768,10 +776,14 @@ void ScanWindow::buildUi()
    /* 「高级选项」**必须**排在 buildParamPanel() 之前: loadSettings() 在它里面被调, 而
     * loadSettings 要把存下来的值写进那三个勾 —— 勾还没建出来就会被读空 */
    QWidget *advPanel = buildAdvPanel();
+   /* 「色标」同上, 也是**先建后摆**: applyDefaults() 与 loadSettings() 都在
+    * buildParamPanel() 里面调, 两个都要写那个「自动跟随」勾 —— 勾还没建出来就是一次空指针。
+    * 摆放位置照旧 (它是"看颜色的", 跟着功率计那一块), 所以建在这儿、加到布局里在后面 */
+   QWidget *shadePanel = buildShadePanel();
    sv->addWidget(buildParamPanel());
    sv->addWidget(buildScanPanel());
    sv->addWidget(buildMeterPanel());
-   sv->addWidget(buildShadePanel());
+   sv->addWidget(shadePanel);
    /* 高级选项摆在最底下: 它是"设好了就别再动"的东西, 平时不该占视线 */
    sv->addWidget(advPanel);
    sv->addStretch(1);
@@ -1576,20 +1588,28 @@ QWidget *ScanWindow::buildShadePanel()
    const double lo = m_canvas->shadeLo();
    const double hi = m_canvas->shadeHi();
 
+   /* 下限就是 0: 功率没有负的。**下限也钉在 0**, 于是"最小 >= 0"这条不用在槽里再判一次 ——
+    * 敲 -5 会被控件自己夹成 0, valueChanged 拿到的一直是合法值 */
+   const QString kShadeTip = QStringLiteral(
+      "功率色阶的两端, 单位 W。\n"
+      "改一个顶到另一个头上时, **另一个会自己让开**(跨度不变) —— 比如最小 0 / 最大 1 时把最小\n"
+      "改成 5, 最大会一起抬到 6。非负数, 且最小 < 最大。\n"
+      "这两个数**不记进 scan.ini** (只有「自动跟随」那个模式记)。");
+
    m_edShadeLo = new QDoubleSpinBox(box);
-   m_edShadeLo->setRange(-1e12, 1e12);
+   m_edShadeLo->setRange(0.0, 1e12);
    m_edShadeLo->setDecimals(6);
    m_edShadeLo->setValue(lo);
+   m_edShadeLo->setToolTip(kShadeTip);
 
    m_edShadeHi = new QDoubleSpinBox(box);
-   m_edShadeHi->setRange(-1e12, 1e12);
+   m_edShadeHi->setRange(0.0, 1e12);
    m_edShadeHi->setDecimals(6);
    m_edShadeHi->setValue(hi);
+   m_edShadeHi->setToolTip(kShadeTip);
 
-   connect(m_edShadeLo, &QDoubleSpinBox::valueChanged, this,
-           [this](double v) { m_canvas->setShadeRange(v, m_edShadeHi->value()); });
-   connect(m_edShadeHi, &QDoubleSpinBox::valueChanged, this,
-           [this](double v) { m_canvas->setShadeRange(m_edShadeLo->value(), v); });
+   connect(m_edShadeLo, &QDoubleSpinBox::valueChanged, this, &ScanWindow::onShadeLoChanged);
+   connect(m_edShadeHi, &QDoubleSpinBox::valueChanged, this, &ScanWindow::onShadeHiChanged);
 
    m_btnFit = new QPushButton(QStringLiteral("按数据定标"), box);
    m_btnFit->setToolTip(QStringLiteral("取已采数据的最小/最大作为色阶两端。**只在按它的时候改一次**"));
@@ -1602,27 +1622,153 @@ QWidget *ScanWindow::buildShadePanel()
       syncShadeEdits();
    });
 
-   QLabel *note = new QLabel(QStringLiteral(
+   m_cbShadeAuto = new QCheckBox(QStringLiteral("自动跟随数据"), box);
+   m_cbShadeAuto->setToolTip(QStringLiteral(
+      "勾上 = 色阶每帧跟着已采数据的最小/最大走, 不用按「按数据定标」。\n"
+      "代价是这也上了: 新采到一个更极端的值, 整张图就重排一次颜色 —— 图上的\"变化\"有一部分"
+      "是色阶自己在动。要拿两张图对比时把它关掉。\n"
+      "这一项**记进 scan.ini** (色标上下限那两个数不记)。"));
+   connect(m_cbShadeAuto, &QCheckBox::toggled, this, [this](bool on) {
+      m_canvas->setAutoFit(on);
+      applyShadeAutoUi(on);
+   });
+
+   /* 两套说明按模式显隐。合成一句做不到: 两边的取舍正好相反 (锁定那句说"不跟着变"是优点,
+    * 自动那句得承认它变) */
+   m_lblLocked = new QLabel(QStringLiteral(
       "色阶**锁定**, 不跟着数据实时变 —— 否则每来一个点整张图都会重排颜色, "
       "看到的\"变化\"其实是色阶自己在动, 那种图不能用来判断任何事。\n"
       "超出范围的格子夹到两端, 数值仍可在悬停里读到。"), box);
-   note->setWordWrap(true);
-   note->setStyleSheet(QStringLiteral("color:#6b7480;"));
+   m_lblAuto = new QLabel(QStringLiteral(
+      "色阶**跟着数据走**: 范围 = 已采数据的最小/最大, 每采到一个新的极值就整张重排一次颜色。\n"
+      "省事, 但上面那条代价照付 —— 要拿两张图对比时把它关掉, 两个数就定住了。\n"
+      "开着的时候上面两个数是**读数**: 打字改不动 (改完下一拍也会被数据算回去, 想定死范围\n"
+      "就先把这个勾去掉)。「取消」对它们同理 —— 它们记的是数据, 不是上一次保存的那对数。\n"
+      "超出范围的格子夹到两端, 数值仍可在悬停里读到。"), box);
+   for (QLabel *l : { m_lblLocked, m_lblAuto })
+   {
+      l->setWordWrap(true);
+      l->setStyleSheet(QStringLiteral("color:#6b7480;"));
+      l->setVisible(l == m_lblLocked);
+   }
 
-   /* 门控行。QFormLayout 有 insertRow, 插到第 0 行 */
    f->insertRow(0, gateBar(GI_SHADE, box));
 
    f->addRow(QStringLiteral("最小"), m_edShadeLo);
    f->addRow(QStringLiteral("最大"), m_edShadeHi);
+   f->addRow(m_cbShadeAuto);
    f->addRow(m_btnFit);
-   f->addRow(note);
+   f->addRow(m_lblLocked);
+   f->addRow(m_lblAuto);
 
-   /* 这一框只有画法, 与滑台怎么走无关 -> 运行中也放开 (今天本来就没锁) */
+   /* 这一框没有"运行中锁住"的项 (改色阶不会把跑起来的那一趟弄歪), 也没有要等设备的项 */
    addGate(GI_SHADE, box,
-           QList<GateItem>{ GateItem{ m_edShadeLo, false, false },
-                            GateItem{ m_edShadeHi, false, false },
-                            GateItem{ m_btnFit,    false, false } });
+           QList<GateItem>{
+              GateItem{ m_edShadeLo,   false, false },
+              GateItem{ m_edShadeHi,   false, false },
+              GateItem{ m_cbShadeAuto, false, false },
+              /* 定标按钮在自动跟随时灰掉 (need_manual), 这个勾本身**不能灰**: 关掉它得按得动 */
+              GateItem{ m_btnFit,      false, false, true },
+           });
    return box;
+}
+
+/* 「最小」「最大」是一对, 任何时候都得 min < max (否则色带没法定标: 色阶是拿这两个数做线性
+ * 映射的, 反着的区间除零)。规则是**推着走**: 被改的那一头越过另一头, 就把另一头一起推过去,
+ * 跨度保持不变 —— 想把整段量程往上挪 (0..1 → 5..6) 时最顺手。夹住改的那一头 (把最小按住不让
+ * 超过最大) 也合法, 但那样想挪量程得先改另一个, 绕一圈, 而且敲进去的数会被改掉, 看着像吞键。
+ *
+ * 推的那一下**屏蔽信号**: 不屏蔽的话被推的那个框会再发一次 valueChanged, 它拿到的一半是自己
+ * 刚被写的新值、一半是这边还没落定的值, 两拍里会闪一次错的量程。
+ *
+ * 跨度取的是"上一次生效的那一份" (画布上还留着的那对值, 这两个槽是唯一的写入方)。两个框的
+ * 读数与画布的色阶一直是一致的, 所以它就是要保留的跨度。
+ *
+ * **这两个槽也会被回灌走到**: 「取消」与"点别块框的编辑、这一框的改动被丢弃"都是把快照写回
+ * 控件, 而不挂信号屏蔽 (回灌要顺带重新下推)。那两处写回的是一对合法值, 但如果中途经过一次
+ * "先写 lo、此时 hi 还是新值" 的错配, 就会白推一下 —— 值错不了 (紧接着那一项就把 hi 写回),
+ * 只是会弹一条**根本不是操作员干的**横幅。所以横幅只在编辑态里发: 那两个框平时是禁用的,
+ * 编辑态 != 操作员在敲。 */
+void ScanWindow::onShadeLoChanged(double lo)
+{
+   double hi = m_edShadeHi->value();
+   if (hi <= lo)
+   {
+      const double span = m_canvas->shadeHi() - m_canvas->shadeLo();
+      hi = lo + ((span > 0.0) ? span : 1.0);
+      QSignalBlocker b(m_edShadeHi);
+      m_edShadeHi->setValue(hi);
+      if (m_gates[GI_SHADE].gate.editing)
+         hint(QStringLiteral("最小顶到最大上了 —— 最大跟着抬到 %1 (跨度不变)")
+                 .arg(QString::number(hi, 'g', 6)), false);
+   }
+   m_canvas->setShadeRange(lo, hi);
+}
+
+void ScanWindow::onShadeHiChanged(double hi)
+{
+   double lo = m_edShadeLo->value();
+   if (hi <= lo)
+   {
+      const double span = m_canvas->shadeHi() - m_canvas->shadeLo();
+      lo = hi - ((span > 0.0) ? span : 1.0);
+      /* 下限非负, 0 就是地板。压到 0 还不够 (hi 自己也在 0 附近) 就只好掉头把 hi 抬回去:
+       * 色阶可以很窄, 但**不能反过来**, 那是一条死规矩 */
+      if (lo < 0.0)
+         lo = 0.0;
+      if (lo >= hi)
+         hi = lo + ((span > 0.0) ? span : 1.0);
+      {
+         QSignalBlocker b(m_edShadeLo);
+         m_edShadeLo->setValue(lo);
+      }
+      {
+         QSignalBlocker b(m_edShadeHi);
+         m_edShadeHi->setValue(hi);
+      }
+      if (m_gates[GI_SHADE].gate.editing)
+         hint(QStringLiteral("最大顶到最小上了 —— 最小让到 %1 (跨度不变; 非负, 0 是下限)")
+                 .arg(QString::number(lo, 'g', 6)), false);
+   }
+   m_canvas->setShadeRange(lo, hi);
+}
+
+/* 自动跟随开着的时候, 两个输入框是**读数**而不是输入: 值由画布按数据算, 打字进去下一拍就被
+ * 覆盖, 不如直接只读。「按数据定标」也就没必要按了 —— 它做的事其实每帧都在做 (它的**可用性**
+ * 走 refreshEditability 的 need_manual, 不在这儿写 setEnabled: 那处才是唯一写点)。 */
+void ScanWindow::applyShadeAutoUi(bool on)
+{
+   m_edShadeLo->setReadOnly(on);
+   m_edShadeHi->setReadOnly(on);
+   m_lblLocked->setVisible(!on);
+   m_lblAuto->setVisible(on);
+
+   if (on)
+      syncShadeAuto();
+}
+
+void ScanWindow::syncShadeAuto()
+{
+   const double lo = m_canvas->shadeLo();
+   const double hi = m_canvas->shadeHi();
+
+   /* 没变就一句话都不做。这一句不是省事: 本函数由 refresh() 每拍 (30Hz) 调用, 而下面那句
+    * gateRebase 会重写框标题 —— 每拍重设一次标题就是每拍重排一次版面。 */
+   if (m_edShadeLo->value() == lo && m_edShadeHi->value() == hi)
+      return;
+
+   /* **必须屏蔽信号**: 不屏蔽的话先设 lo 会触发 valueChanged, 而它拿的是还没更新的
+    * m_edShadeHi->value() —— 色阶会被一个陈值盖一下, 下一拍才纠正回来 (看着像闪)。 */
+   {
+      QSignalBlocker bl(m_edShadeLo), bh(m_edShadeHi);
+      m_edShadeLo->setValue(lo);
+      m_edShadeHi->setValue(hi);
+   }
+
+   /* 同上: 这两个数现在是**程序在写**, 快照跟上, 否则「未保存」标记会一直亮着 ——
+    * 而这一框真正要保存的只有「自动跟随」那个勾 */
+   gateRebase(GI_SHADE, m_edShadeLo);
+   gateRebase(GI_SHADE, m_edShadeHi);
 }
 
 /* ---------------------------------------------------------------- 参数 */
@@ -1653,6 +1799,7 @@ void ScanWindow::applyDefaults()
    m_cbWantDigIn->setChecked(pd.want_dig_in);
    m_cbNpnWrite ->setChecked(pd.npn_write_drive);
    m_cbDiInvert ->setChecked(pd.npn_sw_invert);
+   m_cbShadeAuto->setChecked(pd.shade_auto);   /* 色标自动跟随 ("恢复默认"也回到这一档) */
 
    /* 回零速度刻意不在这里: 「恢复默认」会把 applyDefaults 再跑一遍, 会把为试回零特意
     * 压小的速度抬回去。它的缺省设在 buildHomePanel 里, 之后由 loadSettings 覆盖。 */
@@ -1687,6 +1834,10 @@ void ScanWindow::loadSettings()
    m_cbNpnWrite ->setChecked(pf.npn_write_drive);
    m_cbDiInvert ->setChecked(pf.npn_sw_invert);
 
+   /* 色标自动跟随。这是**模式**不是数值, 所以它记 (上下限那两个数不记, 见 scanprefs.h):
+    * 记不住的话每次开程序都要重新勾一遍 */
+   m_cbShadeAuto->setChecked(pf.shade_auto);
+
    /* 回零速度: -1 = 没记过, 越界的夹回量程内 —— 一个被手改坏的 ini 不该让回零用一个
     * 没验过的速度 (夹取规则在 ecatcmd::home_vel_from_pref, 被自检钉着) */
    m_edHomeVel->setValue((int)ecatcmd::home_vel_from_pref(pf.home_vel));
@@ -1710,6 +1861,7 @@ void ScanWindow::saveSettings()
    pf.want_dig_in     = m_cbWantDigIn->isChecked();
    pf.npn_write_drive = m_cbNpnWrite->isChecked();
    pf.npn_sw_invert   = m_cbDiInvert->isChecked();
+   pf.shade_auto      = m_cbShadeAuto->isChecked();
 
    prefsSave(prefsPath(), pf);
    m_savedNic = pf.nic;
@@ -1819,12 +1971,17 @@ void ScanWindow::pushParams()
 
 void ScanWindow::syncShadeEdits()
 {
-   /* setValue 会触发 valueChanged → setShadeRange, 那是幂等的, 不必屏蔽信号 */
-   m_edShadeLo->setValue(m_canvas->shadeLo());
-   m_edShadeHi->setValue(m_canvas->shadeHi());
+   /* **必须屏蔽信号**: 两个框现在是一对 (改一个会推另一个), 不屏蔽的话先设 lo 会拿着还没更新的
+    * hi 去判"顶没顶到头", 中间经过一次错的量程, 还可能把 hi 白推一下再被下一句改回来。
+    * 值本身不用经信号下推 —— 走到这儿的时候画布的色阶已经是这一对了 (按数据定标定的)。 */
+   {
+      QSignalBlocker bl(m_edShadeLo), bh(m_edShadeHi);
+      m_edShadeLo->setValue(m_canvas->shadeLo());
+      m_edShadeHi->setValue(m_canvas->shadeHi());
+   }
 
-   /* 这是**程序自己**按数据定的标, 不是操作员改的。快照得跟上: 不然正在编辑时按一下
-    * 「按数据定标」, 再按「取消」, 会把色阶滚回定标之前那一份 (那时候的图已经不是那张了) */
+   /* 这是**程序自己**按数据定的标, 不是操作员改的。快照得跟上: 不然编辑态里按一下「按数据
+    * 定标」再按「取消」, 会把色阶滚回定标之前那一份 */
    gateRebase(GI_SHADE, m_edShadeLo);
    gateRebase(GI_SHADE, m_edShadeHi);
 }
@@ -2630,6 +2787,10 @@ void ScanWindow::refresh()
     * 放开; 几何那几项运行中仍然锁住 (改到一半, 落进 CSV 的 (ix,iy) 就和实际位置对不上)。
     * 原来那张"扫描中锁住"的表已经搬进各框的 GateItem.lock_running。 */
    refreshEditability();
+
+   /* 自动跟随: 色阶是画布在画的时候按数据算的, 这里把两个框的读数跟上 (值没变时是 no-op) */
+   if (m_cbShadeAuto->isChecked())
+      syncShadeAuto();
 
    refreshAxisSignals(t);
 
