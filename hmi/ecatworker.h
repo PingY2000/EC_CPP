@@ -657,6 +657,31 @@ private:
       QString text;
    };
 
+   /* 「阻塞命令期间遥测不断流」。
+    *
+    * em_home / em_fault_reset / em_enable_all 这些函数**内部自己跑周期帧** (em__cycle),
+    * 而 run() 那一圈的 publish() 要等它们返回才轮得到 —— 于是整个动作期间界面拿到的是
+    * 冻住的那一份遥测: 回零最长 30 秒, 那 30 秒里使能灯、三个开关灯、位置一起停住不动。
+    * 构造时给总线挂上 em_set_cycle_hook, 析构时摘掉 —— 那些帧里也发一次遥测。
+    *
+    * 挂的时机**只限会阻塞的那几条命令**: 平时那一圈自己每 2ms publish 一次, 挂着等于
+    * 每帧白拷两遍 BusTelem (它里面有 QString)。
+    *
+    * 做成 RAII 而不是前后两句: 摘不到就等于一直挂着, 而这里中间全是 return。 */
+   class BlockTick
+   {
+   public:
+      explicit BlockTick(EcatThread *t);
+      ~BlockTick();
+
+      BlockTick(const BlockTick &)            = delete;
+      BlockTick &operator=(const BlockTick &) = delete;
+
+   private:
+      static void tick(void *user, int wkc);   /* 在 em__cycle 收完一帧时被调 */
+      EcatThread *m_t = nullptr;
+   };
+
    /* 以下全部在工作线程里跑 */
    void drainCommands();
    void doListAdapters();

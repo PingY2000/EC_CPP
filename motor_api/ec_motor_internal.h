@@ -121,6 +121,11 @@ struct em_bus
    int in_op;
    int prev_manualstatechange;
 
+   /* 每周期回调 (见公共头 em_set_cycle_hook)。谁都不挂时是 NULL —— calloc 建的 bus,
+    * 所以初值就是 NULL。只有 em__cycle 读它, 且只读一次 */
+   em_cycle_fn cycle_fn;
+   void       *cycle_user;
+
    em_dirsnap_t snap_rx[EM_MAX_AXES];
    em_dirsnap_t snap_tx[EM_MAX_AXES];
 };

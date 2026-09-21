@@ -210,6 +210,31 @@ BusTelem EcatThread::telemetry() const
 
 void EcatThread::requestQuit() { m_quit.store(true); }
 
+/* ---- BlockTick: 阻塞命令期间让遥测继续流动 (理由全在头文件里) ----
+ *
+ * 回调体 = publish(), 就是那一圈本来要调的东西。区别只是**谁在多线程里跑**: 这是同一个
+ * 工作线程 (em_home 就在它里面跑), 所以 m_ax / m_tgt 这些"只有工作线程碰"的成员照旧。
+ * 两处要注意:
+ *   · **不许在持有 m_mtx 的作用域里构造本对象** —— publish() 自己要拿这把锁, 而它是
+ *     非递归锁, 同线程再进一次当场自锁;
+ *   · 回调每帧一次 (2ms), 与平时那一圈的节拍一致 —— publish() 本来就是按这个频率写的。 */
+EcatThread::BlockTick::BlockTick(EcatThread *t) : m_t(t)
+{
+   if (m_t != nullptr && m_t->m_bus != nullptr)
+      em_set_cycle_hook(m_t->m_bus, &EcatThread::BlockTick::tick, m_t);
+}
+
+EcatThread::BlockTick::~BlockTick()
+{
+   if (m_t != nullptr && m_t->m_bus != nullptr)
+      em_set_cycle_hook(m_t->m_bus, nullptr, nullptr);
+}
+
+void EcatThread::BlockTick::tick(void *user, int wkc)
+{
+   static_cast<EcatThread *>(user)->publish(wkc);
+}
+
 void EcatThread::run()
 {
    QElapsedTimer clk;
@@ -275,15 +300,21 @@ void EcatThread::drainCommands()
       {
          case CMD_LIST:       doListAdapters(); break;
 
+         /* 连接也会阻塞几秒, 但**不挂 BlockTick**: 那几秒里就是"什么都没有" (灯全灰、
+          * 没有轴), 而 m_ax / m_naxis 正在被重建 —— 从那些帧里 publish 出去的是半成品。 */
          case CMD_CONNECT:    doConnect(c.text); break;
 
          case CMD_DISCONNECT: teardown(); break;
 
-         case CMD_ENABLE:     doEnable(); break;
+         /* ---- 会阻塞的四条: 挂 BlockTick, 让那些帧里也发遥测 (理由见头文件) ---- */
+         case CMD_ENABLE:
+            { BlockTick tk(this); doEnable(); }
+            break;
 
          case CMD_DISABLE:
             if (m_bus != nullptr && m_in_op)
             {
+               BlockTick tk(this);
                if (em_disable_all(m_bus) == EM_EXIT_OK)
                   note(QStringLiteral("已失能 (电机释放)"));
                else
@@ -302,12 +333,23 @@ void EcatThread::drainCommands()
             }
             break;
 
+         /* 下面四条不阻塞 (只是改几个成员): 那一圈自己会 publish, 不用挂 */
          case CMD_STOP:       doStop(); break;
          case CMD_ZERO:       doZero(c.axis); break;
          case CMD_CENTER:     doCenter(c.axis); break;
          case CMD_RANGE:      doRange(c.value); break;
-         case CMD_FAULT_RESET: doFaultReset(); break;
-         case CMD_HOME:       doHome(c.axis, c.method, (uint32_t)c.value); break;
+
+         case CMD_FAULT_RESET:
+            /* 逐轴阻塞, 每轴最多 1 秒 —— 复位期间让界面能看见"正在复位…" */
+            { BlockTick tk(this); doFaultReset(); }
+            break;
+
+         case CMD_HOME:
+            /* 本程序里最长的一次阻塞 (最长 HMI_HOME_TMO_MS = 30 秒 + 收尾): 使能灯、三个
+             * 开关灯、位置、状态栏都在这一段里要跟着动。找限位时尤其 —— 那一趟的目的就是
+             * 去压那个开关, 灯不跟着亮就没有任何东西能说明它压上了 */
+            { BlockTick tk(this); doHome(c.axis, c.method, (uint32_t)c.value); }
+            break;
       }
    }
 }
@@ -580,8 +622,10 @@ void EcatThread::doFaultReset()
    }
 
    /* ---- 2. 逐轴复位, 阻塞 (每轴最多 EM_STEP_TMO_MS = 1000ms) ----
-    * 下面那两次**加锁直写 m_telem.resetting** 是界面能看见"正在复位…"的唯一原因
-    * (publish() 与本函数同线程); 复位**不可中断**, 界面只能把它按住。 */
+    * 下面那两次**加锁直写 m_telem.resetting** 与 BlockTick 是两件事, 现在都能让界面看见
+    * "正在复位…": 直写负责"第一个字节之前就写上", BlockTick 负责"阻塞期间一直刷新"
+    * (见 drainCommands 的 CMD_FAULT_RESET)。直写留着 —— 它不依赖那条回调挂没挂,
+    * 而 publish() 从 m_resetting 拷的那一份要等下一帧才出去。复位**不可中断**。 */
    m_resetting = true;
    {
       QMutexLocker lk(&m_mtx);
@@ -706,7 +750,9 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
    }
 
    /* ---- 宣告"正在回零"。**必须在第一个阻塞调用之前** ----
-    * 下面那两次加锁直写是"阻塞期间界面还看得见"的唯一原因, 界面靠它把「停止」换成立即中止。 */
+    * 下面那两次加锁直写让界面**从第一个字节之前**就看得见 (界面靠它把「停止」换成立即中止);
+    * 之后这一整段之所以一直在刷新, 靠的是 CMD_HOME 上那个 BlockTick (见头文件)。
+    * 两件事都要: 直写不依赖回调挂没挂, 而回调那一份要等下一帧才出去。 */
    m_homing = true;
    m_homing_axis = axis;
    m_homing_method = method;

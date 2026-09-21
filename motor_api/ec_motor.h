@@ -287,6 +287,23 @@ int em_enter_op(em_bus_t *bus, int use_dc, uint32_t cycle_us);
  * 更新 (wkc >= 期望 WKC): 短帧时镜像是陈值或半个帧。 */
 int em_service(em_bus_t *bus);
 
+/* ---- 每周期回调 (可选) ----
+ * 每一帧 (em_service / 各阻塞函数内部自己跑的那些帧) 收完、镜像更新完就调一次 fn(user, wkc)。
+ * 用途只有一个: **阻塞命令期间调用方的循环还在不在**。em_home / em_fault_reset /
+ * em_enable_all / em_wait_sw 这些函数内部自己跑周期帧, 调用方那一刻正卡在它们里面, 于是
+ * 调用方自己那一圈"每帧更新一次界面"的活整整停掉一个动作那么久 (回零能跑满 30 秒)。
+ * 挂上回调, 那些帧里也能把界面喂一次。
+ *
+ * 三条约定:
+ *   · **在调用者的线程里同步跑**, 每帧一次 —— 里面别做重活, 更不许回调本 API 的阻塞函数
+ *     (em_home 等), 也不许再收发帧;
+ *   · **只能读**: 回调能改的是调用方自己那份快照, 不许写输出镜像 (否则会插进一段
+ *     没人预期的过程数据, 回零/复位那类时序就变了);
+ *   · fn = NULL 注销。bus 为 NULL 时什么都不做 (便于写在收尾路径上)。
+ * 不挂 = 行为与本函数不存在时一模一样 (motor_test / slide_motion 就是这么用的)。 */
+typedef void (*em_cycle_fn)(void *user, int wkc);
+void em_set_cycle_hook(em_bus_t *bus, em_cycle_fn fn, void *user);
+
 /* 轴的 AL 状态字实读 (含错误位 0x10) */
 uint16_t em_al_state(em_bus_t *bus, int slave);
 

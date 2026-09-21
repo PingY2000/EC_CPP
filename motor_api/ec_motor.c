@@ -1007,10 +1007,24 @@ int em__cycle(em_bus_t *bus)
          bus->axis[i]->short_frames++;
    }
 
+   /* 回调放在**镜像更新之后**: 它读的就是这些镜像, 早一步就会拿到上一帧的值。
+    * 短帧那一支不跳过 —— "这帧不完整"本身就是调用方要知道的事 (见公共头 em_set_cycle_hook) */
+   if (bus->cycle_fn != NULL)
+      bus->cycle_fn(bus->cycle_user, wkc);
+
    return wkc;
 }
 
 int em_service(em_bus_t *bus) { return em__cycle(bus); }
+
+void em_set_cycle_hook(em_bus_t *bus, em_cycle_fn fn, void *user)
+{
+   if (bus == NULL)
+      return;
+
+   bus->cycle_fn   = fn;
+   bus->cycle_user = user;
+}
 
 static int em_axis_bind(em_axis_t *ax, uint16_t pdo_index, const em_field_t *need,
                         int nneed, int *offs_out, const char *label)
