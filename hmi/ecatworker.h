@@ -44,6 +44,11 @@
  * 不能拿 -1 兼这个语义 (em_get_mode 读失败也返回 -1), 也不能借 0 (合法模式号: 未定义)。 */
 #define HMI_MODE_DISP_UNREAD  (-2)
 
+/* AxisTelem::fault_code 的两个哨兵。与 6061h 那个坑同一个: **0x0000 是"无错误"这个真实
+ * 读数**, 拿它兼"还没读"就会在界面上把"不知道"说成"没故障"。 */
+#define HMI_FAULT_CODE_UNREAD (-2)   /* 还没读过 (故障沿刚起来, 那一刻还没轮到 SDO) */
+#define HMI_FAULT_CODE_FAIL   (-1)   /* 读了, 但读不到 (SDO 没应答 / 驱动器不自答) */
+
 /* 一根轴的一帧快照。全部是显示坐标。 */
 struct AxisTelem
 {
@@ -75,6 +80,16 @@ struct AxisTelem
     * 手册 §3.7 把「6061h 读回 6」当作 HM 的前提。它不是每周期刷新的: 6061h 不在 TxPDO 里,
     * 只能 SDO 读, 而 publish() 只读过程数据镜像 —— 由工作线程在连接 / 使能 / 回零收尾时读。 */
    int      mode_disp = HMI_MODE_DISP_UNREAD;
+
+   /* 驱动器故障码 603Fh。**6041h bit3 只说"有故障", 说不了是哪一个** —— 这个才是那件事:
+    * 0x0000 无错误 / 0xFF01 过流 / 0xFF02 过压 / 0xFF03 欠压 / 0xFF04 动力线报警 /
+    * 0xFF06 通讯报警 / 0xFF08 传感器告警 (手册 §报警)。
+    *
+    * 与 mode_disp 同一个道理: 603Fh 不在生效的 TxPDO 映射里 (本机只有 6041h/6064h/606Ch,
+    * 60FDh 是可选的第四项), 只能 SDO 读, 而 publish() 不许做 SDO —— 于是它是**故障沿之后
+    * 才到**的一份数据, 三个取值: 上面那两个哨兵, 或 0..0xFFFF 的实测值。
+    * 只对**报故障的那一根**读; 故障清掉后置回 UNREAD, 于是下一次故障会重新读。 */
+   int      fault_code = HMI_FAULT_CODE_UNREAD;
 };
 
 struct BusTelem
@@ -562,6 +577,156 @@ inline const char *home_end_text(HomeEnd e)
    return "";
 }
 
+/* ---- 故障码 603Fh 的说人话 ----
+ * 判据做成 inline 放这里, 与 mode_text 同一个理由: **scan_selftest 不编 ecatworker.cpp**,
+ * 写在 .cpp 里就永远验不到。 */
+
+/* 手册那张表 (ykd2205pe_ci402.md §报警与指示灯)。0x0000 是**驱动器自报的一个合法读数**
+ * ("无错误"), 不是"没读到" —— 所以它不能兼哨兵值 (见下面那两个负数)。真机上"bit3 置起
+ * 而码读回 0000"是可能的 (故障位上一轮没清), 那也是照实说 0000, 不替它改口。
+ * 返回 nullptr = 手册之外 —— 那种值照实报十六进制, 不猜成"未知故障"。 */
+inline const char *fault_code_meaning(uint16_t code)
+{
+   switch (code)
+   {
+      case 0x0000: return "无错误";
+      case 0xFF01: return "过流";
+      case 0xFF02: return "过压";
+      case 0xFF03: return "欠压";
+      case 0xFF04: return "动力线报警";
+      case 0xFF06: return "通讯报警";
+      case 0xFF08: return "传感器告警";
+   }
+   return nullptr;
+}
+
+/* 这个码该去查什么。**不是诊断结论**, 只是把"下一步看哪儿"指出来 —— 否则操作员看到
+ * 0xFF02 只会想到"换驱动器"。手册那张表就这几个码, 处置办法彼此完全不搭界 (供电 / 机械 /
+ * 接线 / 干扰), 所以值得各写一句。
+ * 顺带一个可对账的地方: 手册 §报警与指示灯里 **ALM 灯的红闪次数就是这几个数字**
+ * (1 过流 / 2 过压 / 3 欠压 / 6 通讯 / 8 传感器)。面板上数出来的次数与这里读到的码对得上,
+ * 说明这条 SDO 读的确实是同一件事; 对不上就先别信这里。返回 nullptr = 手册之外。 */
+inline const char *fault_code_action(uint16_t code)
+{
+   switch (code)
+   {
+      /* 0x0000 这一条是给"bit3 还立着但驱动器自报无错"那一拍用的 —— 它前面已经写了
+       * "0000 (无错误)", 这里再说一遍就重复了, 所以只讲下一步 */
+      case 0x0000: return "码是好的, 只是故障位还没清 —— 点「故障复位」";
+      case 0xFF01: return "过流: 先查机械有没有卡死/堵转, 再查动力线 U V W";
+      case 0xFF02: return "过压: 母线电压偏高, 常见于减速太急或供电过高 —— 查供电, 减速放慢";
+      case 0xFF03: return "欠压: 母线电压偏低 —— 查供电与接触器, 功率级可能掉过电";
+      case 0xFF04: return "动力线报警: 查动力线接线与电机相间/对地";
+      case 0xFF06: return "通讯报警: 查通讯线、干扰源与站号配置";
+      case 0xFF08: return "传感器告警: 查编码器接线与信号 (5V 与编码器电缆)";
+   }
+   return nullptr;
+}
+
+/* 一个 fault_code 字段说成人话: "0xFF02 (过压)" / "0xFF02 (手册之外)" /
+ * "还没读到 (正在读)" / "读不到 (SDO 没应答)"。
+ *
+ * **四句话都写成"接在 603Fh = 后面也通顺"的样子** —— 它要被拼进 "轴X 603Fh = ……"
+ * (fault_axis_text), 也要单独用。写成"正在读 603Fh…"那种自带索引的说法, 拼起来就是
+ * "轴X 603Fh = 正在读 603Fh…"。
+ *
+ * **两种"不知道"必须分开说**: 前者是"再等一帧就有", 后者是"这一趟读不到了"。 */
+inline QString fault_code_text(int code)
+{
+   if (code == HMI_FAULT_CODE_UNREAD)
+      return QStringLiteral("还没读到 (正在读)");
+   if (code == HMI_FAULT_CODE_FAIL)
+      return QStringLiteral("读不到 (SDO 没应答)");
+
+   const uint16_t v   = (uint16_t)(code & 0xFFFF);
+   const char    *mean = fault_code_meaning(v);
+   const QString  hex  = QString::number(v, 16).toUpper()
+                            .rightJustified(4, QLatin1Char('0'));
+
+   return QStringLiteral("0x%1 (%2)")
+             .arg(hex, QString::fromUtf8(mean != nullptr ? mean : "手册之外"));
+}
+
+/* "轴X 603Fh = 0xFF02 (过压)" —— 日志、横幅、自动中止那几句话都从这一句拼,
+ * 免得几处各写一份 (两处说法不一致比说错更难查)。 */
+inline QString fault_axis_text(int i, int code)
+{
+   return QStringLiteral("%1 603Fh = %2")
+             .arg(QString::fromUtf8(axis_label(i)), fault_code_text(code));
+}
+
+inline QString fault_axis_text(const AxisTelem &a, int i)
+{
+   return fault_axis_text(i, a.fault_code);
+}
+
+/* 读到码那一刻写进日志/状态栏的**一整句**: "轴X 603Fh = 0xFF02 (过压) —— 过压: ……"。
+ * 工作线程那边只有轴号与码 (还没有快照), 所以它有自己那个重载。 */
+inline QString fault_code_line(int i, int code)
+{
+   QString s = fault_axis_text(i, code);
+
+   if (code != HMI_FAULT_CODE_UNREAD && code != HMI_FAULT_CODE_FAIL)
+   {
+      const char *act = fault_code_action((uint16_t)(code & 0xFFFF));
+
+      if (act != nullptr)
+         s += QStringLiteral(" —— ") + QString::fromUtf8(act);
+   }
+
+   return s;
+}
+
+/* 哪几根轴报了故障、各自的码是多少, 拼成一句 (没有轴报故障时是空的)。
+ * 用于自动中止那句结论: 6041h 只说得清"有故障", 说清"是哪一个"要靠它。 */
+inline QString faulted_axes_text(const BusTelem &t)
+{
+   QStringList parts;
+
+   for (int i = 0; i < t.naxis && i < EM_MAX_AXES; i++)
+      if (t.ax[i].valid && t.ax[i].mirror_ok && t.ax[i].fault)
+         parts << fault_axis_text(t.ax[i], i);
+
+   return parts.join(QStringLiteral(", "));
+}
+
+/* 故障横幅那一整句。**两拍都用它**: 第一拍码还没到 (那时 fault_code = UNREAD, 这一句说
+ * "还没读到"), 第二拍码到了。同一条模板发两次 —— 界面上每次写的都是"眼下知道的那一份",
+ * 而不是"我刚知道的那一点", 于是迟一拍的那次不会把先前那句顶掉半截。
+ * 有真实码时把"下一步查哪儿"也带上 (fault_code_action): 红横幅是无人值守时唯一还在看的东西。 */
+inline QString fault_banner_text(const BusTelem &t)
+{
+   QString s = QStringLiteral("6041h bit3 = 故障 —— 目标已冻结, 电机状态请以驱动器面板为准。");
+
+   const QString codes = faulted_axes_text(t);
+
+   if (!codes.isEmpty())
+      s += QStringLiteral("  ") + codes + QStringLiteral("。");
+
+   /* 只对**真实读数**说处置办法: UNREAD/FAIL 那两拍本来就没东西可查 */
+   QStringList act;
+
+   for (int i = 0; i < t.naxis && i < EM_MAX_AXES; i++)
+   {
+      const AxisTelem &a = t.ax[i];
+
+      if (!a.valid || !a.mirror_ok || !a.fault)
+         continue;
+      if (a.fault_code == HMI_FAULT_CODE_UNREAD || a.fault_code == HMI_FAULT_CODE_FAIL)
+         continue;
+
+      const char *p = fault_code_action((uint16_t)(a.fault_code & 0xFFFF));
+
+      if (p != nullptr)
+         act << QString::fromUtf8(p);
+   }
+
+   if (!act.isEmpty())
+      s += QStringLiteral("  ") + act.join(QStringLiteral("; ")) + QStringLiteral("。");
+
+   return s;
+}
+
 }   /* namespace ecatcmd */
 
 class EcatThread : public QThread
@@ -694,6 +859,11 @@ private:
    /* 把该轴的实际运行模式 6061h 读一次存进 m_mode_disp[axis] (SDO 读)。
     * **只许在本来就阻塞、或本来就便宜的时刻调** —— publish() / interpolate() 不许调。 */
    void readModeDisp(int axis);
+
+   /* 把报故障那几根的 603Fh 读出来 (SDO 读, 每根一趟只读一次)。
+    * 故障沿是 publish() 发现的, 而 publish() 不许做 SDO —— 于是它只挂个牌子, 由这里在
+    * **下一圈的圈顶**做掉 (2ms 之后)。见 publish() 里 m_fault_read_want 那一段。 */
+   void serviceFaultCodeReads();
    void doZero(int axis);
    void doCenter(int axis);
    void doRange(int32_t range);
@@ -724,6 +894,12 @@ private:
     * 被填 0, 而 0 是合法模式号 ("未定义")。 */
    int        m_mode_disp[EM_MAX_AXES];
    bool       m_fault_latched = false;
+
+   /* 603Fh 的**上次读到值** (HMI_FAULT_CODE_UNREAD / _FAIL / 实测值), 与"这一趟还欠它一次
+    * 读吗"的牌子。同 m_mode_disp: 构造里整体置 UNREAD —— 聚合初始化剩下的会被填 0,
+    * 而 0 是"无错误"这个真实读数。 */
+   int        m_fault_code[EM_MAX_AXES];
+   bool       m_fault_read_want[EM_MAX_AXES] = {};
 
    /* 故障复位进行中 (同 m_busy, 见 BusTelem::resetting); 单独存一份是为了让
     * doFaultReset 自己能在收尾时清干净 */

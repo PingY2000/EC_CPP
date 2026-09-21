@@ -330,15 +330,44 @@ void MainWindow::refresh()
 
    m_lNote->setText(t.note);
 
+   /* 故障横幅 **分两拍** —— 与 scan 侧 (ScanWindow::refresh) 同一套, 两处说法不许不一致。
+    * 下同第一拍: 故障沿。这一刻 603Fh 还没读回来 (那条 SDO 在工作线程下一圈的圈顶做),
+    * 所以只能说"还没读到"; 第二拍: 码到了, 把带码的那一句顶上去 ——
+    * 「驱动器故障要给出故障码」要的就是这一拍。 */
    if (t.fault && !m_faultShown)
    {
       m_faultShown = true;
-      hint(QStringLiteral("6041h bit3 = 故障 —— 目标已冻结, 电机状态请以驱动器面板为准。"
-                          "查清原因再「失能」重来"), true);
+      hint(ecatcmd::fault_banner_text(t) + QStringLiteral("  查清原因再「失能」重来"), true);
+
+      for (int i = 0; i < 2; i++)
+         if (t.ax[i].valid && t.ax[i].mirror_ok && t.ax[i].fault)
+            m_faultCodeShown[i] = t.ax[i].fault_code;
    }
    else if (!t.fault)
    {
       m_faultShown = false;
+
+      /* 故障没了就忘掉说过哪个码, 否则下一次故障读到的若是同一个码, 第二拍永远不会弹 */
+      for (int i = 0; i < 2; i++)
+         m_faultCodeShown[i] = HMI_FAULT_CODE_UNREAD;
+   }
+
+   if (t.fault)
+   {
+      for (int i = 0; i < 2; i++)
+      {
+         const AxisTelem &a = t.ax[i];
+
+         if (!m_connected || !a.valid || !a.mirror_ok || !a.fault)
+            continue;
+         if (a.fault_code == m_faultCodeShown[i])
+            continue;
+
+         m_faultCodeShown[i] = a.fault_code;
+
+         if (a.fault_code != HMI_FAULT_CODE_UNREAD)
+            hint(ecatcmd::fault_banner_text(t) + QStringLiteral("  查清原因再「失能」重来"), true);
+      }
    }
 
    /* 收尾时没能确认失能 (CLI 退出码 10 的语义) —— 唯一必须弹模态的事。用 singleShot

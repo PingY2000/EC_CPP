@@ -191,6 +191,10 @@ public:
 
    /* ---- 注入 ---- */
    void setFault(int i)        { t_.ax[i].fault = true; t_.fault = true; }
+
+   /* 603Fh。**单独一个注入点**: 真实的码是故障沿之后一拍才到的, 所以"故障起来了但码还没到"
+    * (UNREAD) 是常态 —— 测试要能各造出这三种状态 */
+   void setFaultCode(int i, int code) { t_.ax[i].fault_code = code; }
    void setEnabled(int i, bool e) { t_.ax[i].enabled = e; }
 
    /* 撞限位。limit_active 走真判据 ecatcmd::limit_hit(), 与 publish() 同一条函数 —— 照抄一个
@@ -850,7 +854,7 @@ static void test_aborts()
             "the message names the limit switch", what.toStdString());
    }
 
-   caseBegin("abort: 驱动器故障");
+   caseBegin("abort: 驱动器故障 (中止那一句要带上 603Fh 故障码)");
    {
       Rig r;
       r.ctrl.setParams(Rig::smallParams());
@@ -860,10 +864,51 @@ static void test_aborts()
       r.runUntil([&] { return r.ctrl.completedPoints() >= 1; });
 
       bool fired = false;
-      QObject::connect(&r.ctrl, &ScanController::autoAborted, [&](const QString &) { fired = true; });
+      QString why;
+
+      /* **先接好再注入** —— autoAborted 只在源那一帧发一次, 接晚了就永远收不到 */
+      QObject::connect(&r.ctrl, &ScanController::autoAborted,
+                       [&](const QString &s) { fired = true; why = s; });
+
       r.bus.setFault(0);
+      /* 过压。**与过流的处置办法完全不搭界** (一个查供电, 一个查机械) ——
+       * 这一句是无人值守时唯一的现场记录, 说错码就是把人支到错的地方去 */
+      r.bus.setFaultCode(0, 0xFF02);
       r.runUntil([&] { return r.ctrl.state() == ScanController::State::Aborted; }, 5000);
+
       check(fired, "a drive fault aborts the scan");
+      check(why.contains(QStringLiteral("6041h bit3")), "说清是哪个位", why.toStdString());
+      check(why.contains(QStringLiteral("0xFF02")), "中止理由里带上了故障码", why.toStdString());
+      check(why.contains(QStringLiteral("过压")), "还带上了码的意思", why.toStdString());
+      check(why.contains(QStringLiteral("轴X")), "说清是哪一根轴", why.toStdString());
+      /* 另一根没报故障, 不许被一起点名 —— 点错了人就跑去查那根好的 */
+      check(!why.contains(QStringLiteral("轴Y")), "没故障的轴不许被点名", why.toStdString());
+   }
+
+   caseBegin("abort: 驱动器故障 — 码还没到那一拍也要读得通");
+   {
+      /* 真实时序: 码是故障沿**之后**一拍才读回来的 (SDO 在下一圈的圈顶做),
+       * 所以自动中止那一刻 fault_code 多半还是 UNREAD。那一句在这种缺的情况下
+       * 也必须完整 —— 界面上不许留半个 "603Fh = "。 */
+      Rig r;
+      r.ctrl.setParams(Rig::smallParams());
+      r.ctrl.rebuildPlan();
+      QString err;
+      check(r.startScan(QDir::tempPath() + "/scan_fault_unread.csv", &err), "start",
+            err.toStdString());
+      r.runUntil([&] { return r.ctrl.completedPoints() >= 1; });
+
+      QString why;
+      QObject::connect(&r.ctrl, &ScanController::autoAborted, [&](const QString &s) { why = s; });
+
+      r.bus.setFault(0);                 /* 码刻意不设 -> 停在 UNREAD, 就是故障沿那一拍 */
+      r.runUntil([&] { return r.ctrl.state() == ScanController::State::Aborted; }, 5000);
+
+      check(why.contains(QStringLiteral("603Fh")), "把 603Fh 这块牌子举起来", why.toStdString());
+      check(why.contains(QStringLiteral("还没读到")), "照实说还没读到, 不编一个码",
+            why.toStdString());
+      check(!why.contains(QStringLiteral("0x")), "没有码就不许出现十六进制数",
+            why.toStdString());
    }
 
    caseBegin("abort: 掉使能");
@@ -2223,6 +2268,133 @@ static void test_homing()
             "哨兵不许是 -1 —— 那是 em_get_mode() 读失败的返回值");
       check(!has(ecatcmd::mode_text(HMI_MODE_DISP_UNREAD), "读失败"),
             "「没读过」不许说成「读失败」");
+   }
+
+   /* ---- 603Fh (驱动器故障码) ------------------------------------ */
+   /* 上面那个 has 收 const char*, 而 603Fh 这几个 helper 返回 QString (要拼轴号与码) */
+   auto hasq = [](const QString &s, const char *w) {
+      return s.contains(QString::fromUtf8(w));
+   };
+
+   caseBegin("603Fh: 手册那张表逐条 (过流与过压处置办法不搭界, 认错一个就是白查半天)");
+   {
+      /* 表在 docs/ykd2205pe_ci402.md §报警与指示灯 (与 1003h 低 16 位同源)。
+       * **逐条钉住**, 不许写成"非空即通过": 报错码是这台设备上唯一能分开这几种故障的东西。 */
+      check(hasq(ecatcmd::fault_code_text(0x0000), "无错误"), "0000 无错误");
+      check(hasq(ecatcmd::fault_code_text(0xFF01), "过流"),   "FF01 过流");
+      check(hasq(ecatcmd::fault_code_text(0xFF02), "过压"),   "FF02 过压");
+      check(hasq(ecatcmd::fault_code_text(0xFF03), "欠压"),   "FF03 欠压");
+      check(hasq(ecatcmd::fault_code_text(0xFF04), "动力线"), "FF04 动力线报警");
+      check(hasq(ecatcmd::fault_code_text(0xFF06), "通讯"),   "FF06 通讯报警");
+      check(hasq(ecatcmd::fault_code_text(0xFF08), "传感器"), "FF08 传感器告警");
+
+      /* 十六进制也要在: 操作员拿它去对驱动器面板, 而"过压"两个字对不了面板 */
+      check(hasq(ecatcmd::fault_code_text(0xFF02), "FF02"), "码本身照实写出来");
+      check(hasq(ecatcmd::fault_code_text(0x0000), "0000"), "0 要写成 0000, 不是 0");
+      check(!hasq(ecatcmd::fault_code_text(0xFF02), "FF01"), "相邻的码不许抄串");
+
+      /* 手册之外的码照实报十六进制。**猜一个名字比说不知道坏得多** */
+      check(hasq(ecatcmd::fault_code_text(0x1234), "手册"), "1234 不在手册里 -> 不许猜");
+      check(hasq(ecatcmd::fault_code_text(0x1234), "1234"), "但码要照实写出来");
+
+      /* 每一个手册里的码都要有一句"下一步查哪儿" —— 这张表少一条, 红横幅上就少半句,
+       * 而那半句正是操作员唯一能照着做的东西 */
+      const uint16_t known[7] = { 0x0000, 0xFF01, 0xFF02, 0xFF03, 0xFF04, 0xFF06, 0xFF08 };
+
+      for (int k = 0; k < 7; k++)
+         check(ecatcmd::fault_code_action(known[k]) != nullptr,
+               "手册里的每个码都有处置办法");
+
+      /* 反过来: 手册之外的码**不给**建议 —— 没有依据的建议比没有建议坏 */
+      check(ecatcmd::fault_code_action(0x1234) == nullptr, "手册之外的码不编处置办法");
+   }
+
+   caseBegin("603Fh: 哨兵值 —— 「还没读到」「读不到」「0x0000 无错误」是三件事");
+   {
+      check(HMI_FAULT_CODE_UNREAD < 0, "哨兵是负数");
+      check(HMI_FAULT_CODE_UNREAD != HMI_FAULT_CODE_FAIL, "两个哨兵不是一个值");
+      check(HMI_FAULT_CODE_UNREAD != 0x0000 && HMI_FAULT_CODE_FAIL != 0x0000,
+            "哨兵不许是 0 —— 0x0000 是「无错误」这个真实读数");
+
+      const QString u = ecatcmd::fault_code_text(HMI_FAULT_CODE_UNREAD);
+      const QString f = ecatcmd::fault_code_text(HMI_FAULT_CODE_FAIL);
+      const QString z = ecatcmd::fault_code_text(0x0000);
+
+      check(hasq(u, "还没读到"), "没读到的说法");
+      check(hasq(f, "读不到"),   "读不到的说法");
+      /* 与 6061h 那个坑同一个: 两句话要是一样, 一次掉线就会被看成一个从没读过 603Fh 的轴 */
+      check(u != f,      "「还没读到」与「读不到」不能是同一句话");
+      check(u != z && f != z, "「没读到」不许说成「无错误」");
+      check(!hasq(f, "无错误"), "读不到不等于没故障 —— bit3 还立着");
+   }
+
+   caseBegin("603Fh: 拼进「轴X 603Fh = ……」之后仍然通顺");
+   {
+      /* 这几句是拼出来的: "轴X 603Fh = " + fault_code_text()。值那一段要是自带索引
+       * (写成"正在读 603Fh…"), 整句就成了 "轴X 603Fh = 正在读 603Fh…" ——
+       * 所以拼完那一句里 "603Fh" 只能出现一次。 */
+      auto countOf = [](const QString &s) {
+         int n = 0;
+         for (int at = s.indexOf(QStringLiteral("603Fh")); at >= 0;
+              at = s.indexOf(QStringLiteral("603Fh"), at + 1))
+            n++;
+         return n;
+      };
+
+      const int codes[3] = { 0xFF02, HMI_FAULT_CODE_UNREAD, HMI_FAULT_CODE_FAIL };
+
+      for (int k = 0; k < 3; k++)
+         checkEq(countOf(ecatcmd::fault_axis_text(0, codes[k])), 1,
+                 "603Fh 在整句里只出现一次");
+
+      check(hasq(ecatcmd::fault_axis_text(0, 0xFF02), "轴X"), "轴号说成人话");
+      check(hasq(ecatcmd::fault_axis_text(1, 0xFF02), "轴Y"), "另一根也对");
+   }
+
+   caseBegin("603Fh: 横幅上每一根报故障的轴各自的码都要说到");
+   {
+      BusTelem t;
+      t.connected = true;
+      t.in_op     = true;
+      t.naxis     = 2;
+      for (int i = 0; i < 2; i++)
+      {
+         t.ax[i].valid     = true;
+         t.ax[i].mirror_ok = true;
+      }
+
+      /* 没故障: 这一句不许自己编出个码来 */
+      check(ecatcmd::faulted_axes_text(t).isEmpty(), "没故障 -> 不提码");
+      check(!hasq(ecatcmd::fault_banner_text(t), "603Fh"), "没故障 -> 横幅里也不提 603Fh");
+
+      /* 只有轴Y 报故障: 码只许说那一根 —— 说成两根会把操作员支到健康的那根上 */
+      t.ax[1].fault      = true;
+      t.ax[1].fault_code = 0xFF01;
+      check(hasq(ecatcmd::faulted_axes_text(t), "轴Y"), "带上了轴Y");
+      check(hasq(ecatcmd::faulted_axes_text(t), "过流"), "带上了码的意思");
+      check(!hasq(ecatcmd::faulted_axes_text(t), "轴X"), "不许把没故障的轴X 也一起说");
+
+      /* 码还没到 (UNREAD) 与读不到 (FAIL): 两拍都照实说, 都不许编 */
+      t.ax[1].fault_code = HMI_FAULT_CODE_UNREAD;
+      check(hasq(ecatcmd::fault_banner_text(t), "还没读到"), "第一拍: 照实说还没读到");
+      t.ax[1].fault_code = HMI_FAULT_CODE_FAIL;
+      check(hasq(ecatcmd::fault_banner_text(t), "读不到"), "读不到也照实说");
+
+      t.ax[1].fault_code = 0xFF01;
+
+      const QString b = ecatcmd::fault_banner_text(t);
+      check(hasq(b, "6041h bit3"), "横幅说清是哪个位");
+      check(hasq(b, "0xFF01"),    "横幅给出码");
+      check(hasq(b, "过流"),      "横幅给出码的意思");
+      check(hasq(b, "机械"),      "横幅给出下一步查哪儿 —— 处置办法随码走");
+
+      /* 两根一起报: 各自的码都要在, 不能只留后一根 (那正是"故障码"这件事最容易被写丢的地方) */
+      t.ax[0].fault      = true;
+      t.ax[0].fault_code = 0xFF03;
+
+      const QString both = ecatcmd::faulted_axes_text(t);
+      check(hasq(both, "轴X") && hasq(both, "轴Y"), "两根都在");
+      check(hasq(both, "欠压") && hasq(both, "过流"), "两根各自的码都在");
    }
 
    /* ---- 控制器那道闸 -------------------------------------------- */

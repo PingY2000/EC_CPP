@@ -341,7 +341,11 @@ void AxisPanel::refresh(const AxisTelem &t)
    /* 走没走完用下发目标判: CSP 下驱动器没有"到位"信号可等 */
    QString st = t.state;
    if (t.fault)
-      st = QStringLiteral("故障: ") + st;
+      /* 6041h bit3 只说"有故障", **是哪一种看 603Fh** (过流/过压/欠压/动力线/通讯/传感器
+       * 的处置办法完全不搭界)。它是 SDO 读的, 所以故障沿那一拍还没到 —— 那两种情况
+       * fault_code_text 自己会说清 ("还没读到" / "读不到"), 不会编一个码出来 */
+      st = QStringLiteral("故障: ") + st + QStringLiteral(" · 故障码 ")
+             + ecatcmd::fault_code_text(t.fault_code);
    else if (t.enabled && !t.at_target)
       st += QStringLiteral(" · 运动中");
    else if (t.enabled)

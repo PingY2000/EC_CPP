@@ -984,7 +984,9 @@ QWidget *ScanWindow::buildAxisPanel()
       "未使能时点画布不会动: 这是「这个轴现在能不能走」的答案。",
 
       "6041h bit3 —— 驱动器故障位。红亮 = 有故障, 灭 = 无故障。\n"
-      "**扫描中置起会自动中止**; 用右边那格「故障复位」清掉它再启扫。",
+      "**扫描中置起会自动中止**; 用右边那格「故障复位」清掉它再启扫。\n"
+      "**是哪一种故障看故障码 603Fh** (过流/过压/欠压/动力线/通讯/传感器处置办法各不相同),\n"
+      "它不在过程数据里, 只能故障发生后再读一次, 所以红横幅上那句码会**比故障晚一拍**到。",
 
       /* 原点灯是绿的, 所以要说出声来 */
       "60FDh bit2 —— 原点开关现在压着没有 (2310h X0 = 原点)。\n"
@@ -1932,11 +1934,14 @@ void ScanWindow::onFaultResetClicked()
    }
    else
    {
+      /* 名字后面带上 603Fh: **复位只是清故障位, 不消除原因** —— 这点信息正好在操作员
+       * 就要动手的那一帧给他 (遥测里那份码要还是"还没读到", 这一句就照实这么说) */
       QStringList names;
       for (int k = 0; k < ntodo && k < EM_MAX_AXES; k++)
-         names << QStringLiteral("轴%1").arg(todo[k] == 0 ? 'X' : 'Y');
+         names << ecatcmd::fault_axis_text(todo[k], t.ax[todo[k]].fault_code);
       who = QStringLiteral("复位看起来报故障的: %1。复位成功后该轴停在**未使能**, "
-                           "要接着走请重新点「使能」。").arg(names.join(QStringLiteral("、")));
+                           "要接着走请重新点「使能」。**复位清的是故障位, 不是原因** —— "
+                           "同一条故障会再报一次。").arg(names.join(QStringLiteral("、")));
    }
 
    hint(who, false);
@@ -2838,15 +2843,51 @@ void ScanWindow::refresh()
          : QStringLiteral("现在读不了 —— ") + why + QStringLiteral("\n\n") + readOnceTip());
    }
 
-   /* 故障横幅只在上升沿弹一次: 每帧都设会把重绘刷爆, 也会把刚点掉的提示顶回来 */
+   /* 故障横幅 **分两拍**, 说的都是 ecatcmd::fault_banner_text(t) (那一条模板同时管着
+    * "码还没读到"与"码到了"两种说法, 见它的注释):
+    *   第一拍 —— 上升沿。这一刻 603Fh 还没读回来 (那条 SDO 在下一圈), 横幅只能说"还没读到"。
+    *   第二拍 —— 码到了。**「驱动器故障要给出故障码」的重点就在这一拍**: 只弹第一拍的话,
+    *             操作员看到的就是一句"出故障了", 而该查什么全在那四个十六进制数字里。
+    * 两拍都只在"要说的话变了"时才弹: 30Hz 每帧都设会把重绘刷爆, 也会把刚点掉的提示顶回来。 */
    if (t.fault && !m_faultShown)
    {
       m_faultShown = true;
-      hint(QStringLiteral("6041h bit3 = 故障 —— 目标已冻结, 电机状态请以驱动器面板为准。"), true);
+      hint(ecatcmd::fault_banner_text(t), true);
+
+      /* 这一句里已经把**此刻**那份码写进去了 (可能已经有值, 也可能还是"还没读到")。
+       * 记下来, 免得下面第二拍同一帧再弹一遍同样的字 */
+      for (int i = 0; i < 2; i++)
+         if (t.ax[i].valid && t.ax[i].mirror_ok && t.ax[i].fault)
+            m_faultCodeShown[i] = t.ax[i].fault_code;
    }
    else if (!t.fault)
    {
       m_faultShown = false;
+
+      /* 故障没了: 把"横幅上说过哪个码"也忘掉 —— 留着的话下一次故障读到的若是同一个码,
+       * 第二拍就永远不会弹 (这一句就是那条 bug 的闸) */
+      for (int i = 0; i < 2; i++)
+         m_faultCodeShown[i] = HMI_FAULT_CODE_UNREAD;
+   }
+
+   /* 第二拍: 逐轴比"横幅上已经说过的那一个码"。**只有报故障的轴参与**, 且 UNREAD 不算
+    * "变了" (那还是第一拍的状态), FAIL 算 —— "读不到"是这一趟的结论, 该让操作员知道 */
+   if (t.fault)
+   {
+      for (int i = 0; i < 2; i++)
+      {
+         const AxisTelem &a = t.ax[i];
+
+         if (!m_connected || !a.valid || !a.mirror_ok || !a.fault)
+            continue;
+         if (a.fault_code == m_faultCodeShown[i])
+            continue;
+
+         m_faultCodeShown[i] = a.fault_code;
+
+         if (a.fault_code != HMI_FAULT_CODE_UNREAD)
+            hint(ecatcmd::fault_banner_text(t), true);
+      }
    }
 
    if (m_thr->maybeLive() && !m_warnedLive)

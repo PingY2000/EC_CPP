@@ -68,5 +68,9 @@ private:
 
    bool m_connected = false;
    bool m_faultShown = false;
+   /* 故障横幅上**已经说过**的那个 603Fh (一根轴一格)。码是故障沿之后才到的,
+    * 到了要重弹一次横幅, 而"弹过了没有"只能按轴存着 —— 否则 30Hz 每帧都弹。
+    * 与 scan 侧 ScanWindow::m_faultCodeShown 同一套 (两处说法必须一致) */
+   int  m_faultCodeShown[2] = {HMI_FAULT_CODE_UNREAD, HMI_FAULT_CODE_UNREAD};
    bool m_warnedLive = false;
 };

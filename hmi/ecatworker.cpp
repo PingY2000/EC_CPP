@@ -15,6 +15,8 @@ EcatThread::EcatThread(QObject *parent) : QThread(parent)
       m_want[i] = 0;
       /* "还没读过"必须显式写: 0 是一个合法的模式号 (未定义), 不能拿它冒充"没读过" */
       m_mode_disp[i] = HMI_MODE_DISP_UNREAD;
+      /* 同一个坑: 603Fh 的 0x0000 是"无错误"这个真实读数 */
+      m_fault_code[i] = HMI_FAULT_CODE_UNREAD;
    }
 }
 
@@ -247,6 +249,11 @@ void EcatThread::run()
 
       if (m_bus != nullptr && m_in_op)
       {
+         /* 故障码 603Fh: publish() 只挂牌子, SDO 读在这里做 (见 serviceFaultCodeReads)。
+          * 摆在插补之前 —— 牌子是上一圈 publish() 挂的, 而"故障"这件事比"这一帧的目标"
+          * 更急。这一趟读到之前, 界面看到的 fault_code 是 UNREAD, 它自己会说"正在读" */
+         serviceFaultCodeReads();
+
          qint64 now = clk.elapsed();
          uint32_t dt = (uint32_t)(now - last);
          last = now;
@@ -641,9 +648,15 @@ void EcatThread::doFaultReset()
 
       /* 比的是 0, 不是 EM_R_OK (那是 ec_motor_internal.h 里的内部宏, 界面侧不 include) */
       if (em_fault_reset(m_ax[i]) == 0)
+      {
          ok << nm;
+      }
       else
-         bad << nm;
+      {
+         /* 失败的轴上带一份**复位之前**读到的 603Fh —— 复位都没清掉的那个故障,
+          * 码就是下一步要查的东西。此时它多半已经有值了 (故障沿之后服务工作线程读过) */
+         bad << ecatcmd::fault_axis_text(i, m_fault_code[i]);
+      }
    }
 
    m_resetting = false;
@@ -663,8 +676,9 @@ void EcatThread::doFaultReset()
    {
       if (!s.isEmpty())
          s += QStringLiteral("   ");
-      s += QStringLiteral("%1 复位失败 —— **先查清故障原因** (控制台里有 6041h 的实测值, "
-                          "603Fh 是故障码), 不要靠反复点硬顶").arg(bad.join(QStringLiteral("/")));
+      s += QStringLiteral("%1 复位失败 —— **按那个码查清原因再点**, 不要反复点硬顶 "
+                          "(控制台里有 6041h 的实测值)")
+              .arg(bad.join(QStringLiteral("; ")));
    }
 
    /* m_fault_latched **不在这里碰**: 它只有一个写者 (publish()), 清除条件就是 "bit3 掉了"。
@@ -894,6 +908,56 @@ void EcatThread::readModeDisp(int axis)
    m_mode_disp[axis] = em_get_mode(m_ax[axis]);
 }
 
+/* 故障码 603Fh。**6041h bit3 只说"有故障", 说不了是哪一个** —— 过流/过压/欠压/动力线/
+ * 通讯/传感器在界面上长得一模一样, 而处置办法完全不同, 所以必须把 603Fh 读出来。
+ *
+ * 分工: publish() 每帧扫 bit3, 看见某个轴报故障就给它挂一块牌子 (m_fault_read_want);
+ * 真正那条 SDO 读在**这里**做 —— publish() 是每帧跑的, 里面不许有 SDO (一条 603Fh 的
+ * SDO 读就是几毫秒, 挂在 2ms 的圈里等于把圈期交给 SDO 的往返时间, 插补会抖)。
+ *
+ * **一个故障回合只读一次**: 读到就存值, 读不到就存 FAIL, 然后摘牌。故障每 2ms 重挂一次
+ * 的话就成了每 2ms 一条 SDO —— 驱动器不应答时尤其糟 (要等 SDO 超时)。bit3 掉了之后
+ * publish() 会把 m_fault_code 置回 UNREAD, 于是下一次故障会重新读。
+ *
+ * **安全性**: 走到这里 bit3 已经是 1, 驱动器自己早就退电了, 没有运动需要维持; 这一条读
+ * 与 doConnect/doEnable 里的那些 SDO 读同序 (同一根从站、同一个邮箱通道, 只有本线程用)。
+ * 阻塞命令 (em_home 等) 期间跑不到这里 —— 那些帧里 publish() 只挂得上牌子, 读要等它们
+ * 回来。实测意义: 找限位途中报故障, 界面上故障横幅立刻有, 故障码晚一次命令的时间。 */
+void EcatThread::serviceFaultCodeReads()
+{
+   for (int i = 0; i < m_naxis; i++)
+   {
+      if (!m_fault_read_want[i])
+         continue;
+
+      if (m_ax[i] == nullptr)
+      {
+         m_fault_read_want[i] = false;
+         continue;
+      }
+
+      /* 牌子摘掉再读: 无论成败都只试一次 (理由见上面"一个回合只读一次") */
+      m_fault_read_want[i] = false;
+
+      uint16_t v = 0;
+
+      if (em_rd_u16(m_bus, em_axis_slave(m_ax[i]), EM_OID_ERROR_CODE, 0, &v) == 0)
+      {
+         m_fault_code[i] = (int)v;
+         note(ecatcmd::fault_code_line(i, (int)v));
+      }
+      else
+      {
+         /* 与 0x0000 (无错误) 区分开: 读不到 ≠ 没故障 —— bit3 还立在那儿呢 */
+         m_fault_code[i] = HMI_FAULT_CODE_FAIL;
+         note(QStringLiteral("%1 —— bit3 仍立着, 只是码没拿到。"
+                             "面板 ALM 灯的红闪次数可以人工数: 1 过流 / 2 过压 / 3 欠压 / "
+                             "6 通讯 / 8 传感器")
+                 .arg(ecatcmd::fault_axis_text(i, HMI_FAULT_CODE_FAIL)));
+      }
+   }
+}
+
 void EcatThread::doStop()
 {
    /* 停止 = 把目标冻在当前插值点上。**不写 6040h=0x0000**: 那是卸力, 滑台会自由滑 */
@@ -1107,6 +1171,8 @@ void EcatThread::publish(int wkc)
       a.state     = QString::fromUtf8(em_sw_state_str(a.sw));
       a.enabled   = em_is_enabled(ax) != 0;
       a.fault     = (a.sw & EM_SW_FAULT) != 0;
+      /* 只是搬一份**上次读到**的 603Fh —— 这里不做 SDO 读 (理由见 serviceFaultCodeReads) */
+      a.fault_code = m_fault_code[i];
       a.pos       = em_pos(ax) - m_origin[i];
       a.tgt       = m_tgt[i];
       a.want      = want[i];
@@ -1135,7 +1201,23 @@ void EcatThread::publish(int wkc)
                                           di_invert);
 
       if (a.fault)
+      {
          t.fault = true;
+
+         /* 挂"还欠它一次 603Fh 读"的牌子。**一挂一次**: 读到之后
+          * serviceFaultCodeReads 会把牌子摘掉、把值写进 m_fault_code, 于是这里不再挂 ——
+          * 牌子挂着的意思永远是"还没读到", 不会退化成每 2ms 一条 SDO。 */
+         if (m_fault_code[i] == HMI_FAULT_CODE_UNREAD)
+            m_fault_read_want[i] = true;
+      }
+      else
+      {
+         /* 故障没了就把码也放下 (下一次故障重新读)。**留着旧的才是坑**: 一根健康的轴旁边
+          * 挂着一句 "0xFF02 (过压)" 等于在说它现在过压。要留痕看控制台 —— note() 那条在
+          * 那儿, 不会被这里擦掉。 */
+         m_fault_code[i]       = HMI_FAULT_CODE_UNREAD;
+         m_fault_read_want[i]  = false;
+      }
    }
 
    if (t.fault && !m_fault_latched)
@@ -1146,9 +1228,11 @@ void EcatThread::publish(int wkc)
          for (int i = 0; i < EM_MAX_AXES; i++)
             m_want[i] = m_tgt[i];
       }
-      /* 不写 0x0000: 故障时驱动器自己会退电, 这里只停止下发新目标 */
-      note(QStringLiteral("6041h bit3 = Fault -> 已冻结目标。查清故障原因 (603Fh 是故障码), "
-                          "再用「故障复位」清故障位"));
+      /* 不写 0x0000: 故障时驱动器自己会退电, 这里只停止下发新目标。
+       * 这一句只是"先占住状态栏" —— 603Fh 的码要下一圈才读得回来, 读到后
+       * serviceFaultCodeReads 会用带码的那一句把它顶掉 (note 是覆盖写)。 */
+      note(QStringLiteral("6041h bit3 = Fault -> 已冻结目标。**故障码 603Fh 正在读** —— "
+                          "码出来按码处置, 再用「故障复位」清故障位"));
    }
    else if (!t.fault)
    {
@@ -1179,6 +1263,10 @@ void EcatThread::teardown()
    {
       m_ax[i]     = nullptr;
       m_tgt[i]    = 0;
+      /* 603Fh 跟着一起清: 换了台驱动器还挂着上一台读到的码, 是最难查的那种假象。
+       * 牌子也要摘 —— 摘不掉的话下一轮的 serviceFaultCodeReads 会拿着空 m_ax 去读 */
+      m_fault_code[i]      = HMI_FAULT_CODE_UNREAD;
+      m_fault_read_want[i] = false;
    }
 
    if (m_bus != nullptr)

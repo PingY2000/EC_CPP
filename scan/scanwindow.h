@@ -342,6 +342,10 @@ private:
    int32_t m_last_range = 0;
    bool m_connected = false;
    bool m_faultShown = false;
+   /* 故障横幅上**已经说过**的那个 603Fh (一根轴一格)。初值 = HMI_FAULT_CODE_UNREAD ——
+    * 哨兵值都是负数, 不会与任何真实读数撞上。用处: 码是故障沿**之后**才到的, 到了要重弹一次
+    * 横幅, 而"弹过了没有"只能按轴存着, 否则 30Hz 每帧都弹 */
+   int  m_faultCodeShown[2] = {HMI_FAULT_CODE_UNREAD, HMI_FAULT_CODE_UNREAD};
    bool m_limShown[2] = {false, false};   /* 限位横幅的上升沿防重入, 一根轴一个 */
    /* 我们发出去的那条限位横幅原文。下降沿靠它认现在挂着的是不是我们自己那条: 是才清, 不是不能动 */
    QString m_limBanner[2];

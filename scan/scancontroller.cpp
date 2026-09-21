@@ -810,7 +810,17 @@ QString ScanController::healthProblem(const BusTelem &t)
       return QStringLiteral("掉出了 OP 状态 —— 过程数据已经不可信, 扫描自动中止");
 
    if (t.fault)
-      return QStringLiteral("驱动器报故障 (6041h bit3) —— 目标已被冻结, 扫描自动中止");
+   {
+      /* 6041h bit3 只说"有故障"; **说清是哪一个靠 603Fh** (ecatcmd::faulted_axes_text)。
+       * 读不回来时那一句自己会说"还没读到 / 读不到", 不会编一个码出来 ——
+       * 但这句自动中止是当场弹的, 那一刻码通常还没到, 所以中止窗口里那份"还没读到"
+       * 是常态, 不是异常; 后面红横幅上会补上。 */
+      const QString codes = ecatcmd::faulted_axes_text(t);
+
+      return QStringLiteral("驱动器报故障 (6041h bit3) —— 目标已被冻结, 扫描自动中止%1")
+                .arg(codes.isEmpty() ? QString()
+                                     : QStringLiteral("。  故障码: ") + codes);
+   }
 
    /* WKC 不足 = 拔网线 / 掉了供电; 单帧抖动不值得中止, 连续 10 帧 (30Hz 下约 1/3 秒) 才认 */
    if (t.expected_wkc > 0 && t.wkc < t.expected_wkc)
