@@ -1,32 +1,33 @@
 # EC_CPP
 
-面向研控 **YKD2205PE** EtherCAT 滑台驱动器 (CiA 402) 的原生 C / SOEM 工具集。
+面向研控 **YKD2205PE** EtherCAT 滑台驱动器 (CiA 402) 的 Qt 上位机与原生 C 运动接口。
+
+**2026-09-21 清理**: 仓库原先有一批命令行验收/诊断程序 (`aliasinfo` / `slide_verify` /
+`slide_motion` 含 `sm_state` / `sm_pdo` / `test2` / `motor_test`)。`scan` 一个都不依赖,
+所以它们连同 `baseline_ykd2205pe.ini`、`docs/slide_motion_verify.md` 一起删掉了。
+**现在只有两个程序: `scan` (产品) 与 `hmi` (它的前身界面)** —— 外加一个不需要设备就能跑的
+`scan_selftest`。它们留下的**结论**(驱动器实测值、PDO 映射、安全口径) 全部保留在下面的
+文档与代码注释里。
 
 ## 目录结构
 
 | 路径 | 说明 |
 |---|---|
 | [SOEM/](SOEM/) | 下载的第三方 EtherCAT 主站库 (**Simple Open EtherCAT Master**),保持原样不改动 |
-| [aliasinfo/](aliasinfo/) | 自有工具:读取各从站 ESC 0012h-0013h 站点别名 (拨码站号) |
-| [slide_verify/](slide_verify/) | 自有工具:滑台设备导入验证 (扫描总线 → 读 CiA402 对象 → PASS/WARN/FAIL → 退出码) |
-| [slide_motion/](slide_motion/) | 自有工具:**带动作**验收验证 (参数基线 → 使能状态机 → 微动与反馈闭环),**默认不动** |
-| ↳ `sm_state` / `sm_pdo` | 同目录下的两个**独立**专项小程序: 只验证 CiA402 状态机切换。`sm_state` 用 **SDO + PRE_OP**, `sm_pdo` 用 **PDO + OP** (会写 PDO 映射, 见下) |
-| [motor_api/](motor_api/) | 自有工具:**多轴 CiA402 运动接口** (位置同步 CSP / 速度 PV / 回零 HM) + 验收程序 `motor_test`。**至少支持同时驱动两台**, 目标值每周期经过程数据下发 |
-| [hmi/](hmi/) | 自有工具:**Qt Widgets 上位机 (手动调试台)** —— 两台滑台 ±500000 脉冲的 **CSP 点击定位界面** (点哪里去哪里 / 开机位置即零点 / 速度可调)。**默认不编**, 见下 |
-| [scan/](scan/) | 自有工具:**Qt Widgets 上位机 (自动采集)** —— 控制滑台**蛇形扫描**一个矩形区域, 逐点停、逐点读功率计、写 CSV 并画二维热力图。**共用 `hmi/` 的总线工作线程** (原样编进来, 不复制)。默认跟随 `EC_BUILD_HMI`, 见下 |
-| [baseline_ykd2205pe.ini](baseline_ykd2205pe.ini) | 示例参数基线 (由 `slide_motion --dump-baseline` 现场导出后人工审定) |
-| [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md) | YKD2205PE 对象速查与各工具的用法/退出码文档 |
-| [docs/slide_motion_verify.md](docs/slide_motion_verify.md) | `slide_motion` 的完整设计/安全须知/微动判据/实测记录 |
+| [motor_api/](motor_api/) | 自有代码:**多轴 CiA402 运动接口** (位置同步 CSP / 速度 PV / 回零 HM)。**至少支持同时驱动两台**, 目标值每周期经过程数据下发。**纯源码目录** —— 没有 CMakeLists, 两个 `.c` 由 `hmi` 与 `scan` 各自直接编进去 |
+| [hmi/](hmi/) | 自有程序:**Qt Widgets 上位机 (手动调试台)** —— 两台滑台 ±500000 脉冲的 **CSP 点击定位界面** (点哪里去哪里 / 开机位置即零点 / 速度可调), 外加 `ecatworker` 这个总线工作线程。**默认不编**, 见下 |
+| [scan/](scan/) | 自有程序:**Qt Widgets 上位机 (自动采集)** —— 控制滑台**蛇形扫描**一个矩形区域, 逐点停、逐点读功率计、写 CSV 并画二维热力图。**共用 `hmi/` 的总线工作线程** (原样编进来, 不复制)。默认跟随 `EC_BUILD_HMI`, 见下 |
+| [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md) | YKD2205PE 对象速查与实读记录 |
 | [docs/hmi_click_position.md](docs/hmi_click_position.md) | `hmi` (Qt 上位机) 的完整设计: 线程模型 / 坐标与零点 / CSP 插补 / 护栏 / 构建部署的坑 / 验收状态 |
 | [docs/scan_sweep.md](docs/scan_sweep.md) | `scan` (扫描采集) 的完整设计: 网格与蛇形 / 到位判据 / 状态机 / 功率计接口 / CSV 与断点续扫 / 量程算法 / 护栏 / 验收状态 |
-| [YKD2205PE.pdf](YKD2205PE.pdf) | 厂商手册 (参考) |
+| [YKD/](YKD/) | 厂商手册 (参考)。实际在 `YKD/` 下, 有 V1.0 / V1.1 / V2.3 / V2.4 四个版本 —— 文件名带空格, 原来那行 `[YKD2205PE.pdf](YKD2205PE.pdf)` 是死链, 2026-09-21 改成指目录 |
 
-顶层 `CMakeLists.txt` 通过 `add_subdirectory(SOEM)` 引用 SOEM 库,
-再 `add_subdirectory` 各自有工具 —— SOEM 只以子工程身份产出 `soem` 静态库,
-不构建其自带 samples,源码不被改动。
+顶层 `CMakeLists.txt` 通过 `add_subdirectory(SOEM)` 引用 SOEM 库, 再 `add_subdirectory`
+两个上位机 —— SOEM 只以子工程身份产出 `soem` 静态库, 不构建其自带 samples, 源码不被改动。
 
-`hmi/` 由一个开关控制: `-DEC_BUILD_HMI=ON` 才会被 `add_subdirectory`。**默认 OFF**,
-所以没装 Qt 的机器照旧能编上面那些 CLI (那几条构建连 C++ 编译器都不需要有)。
+`hmi/` 由一个开关控制: `-DEC_BUILD_HMI=ON` 才会被 `add_subdirectory`。**默认 OFF** ——
+现在 OFF 等于**只编 SOEM 静态库**, 那是给"只验 SOEM 能不能编过"用的 (`enable_language(CXX)`
+在 `hmi/CMakeLists.txt` 里, 所以这一档连 C++ 编译器都不需要有)。
 `scan/` 由 `EC_BUILD_SCAN` 控制, **默认值就是 `${EC_BUILD_HMI}`** —— 于是现有那条
 `cmake --preset hmi-qt-ucrt64` 一次把两个都编出来, 只想编 hmi 的人 `-DEC_BUILD_SCAN=OFF`。
 两个界面侧都**不 include SOEM**、不调 `ecx_*`: 所有总线操作都在工作线程里, 见
@@ -34,21 +35,16 @@
 
 ## 构建
 
-本机 (MSYS2 UCRT64 MinGW) 示例;VS/CMake 环境把 `build-mingw` 换成 `build` 即可:
+两个程序都要 Qt6 + C++ 编译器, 走的是仓库自带的 preset (见下一节)。
+只编 SOEM 那一步 (不碰 Qt) 是:
 
 ```bash
 cmake -S . -B build-mingw -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_C_COMPILER=C:/msys64/ucrt64/bin/gcc.exe
-cmake --build build-mingw --target slide_verify aliasinfo slide_motion sm_state sm_pdo motor_test
+cmake --build build-mingw --target soem
 ```
 
 产物 (统一输出到仓库根的 `bin/`):
-- `bin/slide_verify.exe`
-- `bin/aliasinfo.exe`
-- `bin/slide_motion.exe`
-- `bin/sm_state.exe`
-- `bin/sm_pdo.exe`
-- `bin/motor_test.exe`
 - `bin/hmi.exe` (仅当 `EC_BUILD_HMI=ON`)
 - `bin/scan.exe` / `bin/scan_selftest.exe` (仅当 `EC_BUILD_SCAN=ON`, 默认跟随 `EC_BUILD_HMI`)
 
@@ -57,8 +53,8 @@ cmake --build build-mingw --target slide_verify aliasinfo slide_motion sm_state 
 完整设计、部署细节与**哪些验收做了 / 哪些还没做**见
 [docs/hmi_click_position.md](docs/hmi_click_position.md)。
 
-先装依赖(**新机器做一次**)。Qt 必须取自 **MSYS2 的 UCRT64 仓库**, 与上面那些 CLI 用
-**同一个** `C:/msys64/ucrt64` 工具链:
+先装依赖(**新机器做一次**)。Qt 必须取自 **MSYS2 的 UCRT64 仓库** —— 编译器和 `motor_api`
+用的是**同一个** `C:/msys64/ucrt64` 工具链 (底下那堆 `-D_UCRT -lucrt` 就是为它准备的):
 
 ```bash
 MSYSTEM=UCRT64 pacman -S --needed mingw-w64-ucrt-x86_64-qt6-base
@@ -171,48 +167,30 @@ PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
 
 ## 运行注意
 
-- `aliasinfo` 与 `slide_verify` 是**只读**的 (不进 OP、不写 6040h 控制字、不动电机)。
-- `slide_motion` **默认也是只读的**: 不给 `--allow-motion` 时不写一个字节。
-  只有显式给 `--allow-motion --allow-jog` 并再过一次交互确认, 它才会让电机通电
-  并移动滑台 —— 真动时**必须有人在设备旁、手放在物理急停上**。
-  它永远不写 `2102h` (EEPROM)、不改 PDO 映射、不写软限位。
-  退出码 **10** = 收尾写完 `6040h=0` 但回读 `6041h` 仍报 Operation enabled,
-  即**电机可能仍带电** —— 它覆盖其它所有退出码, 见到请立即断电确认。
-- `sm_state` / `sm_pdo` 是 CiA402 状态机切换的**专项验证**小程序, 同样**默认只读**:
-  - `sm_state` 只写 `6040h` (SDO, 在 PRE_OP 下)。
-  - `sm_pdo` 用 **PDO + OP** 走同样 8 步 —— 为此它**会写 PDO 映射对象**
-    `1A00h`/`1C13h` (出厂 TxPDO 为空, 不补写就进不了 SAFE_OP)。**只写 RAM,
-    从不写 `2102h` (EEPROM)**; 默认跑完**还原**成运行前快照 (`--keep-mapping` 才保留,
-    `--no-map` 整个跳过)。需要 `--allow-pdo` 才写; 默认只打印 PDO 快照。
-  - 两者都发**零运动指令**、不写 `607Ah`/`6060h`/软限位。但走到 Enable Operation
-    之后电机会通电 (有保持力矩) —— **真跑时人在设备旁, 手放在物理急停上**。
-  - 退出码 **10** 的含义与 `slide_motion` 相同: 收尾未能确认失能, **电机可能仍带电**。
-- `motor_api` / `motor_test` 是**多轴运动接口** (CSP 位置同步 / PV 速度 / HM 回零),
-  与 `slide_motion` 的 SDO + PP 并列, 区别在于**目标值每周期经过程数据下发** ——
-  CSP/PV 要求目标值每周期刷新, SDO 的 700 ms 往返追不上。同样**默认一个字节都不写**:
-  写 PDO 映射要 `--allow-pdo`, 使能/运动要 `--allow-motion`, 回零要 `--home`
-  (它会撞限位、会找原点开关; 加 `--home-lim pos|neg` 则改成**以限位开关为原点** ——
-  方式 18/17, 手册叫「找限位」, 它**必须同时给 `--home`**, 同一类风险同一道授权)。
-  用 `--mode csp|pv` 选 S6 跑位置同步还是速度模式。
-  **先不带任何 `--allow` 参数跑一次**: 它读完总线、打印实读的 PDO 映射与只读参数后
-  就退出 0, 一个字节都不写。退出码 **10** 同理。
-  > **`--allow-motion` 本身就是那句确认, 运行时不再问一次 y/N** —— 别在脚本里顺手
-  > 加上它。(`slide_motion` 有交互确认, 这个工具没有。)
-  > 它**不写死** `1600h`/`1A00h`, 而是先读 `1C12h`/`1C13h` 问"哪个 PDO 生效" ——
-  > 本机 `1C12h` 指的是 **`1601h`**, `1600h` 是一张**没生效**的表。
-  > 同理 `6060h`(运行模式) 就在 `1601h` 里, 所以它由过程数据驱动而不是 SDO ——
-  > 对它做 SDO 写会被下一帧撤销。
-  > **这条规矩适用于表里每一项**: `6081h`/`6083h`/`6084h` 也在 `1601h` 里, 主站每
-  > 周期都在下发它们 —— 不驱动就是下发 0。`6083h` 被下发成 0 会让 PV 的斜坡永远
-  > 起不来(现象: 报速度指令已被接受、却一步不走), 所以加减速度现在由接口下发,
-  > 可用 `--ramp-acc`/`--ramp-dec` 指定。详见
-  > [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md) 的「PDO 映射」。
-- `hmi` (Qt 上位机) 与 CLI **同一套护栏**, 只是把 `--allow-*` 换成了按钮:
+- **「退出码 10」的语义现在只剩模态告警这一种形态。** 原先 CLI 用退出码 10 表示
+  "收尾写完 `6040h = 0` 但回读 `6041h` 仍报 Operation enabled" —— 即**电机可能仍带电**,
+  它覆盖其它所有退出码。两个上位机的收尾是同一件事, 只是报法变成了**弹一个没有「取消」
+  可点的模态框**。**见到请立即断掉驱动器动力电源, 不要只依赖软件。**
+- 运动接口 (`motor_api`) 与 CLI 说过的几条**实测事实**仍然成立, 因为它们约束的是驱动器、
+  不是那个程序:
+  - 它**不写死** `1600h`/`1A00h`, 而是先读 `1C12h`/`1C13h` 问"哪个 PDO 生效" ——
+    本机 `1C12h` 指的是 **`1601h`**, `1600h` 是一张**没生效**的表。
+  - 同理 `6060h`(运行模式) 就在 `1601h` 里, 所以它由过程数据驱动而不是 SDO ——
+    对它做 SDO 写会被下一帧撤销。
+  - **这条规矩适用于表里每一项**: `6081h`/`6083h`/`6084h` 也在 `1601h` 里, 主站每
+    周期都在下发它们 —— 不驱动就是下发 0。`6083h` 被下发成 0 会让 PV 的斜坡永远
+    起不来 (现象: 报速度指令已被接受、却一步不走), 所以加减速度由接口下发
+    (`em_set_ramp()`)。**界面侧不调它** —— `hmi`/`scan` 自己按实测 `dt` 做梯形插补;
+    但 `em_setup` 里进 OP 之前那次 `em__pin_ramp()` (把常量写进镜像) 照走, 谁也绕不开。
+    详见 [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md) 的「PDO 映射」。
+  - 上面这几条**不是 GUI 独有的**: `em_setup` 与 `em__pin_ramp()` 是 `scan` / `hmi`
+    每次「连接」都要走的路, 走错了现象与当年 CLI 上一模一样。
+- `hmi` (Qt 上位机) 沿用**原 CLI 那一套护栏**, 只是把 `--allow-*` 换成了按钮:
   - **启动后一个字节都不写**。按钮形态完全由总线遥测推出来。
   - 顶栏「连接」= `em_open` + `em_setup` + 进 OP, **开始每 2ms 发帧**, 并会覆盖生效 RxPDO
     里主站拥有的那些项 —— **但这一步不发使能, 电机不带电**。点它会先弹一个说清这些的确认框。
   - **「使能」是唯一让电机带电的按钮**, 每次点击都弹模态确认 (要求"人在设备旁、手放在
-    物理急停上") —— 这就是 CLI 的 `--allow-motion`。**没有持久勾选、不自动使能**。
+    物理急停上") —— 这就是原先 CLI 的 `--allow-motion`。**没有持久勾选、不自动使能**。
   - 「停止」= 目标冻在当前位置并**保持保持力矩** (不卸力); 「失能」才是回失能态。
     `6041h` bit3 报故障 → 自动冻结目标 + 红色横幅。
   - 收尾 (断开 / 关窗) = 失能 → **还原 PDO 映射** → 降 `PRE_OP` → 关网卡。收尾时若
@@ -236,12 +214,15 @@ PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
     **第一次请把区域改成 `27 × 0.5` (分辨率 0.5) = 55 点、约 2 分钟**, 看方向和两端到不到位,
     再决定要不要放开整片。硬件限位是真实存在的 (`2311h`/`2312h` 实测 = 2/3:
     X1 = 正限位 / X2 = 负限位, `2310h` = 1 即 X0 = 原点) —— 区域算错就是一头撞上去。
-  - **`2201h` 的实**值**从没被记下来过**, 而它决定"1 单位 = 50000 脉冲"这个前提成不成立
-    (默认 0 = 细分有效 ⇒ 当量来自 `2400h` = 50000; 1 = 电子齿轮比有效 ⇒ 当量来自
-    `2408h`/`2409h` = 1000, **差 50 倍**)。动轴之前先跑一次 `motor_test` 不带任何
-    `--allow*` 的只读那一段 —— 它会打印 `2201h`。基线里现在按手册默认填了 `0` 并注明
-    那是**假设**: `2201h`/`2400h`/`2408h`/`2409h` 四项在 `sm_spec_table[]` 里都是
-    `dangerous` 的, 真值不是 0 会直接挡住动作, 不会静默地按错的当量去扫。
+  - **`2201h` 的真实值从没被记下来过, 而现在没有任何程序会读它。** 它决定"1 单位 =
+    50000 脉冲"这个前提成不成立 (0 = 细分有效 ⇒ 当量来自 `2400h` = 50000; 1 = 电子齿轮比
+    有效 ⇒ 当量来自 `2408h`/`2409h` = 1000, **差 50 倍**)。原先有个 CLI 的只读诊断会把它
+    连宽度一起打印出来, 那个程序与那份参数基线 2026-09-21 一起删掉了, **`sm_spec_table[]`
+    里那道"真值不对就挡住动作"的闸也跟着没了** —— `motor_api/ec_motor.h` 里
+    `EM_OID_GEAR_ENABLE` 现在**只剩定义, 一个调用方都没有**。
+    所以现在只有两条路: 用厂家上位机看一眼 `2201h`, 或者自己临时加一行
+    `em_rd_u16(bus, slave, EM_OID_GEAR_ENABLE, 0, &v)`。**弄清它之前别按缺省区域扫**
+    —— 当量差 50 倍时"27 单位"是 27 圈还是 0.54 圈, 没人知道。
   - 屏幕上的二维面板 **Shift + 左键**点哪里走哪里, 但**扫描进行中一律吞掉** (要先按「中止」)。
     **吞的只是手动定位** —— 只读的「查看」不归那道闸管, 扫描中照样能点。
     手动走点 (以及「全部回中」) 的速度是参数栏里单独的「手动速度」—— **只在没扫描时生效**;
@@ -380,10 +361,8 @@ PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
     其中**「使能」按钮已带电时是灰的、写着「已使能」**(任一轴还没使能就仍可按, 按下去
     使能剩下的那些 —— 故障复位会把某一根单独打回未使能)。**仍然弹的只有三个"出事后"的
     模态**: 扫描自动中止、收尾未能确认失能、收尾超时 —— 它们没有"取消"可点。
-- 全部工具都依赖 **Npcap** 独占网卡 —— 与仓库的 python 链 (pysoem) 一样,
-  **勿同时运行**。界面开着时同样独占: 别在它连着的时候再跑 CLI, 也**别同时开
-  `hmi` 和 `scan`** —— 两个界面各有一份 `ecatworker`, 谁先连上谁占住网卡。
-- 参数为网卡名 (Windows Npcap 形如 `\Device\NPF_{GUID}`),不带参数时列出可用网卡。
-- 详细用法、输出示例与退出码见 [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md)
-  (含 `sm_state`/`sm_pdo` 的选项与退出码表);
-  `slide_motion` 另见 [docs/slide_motion_verify.md](docs/slide_motion_verify.md)。
+- **Npcap 独占网卡。** 界面连着的时候**别同时开 `hmi` 和 `scan`** —— 两个界面各有一份
+  `ecatworker`, 谁先连上谁占住网卡 (与仓库的 python 链 pysoem 同理, 也别和它同时跑)。
+  网卡名是 Windows Npcap 那个形如 `\Device\NPF_{GUID}` 的串, 界面的连接面板里是下拉选,
+  不用手打。
+- 驱动器的对象速查与各项实测值见 [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md)。

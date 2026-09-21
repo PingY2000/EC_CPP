@@ -374,8 +374,8 @@ int em__wr_i32(em_axis_t *ax, uint16_t index, uint8_t sub, int32_t v, const char
  * 现场是 NPN 传感器 (高电平 = 未触发) 而驱动器配着常开, 两者反着: 60FDh 的 bit1/bit2 恒
  * 同时置起 -> 6041h bit11 恒为 1 -> 2204h = 0 把两个方向都挡死 (回零进得去、一动不动)。
  * 置 0x0007 (bit0~bit2 全 1 = 常闭) 是修根: 驱动器自己的限位保护与回零一起跟着对。
- * 宽度按驱动器自报的来 (手册 V2.4 p84 写 U16, slide_motion 的基线表记成 U8 —— 不猜),
- * bit3 以上的位原样保留。 */
+ * 宽度按驱动器自报的来 (手册 V2.4 p84 写 U16, 而当时那份现场基线表记成 U8 —— 两处对不上,
+ * 所以不猜, 读到几字节就按几字节写回), bit3 以上的位原样保留。 */
 
 static int em__di_read(em_bus_t *bus, int slave, uint16_t *val, int *sz)
 {
@@ -1687,7 +1687,9 @@ void em_shutdown(em_bus_t *bus, int restore_mapping, int *motor_maybe_live)
                 bus->snap_rx[i].assign.changed || bus->snap_tx[i].assign.changed)
             {
                printf("  %s: 还原 PDO 映射 ...\n", ax->label);
-               /* 先映射对象, 后分配对象 —— 与 sm_pdo.c 的还原顺序一致 */
+               /* 先映射对象, 后分配对象 —— **这是写入的逆序**, 不是随手排的:
+                * 写入时是先写分配表 (1C12h/1C13h, 见上面第 7 步) 再写映射对象 (第 8 步),
+                * 还原就反过来。撤东西按放的逆序, 中途每一步都是驱动器认得的组合 */
                (void)em_snap_restore(bus, ax->slave, &bus->snap_tx[i].pdo, 4, "TxPDO 1A00h");
                (void)em_snap_restore(bus, ax->slave, &bus->snap_tx[i].assign, 2, "TxPDO 分配 1C13h");
                (void)em_snap_restore(bus, ax->slave, &bus->snap_rx[i].pdo, 4, "RxPDO 1600h");

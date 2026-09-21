@@ -1,5 +1,23 @@
 # Qt 上位机的结构与布置规划
 
+> ### 这是**规划**, 不是现状 —— 2026-09-21 注
+>
+> 本文写在"上 Qt 之前", 前提是**先抽 `ecat_core` 静态库、再上 Qt**。
+> 实际落地时**没有建 `ecat_core/`** —— 仓库里没有这个目录, 也没有 `od/`、
+> `ArmController`、`ReplayBus`、`armEnable` 这些名字。护栏与判定最后落在
+> `motor_api/`(底座 + 运动层)与 `hmi/ecatworker.*`(工作线程)里。
+> **所以 §1 那张「同一个东西存在于多处」的表、§2 的目标目录树、§3 的线程图、
+> §4 的「CLI → GUI」对照、§13 的 P0~P4 验收表, 都当"当时的想法"读,
+> 不要当"该做什么"读。**
+>
+> 另外: 当年被拿来对照的那批命令行工具(`aliasinfo` / `slide_verify` /
+> `slide_motion` / `sm_state` / `sm_pdo` / `test2` / `motor_test`)与参数基线
+> `baseline_ykd2205pe.ini` **已在 2026-09-21 全部移除**(理由: `scan` 不依赖它们),
+> 所以本文里对它们的引用都只是**历史名词**。
+> **真正描述现状的是** [hmi_click_position.md](hmi_click_position.md) 与
+> [scan_sweep.md](scan_sweep.md); 本文留下的价值是**当时为什么这么想**,
+> 以及下面那些至今仍然成立的纪律(§14 那几条)。
+
 目标：在 `EC_CPP` 里增加一个 **Qt Widgets 工程师调试台**（`hmi/`），
 复用现有 SOEM 工具链的判定与护栏。
 
@@ -25,18 +43,21 @@
 
 ## 1. 为什么必须先抽 `ecat_core`
 
-现在同一个东西存在于多处：
+现在同一个东西存在于多处（**下表里那些文件现在都不在了** —— 见文首说明；
+表格保留原样，是因为它是这个规划的前提）：
 
 | 已有实现 | 内容 | 问题 |
 |---|---|---|
-| [slide_motion/sm_bus.c](../slide_motion/sm_bus.c) (733 行) | 时钟 / SDO 读 / 寄存器读 / 错误栈排空 / 身份判定 | 只读底座，但只有 `slide_motion` 一族在用 |
-| [slide_motion/sm_guard.c](../slide_motion/sm_guard.c) (741 行) | **全工程唯一的写入口** | 这条不变量写在 [slide_motion/CMakeLists.txt](../slide_motion/CMakeLists.txt) 里 |
-| [slide_motion/sm_baseline.c](../slide_motion/sm_baseline.c) (688 行) | 基线 INI 解析与比对 | — |
-| [slide_verify/slide_verify.c](../slide_verify/slide_verify.c) (723 行) | 自己一套总线初始化 + 对象校验表 `sv_objs[]` | **重复实现**，不含 `sm_guard` |
-| [slide_motion/test2.c](../slide_motion/test2.c) (1036 行) | 又一套最小实现 | 明确写了"放弃三条保障" |
-| [aliasinfo/aliasinfo.c](../aliasinfo/aliasinfo.c) (114 行) | 只读别名 | — |
+| `slide_motion/sm_bus.c` (733 行) | 时钟 / SDO 读 / 寄存器读 / 错误栈排空 / 身份判定 | 只读底座，但只有 `slide_motion` 一族在用 |
+| `slide_motion/sm_guard.c` (741 行) | **全工程唯一的写入口** | 这条不变量写在 `slide_motion/CMakeLists.txt` 里 |
+| `slide_motion/sm_baseline.c` (688 行) | 基线 INI 解析与比对 | — |
+| `slide_verify/slide_verify.c` (723 行) | 自己一套总线初始化 + 对象校验表 `sv_objs[]` | **重复实现**，不含 `sm_guard` |
+| `slide_motion/test2.c` (1036 行) | 又一套最小实现 | 明确写了"放弃三条保障" |
+| `aliasinfo/aliasinfo.c` (114 行) | 只读别名 | — |
 
 对象清单与判定规则硬编码在三处以上。
+(**这份规划当时要解的"多处重复"问题, 2026-09-21 用另一种方式了结了: 那批重复实现
+连同它们的程序一起删了, 现在只剩 `motor_api` 一份。**)
 
 `ecat_core` 是**让 Qt 不必成为第三个豁免者**的手段。
 
@@ -133,8 +154,10 @@ EC_CPP/
 
 - **SDO 只在"帧与帧的间隙"执行**（步骤 ⑤），不要单开一个 SDO 线程去抢
   `ecx_context`。
-- 运动期 SDO 超时压到 **200ms**（沿用 [sm.h](../slide_motion/sm.h) 里的
-  `SM_SDO_TMO_MOTION`）；非运动期才用 700ms。否则故障后最长 700ms 才发出停机写。
+- 运动期 SDO 超时压到 **200ms**（当年 `sm.h` 的 `SM_SDO_TMO_MOTION` 是这么做的；
+  该文件与那套代码 2026-09-21 一起删了，**这条只是当年的打算, 没有落地**：
+  现在 `motor_api/ec_motor.c` 里**所有** SDO 都走 SOEM 的 `EC_TIMEOUTRXM`(=700ms),
+  没有运动期/非运动期的区分）。
 - **不要每个周期 emit 信号**。1kHz × N 个信号会淹掉 Qt 事件循环。
   改为**一个双缓冲快照**（写满后原子换手指针，GUI 侧只读），
   曲线控件自己维护环形缓冲。
@@ -166,7 +189,7 @@ GUI 里逐条对应：
 - 周期抖动超阈值
 - 面板切走 / 主窗口失焦 / 程序退出
 
-**退出码契约**（[sm.h](../slide_motion/sm.h) 的 0~10）在 GUI 里变成每次动作的**结论条**：
+**退出码契约**（当时 `sm.h` 里那套 0~10）在 GUI 里变成每次动作的**结论条**：
 同一套判定函数返回同一套码，界面**原样显示**"结果: EXIT 10 电机可能仍带电"，
 不要翻译成模糊的红/绿。
 
@@ -277,7 +300,7 @@ Windows 上 DC 抖动超阈值会报同步帧错误。
 
 ## 10. 多轴
 
-总线可能挂 2 台（[aliasinfo/aliasinfo.c](../aliasinfo/aliasinfo.c) 的示例输出就是 2 台）。
+总线可能挂 2 台（当年那个别名扫描程序 `aliasinfo` 的示例输出就是 2 台；**该程序已删**）。
 **一个网卡 → 一个进程 → 一个周期线程驱动所有轴**，DC 是全局的，所以：
 
 - 模型层第一天就要有 `Axis`（= 总线位置，0-based），

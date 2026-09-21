@@ -111,8 +111,9 @@ struct em_bus
     * 与 want_dig_in 分开两道门: 改 PDO 映射是通信配置 (掉电即回), 改参数是驱动器行为 */
    int allow_param;
 
-   /* 2300h 快照, 下标 = 轴序号。sz 是驱动器自报的宽度 —— 手册写 U16 而 slide_motion 的
-    * 基线表记成 U8, 两处对不上, 所以读到几字节就按几字节写回, 不猜 */
+   /* 2300h 快照, 下标 = 轴序号。sz 是驱动器自报的宽度 —— 手册 V2.4 p84 写 U16, 而当时那份
+    * 现场基线表把它记成 U8 (那份表与记它的工具 2026-09-21 一起从仓库移除了), 两处对不上,
+    * 所以读到几字节就按几字节写回, 不猜 */
    int      di_logic_have[EM_MAX_AXES];
    int      di_logic_changed[EM_MAX_AXES];
    int      di_logic_sz[EM_MAX_AXES];

@@ -95,7 +95,11 @@ em_csp_set_target(ax, origin + tgt)  // 每周期一次 —— 这就是 CSP
 等于一次高速冲刺)。**不做** S 曲线、不做前瞻。也**不做**加速段限制(见上)。
 不写 `6081h`,不走 `em_csp_move_multi`。
 
-## 5. 安全护栏(与 CLI 一一对应)
+## 5. 安全护栏(与原 CLI 一一对应)
+
+> 「等价 CLI」那一列是**对照表**,不是"还有个 CLI 可以跑" —— 那批命令行程序
+> **2026-09-21 已从仓库移除**(`scan` 不依赖它们)。这一列留着是因为护栏这套口径
+> 是从它们那儿过来的,对照着看更容易理解每个按钮对应哪一道闸。
 
 | 界面动作 | 等价 CLI | 干什么 |
 |---|---|---|
@@ -170,8 +174,8 @@ cmake --build out/build/hmi-qt-ucrt64 --target hmi
 ```
 
 只走 [CMakePresets.json](../CMakePresets.json) 里的 `hmi-qt-ucrt64`(Ninja,
-编译器与其它 CLI 同一个 `C:/msys64/ucrt64`)。顶层 `EC_BUILD_HMI` **默认 OFF**,
-所以没装 Qt 的机器照旧能编那些 CLI。
+编译器与 SOEM / `motor_api` 用的是同一个 `C:/msys64/ucrt64`)。顶层 `EC_BUILD_HMI`
+**默认 OFF**,所以没装 Qt 的机器照旧能编 (现在 OFF 等于**只编 SOEM 静态库**)。
 configure 失败时 `out/build/hmi-qt-ucrt64/` 里不会有 `build.ninja`,
 **第二条命令报 `ninja: error: loading 'build.ninja'` 永远是连带的**。
 
@@ -247,11 +251,13 @@ C:/msys64/ucrt64/bin/windeployqt6.exe --release --compiler-runtime \
 - **把 PATH 砍到只有 `C:\Windows\System32;C:\Windows` 再启动也正常** ——
   即双击可用,不依赖 MSYS2 环境。
 - 样式表解析无告警(`main.cpp` 里那段 raw string 是 CRLF)。
-- CLI 未被碰坏:`motor_test.exe` 不带任何 `--allow*` 跑通,**退出码 0**,
-  `6064h = 0`、`6502h = 0xA5`。
-  > 实测映射读数**不能当固定事实写死**: 这台驱动器的 RxPDO 映射**被改过**,
-  > 同一块板子在不同日期读到不同映射是常态。每次都实读,实读值以 `motor_test`
-  > 跑出来的那份为准。
+- 当时另外跑了一遍 `bin/motor_test.exe`(不带任何 `--allow*`,只读)为对照,
+  **退出码 0**,`6064h = 0`、`6502h = 0xA5` 两边一致。
+  > **2026-09-21 注**:`motor_test` 已从仓库移除(它不在这里的验收范围内 —— `hmi`
+  > 不需要它)。上面那三个数**是当时测的,保留作为记录**;以后要复核同样的三个数,
+  > 得自己临时写一行 `em_rd_i32` / `em_rd_u16`。
+  > 但仍有一条**不变**的规矩:实测映射读数**不能当固定事实写死** —— 这台驱动器的
+  > RxPDO 映射**被改过**,同一块板子在不同日期读到不同映射是常态。每次都实读。
 - 全部改动文件的 `git diff --stat` == `git diff --ignore-cr-at-eol --stat`;
   `hmi/` 全部 CRLF。
 
@@ -262,12 +268,14 @@ C:/msys64/ucrt64/bin/windeployqt6.exe --release --compiler-runtime \
   **没有实机走过**。第一次跑请盯着控制台:选轴 / 补映射 / 进 OP 的记录会打在那儿。
 - 「使能」与任何动作、速度滑块、回中、停止、失能、两轴独立性、±500000 边界 —— 全部待实测。
   建议第一次点一个离当前位置 **±20000 以内**的坐标看方向对不对。
-- 界面开着时 Npcap 被它独占,**同时不要再跑 CLI**。
+- 界面开着时 Npcap 被它独占,**别同时开 `hmi` 与 `scan`**(也别忘了仓库的 python 链)。
 
 ## 9. 本次不做
 
 - 不抽 `ecat_core`、不做对象字典浏览器 / 基线 diff / 抖动面板 / 报文回放
   —— 那些是 [qt_hmi_layout.md](qt_hmi_layout.md) 的 P0~P4。
+  (**那份规划里的 `ecat_core/` 后来并没有建**, 它在本文这份实现之后也没补上 ——
+  护栏落在 `motor_api` + `ecatworker` 里。见该文顶部的说明。)
 - 不做回零界面:零点靠软件零点,不写驱动器。
 - 不碰那个 S5 `WKC=1` 路径。
 - 不做 PDO 映射修改/还原的界面,固定走 `em_setup(...,1)` + `em_shutdown(...,1)`。

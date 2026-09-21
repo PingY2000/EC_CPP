@@ -103,7 +103,7 @@ int em_arm(em_axis_t *ax)
 
       case EM_MODE_PP:
          em__log(ax->bus, "%s: 模式 PP (轮廓位置) —— 本接口不驱动这个模式 "
-                 "(那是 slide_motion 的活), 不写任何目标值", ax->label);
+                 "(本仓库现在也没有驱动它的程序), 不写任何目标值", ax->label);
          return EM_R_OK;
 
       default:
@@ -1152,9 +1152,10 @@ int em_home(em_axis_t *ax, const em_home_cfg_t *cfg, uint32_t tmo_ms)
                          "        1) 2300h 输入逻辑与现场接线是否一致: 常开的驱动器配 NPN "
                          "传感器 (高电平 = 未触发) 时 X0/X1/X2 **一起反相**, bit11 因此\n"
                          "           恒置 1。改法是把 2300h 的 bit0~bit2 都置 1 (= 0x0007) —— "
-                         "motor_test 用 --allow-param --npn 就能做, scan 界面\n"
-                         "           「高级选项」里那一项默认开着; 要断电也在, 再用厂家工具"
-                         "按 2102h 存一次 EEPROM;\n"
+                         "scan 界面\n"
+                         "           「高级选项」里「写驱动器 2300h = 0x0007 (输入常闭 / NPN)」"
+                         "那一项**默认开着**, 连接时就写 (仅 RAM);\n"
+                         "           要断电也在, 再用厂家工具按 2102h 存一次 EEPROM;\n"
                          "        2) 2204h 超程停车方式 (= 0 停止 / 1 急停 / 2 无效);\n"
                          "        3) 2310h~2312h 的端子分配 (X0 原点 / X1 正限位 / X2 负限位)。\n"
                          "        界面上的「上位机侧取反」勾**帮不了这里**: 它只改主站的"

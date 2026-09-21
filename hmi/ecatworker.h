@@ -21,7 +21,8 @@
 #define HMI_VEL_MAX     100000   /* pul/s, 约 2 圈/秒 */
 #define HMI_VEL_DEF      20000
 
-#define HMI_CYCLE_US      2000   /* 过程数据周期 (µs), 与 motor_test 缺省一致, 不上 DC */
+#define HMI_CYCLE_US      2000   /* 过程数据周期 (µs) —— 2 ms。不上 DC, 所以这个值自由
+                                  * (不需要跟从站的 DC 周期对齐), 改它只用改这一个数 */
 #define HMI_LOOP_MS          2   /* 循环里的让步节拍 */
 #define HMI_STOP_MS        300   /* 进近段留出的刹停时间: 减速度 = v / 0.3s */
 
@@ -292,8 +293,9 @@ inline const char *limit_hit_advice(bool dig_known, bool dig_pos, bool dig_neg,
         "有效, 而那两位是同一路信号经 2300h + 2310h 之后的结果, 所以这是个**自相矛盾**的"
         "读数。先查 2310h~2312h 的功能码对不对 (60FDh 说没压着, 会不会正是因为功能码被"
         "改成 0 了), 再查 2300h 与接线。607Dh 软限位是 CiA402 一般定义里的另一路可能"
-        "来源, 本机实测它是开着的 (不是 0/0), 所以多半不是它; `motor_test` 不带参数跑"
-        "一次会把 607Dh:01/:02 与 6064h 一起打出来";
+        "来源, 本机实测它是开着的 (不是 0/0), 所以多半不是它; 607Dh:01/:02 的实测值当初是"
+        "CLI 的只读诊断打的, 那个程序 2026-09-21 从仓库移除了 —— **现在没有程序会打它**, "
+        "要复核得自己用 em_rd_i32() 临时加一行";
 }
 
 /* 「这一位是怎么回事」的开场白, 带一个 %1 = 轴号。反转开着时 bit11 不参与判定,
@@ -365,7 +367,8 @@ inline const char *home_lim_switch_name(int m)
 }
 
 /* 目标开关此刻压着没有 (只有 17/18 有"目标开关"; 24/29 的基准是原点开关, 不在这里判)。
- * "哪一位是目标"由 EM_HOME_LIM_TARGET_BIT 定义 (在 ec_motor.h 里, motor_test 也读同一份)。 */
+ * "哪一位是目标"由 EM_HOME_LIM_TARGET_BIT 定义 (在 ec_motor.h 里; 现在只有界面侧读它 ——
+ * 信号灯的着色与下面这条判据共用同一份)。 */
 inline bool home_lim_target_active(int m, bool dig_pos, bool dig_neg)
 {
    const uint32_t mask = EM_HOME_LIM_TARGET_BIT(m);
@@ -440,7 +443,7 @@ inline const char *home_lim_branch_text(int m, bool tgt_active)
    return "轴%1 找原点 (方式 %2)";
 }
 
-/* 6099h:02 由 6099h:01 派生: vel_slow = vel_fast / 4 (与 motor_test 收紧 --vel 同式);
+/* 6099h:02 由 6099h:01 派生: vel_slow = vel_fast / 4 —— 这个 1/4 是本仓库定死的比例;
  * 下限 1 —— 写 0 的语义手册没写, 而"返回速度是 0"绝不该是它的意思。 */
 inline uint32_t home_vel_slow(uint32_t vel_fast)
 {

@@ -98,9 +98,11 @@ extern "C" {
 #define EM_HOME_MODE_LIMIT_NEG   17
 
 /* 找限位时"目标那个开关"与"另外那一侧"分别对应 60FDh 的哪一位 —— **只此一处**。
- * 两个使用者: 界面侧 (hmi/ecatworker.h 的 home_lim_target_active, 判 a)/b) 分支与那道否决)
- * 与 motor_test 的发起前预检。两边各写一份就会各错一份, 而且错了正好是"方向反了", 现场
- * 看着就是"按找正限位它朝负限位冲"。非 17/18 返回 0 (没有目标开关) —— 调用方照 0 处理。 */
+ * 现在的使用者只有界面侧 (hmi/ecatworker.h 的 home_lim_target_active / _other, 判 a)/b)
+ * 分支与那道否决)。2026-09-21 之前 motor_test 的发起前预检也读同一份 —— 那个程序已从仓库
+ * 移除, 但这个宏留着: 判据只能有一份, 两边各写一份就会各错一份, 而错了正好是"方向反了",
+ * 现场看着就是"按找正限位它朝负限位冲"。
+ * 非 17/18 返回 0 (没有目标开关) —— 调用方照 0 处理。 */
 #define EM_HOME_LIM_TARGET_BIT(m) \
    (((m) == EM_HOME_MODE_LIMIT_POS) ? EM_DI_POS_LIMIT \
     : (((m) == EM_HOME_MODE_LIMIT_NEG) ? EM_DI_NEG_LIMIT : 0u))
@@ -200,7 +202,7 @@ typedef struct em_axis em_axis_t;  /* 不透明: 一根轴 */
 /* 选轴配置 */
 typedef struct
 {
-   int     bus_pos;   /* 0-based 总线位置 (与 aliasinfo / pysoem --pos 一致) */
+   int     bus_pos;   /* 0-based 总线位置 (= 线序 - 1, 与 SOEM 的 slave 序号差 1) */
    int32_t pos_tol;   /* CSP 到位容差 (pul); <= 0 取 EM_POS_TOL_DEF */
 } em_axis_cfg_t;
 
@@ -300,7 +302,8 @@ int em_service(em_bus_t *bus);
  *   · **只能读**: 回调能改的是调用方自己那份快照, 不许写输出镜像 (否则会插进一段
  *     没人预期的过程数据, 回零/复位那类时序就变了);
  *   · fn = NULL 注销。bus 为 NULL 时什么都不做 (便于写在收尾路径上)。
- * 不挂 = 行为与本函数不存在时一模一样 (motor_test / slide_motion 就是这么用的)。 */
+ * 不挂 = 行为与本函数不存在时一模一样 —— 本仓库只有 scan / hmi 用这个库, 它们挂在
+ * 阻塞命令期间 (见 EcatThread::BlockTick); 不挂在任何地方都等价于这段代码不存在。 */
 typedef void (*em_cycle_fn)(void *user, int wkc);
 void em_set_cycle_hook(em_bus_t *bus, em_cycle_fn fn, void *user);
 

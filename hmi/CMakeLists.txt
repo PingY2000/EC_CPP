@@ -1,14 +1,14 @@
 # hmi: Qt Widgets 上位机 —— 两台滑台的 ±500000 脉冲 CSP 点击定位台。
 #
-# 默认不编 (顶层 EC_BUILD_HMI=OFF): 没装 Qt 的人照旧能编 CLI, 那两条构建连 C++ 编译器
-# 都不需要有 —— 所以 enable_language(CXX) 放在这里而不是顶层 project() 里。
+# 默认不编 (顶层 EC_BUILD_HMI=OFF) —— 现在 OFF 等于只编 SOEM 静态库 (2026-09-21 起
+# 仓库里没有 CLI 程序了)。所以 enable_language(CXX) 放在这里而不是顶层 project() 里:
+# 只验 SOEM 能不能编过的人不该被要求有 C++ 编译器。
 #
 # 界面侧**不 include SOEM**: 所有 ecx_* 都在 ecatworker.cpp 里。见 ecatworker.h 顶部那段。
 #
-# 为什么直接编 motor_api 的两个 .c 而不是链一个库: motor_api 目前没有库目标, 只有
-# motor_test 这个可执行文件 (它把两个 .c 直接编进去)。为 hmi 单独加一个库目标就得顺手
-# 改 motor_api/CMakeLists.txt 和 motor_test 的构建方式 —— 那超出了"纯增量"的范围。
-# 代价只是这两个文件被编两遍。
+# 为什么直接编 motor_api 的两个 .c 而不是链一个库: motor_api/ 现在是**纯源码目录**
+# (2026-09-21 起没有 CMakeLists, 也没有构建目标)。两个 .c 由 hmi 与 scan 各自直接编进去。
+# 为一个只有两个 .c 的目录起库目标, 收益比代价小。代价只是这两个文件被编两遍。
 
 enable_language(CXX)
 set(CMAKE_CXX_STANDARD 17)
