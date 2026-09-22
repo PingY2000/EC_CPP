@@ -28,6 +28,15 @@ MeterLog::~MeterLog()
    }
 }
 
+/* 手上这一批 (还没凑够 m_avg 个读数的那半份) 丢掉。四条路都得丢: 换源、停止、开始、
+ * 以及这一批中途出了错 —— 攒着的那些数是**上一件事**的, 接着算下去会得到一笔跨了状态的
+ * 平均值, 而它在曲线上和别的点长得一模一样 */
+void MeterLog::resetBatch()
+{
+   m_nsamp = 0;
+   m_acc   = 0.0;
+}
+
 /* ---------------------------------------------------------------- 源 */
 
 void MeterLog::setSource(PowerMeter *m)
@@ -61,6 +70,7 @@ void MeterLog::setSource(PowerMeter *m)
    m_pending   = false;
    m_timed_out = false;
    m_due_ms    = m_now_ms;
+   resetBatch();
 
    emit sampleAdded();      /* 曲线立刻变空 */
    emit stateChanged();
@@ -89,6 +99,20 @@ void MeterLog::setInterval(int ms)
    emit stateChanged();
 }
 
+void MeterLog::setAverage(int n)
+{
+   const int v = std::min(kMaxAverage, std::max(1, n));
+   if (v == m_avg)
+      return;
+
+   m_avg = v;
+
+   /* 手上那半份**不丢**: 它就按新的 N 凑够为止 —— 已经要回来的数没人再要得回来一次。
+    * 界面在采集期间把这个框灰着, 所以真要改也只改得动跟随模式那一种 (那时手上根本没有
+    * 半份, 一个请求都没发) */
+   emit stateChanged();
+}
+
 bool MeterLog::start(int interval_ms, QString *err)
 {
    if (m_src == nullptr || !m_src->isOpen())
@@ -103,6 +127,7 @@ bool MeterLog::start(int interval_ms, QString *err)
    m_run       = true;
    m_pending   = false;
    m_timed_out = false;
+   resetBatch();
    /* 第一笔不空等一个间隔: 按下去就该看见数, 否则会以为没生效 */
    m_due_ms    = m_now_ms;
 
@@ -120,6 +145,7 @@ void MeterLog::stop()
    /* 这一句同时是"从超时卡住里出来"的那条路 (见 tick): 作废掉那个未决请求, 下一次 start
     * 就能重新发。代价是可能有一个迟到的回话被丢掉 —— 那正是"停止"要的 */
    m_timed_out = false;
+   resetBatch();
 
    /* 未决请求不撤回 (撤不了): 它回来时 m_pending 已经是 false, 槽里的比对会把它丢掉。
     * 代价只是源那边白跑一次 */
@@ -169,6 +195,9 @@ void MeterLog::tick(int64_t now_ms)
 
       m_timed_out = true;
 
+      /* 手上这一批也作废 (同 onFailed): 到这一刻它已经凑不成一次采样了 */
+      resetBatch();
+
       Sample s;
       s.ms = m_now_ms;
       s.ok = false;
@@ -209,10 +238,23 @@ void MeterLog::onReady(double watts)
    m_pending   = false;
    m_timed_out = false;
 
+   /* 平均: 这一批还没凑够 N 个就先攒着, 并且**下一个子读数不占一个间隔** (一个采样里的
+    * N 次是同一件事, 不是 N 个采样)。真正发不发仍然只由 tick() 那一句决定 —— 这里的
+    * "m_due_ms = 现在"意思是"下一拍就能发", 所以子读数之间会多出不到一拍的界面刷新时间
+    * (30Hz, 最多 33ms)。其余时序一个字都没动。 */
+   m_acc += watts;
+   m_nsamp++;
+   if (m_nsamp < m_avg)
+   {
+      m_due_ms = m_now_ms;
+      return;
+   }
+
    Sample s;
-   s.ms    = m_now_ms;
-   s.watts = watts;
+   s.ms    = m_now_ms;                 /* 时刻取这一批的最后一个读数 */
+   s.watts = m_acc / (double)m_nsamp;
    s.ok    = true;
+   resetBatch();
    record(s);
 }
 
@@ -224,6 +266,11 @@ void MeterLog::onFailed(const QString &err)
 
    m_pending   = false;
    m_timed_out = false;
+
+   /* N 次里有一次没读回来, **这一笔就作废** (攒着的那半份一起丢掉) —— 与扫描那个点读不到
+    * 时同一个口径 (scancontroller.cpp 的 finishPoint 也是把 m_acc 扔掉记 ok=false):
+    * 拿半边的数求平均是编出来的, 而它在曲线上和别的点长得一模一样 */
+   resetBatch();
 
    Sample s;
    s.ms = m_now_ms;
@@ -334,6 +381,21 @@ QString MeterLog::csvHeaderLine()
    return QStringLiteral("unix_ms,elapsed_ms,watts,ok\n");
 }
 
+void MeterLog::setMeta(const QStringList &lines)
+{
+   m_meta = lines;
+}
+
+/* 文件头那几行 `#`。与扫描那份 CSV 同一个格式 (scanlog.cpp 的 beginNew 也这么加),
+ * 于是两份文件的头长得一样, 读的人只要认一种 */
+QString MeterLog::metaBlock() const
+{
+   QString s;
+   for (const QString &l : m_meta)
+      s += QStringLiteral("# %1\n").arg(l);
+   return s;
+}
+
 QString MeterLog::csvRowLine(const Sample &s, int64_t t0)
 {
    /* watts 用 'g',9 —— 量程从 nW 到 W, 与 scanplan.cpp 的 csvRowLine 的 %.9g 同一个口径。
@@ -401,9 +463,11 @@ bool MeterLog::beginRecord(const QString &path, QString *err)
       return false;
    }
 
+   /* meta 行**只在新建文件时写** (接着写的不写), 与表头同一个规矩: 那是"这份文件是怎么
+    * 来的", 不是"这一行是怎么来的"。要改就得换一个文件, 免得到时候说不清哪几行算数 */
    QByteArray head;
    if (fresh)
-      head = csvHeaderLine().toUtf8();
+      head = (metaBlock() + csvHeaderLine()).toUtf8();
    else if (!endsWithNewline(path))
       head = QByteArray("\n");
 
@@ -489,7 +553,8 @@ bool MeterLog::saveBuffer(const QString &path, QString *err) const
       return false;
    }
 
-   QString text = csvHeaderLine();
+   /* 导出这份也带上 meta 行: 它是个**独立文件**, 换个地方打开时上面那些信息一个字都不能少 */
+   QString text = metaBlock() + csvHeaderLine();
    for (const Sample &s : m_v)
       text += csvRowLine(s, m_t0);
 

@@ -387,7 +387,9 @@ bool ScanController::start(const QString &csv_path, QString *err)
    if (m_zero_epoch < 0)
       m_zero_epoch = 0;
 
-   if (!m_log.beginNew(csv_path, m_p, isoNow(), m_zero_epoch, err))
+   /* extra_meta: 这趟是哪台仪器、什么探头/波长/量程/模式采的 (powermeter.h 的
+    * meterMetaLines)。CSV 里那一列叫 watts, 而真机报的可能不是 W —— 这一句就是答案 */
+   if (!m_log.beginNew(csv_path, m_p, isoNow(), m_zero_epoch, meterMetaLines(m_meter), err))
       return false;
 
    if (!armRun(err))

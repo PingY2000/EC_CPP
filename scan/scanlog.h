@@ -6,6 +6,7 @@
 #pragma once
 
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 #include <cstdint>
@@ -27,9 +28,19 @@ public:
    ScanLog(const ScanLog &) = delete;
    ScanLog &operator=(const ScanLog &) = delete;
 
-   /* 新建: 写 meta 两行 + 列名行。父目录不存在会先建出来。 */
+   /* 新建: 写 meta 行 + 列名行。父目录不存在会先建出来。
+    *
+    * extra_meta 是裸 "key=value" 的几行 (meterMetaLines() 的产出, 见 powermeter.h),
+    * 由这里加 "# " 前缀 —— 与连续读数那份 CSV (meterlog) 同一个格式, 两份文件的头长得一样。
+    * 它记的是"这趟是哪台仪器、什么探头、什么波长/量程/模式采的": 换一趟数据回头复核时,
+    * 靠的就是它。
+    *
+    * **只在新建时写**: 续写的那一份表头属于它开头那一趟, 不重写 (理由同 ScanLog::beginAppend
+    * 的注释)。代价是续写之后如果换了波长/量程/模式, 文件里那几行就说的是**第一趟**的配置
+    * —— 所以续写前换过配置的话, 该另起一个文件。 */
    bool beginNew(const QString &path, const Params &p,
-                 const QString &started_iso, int zero_epoch, QString *err);
+                 const QString &started_iso, int zero_epoch,
+                 const QStringList &extra_meta, QString *err);
 
    /* 续写: 文件必须已存在, 不重写表头 (表头记的是那一轮的几何参数) */
    bool beginAppend(const QString &path, QString *err);

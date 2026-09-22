@@ -7,6 +7,32 @@
 
 namespace scan {
 
+QStringList meterMetaLines(const PowerMeter *m)
+{
+   QStringList out;
+   if (m == nullptr)
+      return out;
+
+   /* tag() 是 ASCII 的 (见 powermeter.h): 这两行会原样进 CSV, 而 CSV 的 `#` 行一直全是
+    * ASCII —— 中文字进去, 读的人就得先猜编码 */
+   out << QStringLiteral("meter_source=%1").arg(m->tag());
+
+   /* 单位**一定记**: 那一列叫 watts, 而真机报的可能是 J。文件格式一个字节都没改
+    * (老文件照旧读得进来), 但新写的文件里有一行说得清那一列到底是什么 */
+   out << QStringLiteral("meter_unit=%1").arg(m->unit().isEmpty()
+                                                 ? QStringLiteral("unknown")
+                                                 : m->unit());
+   out += m->configLines();
+   return out;
+}
+
+QString unitLabel(const PowerMeter *m)
+{
+   if (m == nullptr || m->unit().isEmpty())
+      return QStringLiteral("单位不明");
+   return m->unit();
+}
+
 /* 三个模拟实现都用 QTimer::singleShot 把 emit 挪出调用栈: 直接 emit 会让状态机的槽在
  * requestReading() 内部嵌套执行; 延时投递后与真机 (串口回来才 emit) 时序一致。 */
 

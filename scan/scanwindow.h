@@ -139,6 +139,9 @@ private:
    void onMtrBrowseCsv();
    void onMtrExportClicked();
    void onMtrIntervalChanged(int ms);
+   void onMtrAvgChanged(int n);
+   /* "这几行是哪个仪器什么配置采的" -> MeterLog::setMeta (建文件那一刻写进 CSV 的头几行) */
+   void pushMeterMeta();
 
    /* 「X/Y 正/反向回零」与「X/Y 找正/负限位」共用的槽。
     * dir: 0 = 正那侧, 1 = 负那侧; find_limit: false -> 6098h = 24/29 (找**原点开关** X0),
@@ -302,6 +305,8 @@ private:
     * 一起推过去并保留原来的跨度 (见 onShadeLoChanged / onShadeHiChanged)。 */
    QDoubleSpinBox *m_edShadeLo   = nullptr;
    QDoubleSpinBox *m_edShadeHi   = nullptr;
+   /* 色标那两个数是什么单位 —— 跟着取样源走, 每拍由 refreshMeterReadout() 写 */
+   QLabel         *m_lShadeUnit  = nullptr;
    QPushButton    *m_btnFit      = nullptr;
    QCheckBox      *m_cbShadeAuto = nullptr;
    QLabel         *m_lblLocked   = nullptr;   /* 锁定模式那两句说明 (两行, 按模式显隐) */
@@ -317,9 +322,14 @@ private:
    QComboBox      *m_cbMeter   = nullptr;
    QLabel         *m_lMeter    = nullptr;   /* 状态行: kind · 已打开/没打开 · 真机摘要 */
    QDoubleSpinBox *m_edManualV = nullptr;   /* 手填值源 */
+   QDoubleSpinBox *m_edRandomBase = nullptr;/* 随机源的基值 (随机源本来就有这一个旋钮) */
    QDoubleSpinBox *m_edRandomN = nullptr;   /* 随机源的噪声幅度 */
    QLineEdit      *m_edScript  = nullptr;   /* 脚本源: 框里的文本 */
    QPushButton    *m_btnScript = nullptr;
+   /* 两个模拟源共用的"模拟往返延迟": 真机一次往返可能上百毫秒, 而模拟源默认是 20ms ——
+    * 想在没有真机的时候看时序 (间隔、超时、一个未决请求那条约束) 就得把它调大 */
+   QWidget  *m_simRow     = nullptr;
+   QSpinBox *m_edSimDelay = nullptr;
    /* 真机那三项。选项表由设备给 (探头不同, 能选的波长与量程就不同), 一个都不写死。
     * 每一项没有单独的"那一行"要露/藏: 整块 m_devBox 一起显隐, 而某一项设备根本没有时
     * 它是**空的 + 灰的** (判据在 refreshMeterPanel 里) */
@@ -342,6 +352,7 @@ private:
 
    /* 连续读数 (见 meterlog.h) */
    QSpinBox    *m_edMtrInterval  = nullptr;
+   QSpinBox    *m_edMtrAvg       = nullptr;   /* 一次采样平均几个读数 (1 = 每次都要) */
    QPushButton *m_btnMtrStart    = nullptr;
    QPushButton *m_btnMtrStop     = nullptr;
    QPushButton *m_btnMtrClear    = nullptr;

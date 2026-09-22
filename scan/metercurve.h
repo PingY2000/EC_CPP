@@ -1,5 +1,6 @@
 /*
- * scan/metercurve.h —— 「连续读数」那条时间-功率折线。手画, 不依赖任何画图库。
+ * scan/metercurve.h —— 「连续读数」那条读数折线。纵轴是功率 W 还是能量 J 看源 (见 setUnit)。
+ * 手画, 不依赖任何画图库。
  *
  * 为什么手画: 这套 MSYS2 Qt 里**没装 Qt6 Charts** (C:/msys64/ucrt64/lib/cmake/ 下没有
  * Qt6Charts*), 而 MapCanvas 已经是现成的手画范例 —— 暗色常量、niceStep 刻度、QPainter 折线
@@ -33,6 +34,10 @@ public:
    void setPlaceholder(const QString &s);
    /* 左上角那行说明 (源的名字)。空 = 不画 */
    void setSourceName(const QString &s);
+   /* 纵轴的单位字 ("W" / "J" …)。**传空 = 认不出来**, 那时画一个 "?" 并把理由放进 tooltip
+    * —— 真机报的是 W 还是 J 由探头与测量模式定, 而 COM 一个字段都不给 (powermeter.h 的
+    * unit())。这里替它画一个 W 是最坏的那种错: 图看着正常, 单位是编的 */
+   void setUnit(const QString &u);
 
    QSize sizeHint() const override;
 
@@ -43,6 +48,7 @@ private:
    MeterLog *m_log = nullptr;
    QString   m_placeholder;
    QString   m_src_name;
+   QString   m_unit;
 };
 
 }   /* namespace scan */

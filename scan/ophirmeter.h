@@ -28,6 +28,14 @@ struct OphirInfo
    QString sensor_type;      /* thermopile / photodiode / pyroelectric */
    QString sensor_serial;
 
+   /* 读数的单位。**COM 一个字段都不给**: 那份数组是 W 还是 J 由探头与测量模式定。
+    * 这里是从设备自己的两个字判出来的 (见 unitFromDeviceInfo); 空 = 认不出来 */
+   QString unit;
+
+   /* 诊断用的两个版本号。取不到就空着 (那不影响读数, 所以不该因为它打不开设备) */
+   QString com_version;      /* getVersion: COM 对象自己的版本 */
+   QString driver_version;   /* getDriverVersion: 驱动那一串, 原样来自设备 */
+
    QStringList wavelengths;  /* 下拉框的选项, 原样来自设备 */
    QStringList ranges;
    QStringList modes;
@@ -38,6 +46,17 @@ struct OphirInfo
    QString summary;          /* 状态行那句话, 由工作线程拼好 */
 };
 
+/* 由**设备自己的两个字**判读数单位: 当前的测量模式名 (Ophir 的模式名里带 Power / Energy)
+ * 与探头类型 (热释电测的是脉冲能量)。
+ *
+ * **优先看模式名**: 它说了 Power / Energy 就是 W / J; 它说了别的东西 (dBm …) 就直接返回空,
+ * 不让探头类型替它翻案 —— 同一只探头换个模式报的就是另一个量纲, 而对数值顶着 W 进 CSV
+ * 是最坏的一种错。探头类型只在这一项**不存在**时兜底。
+ *
+ * 认不出来就返回空, **不猜** —— 空的意思是"我不知道", 界面照原样写「单位不明」。
+ * 见 docs/scan_sweep.md §25。 */
+QString unitFromDeviceInfo(const QString &sensor_type, const QString &mode_name);
+
 class OphirMeter : public PowerMeter
 {
    Q_OBJECT
@@ -47,6 +66,11 @@ public:
    ~OphirMeter() override;
 
    QString kind() const override;
+   QString tag()  const override;      /* "ophir" */
+
+   /* 单位与配置都从 info() 取 (工作线程读回来的设备状态)。没打开 / 认不出来 -> 空 */
+   QString unit() const override;
+   QStringList configLines() const override;
 
    bool open(QString *err) override;
    void close() override;

@@ -68,9 +68,10 @@ static const char *kOutDir = "scan_out";
  * 永远来不及发出来, 界面上只剩"没有回应"。 */
 static const int kReadOnceTimeoutMs = 6000;
 
-/* 功率的显示格式 (量级从 nW 到 W, 不固定小数位):
+/* 读数的显示格式 (量级从 nW 到 W 那一带, 不固定小数位):
  *   |v| >= 1e-3 -> 'g' 6 位有效数字;  否则 / 0 -> 'e' 4 位有效数字。
- * 只给操作员核对用, 入 CSV 的是 double, 一位没少。 */
+ * 只给操作员核对用, 入 CSV 的是 double, 一位没少。
+ * **它只格式化数字, 不带单位** —— 单位一律由 unitLabel() 跟着取样源给 (真机可能是 J) */
 static QString fmtWatts(double v)
 {
    if (std::fabs(v) >= 1e-3)
@@ -355,6 +356,9 @@ void ScanWindow::refreshMeterPanel()
       m_randomRow->setVisible(idx == 1);
    if (m_scriptRow != nullptr)
       m_scriptRow->setVisible(idx == 2);
+   /* 模拟延迟是随机源与脚本源**共用**的一格 (手动源立刻回, 没有这一项), 所以两个下标都露 */
+   if (m_simRow != nullptr)
+      m_simRow->setVisible(idx == 1 || idx == 2);
 
    const bool dev = (idx == 3 && m_ophir != nullptr && m_ophir->isOpen());
    if (m_devBox != nullptr)
@@ -374,8 +378,12 @@ void ScanWindow::refreshMeterPanel()
    /* ---- 各源自己那几个参数 ---- */
    if (m_edManualV != nullptr)
       m_edManualV->setEnabled(idx == 0 && !rec);
+   if (m_edRandomBase != nullptr)
+      m_edRandomBase->setEnabled(idx == 1 && !rec);
    if (m_edRandomN != nullptr)
       m_edRandomN->setEnabled(idx == 1 && !rec);
+   if (m_edSimDelay != nullptr)
+      m_edSimDelay->setEnabled((idx == 1 || idx == 2) && !rec);
    if (m_edScript != nullptr)
       m_edScript->setEnabled(idx == 2 && !rec);
    if (m_btnScript != nullptr)
@@ -422,6 +430,21 @@ void ScanWindow::refreshMeterPanel()
               "一个请求发出去到下一个发出去的**最小**间隔 —— 实际间隔 = 这个数 + 那次往返。\n"
               "同一时刻只允许一个未决请求 (powermeter.h 的约定), 所以这里不是固定节拍: "
               "真机一次往返可能上百毫秒, 按固定节拍发只会越堆越多。"));
+   }
+
+   if (m_edMtrAvg != nullptr)
+   {
+      /* 与「间隔」同一个判据: 跟随时可以改 (那时一个请求都没发) */
+      m_edMtrAvg->setEnabled(!rec || held);
+      m_edMtrAvg->setToolTip(rec && !held
+         ? QStringLiteral("采集正在跑 —— 先「停止」再改平均次数")
+         : QStringLiteral(
+              "一次采样连着取几个读数求平均 (扫描参数里那个「每点采样」是同一件事)。\n"
+              "1 = 每次都要一个数 (缺省)。调大读得稳: 平均出来的数抖得小, 而代价是每次采样要占"
+              "N 个往返。\n"
+              "N 次里有**一次**没读回来, 这一笔就作废 (记 ok=false) —— 拿半边的数求平均是"
+              "编出来的, 而它在曲线上和别的点长得一模一样。\n"
+              "这 N 个读数是连着要的 (中间不隔一个间隔), 所以「间隔」是采样之间的间隔。"));
    }
 
    if (m_btnMtrStart != nullptr)
@@ -492,13 +515,20 @@ void ScanWindow::refreshMeterReadout()
        * 有个说法, 否则看起来就像程序死了 */
       const bool wedged = m_mlog->timedOut();
 
+      /* 缓冲满了要说出来: 屏幕上那条曲线看着照旧很健康, 只是**最旧的正在被丢掉**, 它已经
+       * 不是全部了。要留全的只有一个办法 —— 让 CSV 记着 (那一份不设上限) */
+      const bool full = m_mlog->full();
+      if (full)
+         t += QStringLiteral("  (**满了** —— 最旧的正在被丢掉; 要全都留着就打开 CSV)");
+
       if (m_mlog->running())
          t = wedged ? QStringLiteral("**卡住了** —— 一个请求超时未回, 采集停着等它 · ") + t
                     : (m_mlog->held() ? QStringLiteral("**跟随扫描中** (不发请求) · ") + t
                                       : QStringLiteral("采集中 · ") + t);
       m_lMtrCount->setText(t);
       m_lMtrCount->setStyleSheet(wedged ? QStringLiteral("color:#ffb020; font-weight:bold;")
-                                        : QStringLiteral("color:#7b8391;"));
+                                        : full ? QStringLiteral("color:#ffb020;")
+                                               : QStringLiteral("color:#7b8391;"));
    }
 
    /* ---- 最近一次读数 (大字号) ----
@@ -513,7 +543,10 @@ void ScanWindow::refreshMeterReadout()
       }
       else if (v.last().ok)
       {
-         m_lMtrLast->setText(QStringLiteral("%1 W").arg(fmtWatts(v.last().watts)));
+         /* 单位跟源头走 (unitLabel): 模拟源是 W, 真机是设备自己报的 W/J, 认不出来写
+          * 「单位不明」—— 这里**不许**硬写一个 W (powermeter.h 的 unit()) */
+         m_lMtrLast->setText(QStringLiteral("%1 %2")
+                                .arg(fmtWatts(v.last().watts), unitLabel(m_meter)));
          m_lMtrLast->setStyleSheet(QString());
       }
       else
@@ -529,9 +562,17 @@ void ScanWindow::refreshMeterReadout()
       const MeterLog::Stats st = m_mlog->stats();
       m_lMtrStats->setText(st.n == 0
          ? QStringLiteral("还没有可用读数")
-         : QStringLiteral("n=%1   最小 %2   最大 %3\n平均 %4   标准差 %5 (W)")
+         : QStringLiteral("n=%1   最小 %2   最大 %3\n平均 %4   标准差 %5 (%6)")
               .arg(st.n)
-              .arg(fmtWatts(st.min), fmtWatts(st.max), fmtWatts(st.mean), fmtWatts(st.sd)));
+              .arg(fmtWatts(st.min), fmtWatts(st.max), fmtWatts(st.mean), fmtWatts(st.sd),
+                   unitLabel(m_meter)));
+
+      /* 平均次数是"这些数是怎么来的": 一次采样是几个读数平均出来的, 直接决定曲线上那些点
+       * 抖不抖、标准差有多小。= 1 时不写 (那是缺省, 不占地方) */
+      const int avg = m_mlog->average();
+      if (avg > 1 && st.n > 0)
+         m_lMtrStats->setText(m_lMtrStats->text()
+            + QStringLiteral("\n每次 %1 个读数取平均 (标准差是各次平均值之间的)").arg(avg));
    }
 
    /* ---- 文件 ---- */
@@ -547,7 +588,21 @@ void ScanWindow::refreshMeterReadout()
    if (m_curve != nullptr)
    {
       m_curve->setSourceName(m_meter != nullptr ? m_meter->kind() : QString());
+      /* 单位传给图, **空字符串照传** —— 图那边画一个 "?" 并把理由放进 tooltip,
+       * 而不是自己挑一个 W 画上 (见 metercurve.h 的 setUnit) */
+      m_curve->setUnit(m_meter != nullptr ? m_meter->unit() : QString());
       m_curve->update();
+   }
+
+   /* ---- 色标那两个数是什么单位 ----
+    * 色阶画的就是取样源的读数, 所以它的单位跟着源头走: 真机报 J 的时候那两个数是 J 而不是
+    * W, 而这一点在控件上原本一个字都没有 (标题写着"功率")。放在这儿是因为这一条每拍都跑 */
+   if (m_lShadeUnit != nullptr)
+   {
+      const QString u = (m_meter != nullptr) ? m_meter->unit() : QString();
+      m_lShadeUnit->setText(u.isEmpty()
+         ? QStringLiteral("单位不明 —— 色阶刻度的数是 W 还是 J 还没判出来 (见功率计那一框)")
+         : QStringLiteral("单位: %1 (跟着取样源)").arg(u));
    }
 }
 
@@ -1721,21 +1776,34 @@ QWidget *ScanWindow::buildMeterPanel()
    m_cbMeter->setCurrentIndex(1);          /* 默认随机源: 一按开始就有数据可看 */
    m_cbMeter->setToolTip(QStringLiteral(
       "扫描与连续读数共用这一个源。**不需要连滑台或总线**: 选真机就能读数。\n"
-      "选真机要装 Ophir 的 StarLab; 界面其余部分与此无关。"));
+      "选真机要装 Ophir 的 StarLab; 界面其余部分与此无关。\n"
+      "三个模拟源 (手动 / 随机 / 脚本) 在驱动层走的是同一条 (请求 -> 读数信号), "
+      "所以拿它验过的时序对真机一样成立。"));
    connect(m_cbMeter, &QComboBox::currentIndexChanged, this, &ScanWindow::onMeterChanged);
 
-   /* 没装 StarLab 的那一项照样列出来, 但灰掉: 不列的话操作员会以为这程序没有真机这条路。
-    * 灰的是**表里那一项**, 不是整个下拉框 —— 三个模拟源照旧能选 */
-   if (!OphirCom::isRegistered())
+   /* 真机这一项不可用之前不让人选, 但**照样列出来**: 不列的话操作员会以为这程序没有真机
+    * 这条路。灰的是**表里那一项**, 不是整个下拉框 —— 三个模拟源照旧能选。
+    *
+    * 两种坏法不一样, 说给操作员的话也就不一样 (isRegistered 是"装没装", isAvailable 是
+    * "装机的那份 typelib 读不读得出来"), 而第二种在界面上原本只会以"打开失败"的样子出现 */
    {
-      const QString why = QStringLiteral(
-         "这台机器上没找到 OphirLMMeasurement 这个 COM 对象 —— "
-         "要先装 Ophir 的 StarLab (PD300R + Juno+ 的驱动就在里面)");
-      auto *m = qobject_cast<QStandardItemModel *>(m_cbMeter->model());
-      if (m != nullptr && m->item(3) != nullptr)
+      QString why;
+      if (!OphirCom::isRegistered())
+         why = QStringLiteral("这台机器上没找到 OphirLMMeasurement 这个 COM 对象 —— "
+                              "要先装 Ophir 的 StarLab (PD300R + Juno+ 的驱动就在里面)");
+      else if (!OphirCom::isAvailable())
+         why = QStringLiteral("COM 对象注册着, 但它的 typelib 读不出来 "
+                              "(0x8002801D TYPE_E_LIBNOTREGISTERED) —— "
+                              "StarLab 装了但装坏了 (或者 dll 被换过), 重装一次");
+
+      if (!why.isEmpty())
       {
-         m->item(3)->setEnabled(false);
-         m->item(3)->setToolTip(why);
+         auto *m = qobject_cast<QStandardItemModel *>(m_cbMeter->model());
+         if (m != nullptr && m->item(3) != nullptr)
+         {
+            m->item(3)->setEnabled(false);
+            m->item(3)->setToolTip(why);
+         }
       }
    }
 
@@ -1770,20 +1838,28 @@ QWidget *ScanWindow::buildMeterPanel()
       h->addWidget(m_edManualV, 1);
    }
 
+   /* 随机源的两个旋钮。**初值都从源自己那儿取** (base()/noise()): 缺省只有一份 —— 在这一列里
+    * 再写一遍 1.0 / 0.05, 就是两处缺省, 迟早对不上 */
    m_randomRow = new QWidget(box);
    {
-      QHBoxLayout *h = new QHBoxLayout(m_randomRow);
-      h->setContentsMargins(0, 0, 0, 0);
-      h->setSpacing(6);
-      h->addWidget(new QLabel(QStringLiteral("噪声"), m_randomRow));
+      QFormLayout *f = new QFormLayout(m_randomRow);
+      f->setContentsMargins(0, 0, 0, 0);
+
+      m_edRandomBase = new QDoubleSpinBox(m_randomRow);
+      m_edRandomBase->setRange(-1e9, 1e9);
+      m_edRandomBase->setDecimals(6);
+      m_edRandomBase->setValue(m_random->base());
+      connect(m_edRandomBase, &QDoubleSpinBox::valueChanged, this,
+              [this](double x) { m_random->setBase(x); });
+      f->addRow(QStringLiteral("基值"), m_edRandomBase);
+
       m_edRandomN = new QDoubleSpinBox(m_randomRow);
       m_edRandomN->setRange(0.0, 1e6);
       m_edRandomN->setDecimals(4);
-      m_edRandomN->setValue(0.05);           /* 与 RandomMeter 的缺省噪声一致 */
-      m_random->setNoise(0.05);
+      m_edRandomN->setValue(m_random->noise());
       connect(m_edRandomN, &QDoubleSpinBox::valueChanged, this,
               [this](double x) { m_random->setNoise(x); });
-      h->addWidget(m_edRandomN, 1);
+      f->addRow(QStringLiteral("噪声"), m_edRandomN);
    }
 
    m_scriptRow = new QWidget(box);
@@ -1803,6 +1879,33 @@ QWidget *ScanWindow::buildMeterPanel()
       connect(m_btnScript, &QPushButton::clicked, this, &ScanWindow::onBrowseScript);
       h->addWidget(m_btnScript);
    }
+
+   /* 模拟往返延迟。真机一次往返可能上百毫秒, 而模拟源默认 20ms —— 不把它调大, 就没法在
+    * 没有真机的时候看时序: 「读一次」那个往返时延、连续读数为什么是回话驱动、把延迟调过
+    * 看门狗 (kTimeoutMs) 时超时那一路长什么样。两个模拟源共用这一个数 */
+   m_simRow = new QWidget(box);
+   {
+      QHBoxLayout *h = new QHBoxLayout(m_simRow);
+      h->setContentsMargins(0, 0, 0, 0);
+      h->setSpacing(6);
+      h->addWidget(new QLabel(QStringLiteral("模拟延迟"), m_simRow));
+      m_edSimDelay = new QSpinBox(m_simRow);
+      m_edSimDelay->setRange(0, MeterLog::kTimeoutMs * 4);
+      m_edSimDelay->setSuffix(QStringLiteral(" ms"));
+      m_edSimDelay->setValue(m_random->delayMs());   /* 两个模拟源的缺省是同一个数 */
+      m_edSimDelay->setToolTip(QStringLiteral(
+         "**装出来的往返时间**: 源收到请求之后隔这么久才回话。\n"
+         "真机一次往返可能上百毫秒。把它调大就能在没有真机的时候看出「读一次」的往返时延、"
+         "连续读数为什么是「回话驱动排下一次」, 以及调大到超过 %1 ms (看门狗) 时超时那一路是\n"
+         "怎么表现的。\n"
+         "随机源与脚本源共用这一个数; 手动源是立刻回, 没有这一项。").arg(MeterLog::kTimeoutMs));
+      connect(m_edSimDelay, &QSpinBox::valueChanged, this, [this](int ms) {
+         m_random->setDelayMs(ms);
+         m_script->setDelayMs(ms);
+      });
+      h->addWidget(m_edSimDelay, 1);
+   }
+   v->addWidget(m_simRow);
 
    v->addWidget(m_manualRow);
    v->addWidget(m_randomRow);
@@ -1906,6 +2009,26 @@ QWidget *ScanWindow::buildMeterPanel()
 
    v->addLayout(ivRow);
 
+   /* 一次采样平均几个读数。与扫描参数里那个「每点采样」是同一件事 —— 那边少了它, 噪声大的
+    * 源就没法读稳; 这里少了它, 同一条曲线上扫描那趟与手采那趟的噪声水平就对不上 */
+   QHBoxLayout *avgRow = new QHBoxLayout;
+   avgRow->setSpacing(6);
+   avgRow->addWidget(new QLabel(QStringLiteral("每次平均"), box));
+   m_edMtrAvg = new QSpinBox(box);
+   m_edMtrAvg->setRange(1, MeterLog::kMaxAverage);
+   m_edMtrAvg->setValue(1);
+   m_edMtrAvg->setSuffix(QStringLiteral(" 次"));
+   m_edMtrAvg->setToolTip(QStringLiteral(
+      "一次采样连着取几个读数求平均 (扫描参数里那个「每点采样」是同一件事)。\n"
+      "1 = 每次都要一个数 (缺省)。调大读得稳: 平均出来的数抖得小, 而代价是每次采样要占"
+      "N 个往返。\n"
+      "N 次里有**一次**没读回来, 这一笔就作废 (记 ok=false) —— 拿半边的数求平均是编出来的,"
+      "而它在曲线上和别的点长得一模一样。\n"
+      "这 N 个读数是连着要的 (中间不隔一个间隔), 所以「间隔」是采样之间的间隔。"));
+   connect(m_edMtrAvg, &QSpinBox::valueChanged, this, &ScanWindow::onMtrAvgChanged);
+   avgRow->addWidget(m_edMtrAvg, 1);
+   v->addLayout(avgRow);
+
    m_lMtrCount = new QLabel(box);
    m_lMtrCount->setStyleSheet(QStringLiteral("color:#7b8391;"));
    v->addWidget(m_lMtrCount);
@@ -1996,7 +2119,7 @@ QWidget *ScanWindow::buildShadePanel()
    /* 下限就是 0: 功率没有负的。**下限也钉在 0**, 于是"最小 >= 0"这条不用在槽里再判一次 ——
     * 敲 -5 会被控件自己夹成 0, valueChanged 拿到的一直是合法值 */
    const QString kShadeTip = QStringLiteral(
-      "功率色阶的两端, 单位 W。\n"
+      "色阶的两端。**单位跟着上面那行字** (模拟源是 W; 真机 W 还是 J 看探头与模式)。\n"
       "改一个顶到另一个头上时, **另一个会自己让开**(跨度不变) —— 比如最小 0 / 最大 1 时把最小\n"
       "改成 5, 最大会一起抬到 6。非负数, 且最小 < 最大。\n"
       "这两个数**不记进 scan.ini** (只有「自动跟随」那个模式记)。");
@@ -2061,6 +2184,15 @@ QWidget *ScanWindow::buildShadePanel()
 
    f->addRow(QStringLiteral("最小"), m_edShadeLo);
    f->addRow(QStringLiteral("最大"), m_edShadeHi);
+
+   /* 单位一行。色阶画的是取样源的读数, 而"色标 (功率)"这个名字里就写着一个单位 —— 这一行
+    * 是真正算数的那个 (每拍由 refreshMeterReadout 跟着源改) */
+   m_lShadeUnit = new QLabel(box);
+   m_lShadeUnit->setWordWrap(true);
+   m_lShadeUnit->setTextFormat(Qt::PlainText);
+   m_lShadeUnit->setStyleSheet(QStringLiteral("color:#7b8391;"));
+   f->addRow(m_lShadeUnit);
+
    f->addRow(m_cbShadeAuto);
    f->addRow(m_btnFit);
    f->addRow(m_lblLocked);
@@ -2693,11 +2825,23 @@ void ScanWindow::onMeterInfoChanged()
 
    const OphirInfo i = m_ophir->info();
 
-   m_lDevInfo->setText(i.valid
+   /* 两行设备事实 + 一行版本 (诊断用)。版本那两行取不到就不占地方 —— 它们是驱动层给的东西
+    * (getVersion / getDriverVersion), 摆出来是为了出事时能一眼说清"装的是哪一版" */
+   QString dev = i.valid
       ? QStringLiteral("%1 / %2   序列号 %3 (表头 %4)\nROM %5   探头类型 %6")
            .arg(i.device_name, i.sensor_name, i.sensor_serial, i.device_serial,
                 i.rom_version, i.sensor_type)
-      : QStringLiteral("设备信息还没读回来"));
+      : QStringLiteral("设备信息还没读回来");
+
+   QStringList vers;
+   if (!i.com_version.isEmpty())
+      vers << QStringLiteral("对象 %1").arg(i.com_version);
+   if (!i.driver_version.isEmpty())
+      vers << QStringLiteral("驱动 %1").arg(i.driver_version);
+   if (!vers.isEmpty())
+      dev += QStringLiteral("\n版本: ") + vers.join(QStringLiteral("   "));
+
+   m_lDevInfo->setText(dev);
 
    if (!is_ophir)
       return;
@@ -2824,8 +2968,10 @@ void ScanWindow::onReadOnceReady(double watts)
    m_readTimer->stop();
 
    const double took = (double)(m_clock.elapsed() - m_readSentMs);
-   m_lReadout->setText(QStringLiteral("读一次 [%1]: %2 W   (往返 %3 ms)")
-                          .arg(m_meter->kind(), fmtWatts(watts))
+   /* 单位跟源头走, 不硬写 W (powermeter.h 的 unit()): 这一行是"拿这台仪器量出来的一个数",
+    * 单位说错了比不说更坏 */
+   m_lReadout->setText(QStringLiteral("读一次 [%1]: %2 %3   (往返 %4 ms)")
+                          .arg(m_meter->kind(), fmtWatts(watts), unitLabel(m_meter))
                           .arg(took, 0, 'f', 0));
    refresh();
 }
@@ -2885,6 +3031,10 @@ void ScanWindow::onMtrStartClicked()
 
    applyMtrCsvDefaultName();
 
+   /* 文件头上那几行 `#` (仪器/探头/波长/量程/模式/单位/间隔/平均次数) —— 在开文件**之前**
+    * 推过去, 因为新文件的表头是 beginRecord 里一次写完的 */
+   pushMeterMeta();
+
    /* 先开文件再开采集: 开不了就不采 —— 让人守着一个"以为在存"的记录是最坏的一种
     * (与扫描那边 append 失败即自动中止同一个道理) */
    QString err;
@@ -2937,6 +3087,31 @@ void ScanWindow::onMtrIntervalChanged(int ms)
       m_mlog->setInterval(ms);
 }
 
+void ScanWindow::onMtrAvgChanged(int n)
+{
+   if (m_mlog != nullptr)
+      m_mlog->setAverage(n);
+
+   /* meta 跟着变: 平均次数直接决定这些数是怎么来的 (几倍于原始读数的稳定度), 换文件时
+    * 必须记下**当时**那个数 —— 见 pushMeterMeta() */
+   pushMeterMeta();
+}
+
+/* 把"这几行是哪个仪器什么配置采的"推给连续读数器, 它建文件时写进去 (meterlog.h 的 setMeta)。
+ * 调用的三个时机: 开始、导出、改平均次数 —— 前两个是"马上要写文件了", 第三个是元数据本身
+ * 变了。做在这里而不是每拍推一次: 每拍都要拼一遍字符串, 而它只在写文件的那一刻有用。 */
+void ScanWindow::pushMeterMeta()
+{
+   if (m_mlog == nullptr)
+      return;
+
+   QStringList lines = meterMetaLines(m_meter);
+   /* 采样节奏也是数据的一部分: 间隔决定时间分辨率, 平均次数决定每个点的噪声 */
+   lines << QStringLiteral("meter_interval_ms=%1").arg(m_edMtrInterval->value());
+   lines << QStringLiteral("meter_avg=%1").arg(m_mlog->average());
+   m_mlog->setMeta(lines);
+}
+
 void ScanWindow::onMtrBrowseCsv()
 {
    const QString start = m_edMtrCsv->text().trimmed().isEmpty()
@@ -2980,6 +3155,9 @@ void ScanWindow::onMtrExportClicked()
       QStringLiteral("CSV (*.csv);;所有文件 (*)"));
    if (f.isEmpty())
       return;
+
+   /* 导出的也是**一个完整的文件**, 头几行照写 (这份是新文件, 每次都要写) */
+   pushMeterMeta();
 
    QString err;
    if (!m_mlog->saveBuffer(f, &err))

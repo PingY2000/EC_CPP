@@ -21,6 +21,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 #include <cstdint>
@@ -48,11 +49,16 @@ public:
    static constexpr int kMaxIntervalMs     = 60000;
    /* 一个请求的看门狗。Ophir 那条自己 1800ms 会报 stale, 这里放宽到 3000 让它先开口 */
    static constexpr int kTimeoutMs         = 3000;
-   /* 环形缓冲容量。够画一条看得很清楚的曲线, 又不至于把一个长时间段吃光内存 */
+   /* 环形缓冲容量。够画一条看得很清楚的曲线, 又不至于把一个长时间段吃光内存。
+    * **满了就在丢最旧的**, 所以 full() 要显示出来 (见 refreshMeterReadout) */
    static constexpr int kCapacity          = 20000;
+   /* 一次采样最多平均几次。与扫描的 samples_per_point 是同一件事, 只是这份没有参数面板 */
+   static constexpr int kMaxAverage        = 64;
 
    /* 一个采样。ok = false 是"要了一次没要回来"(超时/源报错), 不是"读到了 0 W" ——
-    * 与扫描 CSV 的 ok 列同一个口径, 曲线上画成断点, 不算进统计。 */
+    * 与扫描 CSV 的 ok 列同一个口径, 曲线上画成断点, 不算进统计。
+    *
+    * 一次采样可能要 N 个读数 (见 setAverage), 那时 watts 是那 N 个的平均, 时刻取**最后一个** */
    struct Sample
    {
       int64_t ms    = 0;     /* 单调钟 (喂进来的那个), 用来画横轴 */
@@ -95,6 +101,12 @@ public:
    /* 改间隔。跑着时下一拍就用新的 (不打断当前那个未决请求) */
    void setInterval(int ms);
 
+   /* 每个采样平均几次 (1..kMaxAverage, 缺省 1 = 每次都要)。与扫描的 samples_per_point
+    * 同一个口径, 连失败的处理也一样: N 次里**有一次**没读回来, 这一笔就记 ok=false ——
+    * 拿半边的数求平均是编出来的, 而它在曲线上看着和别的点一模一样。 */
+   void setAverage(int n);
+   int  average() const { return m_avg; }
+
    /* 让位 / 收回。hold 期间不发也不排下一次; 放开之后从**当时**重新排, 不补采欠下的 */
    void setHold(bool hold);
 
@@ -105,9 +117,19 @@ public:
 
    const QVector<Sample> &samples() const { return m_v; }
    int   count() const { return (int)m_v.size(); }
+   /* 环形缓冲满了 —— 再采一笔就要丢掉最旧的那一个。**这件事必须让人看见**: 屏幕上
+    * 那条曲线看着照旧很健康, 只是它已经不完整了 */
+   bool  full() const { return m_v.size() >= kCapacity; }
    Stats stats() const;
 
-   /* 边采边写: 建文件 (父目录自动建) + 表头, 之后每个采样追加一行并 flush。
+   /* 写文件时先写的那几行 (`#` 开头) 的内容。裸 key=value, 由本类加 "# " —— 与扫描那份
+    * CSV 的 extra_meta 同一个格式 (scanlog.h)。谁采的就该记下是谁采的: 关于探头/波长/量程/
+    * 模式/单位/平均次数, 这里一个都不留白, 否则数据回头没法复核。
+    * 由界面拼 (meterMetaLines + 间隔/平均次数), 本类不猜里面该有什么。 */
+   void setMeta(const QStringList &lines);
+   const QStringList &meta() const { return m_meta; }
+
+   /* 边采边写: 建文件 (父目录自动建) + meta 行 + 表头, 之后每个采样追加一行并 flush。
     * 崩了/断电只丢最后一个数, 与 ScanLog 同一个取舍。失败不抛, 返回 false + 原因。 */
    bool beginRecord(const QString &path, QString *err);
    void endRecord();
@@ -144,6 +166,8 @@ private:
     * —— 时钟是外面的, 槽里没有别的来源 */
    void record(const Sample &s);
    bool appendCsv(const Sample &s);
+   QString metaBlock() const;          /* m_meta 那几行 + "# " 前缀 + 换行 */
+   void resetBatch();                  /* 丢掉手上这一批还没凑够的读数 */
    static int clampInterval(int ms);
 
    PowerMeter *m_src = nullptr;
@@ -154,12 +178,17 @@ private:
    bool m_hold      = false;
 
    int     m_interval = kDefaultIntervalMs;
+   int     m_avg      = 1;      /* 一次采样平均几个读数 */
+   int     m_nsamp    = 0;      /* 手上这一批已经收到几个 */
+   double  m_acc      = 0.0;    /* 手上这一批的和 */
    int64_t m_now_ms   = 0;      /* 最近一次 tick 的读数 */
    int64_t m_due_ms   = 0;      /* 下一次可以发的时刻 */
    int64_t m_sent_ms  = 0;      /* 这一次是什么时候发的 (看门狗用) */
 
    QVector<Sample> m_v;
    int64_t m_t0 = 0;            /* 第一笔的 ms, 导出时的 elapsed 基准 */
+
+   QStringList m_meta;          /* 写进文件头的 `#` 行 (裸 key=value) */
 
    QFile  *m_f = nullptr;
    QString m_path;

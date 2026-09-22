@@ -50,13 +50,35 @@ void MeterCurve::setSourceName(const QString &s)
    update();
 }
 
+void MeterCurve::setUnit(const QString &u)
+{
+   if (u == m_unit)
+      return;
+
+   m_unit = u;
+
+   /* 「单位不明」那句话只说在 tooltip 里: 图顶上那一行很窄 (参数栏就 320 宽), 而一个 "?"
+    * 已经够让人停下来问一句"这是什么单位"了 —— 那正是要的效果 */
+   setToolTip(u.isEmpty()
+      ? QStringLiteral(
+           "纵轴的单位**不明**。\n"
+           "真机报的是 W 还是 J, 由探头与测量模式决定, 而 Ophir 的 COM 接口一个字段都不给: "
+           "打开设备后是按设备自己报的探头类型与模式名判的, 判不出来就画 「?」 (见 "
+           "powermeter.h 的 unit())。\n"
+           "模拟源 (手动 / 随机 / 脚本) 按定义是 W。")
+      : QStringLiteral("纵轴: %1").arg(u));
+
+   update();
+}
+
 QSize MeterCurve::sizeHint() const
 {
    return QSize(300, 170);
 }
 
 /*
- * 一张时间-功率折线。横轴是"相对第一笔的秒数", 纵轴自动。
+ * 一张读数折线。横轴是"相对第一笔的秒数", 纵轴自动 (值域只看 ok 的那些)。
+ * 纵轴那个单位字由外面给 (setUnit): 真机报的可能是 J, 认不出来时画 "?"。
  */
 void MeterCurve::paintEvent(QPaintEvent *)
 {
@@ -171,7 +193,8 @@ void MeterCurve::paintEvent(QPaintEvent *)
               QStringLiteral("秒"));
    if (!m_src_name.isEmpty())
       p.drawText(QRectF(r.left(), 1, r.width(), 16), Qt::AlignLeft | Qt::AlignVCenter,
-                 QStringLiteral("%1   纵轴: W").arg(m_src_name));
+                 QStringLiteral("%1   纵轴: %2")
+                    .arg(m_src_name, m_unit.isEmpty() ? QStringLiteral("?") : m_unit));
 
    /* ---- 折线 ---- */
    p.setClipRect(r);

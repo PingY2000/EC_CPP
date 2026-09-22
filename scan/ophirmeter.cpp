@@ -84,6 +84,12 @@ QString buildSummary(const OphirInfo &i)
    if (i.mode_index >= 0 && i.mode_index < i.modes.size())
       parts << i.modes.at(i.mode_index);
 
+   /* 读数单位 (由模式名 / 探头类型判出来的那个)。状态行是操作员一眼看得见的地方, 所以
+    * 它也要写出来 —— 而判不出来就照原样写「单位不明」, **不替它填一个 W**。
+    * 与 powermeter.cpp 的 unitLabel() 同一个词, 只是那份收的是 PowerMeter* */
+   parts << (i.unit.isEmpty() ? QStringLiteral("单位不明")
+                              : QStringLiteral("单位 %1").arg(i.unit));
+
    return parts.join(QStringLiteral("  ·  "));
 }
 
@@ -101,6 +107,36 @@ struct ComApartment
 };
 
 }   /* namespace */
+
+/* 由设备自己的两个字判读数单位。**放在匿名空间外面**: 它在 ophirmeter.h 里是给外面用的
+ * (scan_selftest 直接调它验那几条判据), 定义留在匿名空间里会与头文件那份声明撞成二义
+ * (g++: call of overloaded ... is ambiguous) */
+QString unitFromDeviceInfo(const QString &sensor_type, const QString &mode_name)
+{
+   /* 先看**测量模式名**: 那是设备自己的说法, 而且它随模式改 (Power <-> Energy)。
+    * 它说了别的东西 (例如 dBm) 就一律不认 —— 模式名在的时候**不许**探头类型替它翻案:
+    * 一只热电堆探头切到 dBm 模式, 报回来的那个数**不是瓦** (是对数), 那时按探头类型
+    * 说 W 就会让一个对数值顶着瓦的单位被记进 CSV。 */
+   const QString m = mode_name.toLower();
+   if (!m.isEmpty())
+   {
+      if (m.contains(QStringLiteral("energy")))
+         return QStringLiteral("J");
+      if (m.contains(QStringLiteral("power")))
+         return QStringLiteral("W");
+      return QString();      /* 模式名说的是别的东西。**不猜** (见 ophirmeter.h) */
+   }
+
+   /* 模式这一项根本不存在时 (手册 Common Parameters: 探头可能没有这一项) 才退回探头类型:
+    * 热释电探头测的是脉冲能量, 热电堆与光电二极管测的是功率 */
+   const QString t = sensor_type.toLower();
+   if (t.contains(QStringLiteral("pyro")))
+      return QStringLiteral("J");
+   if (t.contains(QStringLiteral("thermo")) || t.contains(QStringLiteral("photodiode")))
+      return QStringLiteral("W");
+
+   return QString();      /* 认不出来。**不猜**, 见 ophirmeter.h 的说明 */
+}
 
 struct OphirMeter::Private
 {
@@ -161,6 +197,51 @@ OphirMeter::~OphirMeter()
 QString OphirMeter::kind() const
 {
    return QStringLiteral("Ophir 功率计 (PD300R/Juno+)");
+}
+
+QString OphirMeter::tag() const
+{
+   return QStringLiteral("ophir");
+}
+
+QString OphirMeter::unit() const
+{
+   return info().unit;
+}
+
+/* 这趟数据是哪个表头、哪个探头、什么波长/量程/模式采的 —— 一行一条 key=value, 进两份
+ * CSV 的 `#` 行 (meterMetaLines 会加 meter_source / meter_unit 两行在它前面)。
+ *
+ * 没打开就**一个空表**: 那时 info() 里全是空的, 记下去只会是一份"说不清来源"的表头。 */
+QStringList OphirMeter::configLines() const
+{
+   const OphirInfo i = info();
+   if (!i.valid)
+      return QStringList();
+
+   /* 值里可以带空格 (模式名就常是 "Power - CW" 这样): `#` 行是按 key 找的, 空格无妨 */
+   QStringList out;
+   auto add = [&out](const QString &k, const QString &v) {
+      if (!v.isEmpty())
+         out << QStringLiteral("%1=%2").arg(k, v);
+   };
+   add(QStringLiteral("meter_device"),        i.device_name);
+   add(QStringLiteral("meter_device_serial"), i.device_serial);
+   add(QStringLiteral("meter_device_rom"),    i.rom_version);
+   add(QStringLiteral("meter_sensor"),        i.sensor_name);
+   add(QStringLiteral("meter_sensor_type"),   i.sensor_type);
+   add(QStringLiteral("meter_sensor_serial"), i.sensor_serial);
+
+   /* 这三项记的是**当前选中的那一项**, 不是整张选项表: 数据是这一档采的 */
+   if (i.wl_index >= 0 && i.wl_index < i.wavelengths.size())
+      add(QStringLiteral("meter_wavelength"), i.wavelengths.at(i.wl_index));
+   if (i.range_index >= 0 && i.range_index < i.ranges.size())
+      add(QStringLiteral("meter_range"), i.ranges.at(i.range_index));
+   if (i.mode_index >= 0 && i.mode_index < i.modes.size())
+      add(QStringLiteral("meter_mode"), i.modes.at(i.mode_index));
+
+   add(QStringLiteral("meter_driver"), i.driver_version);
+   return out;
 }
 
 OphirInfo OphirMeter::info() const
@@ -359,8 +440,27 @@ void OphirMeter::runSession()
          info.range_index = (int)idx;
       if (com.getMeasurementMode(h, k_channel, &idx, &info.modes, &e2))
          info.mode_index = (int)idx;
+
+      /* 单位**在这儿判**, 因为它随模式走: Power 那一档报的是 W, 切到 Energy 同一份数组
+       * 就是 J 了。判不出来留空 (= 不明), 界面照原样写「单位不明」 */
+      const QString mode_now = (info.mode_index >= 0 && info.mode_index < info.modes.size())
+                                  ? info.modes.at(info.mode_index)
+                                  : QString();
+      info.unit = unitFromDeviceInfo(info.sensor_type, mode_now);
    };
    readOptions();
+
+   /* ---- 两个版本号 (纯诊断) ----
+    * 取不到就空着: 一句诊断信息不该把设备挡在门外。GetVersion 给的是个整数, 原样记下来
+    * —— 怎么解读是 Ophir 的事, 这里不替它编一个 "x.y.z" 的格式 */
+   {
+      long ver = 0;
+      if (com.getVersion(&ver, nullptr))
+         info.com_version = QString::number((qlonglong)ver);
+      QString drv;
+      if (com.getDriverVersion(&drv, nullptr))
+         info.driver_version = drv.trimmed();
+   }
 
    /* ---- 开流 ----
     * 不调 ConfigureStreamMode: 缺省的 Standard 就是这里要的 (对象把数据攒起来, 由
@@ -427,6 +527,8 @@ void OphirMeter::runSession()
                p->info.wl_index    = info.wl_index;
                p->info.range_index = info.range_index;
                p->info.mode_index  = info.mode_index;
+               /* 单位跟着模式走: 上面那一句可能刚把它改了 (W <-> J) */
+               p->info.unit        = info.unit;
                p->info.summary     = summary;
             }
             emit infoChanged();

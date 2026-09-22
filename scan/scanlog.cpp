@@ -12,7 +12,8 @@ ScanLog::~ScanLog()
 }
 
 bool ScanLog::beginNew(const QString &path, const Params &p,
-                       const QString &started_iso, int zero_epoch, QString *err)
+                       const QString &started_iso, int zero_epoch,
+                       const QStringList &extra_meta, QString *err)
 {
    close();
 
@@ -41,6 +42,16 @@ bool ScanLog::beginNew(const QString &path, const Params &p,
    m_written = 0;
 
    std::string head = csvMetaLines(p, started_iso.toStdString(), zero_epoch);
+
+   /* 仪器那几行 (探头/波长/量程/模式/单位 …)。加了前缀就是 `#` 注释, 而读回时只认那几个
+    * 几何 key (scanplan.cpp 的 metaGet), 多几行不影响续扫的兼容性判定 —— 自检里有这一条 */
+   for (const QString &l : extra_meta)
+   {
+      head += "# ";
+      head += l.toStdString();
+      head += "\n";
+   }
+
    head += csvColumnHeader();
    head += "\n";
 

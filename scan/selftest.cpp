@@ -262,6 +262,8 @@ class FakeMeter : public PowerMeter
 {
 public:
    QString kind() const override { return QStringLiteral("fake"); }
+   /* tag() 是纯虚的 (powermeter.h): 进 CSV 的那个标识, 纯 ASCII */
+   QString tag()  const override { return QStringLiteral("fake"); }
    bool open(QString *) override { m_open = true; return true; }
    void close() override         { m_open = false; }
 
@@ -588,6 +590,87 @@ static void test_csv()
    outside += "0,99,0,0,0,0,0,1,1,,0,0,0,0,0,0\n";       /* ix 超出 55 */
    check(!csvParseForResume(outside, p, nullptr, nullptr, nullptr, nullptr).empty(),
          "an out-of-grid index rejected");
+}
+
+static void test_meter_meta()
+{
+   caseBegin("meter: 读数单位由设备自己的字判, 判不出来就不猜");
+   {
+      /* 探头类型与测量模式名, 两个来源任一说得清就说得清 */
+      check(unitFromDeviceInfo(QStringLiteral("pyroelectric"), QStringLiteral("Energy"))
+               == QStringLiteral("J"),
+            "热释电 + Energy -> J");
+      check(unitFromDeviceInfo(QStringLiteral("thermopile"), QStringLiteral("Power"))
+               == QStringLiteral("W"),
+            "热电堆 + Power -> W");
+      check(unitFromDeviceInfo(QStringLiteral("photodiode"), QStringLiteral("Power"))
+               == QStringLiteral("W"),
+            "光电二极管 + Power -> W");
+
+      /* 模式名优先于探头类型: 同一只探头在 Energy 模式下报的是 J */
+      check(unitFromDeviceInfo(QStringLiteral("thermopile"), QStringLiteral("Energy"))
+               == QStringLiteral("J"),
+            "模式名说了算");
+
+      /* **认不出来返回空**, 一个字符都不许编 */
+      check(unitFromDeviceInfo(QString(), QString()).isEmpty(), "两个都空 -> 空");
+      check(unitFromDeviceInfo(QStringLiteral("pyroelectric"), QStringLiteral("dBm")).isEmpty(),
+            "dBm 算认不出来 —— 外面判不出那份数组到底是 dBm 还是 W");
+      check(unitFromDeviceInfo(QStringLiteral("unknown-type"), QStringLiteral("Power"))
+               == QStringLiteral("W"),
+            "模式名认得出来就够 (不需要探头也认得)");
+   }
+
+   caseBegin("meter: 两份 CSV 的 meta 行 —— 谁采的 / 什么单位 / 什么配置");
+   {
+      QTemporaryDir dir;
+      check(dir.isValid(), "temp dir");
+
+      Params p;
+      const QString path = dir.filePath(QStringLiteral("s.csv"));
+
+      ScanLog log;
+      QString err;
+
+      /* 界面推过来的是 meterMetaLines() 的产出 (纯 ASCII), 这里原样摆几行 */
+      checkEq((long long)meterMetaLines(nullptr).size(), 0, "没有源 -> 一行都不加");
+
+      QStringList extra = meterMetaLines(nullptr);
+      extra << QStringLiteral("meter_source=ophir")
+            << QStringLiteral("meter_unit=J")
+            << QStringLiteral("meter_mode=Energy");
+
+      check(log.beginNew(path, p, QStringLiteral("2026-09-17T10:00:00"), 3, extra, &err),
+            "beginNew with extra meta", err.toStdString());
+
+      QFile f(path);
+      check(f.open(QIODevice::ReadOnly | QIODevice::Text), "read it back");
+      const QString text = QString::fromUtf8(f.readAll());
+      f.close();
+
+      check(text.contains(QStringLiteral("# meter_unit=J\n")), "单位那一行在文件里");
+      check(text.contains(QStringLiteral("# meter_source=ophir\n")), "来源那一行在文件里");
+
+      /* 位置: 夹在几何那几行与列表头之间 —— 头几行永远是"这份文件是怎么来的" */
+      const int at_meta = text.indexOf(QStringLiteral("# meter_source="));
+      const int at_head = text.indexOf(QStringLiteral("index,ix,iy"));
+      check(at_meta > 0 && at_head > at_meta, "在列表头之前",
+            text.left(300).toStdString());
+      check(text.indexOf(QStringLiteral("# started=")) < at_meta, "几何那几行照旧在前面");
+
+      /* 关键的一条: 头里多了几行, **续扫的兼容性判定一个字都没变** ——
+       * 读回时只认那几个几何 key (scanplan.cpp 的 metaGet), 多的行没人看 */
+      std::vector<char> mask;
+      int max_index = -1;
+      std::string iso;
+      int epoch = -1;
+      const std::string diff =
+         csvParseForResume(text.toStdString(), p, &mask, &max_index, &iso, &epoch);
+      check(diff.empty(), "带 meter 行的文件照样能续扫", diff);
+      checkEq(max_index, -1, "一个点都还没采");
+      checkEq(epoch, 3, "zero_epoch 照旧读得回来");
+      check(iso == "2026-09-17T10:00:00", "started 照旧读得回来", iso);
+   }
 }
 
 static void test_arrive()
@@ -2908,6 +2991,7 @@ static void test_meterlog()
       QString e;
       r.log.setInterval(MeterLog::kMinIntervalMs);
       r.log.start(MeterLog::kMinIntervalMs, &e);
+      check(!r.log.full(), "刚打开的时候没满");
 
       /* 记下每一笔的 ms, 于是"第一个该丢的是谁"是算出来的, 不是猜的 */
       QVector<int64_t> seen;
@@ -2923,10 +3007,143 @@ static void test_meterlog()
 
       check(seen.size() >= want, "确实采够了那么多个 (采 20050 个, 缓冲只有 20000)");
       checkEq(r.log.count(), MeterLog::kCapacity, "缓冲停在容量上, 不是无限涨");
+      /* 满了这件事**必须能问出来**: 屏幕上那条曲线在丢数的时候看着照旧很健康 */
+      check(r.log.full(), "full() 说得出'现在满了, 再采就要丢最旧的'");
       checkEq((long long)r.log.samples().first().ms, (long long)seen[50],
               "留在最前面的正是第 51 笔 —— 丢的只能是最旧的");
       checkEq((long long)r.log.samples().last().ms, (long long)seen.last(),
               "最后一笔就是刚采到的那个");
+   }
+
+   caseBegin("meterlog: 平均 —— 一笔采样要 N 个读数, 少一个都不算数");
+   {
+      MeterRig r(20);
+      QString e;
+
+      checkEq(r.log.average(), 1, "缺省是每次都要 (1)");
+      r.log.setAverage(4);
+      checkEq(r.log.average(), 4, "setAverage 记住了");
+      r.log.setAverage(0);
+      checkEq(r.log.average(), 1, "0 夹到 1");
+      r.log.setAverage(100000);
+      checkEq(r.log.average(), MeterLog::kMaxAverage, "太大夹到 kMaxAverage");
+      r.log.setAverage(4);
+
+      r.log.setInterval(200);
+      check(r.log.start(200, &e), "start()", e.toStdString());
+
+      /* 四个**不同的**数: 求平均与"只留最后一个"在同一个数上看不出区别 */
+      const double v[4] = { 1.0, 2.0, 3.0, 4.0 };
+      for (int i = 0; i < 4; i++)
+      {
+         r.step();                       /* 这一拍把第 i+1 个子读数发出去 */
+         r.meter.setValue(v[i]);         /* 它回来的就是这个数 */
+         r.step();                       /* 回话到, 累加进手上这一批 */
+      }
+
+      checkEq(r.meter.requests(), 4, "一笔采样发了 4 个请求");
+      checkEq(r.log.count(), 1, "4 个读数只记成一笔");
+      checkEq(r.log.stats().n, 1, "这一笔是 ok 的");
+      checkNear(r.log.stats().last, 2.5, "记的是那 4 个的平均 (1+2+3+4)/4");
+
+      /* N 次里有一次没读回来 -> **这一笔作废** (与扫描那个点读不到时同一个口径:
+       * 拿半边的数求平均是编出来的, 而它在曲线上和别的点长得一模一样)。
+       * 两条都得验: 第一个子读数就失败, 与攒到一半才失败 */
+      MeterRig f(20);
+      f.log.setAverage(4);
+      f.log.setInterval(200);
+      f.log.start(200, &e);
+      checkEq(f.log.count(), 0, "刚开始一笔都没有");
+      f.meter.failNext();                  /* 第 1 个子读数就让它失败 */
+      f.run(100);
+      checkEq(f.log.count(), 1, "失败**也算一笔** (ok=false), 不是不记");
+      checkEq(f.log.stats().n, 0, "没读回来的不算进统计");
+      check(!f.log.samples().last().ok, "这一笔是 ok=false");
+
+      MeterRig g(20);
+      g.log.setAverage(4);
+      g.log.setInterval(200);
+      g.log.start(200, &e);
+      g.step();                            /* 发第 1 个子读数 */
+      g.step();                            /* 回来了, 攒进 1 个 (还差 3 个) */
+      checkEq(g.log.count(), 0, "没凑够 N 个, 一笔都不记");
+      g.meter.failNext();                  /* 第 2 个让它失败 */
+      g.step();                            /* 发第 2 个 */
+      g.step();                            /* 失败回来了 */
+      checkEq(g.log.count(), 1, "攒到一半失败 -> 这一笔作废 (ok=false)");
+      checkEq(g.log.stats().n, 0, "攒着的那半份一起丢掉, 没有混进统计");
+      check(!g.log.samples().last().ok, "这一笔是 ok=false");
+      checkEq(g.meter.overlaps(), 0, "全程没有重叠请求");
+   }
+
+   caseBegin("meterlog: 文件头那几行 —— 是谁采的 / 什么单位 / 什么配置");
+   {
+      /* 一个"单位认不出来"的源: 真机判不出来时就是空 (powermeter.h 的 unit()) */
+      struct Unitless : FakeMeter
+      {
+         QString unit() const override { return QString(); }
+         QStringList configLines() const override
+         {
+            return QStringList{} << QStringLiteral("meter_mode=Unknown")
+                                 << QStringLiteral("meter_wavelength=1064");
+         }
+      };
+
+      Unitless src;
+      src.open(nullptr);
+
+      const QStringList ml = meterMetaLines(&src);
+      checkEq((long long)ml.size(), 4, "来源 + 单位 + 它自己报的那两行");
+      check(ml[0] == QStringLiteral("meter_source=fake"), "来源那个键", ml[0].toStdString());
+      check(ml[1] == QStringLiteral("meter_unit=unknown"),
+            "认不出来就写 unknown —— **不许**替它写一个 W", ml[1].toStdString());
+      check(unitLabel(&src) == QStringLiteral("单位不明"), "界面上那一句",
+            unitLabel(&src).toStdString());
+      check(unitLabel(nullptr) == QStringLiteral("单位不明"), "没有源也是这一句");
+      check((long long)meterMetaLines(nullptr).size() == 0, "没有源就一行都不写");
+
+      /* 缺省单位是 W: 三个模拟源按定义就是 (CSV 那一列本来就叫 watts) */
+      FakeMeter plain;
+      check(meterMetaLines(&plain).at(1) == QStringLiteral("meter_unit=W"),
+            "模拟源照旧是 W", meterMetaLines(&plain).at(1).toStdString());
+      check(unitLabel(&plain) == QStringLiteral("W"), "unitLabel 就是那个字");
+
+      QTemporaryDir dir;
+      check(dir.isValid(), "temp dir");
+      const QString csv = dir.filePath(QStringLiteral("meta.csv"));
+
+      MeterRig r(20);
+      r.log.setMeta(QStringList{} << QStringLiteral("meter_source=fake")
+                                 << QStringLiteral("meter_unit=W")
+                                 << QStringLiteral("meter_interval_ms=200")
+                                 << QStringLiteral("meter_avg=1"));
+      QString err;
+      check(r.log.beginRecord(csv, &err), "beginRecord", err.toStdString());
+      r.log.start(200, &err);
+      r.run(600);
+      r.log.stop();
+      r.log.endRecord();
+
+      QFile f(csv);
+      check(f.open(QIODevice::ReadOnly | QIODevice::Text), "read it back");
+      const QString text = QString::fromUtf8(f.readAll());
+      f.close();
+
+      const QStringList lines = text.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+      check(lines.first() == QStringLiteral("# meter_source=fake"),
+            "第一行就是 meta (在表头之前)", lines.first().toStdString());
+      check(text.contains(QStringLiteral("# meter_avg=1\n")), "每一行都带 `# `");
+      checkEq((long long)lines.size(), 5 + r.log.count(), "行数 = 4 行 meta + 表头 + 样本");
+      check(lines.at(4) == QStringLiteral("unix_ms,elapsed_ms,watts,ok"),
+            "列表头照旧**逐字没动**, 单位改记在上面那几行里", lines.at(4).toStdString());
+
+      /* 导出那份**也要**带: 它是个独立文件, 换个地方打开时上面那些字一个都不能少 */
+      const QString dump = dir.filePath(QStringLiteral("meta_dump.csv"));
+      check(r.log.saveBuffer(dump, &err), "saveBuffer", err.toStdString());
+      QFile d(dump);
+      check(d.open(QIODevice::ReadOnly | QIODevice::Text), "read the dump");
+      check(QString::fromUtf8(d.readAll()).contains(QStringLiteral("# meter_unit=W\n")),
+            "导出那份头上也有");
    }
 
    caseBegin("meterlog: 统计 —— ok 的那些才算, 标准差是样本标准差");
@@ -3177,6 +3394,7 @@ int main(int argc, char **argv)
    test_limitsw();
    test_homing();
    test_meter_sources();
+   test_meter_meta();
    test_meterlog();
    test_ophir();
 
