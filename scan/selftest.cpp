@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "editgate.h"
+#include "meterlog.h"
 #include "scanarrive.h"
 #include "scancontroller.h"
 #include "scanlog.h"
@@ -271,6 +272,13 @@ public:
          emit readingFailed(QStringLiteral("没开"));
          return;
       }
+      /* 上一个还没回就又来一个 —— 这正是 powermeter.h 那条"同一时刻只允许一个未决请求"
+       * 禁止的事。记下来: 测试靠它判"仲裁漏了一拍", 因为别的症状全是静默的
+       * (真机上这一下会让一份回话分给两个调用方, 或者一边白等到超时) */
+      if (armed_)
+         overlaps_++;
+
+      requests_++;
       armed_ = true;
       fails_ = fail_next_;
       fail_next_ = false;
@@ -302,6 +310,10 @@ public:
    }
 
    int readings() const { return readings_; }
+   /* 收到过几个请求 (与 readings 不同: 发了但还没回的那些只算在这里) */
+   int requests() const { return requests_; }
+   /* 上一个未决请求还没回, 就又收到了一个请求的次数。**正常必须恒为 0** */
+   int overlaps() const { return overlaps_; }
 
 private:
    double  value_      = 1.0;
@@ -309,6 +321,8 @@ private:
    int64_t due_        = 0;
    int     latency_ms_ = 60;
    int     readings_   = 0;
+   int     requests_   = 0;
+   int     overlaps_   = 0;
    bool    armed_      = false;
    bool    fails_      = false;
    bool    fail_next_  = false;
@@ -2764,6 +2778,384 @@ static void test_ophir()
    }
 }
 
+/* ---------------------------------------------------------------- 连续读数 */
+
+/* 独立功率计窗口那个「连续读数」的台架: 一个 MeterLog + 一个 FakeMeter, 时钟手拨。
+ * 顺序与 Rig::stepOnce 一致 —— 先让采集器看一眼表 (决定发不发), 再放回包 (等价于"硬件"回话)。 */
+struct MeterRig
+{
+   FakeMeter meter;
+   MeterLog  log;
+   int64_t   now = 5000;
+
+   explicit MeterRig(int latency_ms = 60)
+   {
+      meter.setLatency(latency_ms);
+      meter.open(nullptr);
+      log.tick(now);              /* 先把钟对齐, 再挂源 (与 Rig 构造同一个理由) */
+      log.setSource(&meter);
+   }
+
+   void step(int dt = 20)
+   {
+      meter.setNow(now);
+      log.tick(now);
+      meter.pump(now);
+      now += dt;
+   }
+
+   void run(int64_t ms, int dt = 20)
+   {
+      const int64_t stop = now + ms;
+      while (now < stop)
+         step(dt);
+   }
+};
+
+static void test_meterlog()
+{
+   caseBegin("meterlog: 到点才发 —— 一个间隔一个请求, 不等就是不发");
+   {
+      MeterRig r;              /* 往返 60 */
+      QString e;
+      r.log.setInterval(200);
+      check(r.log.start(200, &e), "start()", e.toStdString());
+      checkEq(r.log.intervalMs(), 200, "interval kept");
+
+      /* 按下去那一刻就发第一个 (不空等一个间隔), 但**下一拍不许再发** */
+      r.step(60);
+      checkEq(r.meter.requests(), 1, "第一个请求发出去了");
+      checkEq(r.meter.readings(), 0, "回话还没到 (往返 60)");
+      check(r.log.pending(), "有一个未决请求在飞");
+
+      r.step(60);
+      checkEq(r.meter.readings(), 1, "回话到了");
+      checkEq(r.log.count(), 1, "记下第一笔");
+
+      /* 回话驱动排下一次: 两笔之间的间隔 = 间隔 + 往返 (再算上钟的粒度 60)。
+       * **绝不是每拍一笔** —— 那正是一个未决请求的约束下不能做的事 */
+      r.run(3000);
+      const int n = r.log.count();
+      check(n >= 8, "采到了一串");
+
+      int too_close = 0, too_far = 0;
+      for (int i = 1; i < n; i++)
+      {
+         const int64_t d = r.log.samples()[i].ms - r.log.samples()[i - 1].ms;
+         if (d < 200)
+            too_close++;
+         if (d > 200 + 2 * 60)
+            too_far++;
+      }
+      checkEq(too_close, 0, "没有哪两笔挤得比间隔还近");
+      checkEq(too_far, 0, "也没有哪两笔隔得超出 间隔 + 往返 + 一拍钟");
+      checkEq(r.meter.overlaps(), 0, "**从不**有两个未决请求同时压在一个源上");
+   }
+
+   caseBegin("meterlog: 未决期间再拨多少拍也不发第二个 (往返比间隔长也一样)");
+   {
+      /* 往返 500 > 间隔 20: 固定节拍的做法会在这里堆出一串请求 */
+      MeterRig r(500);
+      QString e;
+      r.log.setInterval(20);
+      r.log.start(20, &e);
+
+      r.run(2000, 20);
+      check(r.log.count() >= 3, "还是采到了数 (节奏里有往返时间, 这是诚实的记法)");
+      checkEq(r.meter.overlaps(), 0, "**没有**因为间隔短就堆请求");
+      check(r.log.count() <= 5, "2000ms / (500+20) 大约就是这么多笔, 不是 100 笔");
+   }
+
+   caseBegin("meterlog: 换源 —— 旧源迟到的回话被丢掉, 缓冲清空");
+   {
+      MeterRig r(500);
+      QString e;
+      r.log.setInterval(200);
+      check(r.log.start(200, &e), "start()", e.toStdString());
+      r.step(20);                                 /* 发出第一个, 500ms 后才回 */
+
+      checkEq(r.meter.requests(), 1, "旧源那儿有一个在飞");
+      const int64_t handed_over_at = r.now;
+
+      FakeMeter other;                            /* 新源, 快得多 */
+      other.setLatency(1);
+      other.open(nullptr);
+
+      r.log.setSource(&other);
+      checkEq(r.log.count(), 0, "缓冲清空 (一条曲线只画一个源)");
+      check(!r.log.pending(), "那一个未决请求作废了");
+
+      /* 旧源那一份现在才回来。**必须被丢掉**: 它是另一个东西采的数 */
+      r.meter.pump(handed_over_at + 1000);
+      checkEq(r.meter.readings(), 1, "旧源确实回了一份 (所以下面这一条才有意义)");
+      checkEq(r.log.count(), 0, "旧源迟到的回话被丢掉 (sender() 不是当前源)");
+
+      /* 新源照常喂数。这一步得自己拨 —— 台架里 pump 的是老那一个 */
+      for (int k = 0; k < 20; k++)
+      {
+         other.setNow(r.now);
+         r.log.tick(r.now);
+         other.pump(r.now);
+         r.now += 20;
+      }
+      check(r.log.count() > 0, "新源在喂数");
+      check(r.log.source() == &other, "当前源就是新的那一个");
+   }
+
+   caseBegin("meterlog: 环形缓冲 —— 到容量丢最旧的那个");
+   {
+      MeterRig r(1);
+      QString e;
+      r.log.setInterval(MeterLog::kMinIntervalMs);
+      r.log.start(MeterLog::kMinIntervalMs, &e);
+
+      /* 记下每一笔的 ms, 于是"第一个该丢的是谁"是算出来的, 不是猜的 */
+      QVector<int64_t> seen;
+      QObject::connect(&r.log, &MeterLog::sampleAdded, [&] {
+         if (!r.log.samples().isEmpty())
+            seen.append(r.log.samples().last().ms);
+      });
+
+      const int want = MeterLog::kCapacity + 50;
+      int guard = 0;
+      while (seen.size() < want && guard++ < want * 4)
+         r.step(30);
+
+      check(seen.size() >= want, "确实采够了那么多个 (采 20050 个, 缓冲只有 20000)");
+      checkEq(r.log.count(), MeterLog::kCapacity, "缓冲停在容量上, 不是无限涨");
+      checkEq((long long)r.log.samples().first().ms, (long long)seen[50],
+              "留在最前面的正是第 51 笔 —— 丢的只能是最旧的");
+      checkEq((long long)r.log.samples().last().ms, (long long)seen.last(),
+              "最后一笔就是刚采到的那个");
+   }
+
+   caseBegin("meterlog: 统计 —— ok 的那些才算, 标准差是样本标准差");
+   {
+      MeterRig r;
+      /* 直接喂已知数 (跟随模式那条路), 统计是纯算术, 不掺时序 */
+      for (double v : {1.0, 2.0, 3.0, 4.0})
+         r.log.addFollowSample(1000 + (int64_t)v, v);
+
+      const MeterLog::Stats s = r.log.stats();
+      checkEq(s.n, 4, "n");
+      checkNear(s.min, 1.0, "min");
+      checkNear(s.max, 4.0, "max");
+      checkNear(s.last, 4.0, "last");
+      checkNear(s.mean, 2.5, "mean");
+      /* 1,2,3,4 -> 样本方差 = (2.25+0.25+0.25+2.25)/3 = 5/3 */
+      checkNear(s.sd, std::sqrt(5.0 / 3.0), "sample sd (除以 n-1)");
+
+      /* 一个 ok=false 不许进统计, 也不许把 last 改掉 */
+      MeterLog::Sample bad;
+      bad.ms = 9999;
+      bad.ok = false;
+      r.log.addFollowSample(bad.ms, 0.0);      /* addFollowSample 一律算 ok, 这里另走超时那条路 */
+      const MeterLog::Stats s2 = r.log.stats();
+      checkEq(s2.n, 5, "跟随点全都算 ok (addFollowSample 的语义)");
+
+      /* 单笔的 sd 是 0, 不是 NaN —— NaN 会一路糊到界面上 */
+      MeterLog empty;
+      checkNear(empty.stats().sd, 0.0, "没有样本时 sd = 0");
+      checkEq(empty.stats().n, 0, "没有样本时 n = 0");
+   }
+
+   caseBegin("meterlog: 看门狗 —— 超时记一笔 ok=false, 并且**停在那儿等**");
+   {
+      /* 往返长过一个数量级: 永远回不来 */
+      MeterRig r(60000);
+      r.log.setInterval(200);
+
+      QString err;
+      int     failed_n = 0;
+      QObject::connect(&r.log, &MeterLog::failed, [&](const QString &) { failed_n++; });
+
+      r.log.start(200, &err);
+      r.run(4000);        /* 跨过 kTimeoutMs */
+
+      checkEq(r.log.count(), 1, "一笔: 那一个超时的空档");
+      check(!r.log.samples().isEmpty() && !r.log.samples().first().ok,
+            "那一笔记成 ok=false (与扫描 CSV 的 ok 列同口径)");
+      checkEq(failed_n, 1, "报了一次 —— 不是每拍都喊");
+      check(r.log.timedOut(), "状态是'卡住了'");
+      checkEq(r.meter.requests(), 1, "**没有再发第二个请求**: 那一个还在源手上");
+      checkEq(r.meter.overlaps(), 0, "所以也不会有两个未决请求同时压着");
+
+      r.run(4000);
+      checkEq(r.log.count(), 1, "还是那一笔: 采集真的停着, 不是继续往前冲");
+      checkEq(r.meter.requests(), 1, "仍然没有第二个请求 (跑了 8 秒也没有)");
+
+      /* 迟到的那一份回来了: 收下它, 并且重新走起来 */
+      r.meter.setLatency(1);
+      r.meter.setNow(r.now);
+      r.meter.pump(r.now + 100000);
+      checkEq(r.log.count(), 2, "迟到的回话收下了 —— 那是个真读数");
+      check(r.log.samples().last().ok, "记成 ok");
+      check(!r.log.timedOut(), "卡住的状态解开了");
+      checkEq(r.meter.overlaps(), 0, "全程没有两个未决请求同时存在");
+
+      r.run(1000);
+      check(r.log.count() > 2, "之后照常续采");
+
+      /* 「停止」是另一条出路: 卡住时按停止, 再开始就能重新发 */
+      MeterRig w(60000);
+      w.log.setInterval(200);
+      w.log.start(200, &err);
+      w.run(4000);
+      check(w.log.timedOut(), "第二个台架也卡住了");
+      w.log.stop();
+      check(!w.log.timedOut() && !w.log.pending(), "「停止」解开了那个未决请求");
+      w.meter.setLatency(1);
+      w.log.start(200, &err);
+      w.meter.setNow(w.now);
+      w.run(600);
+      check(w.log.count() > 1, "重新「开始」之后又能采了");
+   }
+
+   caseBegin("meterlog: setHold —— 停发, 放开之后从当时重排 (不补采欠下的)");
+   {
+      MeterRig r(20);
+      r.log.setInterval(200);
+      QString e;
+      r.log.start(200, &e);
+
+      r.run(600);
+      const int before = r.log.count();
+      /* 数"发出去几个"而不是"收回来几个": 让位那一刻可能正好有一个在飞, 它的回话
+       * 到了也不算违规 —— 违规的是**又发**一个 */
+      const int req_before = r.meter.requests();
+      check(before >= 2, "先采到几个数");
+
+      r.log.setHold(true);
+      check(r.log.running(), "hold 期间 running() 照旧是 true (还在采, 只是让位)");
+      check(!r.log.issuing(), "issuing() 才是'真的在发' —— 扫描那条闸看的是它");
+      r.run(2000);
+      checkEq(r.meter.requests(), req_before, "hold 期间一个请求都不发");
+      check(r.log.count() <= before + 1, "计数也不再涨 (最多是让位那一刻已经在飞的那一个)");
+
+      const int held_ms = r.log.count();
+      r.log.setHold(false);
+      r.step();
+      checkEq(r.log.count(), held_ms, "放开之后第一拍就发, 不是又空等一个间隔");
+
+      r.run(2000);
+      /* 不补采: 2000ms 的 hold 里"欠下"的十个间隔, 放开之后只按正常节奏走 */
+      check(r.log.count() - held_ms <= 12,
+            "欠下的那些**没有**被补采回来 (补出来的是编的)");
+      checkEq(r.meter.overlaps(), 0, "全程没有重叠请求");
+   }
+
+   caseBegin("meterlog: CSV —— 表头逐字固定, 行数与样本数一致, 追加不覆盖");
+   {
+      QTemporaryDir dir;
+      check(dir.isValid(), "temp dir");
+      const QString csv = dir.filePath(QStringLiteral("m.csv"));
+
+      /* 行格式逐字比 —— 列宽与顺序是这个文件对外的全部约定 */
+      MeterLog::Sample s;
+      s.ms = 1234;
+      s.watts = 1.5;
+      s.ok = true;
+      check(MeterLog::csvHeaderLine() == QStringLiteral("unix_ms,elapsed_ms,watts,ok\n"),
+            "表头逐字固定");
+      check(MeterLog::csvRowLine(s, 1000) == QStringLiteral("1234,234,1.5,1\n"),
+            "一行 = unix_ms,elapsed_ms,watts,ok", MeterLog::csvRowLine(s, 1000).toStdString());
+
+      MeterLog::Sample bad;
+      bad.ms = 1234;
+      bad.ok = false;
+      check(MeterLog::csvRowLine(bad, 1000) == QStringLiteral("1234,234,,0\n"),
+            "没读到的那些 watts 列是空的, ok=0 (不是 0 W)",
+            MeterLog::csvRowLine(bad, 1000).toStdString());
+
+      MeterRig r(20);
+      r.log.setInterval(200);
+      QString err;
+      check(r.log.beginRecord(csv, &err), "beginRecord", err.toStdString());
+      check(r.log.recording(), "recording()");
+
+      r.log.start(200, &err);
+      r.run(1200);
+      const int n1 = r.log.count();
+      check(n1 >= 3, "采到几个数");
+      checkEq(r.log.written(), n1, "每一笔都落盘了");
+      r.log.stop();
+      r.log.endRecord();
+      check(!r.log.recording(), "endRecord 之后不再写");
+
+      {
+         QFile f(csv);
+         check(f.open(QIODevice::ReadOnly | QIODevice::Text), "read it back");
+         const QString text = QString::fromUtf8(f.readAll());
+         const QStringList lines = text.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+         checkEq(lines.size(), n1 + 1, "行数 = 表头 + 样本数");
+         check(lines.first() == QStringLiteral("unix_ms,elapsed_ms,watts,ok"),
+               "第一行是表头", lines.first().toStdString());
+         /* 表头只许出现一次 */
+         check(text.count(QStringLiteral("unix_ms")) == 1, "表头只有一个");
+      }
+
+      /* 同一个路径再按一次「开始」: **接着写**, 不覆盖 (覆盖是没法撤销的) */
+      check(r.log.beginRecord(csv, &err), "beginRecord again on the same path", err.toStdString());
+      r.log.start(200, &err);
+      r.run(600);
+      r.log.stop();
+      r.log.endRecord();
+
+      {
+         QFile f(csv);
+         check(f.open(QIODevice::ReadOnly | QIODevice::Text), "read it back again");
+         const QString text = QString::fromUtf8(f.readAll());
+         const QStringList lines = text.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+         check(text.count(QStringLiteral("unix_ms")) == 1, "第二段**没有**再写一个表头");
+         checkEq(lines.size(), n1 + 1 + r.log.count() - n1, "第二段的数接着写在同一份后面");
+         check(lines.size() > n1 + 1, "文件确实变长了, 而不是被截断重来");
+      }
+
+      /* 写不进去: 父目录是个文件 -> false + 原因, 且不抛 */
+      const QString blocker = dir.filePath(QStringLiteral("blocker"));
+      {
+         QFile b(blocker);
+         check(b.open(QIODevice::WriteOnly), "make a file to block the path");
+         b.write("x");
+      }
+      QString why;
+      check(!r.log.beginRecord(blocker + QStringLiteral("/no.csv"), &why),
+            "路径写不进去 -> beginRecord 返回 false");
+      check(!why.isEmpty(), "并且给了一句原因", why.toStdString());
+      check(!r.log.recording(), "失败之后没有半开的文件");
+
+      /* saveBuffer: 整份导出, 不动正在记录的那份文件 */
+      check(r.log.beginRecord(csv, &err), "record into csv again");
+      const QString dump = dir.filePath(QStringLiteral("dump.csv"));
+      check(r.log.saveBuffer(dump, &err), "saveBuffer", err.toStdString());
+      check(r.log.recording(), "saveBuffer 没有把正在记录的那份关掉");
+
+      QFile d(dump);
+      check(d.open(QIODevice::ReadOnly | QIODevice::Text), "read the dump");
+      const QStringList dl = QString::fromUtf8(d.readAll()).split(QLatin1Char('\n'),
+                                                                Qt::SkipEmptyParts);
+      checkEq(dl.size(), r.log.count() + 1, "导出 = 表头 + 缓冲里全部的点");
+   }
+
+   caseBegin("meterlog: 源没打开 / 没给文件名 —— 都是 false + 原因, 不是半开的状态");
+   {
+      MeterLog log;
+      FakeMeter shut;                    /* 没 open() */
+
+      log.setSource(&shut);
+      QString err;
+      check(!log.start(200, &err), "源没打开 -> start 拒绝");
+      check(!err.isEmpty(), "给了原因", err.toStdString());
+      check(!log.running(), "没有半开着");
+
+      /* 一个请求都没发出去 —— 拒绝必须是"什么都没干", 不是"发了一半才发现" */
+      checkEq(shut.readings(), 0, "被拒绝时一个请求都没发");
+
+      check(!log.beginRecord(QString(), &err), "空路径 -> false");
+      check(!err.isEmpty(), "也给了原因", err.toStdString());
+   }
+}
+
 int main(int argc, char **argv)
 {
    QCoreApplication app(argc, argv);
@@ -2785,6 +3177,7 @@ int main(int argc, char **argv)
    test_limitsw();
    test_homing();
    test_meter_sources();
+   test_meterlog();
    test_ophir();
 
    std::printf("\n%d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);

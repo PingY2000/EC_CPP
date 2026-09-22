@@ -1,5 +1,6 @@
 #include "mapcanvas.h"
 
+#include "axisutil.h"
 #include "scancontroller.h"
 
 #include <QFont>
@@ -549,15 +550,16 @@ void MapCanvas::drawRulers(QPainter &p)
       }
    }
 
-   /* 单位写在两根标尺交会的那个角上 —— 光有数字说不清是毫米还是脉冲 */
+   /* 长度单位写在两根标尺交会的那个角上 —— 光有数字说不清是毫米还是脉冲。
+    * 这个单位就是 **mm** (2026-09-22 起): 代码内部与 CSV 表头仍旧叫 "unit", 那是文件格式 */
    p.setPen(C_MUTED);
    p.drawText(QRectF(r.left() - kTick - 30.0, r.bottom() + kTick + kGap, 30.0, 12.0),
-              Qt::AlignRight | Qt::AlignVCenter, QStringLiteral("单位"));
+              Qt::AlignRight | Qt::AlignVCenter, QStringLiteral("mm"));
 
    /* 视野固定, 这行永远写同一个数; 区域多大写在图里那个框上 */
    p.drawText(QRectF(r.left(), r.bottom() + kTick + kGap + 14.0, r.width(), 14.0),
               Qt::AlignHCenter | Qt::AlignTop,
-              QStringLiteral("视野 ±%1 单位 (固定)").arg(half, 0, 'f', 1));
+              QStringLiteral("视野 ±%1 mm (固定)").arg(half, 0, 'f', 1));
 }
 
 void MapCanvas::drawPath(QPainter &p)
@@ -633,7 +635,7 @@ void MapCanvas::drawMarkers(QPainter &p)
       /* 索引 + 坐标: 「重测选中点」按的是**索引**, 得让人看见自己选中的是第几格 */
       p.setPen(C_MUTED);
       p.drawText(QRectF(q.x() - 90, q.y() + h + 2, 180, 15), Qt::AlignCenter,
-                 QStringLiteral("[%1, %2]  (%3, %4) 单位")
+                 QStringLiteral("[%1, %2]  (%3, %4) mm")
                     .arg(m_sel_ix).arg(m_sel_iy)
                     .arg(xu, 0, 'f', 2).arg(yu, 0, 'f', 2));
    }
@@ -708,24 +710,8 @@ void MapCanvas::drawMarkers(QPainter &p)
    }
 }
 
-/*
- * 刻度数字的步长: 从 1 / 2 / 5 × 10^k 里挑一个, 让色阶大约分成 want 段。
- * 挑"整数"是为了让人一眼读到 0.2 / 0.5 / 100 这种数 —— 按 span/5 直接切会得出
- * 0.037 之类读不出来的值, 数字一多反而更看不懂。
- */
-static double niceStep(double span, int want)
-{
-   if (!(span > 0.0) || want < 1)
-      return 0.0;
-
-   const double raw = span / (double)want;
-   const double p   = std::pow(10.0, std::floor(std::log10(raw)));
-   const double m   = raw / p;             /* 落在 [1, 10) */
-
-   const double f = (m <= 1.0) ? 1.0 : (m <= 2.0) ? 2.0 : (m <= 5.0) ? 5.0 : 10.0;
-   return f * p;
-}
-
+/* 刻度数字的步长 (1/2/5 × 10^k)。2026-09-22 起在 scan/axisutil.h 里, 与功率计那条曲线共用
+ * 一份 —— 原先它是本文件的一个 static, 曲线那边要用就得抄第二遍。 */
 void MapCanvas::drawScaleBar(QPainter &p)
 {
    const QRectF r = plotRect();
@@ -840,15 +826,15 @@ void MapCanvas::drawHud(QPainter &p)
    p.setPen(C_MUTED);
    const Params &q = m_ctl->params();
    p.drawText(QRect(x, (int)r.top() + 36, w, 15), Qt::AlignLeft | Qt::AlignVCenter,
-              QStringLiteral("区域 %1 × %2 单位")
+              QStringLiteral("区域 %1 × %2 mm")
                  .arg(q.area_x_unit, 0, 'f', 2)
                  .arg(q.area_y_unit, 0, 'f', 2));
 
-   /* 下沿: 悬停读数 (单位 + 脉冲) */
+   /* 下沿: 悬停读数 (mm + 脉冲) */
    if (m_hover && m_ctl != nullptr)
    {
       const double ppu = m_ctl->params().pulses_per_unit;
-      const QString s = QStringLiteral("(%1, %2) 单位 = (%3, %4) pul")
+      const QString s = QStringLiteral("(%1, %2) mm = (%3, %4) pul")
                            .arg(m_hover_xu, 0, 'f', 2).arg(m_hover_yu, 0, 'f', 2)
                            .arg((long long)std::llround(m_hover_xu * ppu))
                            .arg((long long)std::llround(m_hover_yu * ppu));

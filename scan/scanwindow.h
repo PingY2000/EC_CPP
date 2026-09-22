@@ -37,6 +37,10 @@ class QTimer;
 namespace scan {
 
 class MapCanvas;
+/* 连续读数器与那条曲线 (见 meterlog.h / metercurve.h)。**只用指针**, 所以头文件里不认识
+ * 它们就够 —— 定义在 .cpp 里 include */
+class MeterLog;
+class MeterCurve;
 
 /* 滚轮闸, 定义在 .cpp 里 */
 class WheelNeedsFocus;
@@ -111,16 +115,30 @@ private:
    void onResumeRunClicked();
    void onAbortClicked();
    void onRetestClicked();
+   /* 「取样源」。**不连总线也要能选真机**, 所以它不在任何编辑门控里 —— 那一整块框的判据
+    * 全在 refreshMeterPanel() 一处 (见它的注释) */
    void onMeterChanged(int idx);
-   void onMeterInfoChanged();         /* 真机那三项下拉框 ← OphirMeter::info() */
-   void onMeterCfgChanged();          /* 那三项下拉框 → 设备 */
-   void onBrowseScript();
+   /* 设备信息回来了: 真机那三行填选项表 / 当前选中项。**灰不灰与露不露都不归这里管**,
+    * 那是 refreshMeterPanel() 每拍算的 */
+   void onMeterInfoChanged();
+   /* 操作员改了波长/量程/模式 (真机才有那三项) */
+   void onMeterCfgChanged();
    void onManualValueChanged(double v);
-   /* 「读一次」。与 ScanController 抢同一个未决请求, 故控制器不在 Idle 时按钮禁用;
-    * 靠 m_readPending 认出回调是不是自己那一份 */
+   /* 脚本: 框里的文本与真正读的那份表是两份东西, 同步点只有 pushScriptPath() 一处 */
+   void onBrowseScript();
+   bool pushScriptPath();
+   /* 「读一次」。与 ScanController、以及连续读数器抢同一个未决请求, 三方仲裁在 refresh()
+    * 一处; 靠 m_readPending 认出回调是不是自己那一份 */
    void onReadOnceClicked();
    void onReadOnceReady(double watts);
    void onReadOnceFailed(const QString &err);
+   /* 连续读数: 开始 / 停止 / 清空 / 换输出文件 / 把当前缓冲整份导出 */
+   void onMtrStartClicked();
+   void onMtrStopClicked();
+   void onMtrClearClicked();
+   void onMtrBrowseCsv();
+   void onMtrExportClicked();
+   void onMtrIntervalChanged(int ms);
 
    /* 「X/Y 正/反向回零」与「X/Y 找正/负限位」共用的槽。
     * dir: 0 = 正那侧, 1 = 负那侧; find_limit: false -> 6098h = 24/29 (找**原点开关** X0),
@@ -135,12 +153,13 @@ private:
     * 上次保存的值并重新下推)。状态机在 scan/editgate.h, 这里只管控件。
     *
     * **控件的可用性只由 refreshEditability() 一处写** —— 它在 30Hz 的 refresh() 末尾被调,
-    * 别处再 setEnabled 会被下一拍覆盖 (写按钮槽里更是当场就被盖掉)。 */
+    * 别处再 setEnabled 会被下一拍覆盖 (写按钮槽里更是当场就被盖掉)。
+    * 功率计那一整块框不进门控, 它的判据在 refreshMeterPanel() 里, 由 refreshEditability()
+    * 转调 —— 仍然是"一处写", 只是那处自己又调了一个函数。 */
    struct GateItem
    {
       QWidget *w = nullptr;
       bool     lock_running = false;  /* 运行中也锁住 (几何 / 输出路径这类) */
-      bool     need_dev = false;      /* 还要求真机功率计就绪 (那三个下拉框) */
       bool     need_manual = false;   /* 只在"色阶手动定标"时才可用 (自动跟随时它是多余的) */
    };
    struct PanelGate
@@ -164,8 +183,11 @@ private:
    void gateRebase(int gi, QWidget *w);  /* 程序自己改了这个控件 -> 快照跟上 + 重算标记 */
    void gateDirty(int gi);          /* 重算"有没有改动" (逐项与快照比对, 只影响标题标记) */
    void refreshEditability();
+   /* 功率计那一块框的**全部**判据 (灰不灰 + 哪几行露出来)。只由 refreshEditability() 调 */
+   void refreshMeterPanel();
+   /* 那一框每拍要跟新的字 (状态行 / 统计 / 计数 / 曲线)。放 refresh() 里, 与可用性分开 */
+   void refreshMeterReadout();
    void gateTitle(int gi);          /* 框标题 = 标题 + 标记 */
-   bool meterDevOk() const;         /* 真机三项的可用判据, 一处共用 */
    void onGateEdit(int gi);
    void onGateSave(int gi);
    void onGateCancel(int gi);
@@ -197,7 +219,8 @@ private:
    void onShadeLoChanged(double lo);
    void onShadeHiChanged(double hi);
    void applyCsvDefaultName();
-   bool pushScriptPath();   /* 脚本框的文本 -> 功率计那一路 (文本与状态是两份东西) */
+   /* 连续读数那份 CSV 的文件名留空时按时间戳起一个 (与 applyCsvDefaultName 是两件事) */
+   void applyMtrCsvDefaultName();
 
    /* ---- 三件套 ---- */
    EcatThread       *m_thr  = nullptr;
@@ -206,15 +229,20 @@ private:
    MapCanvas        *m_canvas = nullptr;
 
    /* 四个功率计都留着, m_meter 指向当前选中的那个。m_ophir 是真机那一个 (PD300R + Juno+),
-    * 有自己的工作线程, 还会主动报 infoChanged */
+    * 有自己的工作线程, 还会主动报 infoChanged。**它只有这一个实例**: Ophir 表头是独占的
+    * (第二个实例打开同一个头会 0x80040201), 所以不能有第二个 OphirMeter */
    ManualMeter *m_manual = nullptr;
    RandomMeter *m_random = nullptr;
    ScriptMeter *m_script = nullptr;
    OphirMeter  *m_ophir  = nullptr;
    PowerMeter  *m_meter  = nullptr;
 
-   /* 下拉框正在被程序填, 不是操作员在点 —— 那三项 currentIndexChanged 要吞掉, 否则值会写回设备 */
-   bool m_meterCfgQuiet = false;
+   /* ---- 连续读数那一版 ----
+    * m_mlog 常驻 (它不依赖界面: 跟随扫描时点照收)。
+    * 三方仲裁 (扫描 / 「读一次」/ 连续读数) 的唯一写点就是 refresh() —— 全在这一个函数里,
+    * 因为接口约定"同一时刻只允许一个未决请求" (powermeter.h:28-31)。 */
+   MeterLog   *m_mlog  = nullptr;
+   MeterCurve *m_curve = nullptr;
 
    /* ---- 顶栏 ---- */
    QComboBox   *m_nic       = nullptr;
@@ -279,33 +307,51 @@ private:
    QLabel         *m_lblLocked   = nullptr;   /* 锁定模式那两句说明 (两行, 按模式显隐) */
    QLabel         *m_lblAuto     = nullptr;
 
-   /* ---- 功率计 ---- */
+   /* ---- 功率计 ----
+    * **这一块框不进门控** (2026-09-22 起): 它里面没有"参数", 只有一台随时可以接上/断开的仪器,
+    * 而它的用处恰恰是"还没连总线, 先把真机选上"。所以它不需要先点「编辑」。判据全在
+    * refreshMeterPanel() 一处, 与其余控件同一条规矩 (每拍重算, 不缓存)。
+    *
+    * 2026-09-22 曾经把这七样东西搬进一个独立的功率计窗口、参数栏只留一行取样源; 当天又搬回来
+    * —— 那个窗口要靠菜单点开, 而"外露"是这一块的要求 (见 docs/scan_sweep.md §23)。 */
    QComboBox      *m_cbMeter   = nullptr;
-   QDoubleSpinBox *m_edManualV = nullptr;
-   QDoubleSpinBox *m_edRandomN = nullptr;
-   QLineEdit      *m_edScript  = nullptr;
+   QLabel         *m_lMeter    = nullptr;   /* 状态行: kind · 已打开/没打开 · 真机摘要 */
+   QDoubleSpinBox *m_edManualV = nullptr;   /* 手填值源 */
+   QDoubleSpinBox *m_edRandomN = nullptr;   /* 随机源的噪声幅度 */
+   QLineEdit      *m_edScript  = nullptr;   /* 脚本源: 框里的文本 */
    QPushButton    *m_btnScript = nullptr;
-   QLabel         *m_lMeter    = nullptr;
-   /* 点一下出一个数: 不跑整趟扫描就能确认链路通、探头出的数合理 */
+   /* 真机那三项。选项表由设备给 (探头不同, 能选的波长与量程就不同), 一个都不写死。
+    * 每一项没有单独的"那一行"要露/藏: 整块 m_devBox 一起显隐, 而某一项设备根本没有时
+    * 它是**空的 + 灰的** (判据在 refreshMeterPanel 里) */
+   QComboBox *m_cbWl = nullptr, *m_cbRange = nullptr, *m_cbMeasMode = nullptr;
+   QLabel    *m_lDevInfo = nullptr;
+   /* 各源自己那一行: 选到谁只露谁 (都摊开的话一半的控件永远是灰的) */
+   QWidget *m_manualRow = nullptr, *m_randomRow = nullptr, *m_scriptRow = nullptr;
+   /* 真机那一块 (波长/量程/模式 + 设备信息), 只在选到真机且它开着时才露 */
+   QWidget *m_devBox = nullptr;
+   /* 填充那三个下拉框时挡掉信号: 每 addItem 一次都会被当成操作员改配置 (一串 stop/set/start) */
+   bool m_meterCfgQuiet = false;
+
+   /* 「读一次」的按钮、读数与未决状态。兜底定时器必须留着: 接口约定"恰好回一次"是源那边的
+    * 义务, 源不回时这个动作会永远卡住 —— 而它卡住会连带把连续读数的「开始」压死 */
    QPushButton    *m_btnRead   = nullptr;
    QLabel         *m_lReadout  = nullptr;
-   /* 未决请求的兜底: 接口约定"恰好回一次"是源那边的义务, 源不回时界面会永远停在"读取中…" */
    QTimer         *m_readTimer = nullptr;
    bool            m_readPending = false;
    qint64          m_readSentMs  = 0;   /* m_clock 的读数, 单调钟 */
 
-   /* 真机那三项。选项表由设备给, 不写死 (手册: 不要按型号推断规格)。选中模拟源时整行藏起来 */
-   QComboBox *m_cbWl       = nullptr;
-   QComboBox *m_cbRange    = nullptr;
-   /* 不叫 m_cbMode —— 那名字已给「扫描模式」(方向/蛇形) 用了 */
-   QComboBox *m_cbMeasMode = nullptr;
-   QLabel    *m_lWl        = nullptr;
-   QLabel    *m_lRange     = nullptr;
-   QLabel    *m_lMeasMode  = nullptr;
-   /* 每一行(标签+下拉)的容器, 整行藏起来用 */
-   QWidget   *m_devRowWl    = nullptr;
-   QWidget   *m_devRowRange = nullptr;
-   QWidget   *m_devRowMode  = nullptr;
+   /* 连续读数 (见 meterlog.h) */
+   QSpinBox    *m_edMtrInterval  = nullptr;
+   QPushButton *m_btnMtrStart    = nullptr;
+   QPushButton *m_btnMtrStop     = nullptr;
+   QPushButton *m_btnMtrClear    = nullptr;
+   QPushButton *m_btnMtrExport   = nullptr;
+   QLineEdit   *m_edMtrCsv       = nullptr;
+   QPushButton *m_btnMtrCsv      = nullptr;
+   QLabel      *m_lMtrCount      = nullptr;   /* 缓冲 N 点 / 采集中 / 跟随扫描中 / **卡住了** */
+   QLabel      *m_lMtrLast       = nullptr;   /* 最近一次读数 (大字号) */
+   QLabel      *m_lMtrStats      = nullptr;
+   QLabel      *m_lMtrWritten    = nullptr;
 
    /* ---- 「轴信号」那块表的两个网格 (见 LampGrid)。同一张表上左右排开, 前两格归
     * m_axGrid, 后三格归 m_limGrid ---- */

@@ -158,7 +158,7 @@ std::string validate(const Params &p)
    if (!(p.res_unit > 0.0))
       return "分辨率必须是正数";
    if (!(p.pulses_per_unit > 0.0))
-      return "「1 单位 = ? 脉冲」必须是正数";
+      return "「1 mm = ? 脉冲」必须是正数";
 
    if (p.res_unit > p.area_x_unit || p.res_unit > p.area_y_unit)
       return "分辨率比区域还大 —— 网格只剩一个点, 调小分辨率或放大区域";
@@ -441,10 +441,10 @@ std::string csvParseForResume(const std::string &text, const Params &p,
       std::snprintf(buf, sizeof(buf), "%s %g → %g; ", name, was, now);
       diff += buf;
    };
-   noteDiff("区域X(单位)", a_x, p.area_x_unit);
-   noteDiff("区域Y(单位)", a_y, p.area_y_unit);
-   noteDiff("分辨率(单位)", r_u, p.res_unit);
-   noteDiff("每单位脉冲数", ppu, p.pulses_per_unit);
+   noteDiff("区域X(mm)", a_x, p.area_x_unit);
+   noteDiff("区域Y(mm)", a_y, p.area_y_unit);
+   noteDiff("分辨率(mm)", r_u, p.res_unit);
+   noteDiff("每 mm 脉冲数", ppu, p.pulses_per_unit);
 
    if (!diff.empty())
    {

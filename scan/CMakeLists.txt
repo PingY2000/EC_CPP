@@ -28,6 +28,10 @@ set(CMAKE_AUTOUIC OFF)
 # scanprefs **只链 Qt6::Core** (QSettings 在 Core 里) —— 这是它能进这个列表的前提:
 # 自检那边能真跑一遍"存进去再读回来相等"。见 scanprefs.h 顶部那段。
 #
+# meterlog 同一条规矩: 它是「连续读数」的**全部时序**, 不含界面, 所以自检能用手拨的钟把
+# "到点才发 / 未决期间不再发 / 超时记一笔并续采"整轮跑完。画曲线的那个控件 (metercurve)
+# 不在这里 —— 它要 Qt6::Widgets。
+#
 # ophircom/ophirmeter 是 PD300R + Juno+ 那条真机路 (见 ophircom.h 顶部)。它们也在这里,
 # 是因为自检要能回答"这台机器上 COM 对象注册了没有、能不能建出来、没插表头时能不能
 # 干净地报错" —— 那正是**不需要硬件**的那部分。两个目标因此都要链 ole32/oleaut32。
@@ -38,10 +42,12 @@ set(SCAN_COMMON_SRC
   powermeter.cpp    powermeter.h
   ophircom.cpp      ophircom.h
   ophirmeter.cpp    ophirmeter.h
+  meterlog.cpp      meterlog.h
   scanlog.cpp       scanlog.h
   scanprefs.cpp     scanprefs.h
   busview.h
   editgate.h
+  axisutil.h
 )
 
 # ---------------------------------------------------------------- GUI 程序
@@ -49,6 +55,7 @@ qt_add_executable(scan
   main.cpp
   scanwindow.cpp    scanwindow.h
   mapcanvas.cpp     mapcanvas.h
+  metercurve.cpp    metercurve.h
   ${SCAN_COMMON_SRC}
   ${CMAKE_SOURCE_DIR}/hmi/ecatworker.cpp
   ${CMAKE_SOURCE_DIR}/hmi/ecatworker.h
@@ -139,4 +146,8 @@ target_compile_options(scan_selftest PRIVATE
 # "逻辑对不对", 优化级别对它毫无意义。真机那边 (`bin/scan.exe`) 保持 -O3 不变。
 #
 # GCC/binutils 一升级就可以把下面这行删掉, 然后重跑一遍自检确认。
+#
+# **别把上面这个症状跟"输出文件被占用"混为一谈** —— 后者长得一模一样 (ld 一声不吭、退出码
+# 非 0、输出文件没被写出来), 但原因是 `bin/scan.exe` 还在跑 (试跑完忘了关就会这样), Windows
+# 不让写。**先 `tasklist | findstr scan.exe` 看一眼**, 有残留就杀掉再重链, 别急着改优化级别。
 target_compile_options(scan_selftest PRIVATE $<$<CXX_COMPILER_ID:GNU>:-O1>)

@@ -26,6 +26,10 @@ static const char *want_dig   = "adv/want_dig_in";
 static const char *npn_wr     = "adv/npn_write_drive";
 static const char *npn_sw     = "adv/npn_sw_invert";
 static const char *shade_auto = "shade/auto_fit";
+/* 独立功率计窗口 (2026-09-22)。键名照旧只在这里定义 —— 窗口那边是 load 整个 Prefs、
+ * 改两个字段、再 save 回去, 不自己拼键名 (拼第二遍就会有一边改名一边忘的那天) */
+static const char *mtr_int    = "meter/interval_ms";
+static const char *mtr_csv    = "meter/csv";
 }
 
 QString prefsPath()
@@ -72,6 +76,11 @@ Prefs prefsLoad(const QString &path)
    /* 同样显式带缺省值: ini 里没这一项时要回落到"关", 而不是当成读过 */
    p.shade_auto = s.value(QLatin1String(k::shade_auto), p.shade_auto).toBool();
 
+   /* 功率计窗口那两项。间隔同样显式带缺省值 —— 缺项时 toInt() 会给 0, 那是个非法间隔,
+    * 会被 MeterLog 夹到下限, 于是"没记过"表现成 20ms 而不是 200ms */
+   p.meter_interval_ms = s.value(QLatin1String(k::mtr_int), p.meter_interval_ms).toInt();
+   p.meter_csv         = s.value(QLatin1String(k::mtr_csv)).toString();
+
    return p;
 }
 
@@ -115,6 +124,9 @@ void prefsSave(const QString &path, const Prefs &p)
    s.setValue(QLatin1String(k::npn_sw),    p.npn_sw_invert);
 
    s.setValue(QLatin1String(k::shade_auto), p.shade_auto);
+
+   s.setValue(QLatin1String(k::mtr_int),    p.meter_interval_ms);
+   s.setValue(QLatin1String(k::mtr_csv),    p.meter_csv);
 
    /* 显式 sync: 不靠析构时机保证写盘 */
    s.sync();

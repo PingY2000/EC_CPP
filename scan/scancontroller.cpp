@@ -492,7 +492,7 @@ bool ScanController::retest(int ix, int iy, QString *err)
 
    if (!sameGeom(m_run_p, m_p))
       return fail(err, QStringLiteral(
-         "区域/分辨率/每单位脉冲数被改过了 —— 现在这个 (ix,iy) 和 CSV 里的那一点\n"
+         "区域/分辨率/每 mm 脉冲数被改过了 —— 现在这个 (ix,iy) 和 CSV 里的那一点\n"
          "已经不是同一个地方, 追加进去会把两个坐标混在一个文件里。\n"
          "要重测就把参数改回去, 或者另开一轮。"));
 
