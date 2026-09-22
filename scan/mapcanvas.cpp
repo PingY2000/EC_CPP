@@ -792,7 +792,7 @@ void MapCanvas::drawScaleBar(QPainter &p)
 
    p.setPen(C_MUTED);
    p.drawText(QRect(x0 - 20, y0 + h + 6, 70, 14), Qt::AlignLeft | Qt::AlignTop,
-              QStringLiteral("功率(锁定)"));
+              QStringLiteral("功率 (锁定)"));
 }
 
 void MapCanvas::drawHud(QPainter &p)

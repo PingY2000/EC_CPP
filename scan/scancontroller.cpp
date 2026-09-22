@@ -282,8 +282,8 @@ bool ScanController::armRun(QString *err)
             "%3。\n"
             /* 收尾只讲后果: 扫描期间限位成立就自动中止, 所以现在拒绝。
              * 不许说"会撞上去" —— %3 里有一种成因正是那限位根本不存在 (极性配反) */
-            "扫描期间它是每 tick 都查、成立就自动中止的那一类, "
-            "与其采到一半停在同一格, 不如这一趟现在就不开始。")
+            "扫描期间它每 tick 都查, 成立就中止 —— 与其采到一半停在同一格, "
+            "不如这一趟就不开始。")
                .arg(QString::fromUtf8(ecatcmd::limit_hit_headline(t.di_invert)).arg(i))
                .arg(QString::fromUtf8(ecatcmd::limit_switch_text(
                        a.dig_known, a.dig_pos, a.dig_neg, t.di_invert)))
@@ -306,8 +306,8 @@ bool ScanController::armRun(QString *err)
    }
    if (t.range > 0 && far > t.range)
       return fail(err, QStringLiteral(
-         "最远的网格点是 %1 脉冲, 而当前量程只有 ±%2。\n"
-         "超出量程的目标会被**静默夹掉** —— 那几条边永远扫不到, 而且不报错。\n"
+         "最远的网格点是 %1 pul, 而当前量程只有 ±%2。\n"
+         "超出量程的目标会被静默夹掉 —— 那几条边永远扫不到, 而且不报错。\n"
          "区域改小一点, 或者断开重连一次 (量程是在连接时按区域参数设的)。")
          .arg(far).arg(t.range));
 
@@ -436,13 +436,11 @@ bool ScanController::resume(const QString &csv_path, bool accept_zero_epoch_chan
    {
       return fail(why != nullptr ? why : err,
          QStringLiteral(
-            "这个 CSV 是在**另一次零点**下采的 (文件里是第 %1 次, 现在是第 %2 次)。\n\n"
-            "连接时零点会被重设为「当时所在的位置」, 回零也会把零点整个搬到驱动器\n"
-            "自报的那个原点 —— 这两种事之后, 同一个坐标指的**可能已经是另一个物理\n"
-            "位置**了。就这么接着扫, 下半场会和上半场拼在一张图上, 而图上不会有\n"
-            "任何异常的样子。\n\n"
-            "请先确认: 滑台现在的位置和「上一次零点确立时」是同一个物理位置\n"
-            "(比如都停在同一个机械靠块 / 同一个对位标记上)。确认了再选「继续」。\n\n"
+            "这个 CSV 是在另一次零点下采的 (文件里是第 %1 次, 现在是第 %2 次)。\n\n"
+            "连接与回零都会把零点搬走 —— 之后同一个坐标指的可能已是另一个物理位置,\n"
+            "接着扫会把两份拼在一张图上, 而看不出异常。\n\n"
+            "先确认滑台现在的位置与上次零点确立时是同一个物理位置 (同一个机械靠块 /\n"
+            "对位标记), 再选「继续」。\n\n"
             "文件: %3 (开始于 %4)")
             .arg(csv_epoch).arg(m_zero_epoch)
             .arg(csv_path, fromStd(started_iso)));
@@ -489,14 +487,13 @@ bool ScanController::retest(int ix, int iy, QString *err)
 
    if (!m_log.isOpen())
       return fail(err, QStringLiteral(
-         "还没有在跑的一轮 —— 单点重测是**往那个 CSV 里再追加一行**, 没有文件可追加。\n"
+         "还没有在跑的一轮 —— 单点重测是往那个 CSV 里再追加一行, 没有文件可追加。\n"
          "先「开始」或「续扫」。"));
 
    if (!sameGeom(m_run_p, m_p))
       return fail(err, QStringLiteral(
-         "区域/分辨率/每 mm 脉冲数被改过了 —— 现在这个 (ix,iy) 和 CSV 里的那一点\n"
-         "已经不是同一个地方, 追加进去会把两个坐标混在一个文件里。\n"
-         "要重测就把参数改回去, 或者另开一轮。"));
+         "区域/分辨率/每 mm 脉冲数被改过 —— 现在这个 (ix,iy) 已不是 CSV 里那一点,\n"
+         "追加进去会把两个坐标混在一个文件里。把参数改回去, 或者另开一轮。"));
 
    if (ix < 0 || iy < 0 || ix >= m_nx || iy >= m_ny)
       return fail(err, QStringLiteral("格子 (%1,%2) 超出 %3×%4 的网格")
@@ -730,7 +727,7 @@ void ScanController::tick(int64_t now_ms)
       if (m_now_ms > m_move_deadline_ms)
       {
          abortInternal(QStringLiteral(
-            "走不到位: 下发目标 (%1, %2) 已等 %3 秒, 实测位置 (%4, %5) 一直没进容差 ±%6。\n"
+            "走不到位: 下发目标 (%1, %2) 已等 %3 s, 实测位置 (%4, %5) 一直没进容差 ±%6。\n"
             "多半是卡住、被限位挡住, 或者目标被量程夹掉了。")
             .arg(m_issued[0]).arg(m_issued[1])
             .arg(m_state_ms >= 0 ? (m_now_ms - m_state_ms) / 1000 : 0)
@@ -821,7 +818,7 @@ QString ScanController::healthProblem(const BusTelem &t)
 
       return QStringLiteral("驱动器报故障 (6041h bit3) —— 目标已被冻结, 扫描自动中止%1")
                 .arg(codes.isEmpty() ? QString()
-                                     : QStringLiteral("。  故障码: ") + codes);
+                                     : QStringLiteral("。故障码: ") + codes);
    }
 
    /* WKC 不足 = 拔网线 / 掉了供电; 单帧抖动不值得中止, 连续 10 帧 (30Hz 下约 1/3 秒) 才认 */

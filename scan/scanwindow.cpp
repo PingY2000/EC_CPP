@@ -83,12 +83,9 @@ static QString fmtWatts(double v)
 static const QString &readOnceTip()
 {
    static const QString s = QStringLiteral(
-      "向**当前取样源**要一个数, 结果显示在按钮下面那一行。\n\n"
-      "它走的是扫描用的同一条路 (请求 → 读数信号), 所以这里通了, 采集那条路也就通了。\n\n"
-      "**扫描跑着、或者连续读数正在跑时, 它是灰的**: 接口约定同一时刻只允许一个未决请求, "
-      "那两个时刻请求归别人。\n\n"
-      "报出来的时延是**一次往返的实测值** —— 它必须远小于扫描参数里的读数超时, "
-      "否则真机上会每点都超时。");
+      "向当前取样源要一个数, 结果显示在按钮下面那一行 (与扫描同一条路)。\n"
+      "报出来的是实测往返时延, 要远小于扫描参数里的读数超时。\n"
+      "扫描或连续读数跑着时它是灰的 —— 同一时刻只允许一个未决请求。");
    return s;
 }
 
@@ -230,9 +227,9 @@ QWidget *ScanWindow::gateBar(int gi, QWidget *parent)
    for (QPushButton *b : { g.btnEdit, g.btnSave, g.btnCancel })
       b->setFixedHeight(22);
 
-   g.btnEdit->setToolTip(QStringLiteral("平时**只读** —— 点它才能改。改动当场生效; 「保存」记进 scan.ini, 「取消」退回上次保存的值。扫描/回零中几何类参数仍锁着。"));
+   g.btnEdit->setToolTip(QStringLiteral("平时只读 —— 点它才能改。改动当场生效; 「保存」记进 scan.ini, 「取消」退回上次保存的值。扫描/回零中几何类参数仍锁着。"));
    g.btnSave->setToolTip(QStringLiteral("把这一框的值记进 scan.ini (改动早就生效了, 保存只是记住它)。色标上下限不进 ini; 色标是不是自动跟随会记。\n功率计那一框不在这儿 —— 它整个露在外面, 改了就记。"));
-   g.btnCancel->setToolTip(QStringLiteral("退回**上次保存**的值 (不是程序缺省值), 并立刻重新下推。"));
+   g.btnCancel->setToolTip(QStringLiteral("退回上次保存的值 (不是程序缺省值), 并立刻重新下推。"));
    connect(g.btnEdit,   &QPushButton::clicked, this, [this, gi] { onGateEdit(gi); });
    connect(g.btnSave,   &QPushButton::clicked, this, [this, gi] { onGateSave(gi); });
    connect(g.btnCancel, &QPushButton::clicked, this, [this, gi] { onGateCancel(gi); });
@@ -371,7 +368,7 @@ void ScanWindow::refreshMeterPanel()
       m_cbMeter->setToolTip(rec
          ? QStringLiteral("连续读数正在跑 —— 先「停止」再换源 "
                           "(换了的话同一条曲线上会是两个不同的东西采的数)")
-         : QStringLiteral("扫描与连续读数共用这一个源。**不需要连滑台或总线**: 选真机就能读数。\n"
+         : QStringLiteral("扫描与连续读数共用这一个源。不需要连滑台或总线: 选真机就能读数。\n"
                           "选真机要装 Ophir 的 StarLab; 界面其余部分与此无关。"));
    }
 
@@ -427,9 +424,8 @@ void ScanWindow::refreshMeterPanel()
       m_edMtrInterval->setToolTip(rec && !held
          ? QStringLiteral("采集正在跑 —— 先「停止」再改间隔")
          : QStringLiteral(
-              "一个请求发出去到下一个发出去的**最小**间隔 —— 实际间隔 = 这个数 + 那次往返。\n"
-              "同一时刻只允许一个未决请求 (powermeter.h 的约定), 所以这里不是固定节拍: "
-              "真机一次往返可能上百毫秒, 按固定节拍发只会越堆越多。"));
+              "一个请求发出去到下一个发出去的最小间隔; 实际间隔 = 这个数 + 那次往返。\n"
+              "同一时刻只允许一个未决请求, 所以这不是固定节拍。"));
    }
 
    if (m_edMtrAvg != nullptr)
@@ -439,12 +435,10 @@ void ScanWindow::refreshMeterPanel()
       m_edMtrAvg->setToolTip(rec && !held
          ? QStringLiteral("采集正在跑 —— 先「停止」再改平均次数")
          : QStringLiteral(
-              "一次采样连着取几个读数求平均 (扫描参数里那个「每点采样」是同一件事)。\n"
-              "1 = 每次都要一个数 (缺省)。调大读得稳: 平均出来的数抖得小, 而代价是每次采样要占"
-              "N 个往返。\n"
-              "N 次里有**一次**没读回来, 这一笔就作废 (记 ok=false) —— 拿半边的数求平均是"
-              "编出来的, 而它在曲线上和别的点长得一模一样。\n"
-              "这 N 个读数是连着要的 (中间不隔一个间隔), 所以「间隔」是采样之间的间隔。"));
+              "一次采样连着取几个读数求平均 (与扫描的「每点采样」是同一件事)。\n"
+              "1 = 每次都取一个数。调大读得稳, 代价是每次采样占 N 个往返。\n"
+              "N 次里有一次没读回来, 这一笔就作废 (记 ok=false)。\n"
+              "这 N 个读数是连着要的, 所以「间隔」是采样之间的间隔。"));
    }
 
    if (m_btnMtrStart != nullptr)
@@ -453,7 +447,7 @@ void ScanWindow::refreshMeterPanel()
                               : (m_readPending ? QStringLiteral("「读一次」还在等回话") : QString());
       m_btnMtrStart->setEnabled(!rec && why.isEmpty());
       m_btnMtrStart->setToolTip(why.isEmpty()
-         ? (running ? QStringLiteral("扫描正在跑: 按下去是**跟随**, 曲线画扫描采到的那些点, "
+         ? (running ? QStringLiteral("扫描正在跑: 按下去是跟随, 曲线画扫描采到的那些点, "
                                      "这里不向功率计发请求")
                     : QStringLiteral("按这个开始按间隔连续读数"))
          : QStringLiteral("现在开始不了 —— ") + why);
@@ -488,7 +482,7 @@ void ScanWindow::refreshMeterReadout()
       QString s = QStringLiteral("%1 · %2")
                      .arg(m_meter->kind())
                      .arg(m_meter->isOpen() ? QStringLiteral("已打开")
-                                            : QStringLiteral("**没打开**"));
+                                            : QStringLiteral("没打开"));
       if (m_meter == m_script)
          s += QStringLiteral(" · %1 个值, 游标 %2")
                  .arg(m_script->count()).arg(m_script->cursor());
@@ -519,11 +513,11 @@ void ScanWindow::refreshMeterReadout()
        * 不是全部了。要留全的只有一个办法 —— 让 CSV 记着 (那一份不设上限) */
       const bool full = m_mlog->full();
       if (full)
-         t += QStringLiteral("  (**满了** —— 最旧的正在被丢掉; 要全都留着就打开 CSV)");
+         t += QStringLiteral("  (满了 —— 最旧的正在被丢掉; 要全都留着就打开 CSV)");
 
       if (m_mlog->running())
-         t = wedged ? QStringLiteral("**卡住了** —— 一个请求超时未回, 采集停着等它 · ") + t
-                    : (m_mlog->held() ? QStringLiteral("**跟随扫描中** (不发请求) · ") + t
+         t = wedged ? QStringLiteral("卡住了 —— 一个请求超时未回, 采集停着等它 · ") + t
+                    : (m_mlog->held() ? QStringLiteral("跟随扫描中 (不发请求) · ") + t
                                       : QStringLiteral("采集中 · ") + t);
       m_lMtrCount->setText(t);
       m_lMtrCount->setStyleSheet(wedged ? QStringLiteral("color:#ffb020; font-weight:bold;")
@@ -601,7 +595,7 @@ void ScanWindow::refreshMeterReadout()
    {
       const QString u = (m_meter != nullptr) ? m_meter->unit() : QString();
       m_lShadeUnit->setText(u.isEmpty()
-         ? QStringLiteral("单位不明 —— 色阶刻度的数是 W 还是 J 还没判出来 (见功率计那一框)")
+         ? QStringLiteral("单位不明 —— 色标刻度的数是 W 还是 J 还没判出来 (见功率计那一框)")
          : QStringLiteral("单位: %1 (跟着取样源)").arg(u));
    }
 }
@@ -704,8 +698,8 @@ void ScanWindow::onAdvToggled()
    refreshAdvWarn();
 
    if (m_connected && (dig != m_advLastWantDig || wr != m_advLastNpnWrite))
-      hint(QStringLiteral("已记下: 这两个是**连接期参数**, 下次「连接」时才生效。"
-                          "**本次连接不受影响**。"),
+      hint(QStringLiteral("已记下: 这两个是连接期参数, 下次「连接」时才生效。"
+                          "本次连接不受影响。"),
            false);
 
    m_advLastWantDig  = dig;
@@ -728,7 +722,7 @@ void ScanWindow::onDiInvertToggled(bool on)
 
    if (!t.connected)
    {
-      hint(QStringLiteral("已打开上位机侧取反 (连上之后生效)。**只治本程序这一侧**, 驱动器不受影响。"), false);
+      hint(QStringLiteral("已打开上位机侧取反 (连上之后生效)。只治本程序, 驱动器不受影响。"), false);
       return;
    }
 
@@ -739,7 +733,7 @@ void ScanWindow::onDiInvertToggled(bool on)
    }
 
    const AxisTelem &a = t.ax[0];
-   hint(QStringLiteral("已打开上位机侧取反 (轴0 反相后: 正限位 %1 / 负限位 %2)。**只治本程序这一侧** —— 驱动器自己的 bit11 与限位保护不受影响。").arg(a.dig_pos ? QStringLiteral("压着") : QStringLiteral("松开"), a.dig_neg ? QStringLiteral("压着") : QStringLiteral("松开")), false);
+   hint(QStringLiteral("已打开上位机侧取反 (轴0 反相后: 正限位 %1 / 负限位 %2)。只治本程序 —— 驱动器自己的 bit11 与限位保护不受影响。").arg(a.dig_pos ? QStringLiteral("压着") : QStringLiteral("松开"), a.dig_neg ? QStringLiteral("压着") : QStringLiteral("松开")), false);
 }
 
 /* ---------------------------------------------------------------- 信号灯 */
@@ -1006,7 +1000,7 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
    m_thr->start();
    m_thr->postListAdapters();
 
-   hint(QStringLiteral("未连接: 界面此时是**只读**的, 不往总线写一个字节。"), false);
+   hint(QStringLiteral("未连接: 界面此时是只读的, 不往总线写一个字节。"), false);
    refresh();
 }
 
@@ -1135,14 +1129,10 @@ void ScanWindow::buildUi()
    /* 这一盏说的是判据, 不是开关本身: 默认判据是 6041h bit11 (勾了输入反转就换成反相后的
     * 那两个限位开关), 回答的是"会不会中止扫描"那一个问题 */
    const QString limTip = QStringLiteral(
-      "硬件限位信号灯 (6041h bit11) —— **这一盏说的是「会不会中止扫描」**。\n"
-      "红亮 = 手册对这一位的定义「**硬件限位信号有效**」成立了, 扫描中会自动中止。\n"
-      "它报的是那路信号**此刻的电平**, 不是「撞过了」—— 所以它未必真有个开关压着: "
-      "极性配反 (NPN 传感器 + 2300h 按常开配) 会让它一直亮着。\n\n"
-      "它**不**等同于参数栏「限位开关」那六盏: 那一组说的是**开关本身压着没有** (60FDh)。\n"
-      "两者可能不一致 —— 不一致时**以这一盏为准**。扫描经过原点开关不会中止。\n\n"
-      "勾上「高级选项」里的「上位机侧取反」之后这一盏换了判据: 那时它看的是**反相之后的**"
-      "两个限位开关, 与 6041h bit11 无关 (「以这一盏为准」仍然成立 —— 只是来源换了)。")
+      "6041h bit11 —— 会不会中止扫描。\n"
+      "红亮 = 「硬件限位信号有效」成立, 扫描中自动中止; 经过原点开关不中止。\n"
+      "报的是那路信号此刻的电平, 不是「撞过了」(极性配反会一直亮)。\n"
+      "与参数栏那六盏 (60FDh, 开关本身) 不一致时以它为准; 勾了取反后改看反相后的两个开关。")
       + QString::fromUtf8(kLampRule);
 
    m_lampX = makeLamp(this, limTip);
@@ -1202,7 +1192,7 @@ QWidget *ScanWindow::buildTopBar()
    connect(m_btnNic, &QPushButton::clicked, m_thr, &EcatThread::postListAdapters);
 
    m_btnConn = new QPushButton(QStringLiteral("连接 (进 OP)"), w);
-   m_btnConn->setToolTip(QStringLiteral("打开发帧、进 OP。**电机仍不带电** —— 使能才带电。当前位置被重设为显示坐标 0。"));
+   m_btnConn->setToolTip(QStringLiteral("打开发帧、进 OP。电机仍不带电 —— 使能才带电。当前位置被重设为显示坐标 0。"));
    connect(m_btnConn, &QPushButton::clicked, this, &ScanWindow::onConnectClicked);
 
    m_btnEnable = new QPushButton(QStringLiteral("使能"), w);
@@ -1211,7 +1201,7 @@ QWidget *ScanWindow::buildTopBar()
    connect(m_btnEnable, &QPushButton::clicked, this, &ScanWindow::onEnableClicked);
 
    m_btnStop = new QPushButton(QStringLiteral("停止"), w);
-   m_btnStop->setToolTip(QStringLiteral("目标冻在当前位置, **保持保持力矩**。回零中按它 = 立即中止回零; 扫描中请用「中止」。"));
+   m_btnStop->setToolTip(QStringLiteral("目标冻在当前位置, 保持力矩。回零中按它 = 立即中止回零; 扫描中请用「中止」。"));
    /* 走槽而不是直连 postStop: 回零期间这个按钮必须换成立即中止 (非回零时两者一字不差) */
    connect(m_btnStop, &QPushButton::clicked, this, &ScanWindow::onStopClicked);
 
@@ -1224,7 +1214,7 @@ QWidget *ScanWindow::buildTopBar()
    connect(m_btnCenter, &QPushButton::clicked, this, &ScanWindow::onCenterAllClicked);
 
    m_btnZero = new QPushButton(QStringLiteral("设为区域中心"), w);
-   m_btnZero->setToolTip(QStringLiteral("把**当前位置**定为显示坐标 0, 也就是扫描区域的中心。零点世代 +1。"));
+   m_btnZero->setToolTip(QStringLiteral("把当前位置定为显示坐标 0, 也就是扫描区域的中心。零点世代 +1。"));
    connect(m_btnZero, &QPushButton::clicked, this, &ScanWindow::onZeroHereClicked);
 
    QHBoxLayout *bar = new QHBoxLayout(w);
@@ -1285,28 +1275,25 @@ QWidget *ScanWindow::buildAxisPanel()
       "6041h bit2 —— 电机带电。绿亮 = 已使能, 灭 = 未使能。\n"
       "未使能时点画布不会动: 这是「这个轴现在能不能走」的答案。",
 
-      "6041h bit3 —— 驱动器故障位。红亮 = 有故障, 灭 = 无故障。\n"
-      "**扫描中置起会自动中止**; 用右边那格「故障复位」清掉它再启扫。\n"
-      "**是哪一种故障看故障码 603Fh** (过流/过压/欠压/动力线/通讯/传感器处置办法各不相同),\n"
-      "它不在过程数据里, 只能故障发生后再读一次, 所以红横幅上那句码会**比故障晚一拍**到。",
+      "6041h bit3 —— 驱动器故障位。红亮 = 有故障。\n"
+      "扫描中置起会自动中止; 用右边那格「故障复位」清掉再启扫。\n"
+      "是哪一种故障看 603Fh 故障码 (过流/过压/欠压/动力线/通讯/传感器各不相同)。\n"
+      "它不在过程数据里, 是故障后再读一次的, 所以横幅上那句码会晚一拍。",
 
       /* 原点灯是绿的, 所以要说出声来 */
       "60FDh bit2 —— 原点开关现在压着没有 (2310h X0 = 原点)。\n"
-      "**绿亮 = 正压着, 灭 = 松开。压着是位置信息不是故障** ——\n"
-      "回零时压到原点是正常动作, 扫描经过原点开关**不会**中止。\n"
-      "这一格说的是**开关本身**, 与「会不会中止扫描」是两个问题: 后者看 6041h bit11。",
+      "绿亮 = 压着; 压着是位置信息不是故障, 回零压到它、扫描经过它都不中止。\n"
+      "这一格说的是开关本身, 会不会中止扫描看状态栏那盏 (6041h bit11)。",
 
       "60FDh bit1 —— 正限位开关现在压着没有 (2311h X1 = 正限位)。\n"
-      "**红亮 = 正压着, 要立刻处理; 灭 = 松开** —— 压着时先手动把滑台走离限位。\n"
-      "这一格说的是**开关本身**; 会不会中止扫描看状态栏那盏 (6041h bit11)。\n"
-      "两者本该同源 (都经 2300h + 2310h 出来), 不一致时**默认以 bit11 为准**;\n"
-      "但勾了「高级选项」里的「上位机侧取反」之后改以反相后的开关为准。",
+      "红亮 = 压着, 先手动把滑台走离限位。\n"
+      "这一格说的是开关本身; 会不会中止扫描看状态栏那盏 (6041h bit11)。\n"
+      "两者同源, 不一致时以 bit11 为准; 勾了取反之后以反相后的开关为准。",
 
       "60FDh bit0 —— 负限位开关现在压着没有 (2312h X2 = 负限位)。\n"
-      "**红亮 = 正压着, 要立刻处理; 灭 = 松开** —— 压着时先手动把滑台走离限位。\n"
-      "这一格说的是**开关本身**; 会不会中止扫描看状态栏那盏 (6041h bit11)。\n"
-      "两者本该同源 (都经 2300h + 2310h 出来), 不一致时**默认以 bit11 为准**;\n"
-      "但勾了「高级选项」里的「上位机侧取反」之后改以反相后的开关为准。"
+      "红亮 = 压着, 先手动把滑台走离限位。\n"
+      "这一格说的是开关本身; 会不会中止扫描看状态栏那盏 (6041h bit11)。\n"
+      "两者同源, 不一致时以 bit11 为准; 勾了取反之后以反相后的开关为准。"
    };
 
    for (int s = 0; s < SIGN_NCOL; s++)
@@ -1340,7 +1327,7 @@ QWidget *ScanWindow::buildAxisPanel()
     * 推的, 永远滞后于驱动器; 这里只拦界面自己才知道的两件事: 没连接、扫描在跑 (工作线程另
     * 有闸)。它也不是"一根轴一个": 命令是全总线的, 只对 6041h bit3 置起的那几根动手 */
    m_btnFaultRst = new QPushButton(QStringLiteral("故障复位"), box);
-   m_btnFaultRst->setToolTip(QStringLiteral("清故障 (先写 6040h=0 卸力、再抬 bit7)。**只对 6041h bit3 = 故障的轴做**, 没故障时**一个字节都不写**。复位后停**未使能**; 每轴最多 1 秒且不可中断。"));
+   m_btnFaultRst->setToolTip(QStringLiteral("清故障 (先写 6040h=0 卸力、再抬 bit7)。只对 6041h bit3 = 故障的轴做, 没故障时一个字节都不写。复位后停未使能; 每轴最多 1 s 且不可中断。"));
    connect(m_btnFaultRst, &QPushButton::clicked, this, &ScanWindow::onFaultResetClicked);
    g->addWidget(m_btnFaultRst, 1, SIGN_NCOL + 1, 2, 1);
 
@@ -1366,13 +1353,13 @@ QWidget *ScanWindow::buildAdvPanel()
    v->setSpacing(4);
 
    m_cbWantDigIn = new QCheckBox(QStringLiteral("让 60FDh 进 TxPDO (连接时补写 1A00h)"), box);
-   m_cbWantDigIn->setToolTip(QStringLiteral("连接时把 60FDh 追加进 TxPDO —— 不补它, 上面三个限位灯一直是灰的。**只写 RAM**, 断开时还原。改了要重新「连接」。"));
+   m_cbWantDigIn->setToolTip(QStringLiteral("连接时把 60FDh 追加进 TxPDO —— 不补它, 上面三个限位灯一直是灰的。只写 RAM, 断开时还原。改了要重新「连接」。"));
 
    m_cbNpnWrite = new QCheckBox(QStringLiteral("写驱动器 2300h = 0x0007 (输入常闭 / NPN)"), box);
-   m_cbNpnWrite->setToolTip(QStringLiteral("连接时把各轴 2300h 的 bit0~bit2 写成 1 (常闭), 收尾写回原值 (**只写 RAM**)。改了要重新「连接」。"));
+   m_cbNpnWrite->setToolTip(QStringLiteral("连接时把各轴 2300h 的 bit0~bit2 写成 1 (常闭), 收尾写回原值 (只写 RAM)。改了要重新「连接」。"));
 
    m_cbDiInvert = new QCheckBox(QStringLiteral("上位机侧取反 (只改本程序的判据)"), box);
-   m_cbDiInvert->setToolTip(QStringLiteral("把驱动器报的 X0~X3 三位在**本程序这一侧**翻回来, 不改驱动器。与上面「写驱动器 2300h」同时勾 = 双反相, **扫描永远开不了**。运行期立刻生效。"));
+   m_cbDiInvert->setToolTip(QStringLiteral("把驱动器报的 X0~X3 三位在本程序翻回来, 不改驱动器。与上面「写驱动器 2300h」同时勾 = 双反相, 扫描永远开不了。运行期立刻生效。"));
 
    m_lAdvWarn = new QLabel(box);
    m_lAdvWarn->setWordWrap(true);
@@ -1418,7 +1405,7 @@ static const char *kHomeBtnText[4] = { "正向回零", "反向回零", "找正�
  * 出处只有两处, 都在 tooltip 与顶部那条横幅里 (事前 / 事中), 框里不再写说明文字。 */
 QWidget *ScanWindow::buildHomePanel()
 {
-   QGroupBox *box = new QGroupBox(QStringLiteral("原点模式"), this);
+   QGroupBox *box = new QGroupBox(QStringLiteral("回零与找限位"), this);
    QGridLayout *g = new QGridLayout(box);
    g->setContentsMargins(6, 4, 6, 6);
    g->setHorizontalSpacing(8);
@@ -1434,7 +1421,12 @@ QWidget *ScanWindow::buildHomePanel()
    m_edHomeVel->setValue(HMI_HOME_VEL_DEF);
    /* 「够不着开关请先把滑台挪近, 不要为了够得着去调高速度」原本写在框里那行小字上, 那行
     * 删了之后搬到这里 —— 它是这个值唯一的一句事后提醒 */
-   m_edHomeVel->setToolTip(QStringLiteral("八个按钮共用的找原点速度 6099h:01 (返回速度是它的 1/4, 加减速由它派生)。**它同时是「能找多远」的上限**: 速度 × 30 秒。够不着开关请先把滑台挪近, **不要**为了够得着去调高速度。第一次在陌生的机器上试方向, 压到下限 100。"));
+   /* 这个数有两层意思: 表面是速度, 实际是「能找多远」的上限 (速度 × 30 s)。够不着开关时
+    * 该挪滑台 —— 调高速度等于把撞上去的动能一起调高 */
+   m_edHomeVel->setToolTip(QStringLiteral(
+      "八个找原点按钮共用的速度 6099h:01 (返回速度是它的 1/4)。\n"
+      "它同时是「能找多远」的上限: 速度 × 30 s —— 够不着开关请先把滑台挪近, 不要为够得着去调高速度。\n"
+      "第一次在陌生机器上试方向, 压到下限 100。"));
 
    g->addWidget(new QLabel(QStringLiteral("速度"), box), 0, 0);
    g->addWidget(m_edHomeVel, 0, 1, 1, 2);   /* 占 1~2 列 */
@@ -1473,7 +1465,9 @@ QWidget *ScanWindow::buildHomePanel()
             m_btnHome[i][d] = new QPushButton(
                QString::fromUtf8(kHomeBtnText[d]), box);
             m_btnHome[i][d]->setObjectName(QStringLiteral("danger"));
-            m_btnHome[i][d]->setToolTip(QStringLiteral("轴%1: 6098h = %2 —— 原点开关 (X0) 为原点, 先朝**%3**高速找。驱动器自己带电移动, **软件拦不住它撞开关**, 只有「停止」能立即中止。该轴会**先失能** (竖直轴失去保持力矩)。方向对不对只有试一次才知道。").arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y")).arg(meth).arg(QString::fromUtf8(ecatcmd::home_dir_text(neg))));
+            m_btnHome[i][d]->setToolTip(QStringLiteral("轴%1: 6098h = %2 —— 原点开关 (X0) 为原点, 先朝%3高速找。\n"
+                                                       "驱动器自己带电移动, 软件拦不住它撞开关, 只有「停止」能立即中止;\n"
+                                                       "该轴会先失能 (竖直轴失去保持力矩)。方向对不对只有试一次才知道。").arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y")).arg(meth).arg(QString::fromUtf8(ecatcmd::home_dir_text(neg))));
 
             connect(m_btnHome[i][d], &QPushButton::clicked, this,
                      [this, i, d] { onHomeClicked(i, d, false); });
@@ -1489,7 +1483,12 @@ QWidget *ScanWindow::buildHomePanel()
             m_btnLim[i][d] = new QPushButton(
                QString::fromUtf8(kHomeBtnText[2 + d]), box);
             m_btnLim[i][d]->setObjectName(QStringLiteral("danger"));
-            m_btnLim[i][d]->setToolTip(QStringLiteral("轴%1: 6098h = %2 —— %3开关为原点。驱动器按发起那一刻那个开关压着没有选分支:\n  a) 没压着: 先**%4高速**去找它, 碰到后减速停止, 再反向低速退开\n  b) 已经压着: 直接**%5低速**退开 (首段方向与 a) 相反 —— 不是点错了)\n两条都停在**开关的释放点**; 控制台会先打出这一趟走哪条。\n\n**碰到限位是这一趟的目的, 不是故障**。找完之后显示坐标的 0 就在那个释放点上, 那一侧几乎没有行程 —— 先按实测行程重算扫描区域。\n\n该轴会**先失能** (竖直轴失去保持力矩)。").arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y")).arg(meth).arg(QString::fromUtf8(ecatcmd::home_method_short(meth))).arg(QString::fromUtf8(ecatcmd::home_method_first_dir(meth, false))).arg(QString::fromUtf8(ecatcmd::home_method_first_dir(meth, true))));
+            m_btnLim[i][d]->setToolTip(QStringLiteral("轴%1: 6098h = %2 —— %3开关为原点, 按发起那一刻它压着没有选分支:\n"
+                                                       "  a) 没压着: 先%4高速去找它, 碰到后减速停止, 再反向低速退开\n"
+                                                       "  b) 已经压着: 直接%5低速退开 (首段与 a) 相反, 不是点错了)\n"
+                                                       "两条都停在开关的释放点, 碰到限位是这趟的目的而不是故障。\n"
+                                                       "坐标 0 就落在那个释放点上, 那一侧几乎没有行程 —— 先按实测行程重算区域。\n"
+                                                       "该轴会先失能。").arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y")).arg(meth).arg(QString::fromUtf8(ecatcmd::home_method_short(meth))).arg(QString::fromUtf8(ecatcmd::home_method_first_dir(meth, false))).arg(QString::fromUtf8(ecatcmd::home_method_first_dir(meth, true))));
 
             connect(m_btnLim[i][d], &QPushButton::clicked, this,
                      [this, i, d] { onHomeClicked(i, d, true); });
@@ -1521,7 +1520,7 @@ QWidget *ScanWindow::buildParamPanel()
    m_edAreaX->setDecimals(3);
    m_edAreaX->setSingleStep(1.0);
    m_edAreaX->setSuffix(QStringLiteral(" mm"));
-   m_edAreaX->setToolTip(QStringLiteral("区域的 X 边长 (mm), **以原点为中心** → ±(X/2)"));
+   m_edAreaX->setToolTip(QStringLiteral("区域的 X 边长 (mm), 以原点为中心 → ±(X/2)"));
 
    m_edAreaY = new QDoubleSpinBox(box);
    m_edAreaY->setRange(0.1, 500.0);
@@ -1534,18 +1533,17 @@ QWidget *ScanWindow::buildParamPanel()
    m_edRes->setDecimals(3);
    m_edRes->setSingleStep(0.1);
    m_edRes->setSuffix(QStringLiteral(" mm"));
-   m_edRes->setToolTip(QStringLiteral("网格间距 (mm)。点数 = (floor(区域/分辨率)+1)²"));
+   m_edRes->setToolTip(QStringLiteral("分辨率 (mm)。点数 = (floor(区域/分辨率)+1)²"));
 
    m_edPpu = new QDoubleSpinBox(box);
    m_edPpu->setRange(100.0, 1000000.0);
    m_edPpu->setDecimals(0);
    m_edPpu->setSingleStep(1000.0);
-   m_edPpu->setSuffix(QStringLiteral(" 脉冲"));
+   m_edPpu->setSuffix(QStringLiteral(" pul"));
    m_edPpu->setToolTip(QStringLiteral(
-      "1 mm = 多少脉冲 (也就是「每毫米多少脉冲」)。\n"
-      "缺省 50000 是 2400h 实测的**一圈**: 按这个缺省, 丝杠一圈正好走 1 mm。\n"
-      "导程不是 1 mm 的机器, 这里要按自己的丝杠改 —— 它填错了区域就会走偏, "
-      "而屏幕上看着还是对的"));
+      "每 1 mm 走多少 pul (脉冲当量)。\n"
+      "缺省 50000 是 2400h 实测的一圈: 按这个缺省, 丝杠一圈正好走 1 mm。\n"
+      "导程不是 1 mm 的机器要按自己的丝杠改 —— 填错了区域会走偏, 而屏幕上看着还是对的。"));
 
    m_edSpeed = new QSpinBox(box);
    m_edSpeed->setRange(HMI_VEL_MIN, HMI_VEL_MAX);
@@ -1572,7 +1570,7 @@ QWidget *ScanWindow::buildParamPanel()
    m_edSettle->setRange(0, 10000);
    m_edSettle->setSingleStep(20);
    m_edSettle->setSuffix(QStringLiteral(" ms"));
-   m_edSettle->setToolTip(QStringLiteral("「到位」要**连续**成立这么久才算数。"));
+   m_edSettle->setToolTip(QStringLiteral("「到位」要连续成立这么久才算数。"));
 
    m_edSamples = new QSpinBox(box);
    m_edSamples->setRange(1, 100);
@@ -1617,7 +1615,7 @@ QWidget *ScanWindow::buildParamPanel()
    {
       /* 提示里的数字从 Params 现算 —— 手抄一份的话, 缺省值一改这里就成了假话 */
       const Params d0;
-      m_btnDef->setToolTip(QStringLiteral("这一组每一项都回到程序缺省值。**CSV 输出路径不动**。"));
+      m_btnDef->setToolTip(QStringLiteral("这一组每一项都回到程序缺省值。CSV 输出路径不动。"));
    }
    connect(m_btnDef, &QPushButton::clicked, this, &ScanWindow::onRestoreDefaults);
 
@@ -1693,7 +1691,7 @@ QWidget *ScanWindow::buildScanPanel()
    connect(m_btnStart, &QPushButton::clicked, this, &ScanWindow::onStartClicked);
 
    m_btnPause = new QPushButton(QStringLiteral("暂停"), box);
-   m_btnPause->setToolTip(QStringLiteral("立刻冻在当前位置 (**保持保持力矩**)。「继续」会重新走完当前点并重采。"));
+   m_btnPause->setToolTip(QStringLiteral("立刻冻在当前位置 (保持力矩)。「继续」会重新走完当前点并重采。"));
    connect(m_btnPause, &QPushButton::clicked, this, &ScanWindow::onPauseClicked);
 
    m_btnResume = new QPushButton(QStringLiteral("继续"), box);
@@ -1701,16 +1699,16 @@ QWidget *ScanWindow::buildScanPanel()
 
    m_btnAbort = new QPushButton(QStringLiteral("中止"), box);
    m_btnAbort->setObjectName(QStringLiteral("danger"));
-   m_btnAbort->setToolTip(QStringLiteral("冻住并结束本轮。**已采数据留在 CSV 里**, 之后可以续扫。"));
+   m_btnAbort->setToolTip(QStringLiteral("冻住并结束本轮。已采数据留在 CSV 里, 之后可以续扫。"));
    connect(m_btnAbort, &QPushButton::clicked, this, &ScanWindow::onAbortClicked);
 
    m_btnRetest = new QPushButton(QStringLiteral("重测选中点"), box);
-   m_btnRetest->setToolTip(QStringLiteral("先在画布上**左键**选中一格, 再点这个。"));
+   m_btnRetest->setToolTip(QStringLiteral("先在画布上左键选中一格, 再点这个。"));
 
    connect(m_btnRetest, &QPushButton::clicked, this, &ScanWindow::onRetestClicked);
 
    m_btnOpen = new QPushButton(QStringLiteral("打开 CSV 续扫"), box);
-   m_btnOpen->setToolTip(QStringLiteral("读回已有数据 → 只补没采过的点 → **继续追加同一个文件**"));
+   m_btnOpen->setToolTip(QStringLiteral("读回已有数据 → 只补没采过的点 → 继续追加同一个文件"));
    connect(m_btnOpen, &QPushButton::clicked, this, &ScanWindow::onOpenCsvClicked);
 
    m_lProg = new QLabel(box);
@@ -1775,10 +1773,8 @@ QWidget *ScanWindow::buildMeterPanel()
    m_cbMeter->addItem(m_ophir->kind());
    m_cbMeter->setCurrentIndex(1);          /* 默认随机源: 一按开始就有数据可看 */
    m_cbMeter->setToolTip(QStringLiteral(
-      "扫描与连续读数共用这一个源。**不需要连滑台或总线**: 选真机就能读数。\n"
-      "选真机要装 Ophir 的 StarLab; 界面其余部分与此无关。\n"
-      "三个模拟源 (手动 / 随机 / 脚本) 在驱动层走的是同一条 (请求 -> 读数信号), "
-      "所以拿它验过的时序对真机一样成立。"));
+      "扫描与连续读数共用这一个源, 不需要连滑台或总线; 选真机要装 Ophir 的 StarLab。\n"
+      "三个模拟源与真机在驱动层走同一条路 (请求 → 读数信号), 拿模拟源验过的时序对真机一样成立。"));
    connect(m_cbMeter, &QComboBox::currentIndexChanged, this, &ScanWindow::onMeterChanged);
 
    /* 真机这一项不可用之前不让人选, 但**照样列出来**: 不列的话操作员会以为这程序没有真机
@@ -1792,9 +1788,9 @@ QWidget *ScanWindow::buildMeterPanel()
          why = QStringLiteral("这台机器上没找到 OphirLMMeasurement 这个 COM 对象 —— "
                               "要先装 Ophir 的 StarLab (PD300R + Juno+ 的驱动就在里面)");
       else if (!OphirCom::isAvailable())
-         why = QStringLiteral("COM 对象注册着, 但它的 typelib 读不出来 "
+         why = QStringLiteral("COM 对象注册着, typelib 却读不出来 "
                               "(0x8002801D TYPE_E_LIBNOTREGISTERED) —— "
-                              "StarLab 装了但装坏了 (或者 dll 被换过), 重装一次");
+                              "StarLab 装了但坏了 (或 dll 被换过), 重装一次");
 
       if (!why.isEmpty())
       {
@@ -1894,10 +1890,8 @@ QWidget *ScanWindow::buildMeterPanel()
       m_edSimDelay->setSuffix(QStringLiteral(" ms"));
       m_edSimDelay->setValue(m_random->delayMs());   /* 两个模拟源的缺省是同一个数 */
       m_edSimDelay->setToolTip(QStringLiteral(
-         "**装出来的往返时间**: 源收到请求之后隔这么久才回话。\n"
-         "真机一次往返可能上百毫秒。把它调大就能在没有真机的时候看出「读一次」的往返时延、"
-         "连续读数为什么是「回话驱动排下一次」, 以及调大到超过 %1 ms (看门狗) 时超时那一路是\n"
-         "怎么表现的。\n"
+         "装出来的往返时间: 源收到请求之后隔这么久才回话 (真机一次往返可能上百毫秒)。\n"
+         "调大它就能在没有真机时看出「读一次」的往返时延, 以及超过 %1 ms (看门狗) 时超时那一路怎么表现。\n"
          "随机源与脚本源共用这一个数; 手动源是立刻回, 没有这一项。").arg(MeterLog::kTimeoutMs));
       connect(m_edSimDelay, &QSpinBox::valueChanged, this, [this](int ms) {
          m_random->setDelayMs(ms);
@@ -1965,7 +1959,7 @@ QWidget *ScanWindow::buildMeterPanel()
          return;
       m_readPending = false;
       const double took = (double)(m_clock.elapsed() - m_readSentMs);
-      m_lReadout->setText(QStringLiteral("读一次: 没有回应 (等了 %1 秒) —— "
+      m_lReadout->setText(QStringLiteral("读一次: 没有回应 (等了 %1 s) —— "
                                          "取样源答应了却一个数都没回")
                              .arg(took / 1000.0, 0, 'f', 1));
       refresh();
@@ -1987,9 +1981,8 @@ QWidget *ScanWindow::buildMeterPanel()
    m_edMtrInterval->setValue(MeterLog::kDefaultIntervalMs);
    m_edMtrInterval->setSuffix(QStringLiteral(" ms"));
    m_edMtrInterval->setToolTip(QStringLiteral(
-      "一个请求发出去到下一个发出去的**最小**间隔 —— 实际间隔 = 这个数 + 那次往返。\n"
-      "同一时刻只允许一个未决请求 (powermeter.h 的约定), 所以这里不是固定节拍: "
-      "真机一次往返可能上百毫秒, 按固定节拍发只会越堆越多。"));
+      "一个请求发出去到下一个发出去的最小间隔; 实际间隔 = 这个数 + 那次往返。\n"
+      "同一时刻只允许一个未决请求, 所以这不是固定节拍。"));
    connect(m_edMtrInterval, &QSpinBox::valueChanged, this, &ScanWindow::onMtrIntervalChanged);
    ivRow->addWidget(m_edMtrInterval, 1);
 
@@ -2019,12 +2012,10 @@ QWidget *ScanWindow::buildMeterPanel()
    m_edMtrAvg->setValue(1);
    m_edMtrAvg->setSuffix(QStringLiteral(" 次"));
    m_edMtrAvg->setToolTip(QStringLiteral(
-      "一次采样连着取几个读数求平均 (扫描参数里那个「每点采样」是同一件事)。\n"
-      "1 = 每次都要一个数 (缺省)。调大读得稳: 平均出来的数抖得小, 而代价是每次采样要占"
-      "N 个往返。\n"
-      "N 次里有**一次**没读回来, 这一笔就作废 (记 ok=false) —— 拿半边的数求平均是编出来的,"
-      "而它在曲线上和别的点长得一模一样。\n"
-      "这 N 个读数是连着要的 (中间不隔一个间隔), 所以「间隔」是采样之间的间隔。"));
+      "一次采样连着取几个读数求平均 (与扫描的「每点采样」是同一件事)。\n"
+      "1 = 每次都取一个数。调大读得稳, 代价是每次采样占 N 个往返。\n"
+      "N 次里有一次没读回来, 这一笔就作废 (记 ok=false)。\n"
+      "这 N 个读数是连着要的, 所以「间隔」是采样之间的间隔。"));
    connect(m_edMtrAvg, &QSpinBox::valueChanged, this, &ScanWindow::onMtrAvgChanged);
    avgRow->addWidget(m_edMtrAvg, 1);
    v->addLayout(avgRow);
@@ -2078,7 +2069,7 @@ QWidget *ScanWindow::buildMeterPanel()
    v->addWidget(m_lMtrWritten);
 
    QLabel *note = new QLabel(
-      QStringLiteral("「开始」按上面的路径写: 文件空的/不存在就写表头, 已经有内容就**接着写**, "
+      QStringLiteral("「开始」按上面的路径写: 文件空的/不存在就写表头, 已经有内容就接着写, "
                      "不覆盖。文件名留空会自动按时间戳起一个。"),
       box);
    note->setWordWrap(true);
@@ -2110,7 +2101,7 @@ QWidget *ScanWindow::buildMeterPanel()
 
 QWidget *ScanWindow::buildShadePanel()
 {
-   QGroupBox *box = new QGroupBox(QStringLiteral("色标 (功率)"), this);
+   QGroupBox *box = new QGroupBox(QStringLiteral("色标"), this);
    QFormLayout *f = new QFormLayout(box);
 
    const double lo = m_canvas->shadeLo();
@@ -2119,10 +2110,9 @@ QWidget *ScanWindow::buildShadePanel()
    /* 下限就是 0: 功率没有负的。**下限也钉在 0**, 于是"最小 >= 0"这条不用在槽里再判一次 ——
     * 敲 -5 会被控件自己夹成 0, valueChanged 拿到的一直是合法值 */
    const QString kShadeTip = QStringLiteral(
-      "色阶的两端。**单位跟着上面那行字** (模拟源是 W; 真机 W 还是 J 看探头与模式)。\n"
-      "改一个顶到另一个头上时, **另一个会自己让开**(跨度不变) —— 比如最小 0 / 最大 1 时把最小\n"
-      "改成 5, 最大会一起抬到 6。非负数, 且最小 < 最大。\n"
-      "这两个数**不记进 scan.ini** (只有「自动跟随」那个模式记)。");
+      "色标的两端, 单位跟着上面那行字 (模拟源是 W; 真机看探头与模式)。\n"
+      "改一个顶到另一个头上时另一个会自己让开 (跨度不变); 非负数, 且最小 < 最大。\n"
+      "这两个数不记进 scan.ini (只有「自动跟随」那个模式记)。");
 
    m_edShadeLo = new QDoubleSpinBox(box);
    m_edShadeLo->setRange(0.0, 1e12);
@@ -2140,7 +2130,7 @@ QWidget *ScanWindow::buildShadePanel()
    connect(m_edShadeHi, &QDoubleSpinBox::valueChanged, this, &ScanWindow::onShadeHiChanged);
 
    m_btnFit = new QPushButton(QStringLiteral("按数据定标"), box);
-   m_btnFit->setToolTip(QStringLiteral("取已采数据的最小/最大作为色阶两端。**只在按它的时候改一次**"));
+   m_btnFit->setToolTip(QStringLiteral("取已采数据的最小/最大作为色标两端。只在按它的时候改一次"));
    connect(m_btnFit, &QPushButton::clicked, this, [this] {
       if (!m_canvas->fitShadeToData())
       {
@@ -2152,10 +2142,9 @@ QWidget *ScanWindow::buildShadePanel()
 
    m_cbShadeAuto = new QCheckBox(QStringLiteral("自动跟随数据"), box);
    m_cbShadeAuto->setToolTip(QStringLiteral(
-      "勾上 = 色阶每帧跟着已采数据的最小/最大走, 不用按「按数据定标」。\n"
-      "代价是这也上了: 新采到一个更极端的值, 整张图就重排一次颜色 —— 图上的\"变化\"有一部分"
-      "是色阶自己在动。要拿两张图对比时把它关掉。\n"
-      "这一项**记进 scan.ini** (色标上下限那两个数不记)。"));
+      "勾上 = 色标每帧跟着已采数据的最小/最大走, 不用按「按数据定标」。\n"
+      "代价是图上的\"变化\"有一部分来自色标自己在动; 要拿两张图对比时关掉它。\n"
+      "这一项记进 scan.ini (色标上下限那两个数不记)。"));
    connect(m_cbShadeAuto, &QCheckBox::toggled, this, [this](bool on) {
       m_canvas->setAutoFit(on);
       applyShadeAutoUi(on);
@@ -2164,14 +2153,12 @@ QWidget *ScanWindow::buildShadePanel()
    /* 两套说明按模式显隐。合成一句做不到: 两边的取舍正好相反 (锁定那句说"不跟着变"是优点,
     * 自动那句得承认它变) */
    m_lblLocked = new QLabel(QStringLiteral(
-      "色阶**锁定**, 不跟着数据实时变 —— 否则每来一个点整张图都会重排颜色, "
-      "看到的\"变化\"其实是色阶自己在动, 那种图不能用来判断任何事。\n"
+      "色标锁定, 不跟着数据实时变 —— 否则每来一个点整张图都重排颜色, 看到的\"变化\"其实是"
+      "色标自己在动, 那种图不能用来判断任何事。\n"
       "超出范围的格子夹到两端, 数值仍可在悬停里读到。"), box);
    m_lblAuto = new QLabel(QStringLiteral(
-      "色阶**跟着数据走**: 范围 = 已采数据的最小/最大, 每采到一个新的极值就整张重排一次颜色。\n"
-      "省事, 但上面那条代价照付 —— 要拿两张图对比时把它关掉, 两个数就定住了。\n"
-      "开着的时候上面两个数是**读数**: 打字改不动 (改完下一拍也会被数据算回去, 想定死范围\n"
-      "就先把这个勾去掉)。「取消」对它们同理 —— 它们记的是数据, 不是上一次保存的那对数。\n"
+      "色标跟着数据走: 范围 = 已采数据的最小/最大, 每采到一个新的极值就整张重排一次颜色。\n"
+      "开着时上面两个数是读数, 打字改不动 (想定死范围先去掉这个勾); 「取消」对它们同理。\n"
       "超出范围的格子夹到两端, 数值仍可在悬停里读到。"), box);
    for (QLabel *l : { m_lblLocked, m_lblAuto })
    {
@@ -2435,7 +2422,7 @@ void ScanWindow::onRestoreDefaults()
 
    const Params d;
    hint(QStringLiteral("扫描参数已恢复默认 (区域 %1 × %2 mm, 分辨率 %3 mm, "
-                       "1 mm = %4 脉冲, 速度 %5 pul/s)。CSV 输出路径没动")
+                       "1 mm = %4 pul, 速度 %5 pul/s)。CSV 输出路径没动")
            .arg(d.area_x_unit, 0, 'f', 0).arg(d.area_y_unit, 0, 'f', 0)
            .arg(d.res_unit, 0, 'f', 3).arg(d.pulses_per_unit, 0, 'f', 0)
            .arg(d.speed_pul_s), false);
@@ -2484,19 +2471,19 @@ void ScanWindow::pushParams()
    const qint64 total = (qint64)nx * (qint64)ny;
 
    if (total > kMaxPlanPoints)
-      m_lGrid->setText(QStringLiteral("网格 %1 × %2 = **%3 点**   ±%4 mm\n"
-                                      "**超过上限 %5 —— 网格没有建** (画布此刻是空的, "
+      m_lGrid->setText(QStringLiteral("网格 %1 × %2 = %3 点   ±%4 mm\n"
+                                      "超过上限 %5 —— 网格没有建 (画布此刻是空的, "
                                       "「开始扫描」按不动)")
                           .arg(nx).arg(ny).arg(total)
                           .arg(p.area_x_unit / 2.0, 0, 'f', 3)
                           .arg(kMaxPlanPoints));
    else
-      m_lGrid->setText(QStringLiteral("网格 %1 × %2 = **%3 点**   ±%4 mm")
+      m_lGrid->setText(QStringLiteral("网格 %1 × %2 = %3 点   ±%4 mm")
                           .arg(nx).arg(ny).arg(total)
                           .arg(p.area_x_unit / 2.0, 0, 'f', 3));
 
    /* 预估是线性的, 实际一定更长 (每次移动的进近段都要减速), 这一句必须写出来 */
-   m_lEst->setText(QStringLiteral("每点 ≈ %1 ms   全程 ≈ %2\n(线性估计, **实际更长**)").arg(estimatePerPointMs(p)).arg(fmtDur(m_ctl->estimateTotalMs())));
+   m_lEst->setText(QStringLiteral("每点 ≈ %1 ms   全程 ≈ %2\n(线性估计, 实际更长)").arg(estimatePerPointMs(p)).arg(fmtDur(m_ctl->estimateTotalMs())));
 
    /* 两条否决: 参数本身不合法 / 几何超出量程 (超出的部分会被静默夹掉) */
    QString bad = m_ctl->paramsError();
@@ -2583,13 +2570,13 @@ void ScanWindow::onConnectClicked()
    if (m_nic->currentIndex() < 0 || m_nic->currentData().toString().isEmpty())
    {
       hint(QStringLiteral("先选一块网卡。下拉框是空的就点「刷新网卡」, "
-                          "还是没有就说明 **Npcap 没装**"), false);
+                          "还是没有就说明 Npcap 没装"), false);
       return;
    }
 
    /* 不弹确认框, 进来就发。它写什么由按钮上的 tooltip 一直写着: 进 OP 开始发帧、
     * 覆盖生效映射里主站拥有的项, 但不发使能 (电机不带电) */
-   hint(QStringLiteral("正在连接... (选轴 / 补映射 / 进 OP 都要做 SDO, 慢是正常的)"), false);
+   hint(QStringLiteral("正在连接… (选轴 / 补映射 / 进 OP 都要做 SDO, 慢是正常的)"), false);
 
    /* 连上之前先记住这张卡: 连接失败也说明人选的就是它, 下次开机仍该默认它 */
    saveSettings();
@@ -2628,7 +2615,7 @@ void ScanWindow::onFaultResetClicked()
    if (ntodo == 0)
    {
       who = QStringLiteral("看起来没有轴报故障 (6041h bit3 都是 0) —— "
-                           "这一下大概率**一个字节都不会写**。"
+                           "这一下大概率一个字节都不会写。"
                            "(故障要真是刚起来的, 工作线程会看到它并照常复位。)");
    }
    else
@@ -2638,8 +2625,8 @@ void ScanWindow::onFaultResetClicked()
       QStringList names;
       for (int k = 0; k < ntodo && k < EM_MAX_AXES; k++)
          names << ecatcmd::fault_axis_text(todo[k], t.ax[todo[k]].fault_code);
-      who = QStringLiteral("复位看起来报故障的: %1。复位成功后该轴停在**未使能**, "
-                           "要接着走请重新点「使能」。**复位清的是故障位, 不是原因** —— "
+      who = QStringLiteral("复位看起来报故障的: %1。复位成功后该轴停在未使能, "
+                           "要接着走请重新点「使能」。复位清的是故障位, 不是原因 —— "
                            "同一条故障会再报一次。").arg(names.join(QStringLiteral("、")));
    }
 
@@ -2715,7 +2702,7 @@ void ScanWindow::onHomeClicked(int axis, int dir, bool find_limit)
 
    /* 这一句只在**命令没被那道闸接住**时才留得住 (真开始回零的话, 最多 33ms 之后
     * refresh 就会用"轴X 正在回零…"那条**状态**横幅把它盖掉 —— 那是设计如此)。 */
-   hint(QStringLiteral("轴 %1 的 %2已发出 (方式 %3, 速度 %4 pul/s)。**按「停止」可立即中止**。").arg(ax, act).arg(meth).arg(vel), false);
+   hint(QStringLiteral("轴 %1 的 %2 已发出 (方式 %3, 速度 %4 pul/s)。按「停止」可立即中止。").arg(ax, act).arg(meth).arg(vel), false);
 }
 
 void ScanWindow::onZeroHereClicked()
@@ -3022,7 +3009,7 @@ void ScanWindow::onMtrStartClicked()
          hint(err, true);
          return;
       }
-      hint(QStringLiteral("扫描正在跑 —— 切到**跟随**: 曲线画扫描采到的那些点, "
+      hint(QStringLiteral("扫描正在跑 —— 切到跟随: 曲线画扫描采到的那些点, "
                           "这里不向功率计发请求, 也不写文件 (那份数据在扫描的 CSV 里)"),
            false);
       refresh();
@@ -3228,7 +3215,7 @@ void ScanWindow::onStartClicked()
    }
 
    /* 出发那一句必须在 m_ctl->start 之后: 它念的是控制器真建出来的网格 (gridNx/totalPoints) */
-   hint(QStringLiteral("扫描开始: 区域 %1 × %2 mm (±%3) 共 %4 × %5 = **%6 点**, "
+   hint(QStringLiteral("扫描开始: 区域 %1 × %2 mm (±%3) 共 %4 × %5 = %6 点, "
                        "预计全程 %7; 取样源 %8, 数据写入 %9")
            .arg(p.area_x_unit, 0, 'f', 3).arg(p.area_y_unit, 0, 'f', 3)
            .arg(p.area_x_unit / 2.0, 0, 'f', 3)
@@ -3297,7 +3284,7 @@ void ScanWindow::onOpenCsvClicked()
 void ScanWindow::onPauseClicked()
 {
    m_ctl->pause();
-   hint(QStringLiteral("已暂停 —— 目标冻在当前位置, **保持保持力矩**。「继续」会重新走完当前点并重采"), false);
+   hint(QStringLiteral("已暂停 —— 目标冻在当前位置, 保持力矩。「继续」会重新走完当前点并重采"), false);
    refresh();
 }
 
@@ -3324,7 +3311,7 @@ void ScanWindow::onRetestClicked()
    const int iy = m_canvas->selectedIy();
    if (ix < 0 || iy < 0)
    {
-      hint(QStringLiteral("先在画布上用 **左键** 选中一格"), false);
+      hint(QStringLiteral("先在画布上用左键选中一格"), false);
       return;
    }
 
@@ -3424,7 +3411,7 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
       {
          /* 「有效」而不是「撞上」—— 这一位是 CiA402 的 internal limit active,
           * 不等于"物理上已经撞到限位开关"。这一格短, 只能放驱动器自己那句话 */
-         lb->setText(ax + QStringLiteral(" 有效!"));
+         lb->setText(ax + QStringLiteral(" 有效"));
          lb->setStyleSheet(QStringLiteral(
             "background:#5a1f1f; color:#ffb3b3; padding:2px 6px;"
             "border-radius:3px; font-weight:bold;"));
@@ -3450,7 +3437,7 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
           * 说的都是信号不是"撞上了" (手册: 该位是电平不是闩锁)。这里不改判定。 */
          if (a.dig_known)
             std::printf("[scan] 轴%d 限位判据置起: 反转=%d  sw=0x%04X  60FDh 位: "
-                        "原点(bit2)=%d 正限位(bit1)=%d 负限位(bit0)=%d\n",
+                        "原点 (bit2)=%d 正限位 (bit1)=%d 负限位 (bit0)=%d\n",
                         i, t.di_invert ? 1 : 0, (unsigned)a.sw, a.dig_home ? 1 : 0,
                         a.dig_pos ? 1 : 0, a.dig_neg ? 1 : 0);
          else
@@ -3645,7 +3632,7 @@ void ScanWindow::refresh()
           * 开着时两者正好相反, 说成"正在反向退开"会恰好说反。分支预告在控制台里 (那句
           * 是工作线程按驱动器自己的读数打的); 这里只报**信号此刻有效**这件事实, 与限位灯
           * 同一份量、同一个措辞。 */
-         s = QStringLiteral("轴%1 正在%2 (方式 %3) —— **按「停止」可立即中止**")
+         s = QStringLiteral("轴%1 正在%2 (方式 %3) —— 按「停止」可立即中止")
                 .arg(nm, QString::fromUtf8(ecatcmd::home_method_short(m)))
                 .arg(m);
 
@@ -3656,7 +3643,7 @@ void ScanWindow::refresh()
       }
       else
       {
-         s = QStringLiteral("轴%1 正在回零 (方式 %2, %3高速先找) —— **按「停止」可立即中止**")
+         s = QStringLiteral("轴%1 正在回零 (方式 %2, %3高速先找) —— 按「停止」可立即中止")
                 .arg(nm).arg(m)
                 .arg(QString::fromUtf8(ecatcmd::home_method_first_dir(m, false)));
       }
@@ -3851,7 +3838,7 @@ void ScanWindow::hint(const QString &s, bool fault)
 
 void ScanWindow::showFault(const QString &why)
 {
-   hint(QStringLiteral("**扫描已自动中止**: ") + why, true);
+   hint(QStringLiteral("扫描已自动中止: ") + why, true);
 
    /* 自动中止还要弹模态 (横幅之外, 无人值守时不会错过), 用 singleShot 挪出这一帧再弹,
     * 免得在 30Hz 的槽里嵌套事件循环 */
@@ -3872,10 +3859,9 @@ void ScanWindow::warnMaybeLive()
 {
    QMessageBox::critical(this, QStringLiteral("电机可能仍带电"),
       QStringLiteral(
-         "收尾时**未能确认所有轴都失能** —— 与控制台退出码 10 同一语义。\n\n"
+         "收尾时未能确认所有轴都失能 (同控制台退出码 10)。\n\n"
          "立即断开驱动器的动力电源, 不要只依赖软件。\n\n"
-         "常见原因是收尾过程中总线已经掉了: 那时驱动器还带着力矩, 而我们已经没有\n"
-         "通道去撤它。"));
+         "常见原因是收尾中途总线掉了 —— 那时驱动器还带着力矩, 已经没有通道去撤它。"));
 }
 
 /* ---------------------------------------------------------------- 收尾 */
@@ -3933,7 +3919,7 @@ void ScanWindow::closeEvent(QCloseEvent *e)
       if (!m_thr->wait(15000))
       {
          QMessageBox::warning(this, QStringLiteral("收尾超时"),
-            QStringLiteral("工作线程 15 秒没退出来 —— 收尾可能没走完。\n"
+            QStringLiteral("工作线程 15 s 没退出来 —— 收尾可能没走完。\n"
                            "关掉窗口后, 请直接断掉驱动器的动力电源。"));
       }
       else if (m_thr->maybeLive() && !m_warnedLive)

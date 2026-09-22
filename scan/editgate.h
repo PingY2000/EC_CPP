@@ -91,10 +91,8 @@ inline const char *doubleInvertWarning(bool npn_write_drive, bool npn_sw_invert)
    if (!(npn_write_drive && npn_sw_invert))
       return nullptr;
 
-   return "双反相 —— 「写驱动器 2300h」与「上位机侧取反」都勾着: 驱动器被改成常闭"
-          " (2300h = 0x0007), 而上位机又把读到的那三位翻回去。判据此时只看反相后的两个"
-          "限位开关, 反相之后它们空载时都是 1 -> 判据**恒成立** -> 扫描永远开不了"
-          " (只多报, 不漏报)。正确做法只有一个: 把「上位机侧取反」关掉。";
+   return "双反相: 「写驱动器 2300h」与「上位机侧取反」都勾着 —— 判据恒成立, "
+          "扫描永远开不了。正确做法只有一个: 把「上位机侧取反」关掉。";
 }
 
 }   /* namespace editgate */

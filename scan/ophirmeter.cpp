@@ -186,7 +186,7 @@ OphirMeter::~OphirMeter()
       /* 断掉它的所有连接 (免得它往一个正在死的对象上投信号), 然后把线程和 p 一起漏掉 */
       t->disconnect();
       std::fprintf(stderr,
-                   "[ophirmeter] 采集线程 15s 没收掉 (COM 调用卡在驱动里?), "
+                   "[ophirmeter] 采集线程 15 s 没收掉 (COM 调用卡在驱动里?), "
                    "故意泄漏它以免 use-after-free。请检查设备与 USB\n");
       return;
    }
@@ -373,9 +373,9 @@ void OphirMeter::runSession()
    if (serials.isEmpty())
    {
       /* 手册的排查顺序: 线 / 供电 / Windows 认不认 / StarLab 认不认, 不是先改代码 */
-      failOpen(QStringLiteral("没找到 Ophir USB 设备。Juno+ 插好了吗? "
-                              "先开 StarLab 看看它认不认这块表头 —— "
-                              "StarLab 里都读不到功率的话, 问题在硬件或驱动, 不在这个程序里"));
+      failOpen(QStringLiteral("没找到 Ophir USB 设备 —— 确认 Juno+ 插好, "
+                              "并用 StarLab 看它认不认这块表头: StarLab 里也读不到功率, "
+                              "问题就在硬件或驱动, 不在这个程序里"));
       return;
    }
 
@@ -408,7 +408,7 @@ void OphirMeter::runSession()
    if (com.isSensorExists(h, k_channel, &sensor_ok, &err) && !sensor_ok)
    {
       failOpenWithDevice(QStringLiteral("表头在, 但通道 %1 上没有探头 —— "
-                                        "PD300R 插到 Juno+ 上了吗?").arg(k_channel));
+                                        "确认 PD300R 插在 Juno+ 上").arg(k_channel));
       return;
    }
 

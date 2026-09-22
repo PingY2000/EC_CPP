@@ -325,7 +325,7 @@ void EcatThread::drainCommands()
                if (em_disable_all(m_bus) == EM_EXIT_OK)
                   note(QStringLiteral("已失能 (电机释放)"));
                else
-                  note(QStringLiteral("失能有轴没退干净 —— **电机可能仍带电**, "
+                  note(QStringLiteral("失能有轴没退干净 —— 电机可能仍带电, "
                                       "看控制台里是哪一根"));
             }
             /* 失能后目标跟着实际位置, 免得再使能时把旧目标当成新指令 */
@@ -416,7 +416,7 @@ void EcatThread::doConnectInner(const QString &ifname)
    int n = em_open(m_bus, ifn.constData());
    if (n <= 0)
    {
-      note(QStringLiteral("打不开网卡。多半是**被别的程序独占** (Npcap 单进程), "
+      note(QStringLiteral("打不开网卡。多半是被别的程序独占 (Npcap 单进程), "
                           "或没装 Npcap, 或不是管理员。先确认没有别的东西在用这张卡"));
       em_bus_free(m_bus);
       m_bus = nullptr;
@@ -500,9 +500,9 @@ void EcatThread::doConnectInner(const QString &ifname)
          em_allow_param_write(m_bus, 1);
          if (em_di_set_logic(m_bus, EM_DI_LOGIC_NPN) != 0)
             di_fail = QStringLiteral(
-               "2300h 写入失败 (原因见控制台): 有轴仍是原极性 -> 驱动器照旧把「没触发」"
+               "2300h 写入失败 (原因见控制台): 有轴仍是原极性 → 驱动器照旧把「没触发」"
                "读成「触发」, 定位与限位一起错, 扫描可能开不了。"
-               "退路: 勾上「高级选项」里的「上位机侧取反」");
+               "退路: 勾「上位机侧取反」");
          em_allow_param_write(m_bus, 0);
       }
    }
@@ -554,7 +554,7 @@ void EcatThread::doEnable()
    }
    if (!m_origin_ready)
    {
-      note(QStringLiteral("还没收到完整的过程数据帧 -> 位置未知, 拒绝使能"));
+      note(QStringLiteral("还没收到完整的过程数据帧 → 位置未知, 拒绝使能"));
       return;
    }
 
@@ -564,7 +564,7 @@ void EcatThread::doEnable()
          continue;
       if (em_set_mode(m_ax[i], EM_MODE_CSP) != EM_EXIT_OK)
       {
-         note(QStringLiteral("轴%1: 切到 CSP 模式失败 -> 中止使能 (原因见控制台)")
+         note(QStringLiteral("轴%1: 切到 CSP 模式失败 → 中止使能 (原因见控制台)")
                  .arg(i));
          return;
       }
@@ -573,7 +573,7 @@ void EcatThread::doEnable()
    if (em_enable_all(m_bus) != EM_EXIT_OK)
    {
       note(QStringLiteral("使能失败 —— 控制台里写着是哪一步。"
-                          "**不要重复点**: 先看是不是 6041h 报了故障或限位"));
+                          "不要重复点: 先看是不是 6041h 报了故障或限位"));
       return;
    }
 
@@ -622,9 +622,9 @@ void EcatThread::doFaultReset()
    if (ntodo == 0)
    {
       /* 这一句是重点: **真的一个字节都没写** */
-      note(QStringLiteral("没有轴报故障 (6041h bit3 都是 0) -> **一个字节都没写**。"
-                          "复位只对报故障的轴做: 它的动作是先把 6040h 写成 0x0000 "
-                          "(卸力) 再抬 bit7, 对一根健康的轴做这件事会松开它的保持力矩"));
+      note(QStringLiteral("没有轴报故障 (6041h bit3 都是 0) → 一个字节都没写。"
+                          "复位只对报故障的轴做 —— 它要先把 6040h 写成 0x0000 (卸力) "
+                          "再抬 bit7, 对一根健康的轴做会松开它的保持力矩"));
       return;
    }
 
@@ -669,14 +669,14 @@ void EcatThread::doFaultReset()
    QString s;
 
    if (!ok.isEmpty())
-      s = QStringLiteral("%1 故障已清。该轴现在停在**未使能** —— 复位最后写的是 "
+      s = QStringLiteral("%1 故障已清。该轴现在停在未使能 —— 复位最后写的是 "
                          "6040h = 0x0000, 要接着走请重新点「使能」").arg(ok.join(QStringLiteral("/")));
 
    if (!bad.isEmpty())
    {
       if (!s.isEmpty())
          s += QStringLiteral("   ");
-      s += QStringLiteral("%1 复位失败 —— **按那个码查清原因再点**, 不要反复点硬顶 "
+      s += QStringLiteral("%1 复位失败 —— 按那个码查清原因再点, 不要反复点硬顶 "
                           "(控制台里有 6041h 的实测值)")
               .arg(bad.join(QStringLiteral("; ")));
    }
@@ -718,7 +718,7 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
    if (!ecatcmd::home_method_allowed(method))
    {
       note(QStringLiteral("回零方式 %1 不在允许的范围内 (只用 24/29 找原点、18/17 找限位) "
-                          "-> **一个字节都没写**")
+                          "→ 一个字节都没写")
               .arg(method));
       return;
    }
@@ -727,7 +727,7 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
                                            mirror_ok, fault, any_moving);
    if (why != nullptr)
    {
-      note(QStringLiteral("%1 回零没有发起: %2 -> **一个字节都没写**")
+      note(QStringLiteral("%1 回零没有发起: %2 → 一个字节都没写")
               .arg(QString::fromUtf8(ecatcmd::axis_label(axis)),
                    QString::fromUtf8(why)));
       return;
@@ -754,7 +754,7 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
       const char *no = ecatcmd::home_lim_refusal(dig_known, tgt, other);
       if (no != nullptr)
       {
-         note(QStringLiteral("%1 %2没有发起: %3 -> **一个字节都没写**")
+         note(QStringLiteral("%1 %2没有发起: %3 → 一个字节都没写")
                  .arg(nm, QString::fromUtf8(ecatcmd::home_method_short(method)),
                       QString::fromUtf8(no)));
          return;
@@ -892,7 +892,7 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
                                        "先别再走"));
    }
 
-   s += QStringLiteral(" [6099h:01 = %1, :02 = %2 pul/s, 609Ah = %3, 上限 %4 秒]")
+   s += QStringLiteral(" [6099h:01 = %1, :02 = %2 pul/s, 609Ah = %3, 上限 %4 s]")
            .arg(cfg.vel_fast).arg(cfg.vel_slow).arg(cfg.acc).arg(HMI_HOME_TMO_MS / 1000);
 
    note(s);
@@ -967,7 +967,7 @@ void EcatThread::doStop()
          m_want[i] = m_tgt[i];
    }
 
-   note(QStringLiteral("已停止: 目标冻在当前位置, 仍带保持力矩(未卸力)"));
+   note(QStringLiteral("已停止: 目标冻在当前位置, 仍带保持力矩 (未卸力)"));
 }
 
 void EcatThread::doZero(int axis)
@@ -981,7 +981,7 @@ void EcatThread::doZero(int axis)
 
    if (m_want[axis] != m_tgt[axis])
    {
-      note(QStringLiteral("轴%1 还在走 -> 等停稳了再设零 (否则零点会落在半路上)")
+      note(QStringLiteral("轴%1 还在走 → 等停稳了再设零 (否则零点会落在半路上)")
               .arg(axis));
       return;
    }
@@ -1019,26 +1019,26 @@ void EcatThread::doRange(int32_t range)
    if (range >= old)
    {
       m_range.store(range);
-      note(QStringLiteral("量程已从 ±%1 改为 ±%2 脉冲 (只放大, 不产生任何运动)")
+      note(QStringLiteral("量程已从 ±%1 改为 ±%2 pul (只放大, 不产生任何运动)")
               .arg(old).arg(range));
       return;
    }
 
-   /* 缩小 —— 逐轴确认装得下。m_tgt 是工作线程独占的, 这里读它不需要锁 */
+   /* 缩小 —— 逐轴确认装得下。m_tgt 是工作线程独占的, 这里读它不需要锁。
+    * 装不下就整条拒绝, 不夹目标: 夹一下等于凭空下发一次运动。 */
    for (int i = 0; i < m_naxis; i++)
    {
       if (m_tgt[i] > range || m_tgt[i] < -range)
       {
-         note(QStringLiteral("量程改小被**拒绝**: 轴%1 当前下发目标 %2 超出新量程 ±%3。"
-                             "先把滑台走回新量程内 (或点「回中」) —— "
-                             "为了迁就新量程去夹一下目标就等于凭空下发一次运动")
+         note(QStringLiteral("量程改小被拒绝: 轴%1 当前下发目标 %2 超出新量程 ±%3。"
+                             "先把滑台走回新量程内 (或点「回中」)")
                  .arg(i).arg(m_tgt[i]).arg(range));
          return;
       }
    }
 
    m_range.store(range);
-   note(QStringLiteral("量程已从 ±%1 改为 ±%2 脉冲").arg(old).arg(range));
+   note(QStringLiteral("量程已从 ±%1 改为 ±%2 pul").arg(old).arg(range));
 }
 
 void EcatThread::tryInitOrigin()
@@ -1063,8 +1063,8 @@ void EcatThread::tryInitOrigin()
    }
 
    m_origin_ready = true;
-   note(QStringLiteral("零点是**连接时读到的位置**: 界面正中 = 现在这里, 可点范围 ±%1 脉冲 "
-                       "(50000 pul/圈 => ±%2 圈)。换个零点用「把当前位置设为 0」")
+   note(QStringLiteral("零点是连接时读到的位置: 界面正中 = 现在这里, 可点范围 ±%1 pul "
+                       "(50000 pul/rev, 即 ±%2 rev)。换个零点用「把当前位置设为 0」")
            .arg(m_range.load())
            .arg(m_range.load() / 50000.0, 0, 'f', 1));
 }
@@ -1231,7 +1231,7 @@ void EcatThread::publish(int wkc)
       /* 不写 0x0000: 故障时驱动器自己会退电, 这里只停止下发新目标。
        * 这一句只是"先占住状态栏" —— 603Fh 的码要下一圈才读得回来, 读到后
        * serviceFaultCodeReads 会用带码的那一句把它顶掉 (note 是覆盖写)。 */
-      note(QStringLiteral("6041h bit3 = Fault -> 已冻结目标。**故障码 603Fh 正在读** —— "
+      note(QStringLiteral("6041h bit3 = Fault → 已冻结目标。故障码 603Fh 正在读 —— "
                           "码出来按码处置, 再用「故障复位」清故障位"));
    }
    else if (!t.fault)

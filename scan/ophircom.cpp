@@ -635,7 +635,7 @@ bool OphirCom::create(QString *err)
    {
       if (err)
          *err = QStringLiteral("系统里没有注册 OphirLMMeasurement.CoLMMeasurement —— "
-                               "StarLab 装了吗? (StarLab 的安装过程会注册这个 COM 对象)");
+                               "这个 COM 对象由 StarLab 的安装过程注册, 先确认它装了");
       destroy();
       return false;
    }

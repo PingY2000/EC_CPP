@@ -415,7 +415,7 @@ struct Rig
 
 static void test_grid()
 {
-   caseBegin("grid: 27x27 @ 0.5 -> 55x55");
+   caseBegin("grid: 27x27 @ 0.5 → 55x55");
 
    Params p;
    checkEq(axisCount(p.area_x_unit, p.res_unit), 55, "nx");
@@ -447,7 +447,7 @@ static void test_grid()
 
    /* 除不尽时网格居中且不越界 */
    std::vector<double> odd = axisCoords(10.0, 3.0);   /* n = 4, span = 9 < 10 */
-   checkEq((long long)odd.size(), 4, "10/3 -> 4 points");
+   checkEq((long long)odd.size(), 4, "10/3 → 4 points");
    checkNear(odd.front(), -4.5, "10/3 first");
    checkNear(odd.back(),   4.5, "10/3 last");
    check(std::fabs(odd.back()) <= 5.0, "grid stays inside the area");
@@ -599,13 +599,13 @@ static void test_meter_meta()
       /* 探头类型与测量模式名, 两个来源任一说得清就说得清 */
       check(unitFromDeviceInfo(QStringLiteral("pyroelectric"), QStringLiteral("Energy"))
                == QStringLiteral("J"),
-            "热释电 + Energy -> J");
+            "热释电 + Energy → J");
       check(unitFromDeviceInfo(QStringLiteral("thermopile"), QStringLiteral("Power"))
                == QStringLiteral("W"),
-            "热电堆 + Power -> W");
+            "热电堆 + Power → W");
       check(unitFromDeviceInfo(QStringLiteral("photodiode"), QStringLiteral("Power"))
                == QStringLiteral("W"),
-            "光电二极管 + Power -> W");
+            "光电二极管 + Power → W");
 
       /* 模式名优先于探头类型: 同一只探头在 Energy 模式下报的是 J */
       check(unitFromDeviceInfo(QStringLiteral("thermopile"), QStringLiteral("Energy"))
@@ -613,7 +613,7 @@ static void test_meter_meta()
             "模式名说了算");
 
       /* **认不出来返回空**, 一个字符都不许编 */
-      check(unitFromDeviceInfo(QString(), QString()).isEmpty(), "两个都空 -> 空");
+      check(unitFromDeviceInfo(QString(), QString()).isEmpty(), "两个都空 → 空");
       check(unitFromDeviceInfo(QStringLiteral("pyroelectric"), QStringLiteral("dBm")).isEmpty(),
             "dBm 算认不出来 —— 外面判不出那份数组到底是 dBm 还是 W");
       check(unitFromDeviceInfo(QStringLiteral("unknown-type"), QStringLiteral("Power"))
@@ -633,7 +633,7 @@ static void test_meter_meta()
       QString err;
 
       /* 界面推过来的是 meterMetaLines() 的产出 (纯 ASCII), 这里原样摆几行 */
-      checkEq((long long)meterMetaLines(nullptr).size(), 0, "没有源 -> 一行都不加");
+      checkEq((long long)meterMetaLines(nullptr).size(), 0, "没有源 → 一行都不加");
 
       QStringList extra = meterMetaLines(nullptr);
       extra << QStringLiteral("meter_source=ophir")
@@ -930,7 +930,7 @@ static void test_run()
 
 static void test_aborts()
 {
-   caseBegin("abort: 撞硬件限位 -> 自动中止");
+   caseBegin("abort: 撞硬件限位 → 自动中止");
    {
       Rig r;
       r.ctrl.setParams(Rig::smallParams());
@@ -1154,27 +1154,27 @@ static void test_preflight()
       QString err;
 
       r.bus.setEnabled(0, false);
-      check(!r.startScan(QDir::tempPath() + "/pf1.csv", &err), "not enabled -> refused");
+      check(!r.startScan(QDir::tempPath() + "/pf1.csv", &err), "not enabled → refused");
       check(err.contains(QStringLiteral("使能")), "the reason says so", err.toStdString());
 
       r.bus.setEnabled(0, true);
       r.meter.close();
-      check(!r.startScan(QDir::tempPath() + "/pf2.csv", &err), "no meter -> refused");
+      check(!r.startScan(QDir::tempPath() + "/pf2.csv", &err), "no meter → refused");
       check(err.contains(QStringLiteral("功率计")), "the reason mentions the meter", err.toStdString());
 
       r.meter.open(nullptr);
       r.bus.setLimit(1, true);
       check(!r.startScan(QDir::tempPath() + "/pf3.csv", &err),
-            "already sitting on a limit switch -> refused");
+            "already sitting on a limit switch → refused");
       check(err.contains(QStringLiteral("bit11")), "the reason mentions bit11", err.toStdString());
 
       r.bus.setLimit(1, false);
       r.bus.setInOp(false);
-      check(!r.startScan(QDir::tempPath() + "/pf4.csv", &err), "not in OP -> refused");
+      check(!r.startScan(QDir::tempPath() + "/pf4.csv", &err), "not in OP → refused");
 
       /* 一切正常时**必须放行** —— 只会拒绝的 Preflight 跟没写一样 */
       r.bus.setInOp(true);
-      check(r.startScan(QDir::tempPath() + "/pf5.csv", &err), "healthy -> accepted", err.toStdString());
+      check(r.startScan(QDir::tempPath() + "/pf5.csv", &err), "healthy → accepted", err.toStdString());
       r.ctrl.abort(QString());
    }
 
@@ -1366,7 +1366,7 @@ static void test_editgate()
       check(std::string(editgate::titleMark(g)).empty(), "于是标记也没冒出来");
    }
 
-   caseBegin("editgate: 进了编辑态但没改 -> 有编辑权, 没有未保存的东西");
+   caseBegin("editgate: 进了编辑态但没改 → 有编辑权, 没有未保存的东西");
    {
       editgate::Gate g;
       check(editgate::begin(&g), "第一次 begin 成功");
@@ -1377,7 +1377,7 @@ static void test_editgate()
       check(has(editgate::titleMark(g), "未保存"), "改一下就出现「未保存」");
    }
 
-   caseBegin("editgate: 改回原值 -> 标记自己消失");
+   caseBegin("editgate: 改回原值 → 标记自己消失");
    {
       editgate::Gate g;
       editgate::begin(&g);
@@ -1385,7 +1385,7 @@ static void test_editgate()
       check(has(editgate::titleMark(g), "未保存"), "改一下就有标记");
 
       editgate::undirty(&g);
-      check(!g.dirty, "界面侧逐项比对发现与快照一致 -> 标记落下");
+      check(!g.dirty, "界面侧逐项比对发现与快照一致 → 标记落下");
       check(std::string(editgate::titleMark(g)).empty(), "标题回到干净的那一份");
       check(g.editing, "但还在编辑态: 清标记不等于退出编辑");
 
@@ -1416,12 +1416,12 @@ static void test_editgate()
    {
       editgate::Gate g;
       editgate::begin(&g);
-      check(!editgate::drop(&g), "进了编辑态又没改 -> 调用方什么都不用做");
+      check(!editgate::drop(&g), "进了编辑态又没改 → 调用方什么都不用做");
       check(!has(editgate::titleMark(g), "已丢弃"), "没改过就不留「已丢弃」");
 
       editgate::begin(&g);
       editgate::markDirty(&g);
-      check(editgate::drop(&g), "有改动 -> 调用方必须回滚控件并重新下推");
+      check(editgate::drop(&g), "有改动 → 调用方必须回滚控件并重新下推");
       check(!g.editing, "丢弃也退出编辑态");
       check(has(editgate::titleMark(g), "未保存"), "痕迹说清「未保存」");
       check(has(editgate::titleMark(g), "已丢弃"), "并说清它已经被丢掉");
@@ -1438,17 +1438,17 @@ static void test_editgate()
       check(editgate::doubleInvertWarning(false, false) == nullptr, "两个都不勾: 无事");
 
       const char *w = editgate::doubleInvertWarning(true, true);
-      check(w != nullptr, "两个都勾 -> 必须给警告");
+      check(w != nullptr, "两个都勾 → 必须给警告");
       check(has(w, "恒成立"), "措辞必须点明判据恒成立", w ? w : "");
       check(has(w, "上位机侧取反"), "并指出该关掉哪一个", w ? w : "");
    }
 
    caseBegin("editgate: 2300h 的掩码比较 — 高几位无关");
    {
-      check(!EM_DI_LOGIC_EQ(0x0000u, EM_DI_LOGIC_NPN), "常开 -> 要写");
-      check( EM_DI_LOGIC_EQ(0x0007u, EM_DI_LOGIC_NPN), "已经是 NPN -> 一个字节都不写");
+      check(!EM_DI_LOGIC_EQ(0x0000u, EM_DI_LOGIC_NPN), "常开 → 要写");
+      check( EM_DI_LOGIC_EQ(0x0007u, EM_DI_LOGIC_NPN), "已经是 NPN → 一个字节都不写");
       check( EM_DI_LOGIC_EQ(0xF007u, EM_DI_LOGIC_NPN), "高位有别的位不关这三位的事");
-      check(!EM_DI_LOGIC_EQ(0x0006u, EM_DI_LOGIC_NPN), "只对两位 -> 还要写");
+      check(!EM_DI_LOGIC_EQ(0x0006u, EM_DI_LOGIC_NPN), "只对两位 → 还要写");
       check( EM_DI_LOGIC_EQ(EM_DI_LOGIC_MASK, EM_DI_LOGIC_NPN), "掩码就是 0x0007");
    }
 }
@@ -1519,7 +1519,7 @@ static void test_advprefs()
    caseBegin("advprefs: 色标「自动跟随数据」是个模式 —— 缺省关、缺项回落到关、存得住");
    {
       const Prefs p;
-      check(!p.shade_auto, "缺省关 (锁定的色阶才是能拿两张图对比的那一种)");
+      check(!p.shade_auto, "缺省关 (锁定的色标才是能拿两张图对比的那一种)");
 
       QTemporaryDir dir;
       const QString ini = dir.filePath(QStringLiteral("scan.ini"));
@@ -1545,11 +1545,11 @@ static void test_advprefs()
    caseBegin("advprefs: 被手改坏的 ini 不许直接把速度拿去用");
    {
       checkEq(ecatcmd::home_vel_from_pref(-1), HMI_HOME_VEL_DEF,
-              "-1 = 没记过 -> 用驱动器实测值");
+              "-1 = 没记过 → 用驱动器实测值");
       checkEq(ecatcmd::home_vel_from_pref(0),  HMI_HOME_VEL_DEF, "0 也算没记过");
       checkEq(ecatcmd::home_vel_from_pref(30000), 30000, "正常值原样用");
-      checkEq(ecatcmd::home_vel_from_pref(1), HMI_HOME_VEL_MIN, "太小 -> 夹到下限");
-      checkEq(ecatcmd::home_vel_from_pref(999999999), HMI_HOME_VEL_MAX, "太大 -> 夹到上限");
+      checkEq(ecatcmd::home_vel_from_pref(1), HMI_HOME_VEL_MIN, "太小 → 夹到下限");
+      checkEq(ecatcmd::home_vel_from_pref(999999999), HMI_HOME_VEL_MAX, "太大 → 夹到上限");
    }
 }
 
@@ -1568,10 +1568,10 @@ static void test_faultreset()
    caseBegin("faultreset: 只有「可信 + 有故障」才许碰");
    check(!axis_needs_reset(false, true,  true),  "invalid axis is skipped");
    check(!axis_needs_reset(false, false, true),  "invalid + unknown is skipped");
-   check(!axis_needs_reset(true,  false, true),  "**unknown (mirror_ok=false) is skipped, not guessed**");
+   check(!axis_needs_reset(true,  false, true),  "unknown (mirror_ok=false) is skipped, not guessed");
    check(!axis_needs_reset(true,  true,  false), "healthy axis is never written to");
    check(!axis_needs_reset(true,  false, false), "unknown + healthy is skipped");
-   check( axis_needs_reset(true,  true,  true),  "trusted + faulted -> reset");
+   check( axis_needs_reset(true,  true,  true),  "trusted + faulted → reset");
 
    /* ---- 从一份遥测里挑出该复位的轴 ---- */
    caseBegin("faultreset: 挑轴 — 挑不到就一个字节都不写");
@@ -1587,7 +1587,7 @@ static void test_faultreset()
       int out[EM_MAX_AXES];
 
       /* 一根都没故障 —— 这是最要紧的一种情况: 返回 0 = 一个字节都不该写 */
-      checkEq(pick_faulted_axes(t, out, EM_MAX_AXES), 0, "no fault -> nothing to do");
+      checkEq(pick_faulted_axes(t, out, EM_MAX_AXES), 0, "no fault → nothing to do");
 
       /* 两根都故障 */
       t.ax[0].fault = t.ax[1].fault = true;
@@ -1603,17 +1603,17 @@ static void test_faultreset()
 
       /* 状态未知的轴线上一根都不碰 */
       t.ax[0].mirror_ok = false;
-      checkEq(pick_faulted_axes(t, out, EM_MAX_AXES), 0, "all unknown -> nothing");
+      checkEq(pick_faulted_axes(t, out, EM_MAX_AXES), 0, "all unknown → nothing");
 
       /* valid=false 同理 */
       t.ax[0].mirror_ok = true;
       t.ax[0].valid     = false;
-      checkEq(pick_faulted_axes(t, out, EM_MAX_AXES), 0, "invalid -> nothing");
+      checkEq(pick_faulted_axes(t, out, EM_MAX_AXES), 0, "invalid → nothing");
 
       /* 没有轴 */
       BusTelem none;
       none.naxis = 0;
-      checkEq(pick_faulted_axes(none, out, EM_MAX_AXES), 0, "no axes -> nothing");
+      checkEq(pick_faulted_axes(none, out, EM_MAX_AXES), 0, "no axes → nothing");
 
       /* out 装不下时**仍返回真实条数**: 调用方靠这个数决定该说什么 */
       t.ax[0].valid = true;
@@ -1638,50 +1638,50 @@ static void test_limitsw()
    const uint16_t LIM = EM_SW_INTLIMIT;
 
    caseBegin("limitsw: 今天的判定 = bit11 单独, 一个比特没变");
-   check( limit_hit(LIM, false, false, false, false), "bit11 + nothing known -> still hit");
-   check( limit_hit(LIM, true,  false, false, false), "bit11 + both switches released -> still hit");
+   check( limit_hit(LIM, false, false, false, false), "bit11 + nothing known → still hit");
+   check( limit_hit(LIM, true,  false, false, false), "bit11 + both switches released → still hit");
    check( limit_hit(LIM, true,  true,  false, false), "bit11 + positive switch");
    check( limit_hit(LIM, true,  false, true,  false), "bit11 + negative switch");
-   check(!limit_hit(0,   true,  true,  true,  false), "no bit11 -> never a hit");
+   check(!limit_hit(0,   true,  true,  true,  false), "no bit11 → never a hit");
    check(!limit_hit(0,   false, false, false, false), "no bit11, nothing known");
 
    /* 「原点不算」在类型上就成立: limit_hit 的参数里没有原点那一位, 它不可能影响中止判定。
     * 故"只压住原点"长的就是 (pos=false, neg=false) 这一组。 */
    caseBegin("limitsw: 精判据 (开关关着的那条分支)");
    check(!limit_hit_rule(LIM, true,  false, false, LIMIT_RULE_REFINED),
-         "**bit11 + only the home switch pressed (pos/neg both released) -> NOT a hit**");
-   check( limit_hit_rule(LIM, true,  true,  false, LIMIT_RULE_REFINED), "bit11 + positive switch -> hit");
-   check( limit_hit_rule(LIM, true,  false, true,  LIMIT_RULE_REFINED), "bit11 + negative switch -> hit");
-   check( limit_hit_rule(LIM, true,  true,  true,  LIMIT_RULE_REFINED), "bit11 + both -> hit");
+         "bit11 + only the home switch pressed (pos/neg both released) → NOT a hit");
+   check( limit_hit_rule(LIM, true,  true,  false, LIMIT_RULE_REFINED), "bit11 + positive switch → hit");
+   check( limit_hit_rule(LIM, true,  false, true,  LIMIT_RULE_REFINED), "bit11 + negative switch → hit");
+   check( limit_hit_rule(LIM, true,  true,  true,  LIMIT_RULE_REFINED), "bit11 + both → hit");
    /* **这一条是"不弱化"的保证**: 不知道 60FDh 就退回旧判据, 保护一点不减 */
    check( limit_hit_rule(LIM, false, false, false, LIMIT_RULE_REFINED),
-         "bit11 + unknown 60FDh -> falls back to bit11 alone");
-   check(!limit_hit_rule(0,   true,  false, false, LIMIT_RULE_REFINED), "no bit11 -> still no hit");
+         "bit11 + unknown 60FDh → falls back to bit11 alone");
+   check(!limit_hit_rule(0,   true,  false, false, LIMIT_RULE_REFINED), "no bit11 → still no hit");
 
    /* ---- 第三条判据: 输入反转 (NPN) ----
     * 反转的语义是用开关的真实状态替掉驱动器的意见, bit11 必须整个退场 —— 故不复用 REFINED:
     * 哪天 2300h 改对而反转忘了关, bit11 变 0 会把 `bit11 && ...` 恒置为 false, 保护静悄悄地全没。 */
    caseBegin("limitsw: 反转那条判据 —— bit11 不参与, 保护压在开关上");
    check(!limit_hit_rule(LIM, true,  false, false, LIMIT_RULE_INVERT),
-         "**bit11 set but both switches released -> NOT a hit** (bit11 is stuck-1 here)");
+         "bit11 set but both switches released → NOT a hit (bit11 is stuck-1 here)");
    check( limit_hit_rule(LIM, true,  true,  false, LIMIT_RULE_INVERT),
-         "inverted: positive switch pressed -> hit");
+         "inverted: positive switch pressed → hit");
    check( limit_hit_rule(LIM, true,  false, true,  LIMIT_RULE_INVERT),
-         "inverted: negative switch pressed -> hit");
+         "inverted: negative switch pressed → hit");
    /* 反转开着时 bit11 不参与判据, 置不置起结果一样 */
    check( limit_hit_rule(0,   true,  true,  false, LIMIT_RULE_INVERT)
        == limit_hit_rule(LIM, true,  true,  false, LIMIT_RULE_INVERT),
          "inverted: bit11 makes no difference at all");
    /* 三条判据里只有这条把「未知」判成中止: bit11 不用了, 开关又读不到, 退无可退。 */
    check( limit_hit_rule(0,   false, false, false, LIMIT_RULE_INVERT),
-         "inverted + unknown 60FDh -> abort, because there is no judge left");
+         "inverted + unknown 60FDh → abort, because there is no judge left");
 
    caseBegin("limitsw: 哪个开关选哪条判据 —— 只此一处 (limit_rule_for)");
    checkEq((int)limit_rule_for(false),
            (int)(kRefineLimitWithDigIn != 0 ? LIMIT_RULE_REFINED : LIMIT_RULE_BIT11),
-           "反转关着 -> 由 kRefineLimitWithDigIn 那个编译期开关决定");
+           "反转关着 → 由 kRefineLimitWithDigIn 那个编译期开关决定");
    checkEq((int)limit_rule_for(true), (int)LIMIT_RULE_INVERT,
-           "反转开着 -> 一定是 INVERT, 与那个编译期开关无关");
+           "反转开着 → 一定是 INVERT, 与那个编译期开关无关");
    /* 端到端那一条: 同一份输入, 反转一开一关必须得到**相反**的结论 —— 否则这个开关没接上 */
    check( limit_hit(LIM, true, false, false, false)
        && !limit_hit(LIM, true, false, false, true),
@@ -1696,7 +1696,7 @@ static void test_limitsw()
       const char *unk_inv = limit_switch_text(false, false, false, true);
       check(std::strstr(unk_inv, "取反") != nullptr,
             "unknown + invert is called out as one judge short", unk_inv);
-      check(std::strcmp(unk, unk_inv) != 0, "...and it is not the same sentence");
+      check(std::strcmp(unk, unk_inv) != 0, "…and it is not the same sentence");
 
       const char *none_p = limit_switch_text(true, false, false, false);
       check(std::strstr(none_p, "都没压着") != nullptr, "known + released says so", none_p);
@@ -1730,7 +1730,7 @@ static void test_limitsw()
       check(std::strstr(adv, "上位机侧取反") != nullptr, "the advice mentions the new way out",
             adv);
       check(std::strstr(adv, "只治软件") != nullptr,
-            "...and says plainly that it only fixes this side", adv);
+            "…and says plainly that it only fixes this side", adv);
 
       /* 真正的单边压着 —— 那句"走离限位"在**这一支**上仍然是对的 */
       const char *one = limit_hit_advice(true, true, false, false, false);
@@ -1743,9 +1743,9 @@ static void test_limitsw()
       const char *a3 = limit_hit_advice(true, false, false, true, false);
       check(std::strcmp(a1, a2) != 0 && std::strcmp(a2, a3) != 0 && std::strcmp(a1, a3) != 0,
             "unknown / neither-pressed / home-only each get their own advice");
-      check(std::strstr(a2, "607Dh") != nullptr, "neither pressed -> look at the soft limits",
+      check(std::strstr(a2, "607Dh") != nullptr, "neither pressed → look at the soft limits",
             a2);
-      check(std::strstr(a3, "原点") != nullptr, "home only -> says it is the home switch", a3);
+      check(std::strstr(a3, "原点") != nullptr, "home only → says it is the home switch", a3);
    }
 
    /* ---- 反转开着时, 上面那几句的意思全变了, 必须是另外几句话 ----
@@ -1757,7 +1757,7 @@ static void test_limitsw()
       const char *t_on  = limit_switch_text(true, true, true, true);
       check(std::strcmp(t_off, t_on) != 0, "same input, two different sentences");
       check(std::strstr(t_on, "2300h") == nullptr,
-            "**with invert on it must NOT send you to 2300h** — polarity is already handled",
+            "with invert on it must NOT send you to 2300h — polarity is already handled",
             t_on);
       check(std::strstr(t_on, "反相") != nullptr, "it says the values are post-inversion", t_on);
 
@@ -1779,7 +1779,7 @@ static void test_limitsw()
       const char *u_off = limit_hit_advice(false, false, false, false, false);
       check(std::strcmp(u_on, u_off) != 0, "unknown 60FDh: invert changes the advice");
       check(std::strstr(u_on, "永远开不了") != nullptr,
-            "**with invert on, unknown 60FDh means the scan can never start**", u_on);
+            "with invert on, unknown 60FDh means the scan can never start", u_on);
       check(std::strstr(u_on, "关掉") != nullptr, "and one way out is to turn the invert off",
             u_on);
 
@@ -1791,7 +1791,7 @@ static void test_limitsw()
             && std::strstr(h_off, "置起") != nullptr,
             "invert off: the headline says bit11 is set", h_off);
       check(std::strstr(h_on, "置起") == nullptr,
-            "**invert on: the headline must NOT claim bit11 is set** — it is not the judge",
+            "invert on: the headline must NOT claim bit11 is set — it is not the judge",
             h_on);
 
       /* 措辞必须落在信号上, 不能落到"撞上了"。ykd 手册 V2.4: 6041h bit11 = 「硬件限位信号有效时
@@ -1799,19 +1799,19 @@ static void test_limitsw()
       check(std::strstr(h_off, "硬件限位信号有效") != nullptr,
             "the headline uses the manual's own wording for bit11", h_off);
       check(std::strstr(h_off, "撞") == nullptr,
-            "**and it does not say the axis crashed into a limit** — bit11 is a level, "
+            "and it does not say the axis crashed into a limit — bit11 is a level, "
             "not a collision", h_off);
       check(std::strstr(h_off, "驱动器认为") == nullptr,
-            "...nor that the drive 'thinks' anything: nothing here is a verdict", h_off);
+            "…nor that the drive 'thinks' anything: nothing here is a verdict", h_off);
       check(std::strstr(h_on, "无关") != nullptr,
-            "...and it answers the obvious question by saying bit11 is unrelated", h_on);
+            "…and it answers the obvious question by saying bit11 is unrelated", h_on);
       check(std::strcmp(h_off, h_on) != 0, "two headlines, not one");
    }
 
    /* ---- 新灯不参与任何中止判据 ----
     * 只有原点开关压着时扫描必须一路跑到 Done。扫描区域本来就可能停在一个开关上, 用监视量去
     * 触发会白中止一趟一小时的活。 */
-   caseBegin("limitsw: 只压住原点开关 -> 扫描照跑, 一次都不中止");
+   caseBegin("limitsw: 只压住原点开关 → 扫描照跑, 一次都不中止");
    {
       Rig r;
       r.ctrl.setParams(Rig::smallParams());
@@ -1829,7 +1829,7 @@ static void test_limitsw()
                        [&](const QString &s) { fired = true; what = s; });
 
       check(r.runToIdle(120000), "runs to the end");
-      check(!fired, "**the home switch never aborts a scan**", what.toStdString());
+      check(!fired, "the home switch never aborts a scan", what.toStdString());
       checkEq(r.ctrl.completedPoints(), 25, "all 25 points collected");
       check(r.ctrl.state() == ScanController::State::Done, "Done, not Aborted");
    }
@@ -1849,7 +1849,7 @@ static void test_limitsw()
 
       QString err;
       check(!r.startScan(QDir::tempPath() + "/scan_npn_off.csv", &err),
-            "反转关着 -> 拒绝启扫 (拦得住, 这是对的)", err.toStdString());
+            "反转关着 → 拒绝启扫 (拦得住, 这是对的)", err.toStdString());
       {
          const QByteArray eb = err.toUtf8();
          check(std::strstr(eb.constData(), "2300h") != nullptr,
@@ -1865,13 +1865,13 @@ static void test_limitsw()
 
       err.clear();
       check(r.startScan(QDir::tempPath() + "/scan_npn_on.csv", &err),
-            "**反转打开 -> 能启扫** (这才是这台机器要的)", err.toStdString());
+            "反转打开 → 能启扫 (这才是这台机器要的)", err.toStdString());
    }
 
    /* ---- 旧判据没退化 ----
     * 60FDh 读不到的机器 (本机的常态: 生效的 1A00h 里没有它) 上, bit11 置起照样中止。这一条
     * 与上面那条是一对: 把原点排除掉, 不等于把保护削弱。 */
-   caseBegin("limitsw: bit11 置起而 60FDh 未知 -> 照样中止 (旧判据没退化)");
+   caseBegin("limitsw: bit11 置起而 60FDh 未知 → 照样中止 (旧判据没退化)");
    {
       Rig r;
       r.ctrl.setParams(Rig::smallParams());
@@ -1892,7 +1892,7 @@ static void test_limitsw()
       check(fired, "still aborts");
       check(what.contains(QStringLiteral("bit11")), "names bit11", what.toStdString());
       check(what.contains(QStringLiteral("无从得知")),
-            "**and says the switch state is unknown instead of pretending it is known**",
+            "and says the switch state is unknown instead of pretending it is known",
             what.toStdString());
    }
 
@@ -1934,7 +1934,7 @@ static void test_homing()
    };
 
    /* ---- 方向 ---------------------------------------------------- */
-   caseBegin("回零: 正/反向 -> 6098h（24 / 29）");
+   caseBegin("回零: 正/反向 → 6098h（24 / 29）");
    {
       checkEq(ecatcmd::home_method_for(false), 24, "正向 = 方式 24");
       checkEq(ecatcmd::home_method_for(true),  29, "反向 = 方式 29");
@@ -1953,7 +1953,7 @@ static void test_homing()
    }
 
    /* ---- 找限位: 方式号与白名单 ---------------------------------- */
-   caseBegin("找限位: 正/负 -> 6098h（18 / 17）, 以及四方式的白名单");
+   caseBegin("找限位: 正/负 → 6098h（18 / 17）, 以及四方式的白名单");
    {
       checkEq(ecatcmd::home_lim_method_for(false), 18, "正限位 = 方式 18");
       checkEq(ecatcmd::home_lim_method_for(true),  17, "负限位 = 方式 17");
@@ -2065,7 +2065,7 @@ static void test_homing()
    }
 
    /* ---- 找限位: 目标/另一侧是哪两位 ----------------------------- */
-   caseBegin("找限位: 目标开关 -> 60FDh 的哪一位（只此一处）");
+   caseBegin("找限位: 目标开关 → 60FDh 的哪一位（只此一处）");
    {
       /* 这两条是"哪一位是目标"的唯一定义。允否、分支预告、横幅都读它, 所以它错了
        * 就是三处一起错, 而且**方向会正好反过来** */
@@ -2111,23 +2111,23 @@ static void test_homing()
    caseBegin("找限位闸: 只否决「60FDh 读不到」与「两侧同时有效」");
    {
       check(ecatcmd::home_lim_refusal(true, false, false) == nullptr,
-            "读得到 + 两侧都没压着 -> 放行 (a) 分支)");
+            "读得到 + 两侧都没压着 → 放行 (a) 分支)");
       check(ecatcmd::home_lim_refusal(true, true, false) == nullptr,
-            "读得到 + 目标压着 -> 放行 (b) 分支) —— b) 是正规做法, 不是要拦的情形");
+            "读得到 + 目标压着 → 放行 (b) 分支) —— b) 是正规做法, 不是要拦的情形");
       check(ecatcmd::home_lim_refusal(true, false, true) == nullptr,
-            "读得到 + **另一侧**压着 -> 放行 (朝目标去正好是远离那一侧)");
+            "读得到 + 另一侧压着 → 放行 (朝目标去正好是远离那一侧)");
 
       const char *r = ecatcmd::home_lim_refusal(false, false, false);
-      check(r != nullptr, "60FDh 读不到 -> 不放行");
+      check(r != nullptr, "60FDh 读不到 → 不放行");
       check(has(r, "60FDh"), "说清楚是 60FDh 的事");
       check(has(r, "TxPDO"), "指到「让 60FDh 进 TxPDO」这条路");
-      check(has(r, "拒绝"), "**必须有「拒绝」两个字** —— 界面横幅就是照它上红色的");
+      check(has(r, "拒绝"), "必须有「拒绝」两个字 —— 界面横幅就是照它上红色的");
 
       r = ecatcmd::home_lim_refusal(true, true, true);
-      check(r != nullptr, "两侧同时有效 -> 不放行");
+      check(r != nullptr, "两侧同时有效 → 不放行");
       check(has(r, "2300h"), "指到 2300h（极性配反是本机实测过的那个原因）");
       check(has(r, "同时"), "说清楚「同时」才是问题");
-      check(has(r, "拒绝"), "**必须有「拒绝」两个字**");
+      check(has(r, "拒绝"), "必须有「拒绝」两个字");
 
       /* 读不到与两侧同时有效**是两句不同的话**。同一句话会让操作员去查错的东西:
        * 前者是"没打开一个勾", 后者是"接线/极性与读数不符" */
@@ -2167,7 +2167,7 @@ static void test_homing()
       {
          check(has(txt[i], "高速") || has(txt[i], "低速"), "每格都写了快慢");
          check(has(txt[i], "释放点"),
-               "每格都写明**落点 = 开关的释放点** —— 那就是这趟结束之后坐标 0 的位置, "
+               "每格都写明落点 = 开关的释放点 —— 那就是这趟结束之后坐标 0 的位置, "
                "不写清楚, 操作员会以为 0 在开关的中心上");
       }
 
@@ -2191,11 +2191,11 @@ static void test_homing()
    /* ---- 返回速度派生 -------------------------------------------- */
    caseBegin("回零: 6099h:02 = 6099h:01 / 4（下限 1）");
    {
-      checkEq(ecatcmd::home_vel_slow(2000), 500, "2000 -> 500");
-      checkEq(ecatcmd::home_vel_slow(1000), 250, "1000 -> 250");
-      checkEq(ecatcmd::home_vel_slow(4),      1, "4 -> 1");
-      checkEq(ecatcmd::home_vel_slow(3),      1, "3 -> 整除到 0, 由下限救回 1");
-      checkEq(ecatcmd::home_vel_slow(0),      1, "0 -> 1（写 0 是什么语义手册没写, 而"
+      checkEq(ecatcmd::home_vel_slow(2000), 500, "2000 → 500");
+      checkEq(ecatcmd::home_vel_slow(1000), 250, "1000 → 250");
+      checkEq(ecatcmd::home_vel_slow(4),      1, "4 → 1");
+      checkEq(ecatcmd::home_vel_slow(3),      1, "3 → 整除到 0, 由下限救回 1");
+      checkEq(ecatcmd::home_vel_slow(0),      1, "0 → 1（写 0 是什么语义手册没写, 而"
                                                 "「返回速度是 0」绝不该是它的意思）");
 
       /* 全域不变式, 比逐个例子管用: 返回速度永远 >= 1 (绝不许发 0 出去), 且 <= 找原点
@@ -2213,14 +2213,14 @@ static void test_homing()
    /* ---- 夹取 ---------------------------------------------------- */
    caseBegin("回零: 速度夹取与输入框的上下限是同一个宏");
    {
-      checkEq(ecatcmd::home_vel_clamp(0),         HMI_HOME_VEL_MIN, "0 -> 下限");
-      checkEq(ecatcmd::home_vel_clamp(99),        HMI_HOME_VEL_MIN, "99 -> 下限");
+      checkEq(ecatcmd::home_vel_clamp(0),         HMI_HOME_VEL_MIN, "0 → 下限");
+      checkEq(ecatcmd::home_vel_clamp(99),        HMI_HOME_VEL_MIN, "99 → 下限");
       /* **比上限高一点点**, 不写一个具体的数 —— 上一个版本这里写的是 2001, 而 2001
        * 在上限从 2000 提到 100000 之后就成了一个**合法值**, 这条断言会从"验夹取"
        * 变成"验上限还是 2000"。夹取测的是边界关系, 不是某一个数 */
       checkEq(ecatcmd::home_vel_clamp((int32_t)HMI_HOME_VEL_MAX + 1), HMI_HOME_VEL_MAX,
-              "MAX + 1 -> 上限");
-      checkEq(ecatcmd::home_vel_clamp(2147483647), HMI_HOME_VEL_MAX, "INT32_MAX -> 上限");
+              "MAX + 1 → 上限");
+      checkEq(ecatcmd::home_vel_clamp(2147483647), HMI_HOME_VEL_MAX, "INT32_MAX → 上限");
       checkEq(ecatcmd::home_vel_clamp(HMI_HOME_VEL_DEF), HMI_HOME_VEL_DEF, "缺省值原样通过");
 
       /* 这一条锁的是"**界面上显示的数就是线上发的数**": 输入框的 range 与这道夹取读的
@@ -2237,7 +2237,7 @@ static void test_homing()
    }
 
    /* ---- 加减速 -------------------------------------------------- */
-   caseBegin("回零: 609Ah 由速度派生 —— 斜坡时间 0.1 秒, 加速度封顶");
+   caseBegin("回零: 609Ah 由速度派生 —— 斜坡时间 0.1 s, 加速度封顶");
    {
       /* 驱动器自己那一对实测值: 6099h:01 = 50000, 609Ah = 500000。这一条钉的是
        * "斜坡时间 = 0.1 秒"这个约定的源头 —— 它一变, 这行就该响 */
@@ -2251,15 +2251,15 @@ static void test_homing()
       for (uint32_t v = HMI_HOME_VEL_MIN; v <= HMI_HOME_ACC_MAX / 10u; v++)
          if (ecatcmd::home_accel_for(v) != v * 10u)
             ramp = false;
-      check(ramp, "下限..50000 全域: 斜坡时间恒为 0.1 秒 (acc == v * 10)");
+      check(ramp, "下限..50000 全域: 斜坡时间恒为 0.1 s (acc == v * 10)");
 
       /* 封顶: 一个很高的速度**不许**换来一个比机器自己配的还硬的加速度 */
-      checkEq(ecatcmd::home_accel_for(50001), HMI_HOME_ACC_MAX, "刚过 50000 -> 封顶");
+      checkEq(ecatcmd::home_accel_for(50001), HMI_HOME_ACC_MAX, "刚过 50000 → 封顶");
       checkEq(ecatcmd::home_accel_for(HMI_HOME_VEL_MAX), HMI_HOME_ACC_MAX,
-              "上限速度 -> 还是封顶 (斜坡变长到 0.2 秒, 而不是加速度翻倍)");
+              "上限速度 → 还是封顶 (斜坡变长到 0.2 s, 而不是加速度翻倍)");
       /* 没有那个除法守卫的话 v * 10 会回绕, 于是"很大的速度"算出"很小的加速度" */
       checkEq(ecatcmd::home_accel_for(4294967295u), HMI_HOME_ACC_MAX,
-              "UINT32_MAX -> 封顶, 不回绕");
+              "UINT32_MAX → 封顶, 不回绕");
 
       bool mono = true, cap = true;
       for (uint32_t v = HMI_HOME_VEL_MIN; v <= HMI_HOME_VEL_MAX; v++)
@@ -2274,36 +2274,36 @@ static void test_homing()
    }
 
    /* ---- 闸 ------------------------------------------------------ */
-   caseBegin("回零闸: 分支, 以及分支的**顺序**");
+   caseBegin("回零闸: 分支, 以及分支的顺序");
    {
       check(ecatcmd::home_refusal(true, true, true, false, false) == nullptr,
-            "全清 -> 放行 (nullptr)");
+            "全清 → 放行 (nullptr)");
 
       check(has(ecatcmd::home_refusal(false, true, true, false, false), "总线"),
-            "没连上 -> 说总线");
+            "没连上 → 说总线");
       check(has(ecatcmd::home_refusal(false, true, true, true, false), "总线"),
-            "没连上 + 有故障 -> 还是先说总线: 那时连状态字都没有, 说故障是在猜");
+            "没连上 + 有故障 → 还是先说总线: 那时连状态字都没有, 说故障是在猜");
 
       check(has(ecatcmd::home_refusal(true, false, true, false, false), "位置"),
-            "一笔 6064h 都没取到 -> 说位置未知");
+            "一笔 6064h 都没取到 → 说位置未知");
 
       /* **顺序的要害**: 一个从没收到过的状态字里的 bit3 不是信息。这一条与
        * axis_needs_reset 编码的是同一条规矩 */
       const char *r = ecatcmd::home_refusal(true, true, false, true, false);
-      check(has(r, "未知"), "丢帧 + 有故障 -> 说「状态未知」");
+      check(has(r, "未知"), "丢帧 + 有故障 → 说「状态未知」");
       check(!has(r, "bit3"), "丢帧时不许拿一个没收到过的状态字里的 bit3 说事");
 
       r = ecatcmd::home_refusal(true, true, true, true, false);
-      check(has(r, "bit3") && has(r, "故障复位"), "有故障 -> 点名 bit3, 并指到「故障复位」");
+      check(has(r, "bit3") && has(r, "故障复位"), "有故障 → 点名 bit3, 并指到「故障复位」");
 
       r = ecatcmd::home_refusal(true, true, true, false, true);
-      check(has(r, "停止"), "还有轴在走 -> 让人先按「停止」");
+      check(has(r, "停止"), "还有轴在走 → 让人先按「停止」");
       check(has(r, "回零期间插补器是停的") || has(r, "停在半途"),
-            "还要说明白**为什么** —— 不然那句话看着像没道理的门槛");
+            "还要说明白为什么 —— 不然那句话看着像没道理的门槛");
    }
 
    /* ---- 收尾结局 ------------------------------------------------ */
-   caseBegin("回零收尾: 结局由**实测状态**定, 不由返回码排列组合");
+   caseBegin("回零收尾: 结局由实测状态定, 不由返回码排列组合");
    {
       check(ecatcmd::home_end_state(false, false, true,  0) == ecatcmd::HOME_END_NEVER_STARTED,
             "没发起过就是没发起过");
@@ -2311,24 +2311,24 @@ static void test_homing()
             "闸拦下时哪怕现场有故障, 也不是「这次回零把它搞坏了」");
 
       check(ecatcmd::home_end_state(true, true, false, 0) == ecatcmd::HOME_END_FAULTED,
-            "bit3 还在 -> 故障");
+            "bit3 还在 → 故障");
       /* 按 CiA402 这两条不该同时成立; 万一真同时读到, 该报的是**故障** —— 那才是要人
        * 动手的那一件事。反过来说成"保持中"就是漏掉一个真故障 */
       check(ecatcmd::home_end_state(true, true, true, 0) == ecatcmd::HOME_END_FAULTED,
-            "故障与使能同时读到 -> 报故障");
+            "故障与使能同时读到 → 报故障");
 
       check(ecatcmd::home_end_state(true, false, false, 0) == ecatcmd::HOME_END_STRANDED,
-            "没使能也没故障 -> 状态不明");
+            "没使能也没故障 → 状态不明");
       /* 这一格是这道函数存在的**主要理由**: 轴可能确实带电, 但驱动器不按 CSP 解释
        * 607Ah, 而 interpolate() 每周期都在往 607Ah 里写 —— "带力矩停着"和
        * "带电但模式不对"是两件事, 说成 HOLDING 就是撒谎 */
       check(ecatcmd::home_end_state(true, false, true, -1) == ecatcmd::HOME_END_STRANDED,
-            "已使能但没切回 CSP -> 不能说 HOLDING");
+            "已使能但没切回 CSP → 不能说 HOLDING");
       check(ecatcmd::home_end_state(true, false, false, -1) == ecatcmd::HOME_END_STRANDED,
             "两样都不成立");
 
       check(ecatcmd::home_end_state(true, false, true, 0) == ecatcmd::HOME_END_HOLDING,
-            "已使能 + 已是 CSP -> 保持中 (用户要的那一档)");
+            "已使能 + 已是 CSP → 保持中 (用户要的那一档)");
    }
 
    /* ---- 措辞 ---------------------------------------------------- */
@@ -2343,14 +2343,14 @@ static void test_homing()
       check(has(ecatcmd::home_end_text(ecatcmd::HOME_END_HOLDING), "保持"),
             "HOLDING 要明说「带保持力矩」 —— 用户就是照这句决定敢不敢松手");
 
-      check(has(ecatcmd::home_cause_text(0), "到位"), "rc = 0 -> 到位");
+      check(has(ecatcmd::home_cause_text(0), "到位"), "rc = 0 → 到位");
       check(has(ecatcmd::home_cause_text(1), "停止"), "rc = 1 点名「停止」");
       /* **被「停止」中止不是失败。** 那是人让它停的, 说成失败会让人去找一个不存在
        * 的毛病 (这条路径本来就是本功能的半个需求) */
       check(!has(ecatcmd::home_cause_text(1), "失败"), "被「停止」中止不许说成失败");
       check(has(ecatcmd::home_cause_text(-1), "方向"), "真失败时给换方向的建议");
       check(has(ecatcmd::home_cause_text(-1), "硬顶"),
-            "失败建议里写明**别硬顶** —— 撞着开关还硬回, 才是真会伤机器的做法");
+            "失败建议里写明别硬顶 —— 撞着开关还硬回, 才是真会伤机器的做法");
       /* 失败那一格混着至少五种原因 (方式越界 / 参数写不进 / 驱动器没接受 HM 模式 /
        * 等 bit12 超时 / bit3 或 bit13)。**它们是同一句话就必须告诉人上哪去分开** ——
        * 否则操作员只会照着"方向不对"反复换按钮, 而真正的原因是"驱动器压根没进 HM"。 */
@@ -2382,9 +2382,9 @@ static void test_homing()
 
       /* 手册之外的模式号照实说不认识。**猜一个名字比说不知道坏得多** ——
        * 2 在别的厂家是 VL (速度模式), 本驱动器手册里没有它。 */
-      check(has(ecatcmd::mode_text(2), "手册"),  "2 不在手册里 -> 不许猜");
-      check(has(ecatcmd::mode_text(9), "手册"),  "9 不在手册里 -> 不许猜");
-      check(has(ecatcmd::mode_text(-3), "手册"), "-3 不在手册里 -> 不许猜");
+      check(has(ecatcmd::mode_text(2), "手册"),  "2 不在手册里 → 不许猜");
+      check(has(ecatcmd::mode_text(9), "手册"),  "9 不在手册里 → 不许猜");
+      check(has(ecatcmd::mode_text(-3), "手册"), "-3 不在手册里 → 不许猜");
    }
 
    /* ---- 6061h 那个哨兵值本身 ------------------------------------ */
@@ -2421,7 +2421,7 @@ static void test_homing()
       check(!hasq(ecatcmd::fault_code_text(0xFF02), "FF01"), "相邻的码不许抄串");
 
       /* 手册之外的码照实报十六进制。**猜一个名字比说不知道坏得多** */
-      check(hasq(ecatcmd::fault_code_text(0x1234), "手册"), "1234 不在手册里 -> 不许猜");
+      check(hasq(ecatcmd::fault_code_text(0x1234), "手册"), "1234 不在手册里 → 不许猜");
       check(hasq(ecatcmd::fault_code_text(0x1234), "1234"), "但码要照实写出来");
 
       /* 每一个手册里的码都要有一句"下一步查哪儿" —— 这张表少一条, 红横幅上就少半句,
@@ -2491,8 +2491,8 @@ static void test_homing()
       }
 
       /* 没故障: 这一句不许自己编出个码来 */
-      check(ecatcmd::faulted_axes_text(t).isEmpty(), "没故障 -> 不提码");
-      check(!hasq(ecatcmd::fault_banner_text(t), "603Fh"), "没故障 -> 横幅里也不提 603Fh");
+      check(ecatcmd::faulted_axes_text(t).isEmpty(), "没故障 → 不提码");
+      check(!hasq(ecatcmd::fault_banner_text(t), "603Fh"), "没故障 → 横幅里也不提 603Fh");
 
       /* 只有轴Y 报故障: 码只许说那一根 —— 说成两根会把操作员支到健康的那根上 */
       t.ax[1].fault      = true;
@@ -2532,13 +2532,13 @@ static void test_homing()
       QString err;
 
       r.bus.setHoming(true);
-      check(!r.startScan(QDir::tempPath() + "/hm1.csv", &err), "回零中 -> 拒绝起扫");
+      check(!r.startScan(QDir::tempPath() + "/hm1.csv", &err), "回零中 → 拒绝起扫");
       check(err.contains(QStringLiteral("回零")), "理由说的是回零", err.toStdString());
 
       /* 这道闸是"等一下", 不是"这份数据坏了" —— 回零做完必须马上能接着扫。
        * 只会拒绝的闸跟没写一样 (同 preflight 那条的规矩) */
       r.bus.setHoming(false);
-      check(r.startScan(QDir::tempPath() + "/hm2.csv", &err), "回零结束 -> 放行",
+      check(r.startScan(QDir::tempPath() + "/hm2.csv", &err), "回零结束 → 放行",
             err.toStdString());
       r.ctrl.abort(QString());
    }
@@ -2596,14 +2596,14 @@ static void test_meter_sources()
       /* 没打开: 请求必须得到**恰好一次** readingFailed (不是 0 次, 也不是 2 次) */
       const Reply shut = ask(&man);
       check(shut.ready == 0 && shut.failed == 1,
-            "closed -> exactly one failure, no reading", shut.err.toStdString());
+            "closed → exactly one failure, no reading", shut.err.toStdString());
       check(!man.isOpen(), "and it stays closed");
 
       QString e;
       check(man.open(&e), "open()", e.toStdString());
 
       const Reply r = ask(&man);
-      checkEq(r.ready, 1, "open -> exactly one reading");
+      checkEq(r.ready, 1, "open → exactly one reading");
       checkNear(r.watts, 0.25, "and it is the value that was set");
    }
 
@@ -2675,7 +2675,7 @@ static void test_meter_sources()
    /* 这条不是在验某个源的行为, 是在验那条约定本身 —— 也就是界面上那个按钮为什么必须在扫描
     * 期间禁用: 两个请求撞在一起时, 源会老老实实回两次, 谁也不知道哪个数属于哪一次。真机那条
     * (Ophir) 更狠: 它按时间戳只认严格更新的采样, 于是其中一边白等到超时。 */
-   caseBegin("meter: 两个未决请求撞在一起 -> 源回两次, 所以闸门必须由调用方把");
+   caseBegin("meter: 两个未决请求撞在一起 → 源回两次, 所以闸门必须由调用方把");
    {
       ManualMeter man;
       man.setValue(1.0);
@@ -2693,7 +2693,7 @@ static void test_meter_sources()
          loop.exec();
       }
 
-      checkEq(n, 2, "two overlapping requests -> two readings, unresolvable by the caller");
+      checkEq(n, 2, "two overlapping requests → two readings, unresolvable by the caller");
    }
 
    /* 这就是那个闸门要挡的东西 —— 而闸门在界面上 (ScanWindow::refresh 里那条 setEnabled),
@@ -2932,7 +2932,7 @@ static void test_meterlog()
       }
       checkEq(too_close, 0, "没有哪两笔挤得比间隔还近");
       checkEq(too_far, 0, "也没有哪两笔隔得超出 间隔 + 往返 + 一拍钟");
-      checkEq(r.meter.overlaps(), 0, "**从不**有两个未决请求同时压在一个源上");
+      checkEq(r.meter.overlaps(), 0, "从不有两个未决请求同时压在一个源上");
    }
 
    caseBegin("meterlog: 未决期间再拨多少拍也不发第二个 (往返比间隔长也一样)");
@@ -2945,7 +2945,7 @@ static void test_meterlog()
 
       r.run(2000, 20);
       check(r.log.count() >= 3, "还是采到了数 (节奏里有往返时间, 这是诚实的记法)");
-      checkEq(r.meter.overlaps(), 0, "**没有**因为间隔短就堆请求");
+      checkEq(r.meter.overlaps(), 0, "没有因为间隔短就堆请求");
       check(r.log.count() <= 5, "2000ms / (500+20) 大约就是这么多笔, 不是 100 笔");
    }
 
@@ -3056,7 +3056,7 @@ static void test_meterlog()
       checkEq(f.log.count(), 0, "刚开始一笔都没有");
       f.meter.failNext();                  /* 第 1 个子读数就让它失败 */
       f.run(100);
-      checkEq(f.log.count(), 1, "失败**也算一笔** (ok=false), 不是不记");
+      checkEq(f.log.count(), 1, "失败也算一笔 (ok=false), 不是不记");
       checkEq(f.log.stats().n, 0, "没读回来的不算进统计");
       check(!f.log.samples().last().ok, "这一笔是 ok=false");
 
@@ -3070,7 +3070,7 @@ static void test_meterlog()
       g.meter.failNext();                  /* 第 2 个让它失败 */
       g.step();                            /* 发第 2 个 */
       g.step();                            /* 失败回来了 */
-      checkEq(g.log.count(), 1, "攒到一半失败 -> 这一笔作废 (ok=false)");
+      checkEq(g.log.count(), 1, "攒到一半失败 → 这一笔作废 (ok=false)");
       checkEq(g.log.stats().n, 0, "攒着的那半份一起丢掉, 没有混进统计");
       check(!g.log.samples().last().ok, "这一笔是 ok=false");
       checkEq(g.meter.overlaps(), 0, "全程没有重叠请求");
@@ -3096,7 +3096,7 @@ static void test_meterlog()
       checkEq((long long)ml.size(), 4, "来源 + 单位 + 它自己报的那两行");
       check(ml[0] == QStringLiteral("meter_source=fake"), "来源那个键", ml[0].toStdString());
       check(ml[1] == QStringLiteral("meter_unit=unknown"),
-            "认不出来就写 unknown —— **不许**替它写一个 W", ml[1].toStdString());
+            "认不出来就写 unknown —— 不许替它写一个 W", ml[1].toStdString());
       check(unitLabel(&src) == QStringLiteral("单位不明"), "界面上那一句",
             unitLabel(&src).toStdString());
       check(unitLabel(nullptr) == QStringLiteral("单位不明"), "没有源也是这一句");
@@ -3135,7 +3135,7 @@ static void test_meterlog()
       check(text.contains(QStringLiteral("# meter_avg=1\n")), "每一行都带 `# `");
       checkEq((long long)lines.size(), 5 + r.log.count(), "行数 = 4 行 meta + 表头 + 样本");
       check(lines.at(4) == QStringLiteral("unix_ms,elapsed_ms,watts,ok"),
-            "列表头照旧**逐字没动**, 单位改记在上面那几行里", lines.at(4).toStdString());
+            "列表头照旧逐字没动, 单位改记在上面那几行里", lines.at(4).toStdString());
 
       /* 导出那份**也要**带: 它是个独立文件, 换个地方打开时上面那些字一个都不能少 */
       const QString dump = dir.filePath(QStringLiteral("meta_dump.csv"));
@@ -3176,7 +3176,7 @@ static void test_meterlog()
       checkEq(empty.stats().n, 0, "没有样本时 n = 0");
    }
 
-   caseBegin("meterlog: 看门狗 —— 超时记一笔 ok=false, 并且**停在那儿等**");
+   caseBegin("meterlog: 看门狗 —— 超时记一笔 ok=false, 并且停在那儿等");
    {
       /* 往返长过一个数量级: 永远回不来 */
       MeterRig r(60000);
@@ -3194,12 +3194,12 @@ static void test_meterlog()
             "那一笔记成 ok=false (与扫描 CSV 的 ok 列同口径)");
       checkEq(failed_n, 1, "报了一次 —— 不是每拍都喊");
       check(r.log.timedOut(), "状态是'卡住了'");
-      checkEq(r.meter.requests(), 1, "**没有再发第二个请求**: 那一个还在源手上");
+      checkEq(r.meter.requests(), 1, "没有再发第二个请求: 那一个还在源手上");
       checkEq(r.meter.overlaps(), 0, "所以也不会有两个未决请求同时压着");
 
       r.run(4000);
       checkEq(r.log.count(), 1, "还是那一笔: 采集真的停着, 不是继续往前冲");
-      checkEq(r.meter.requests(), 1, "仍然没有第二个请求 (跑了 8 秒也没有)");
+      checkEq(r.meter.requests(), 1, "仍然没有第二个请求 (跑了 8 s 也没有)");
 
       /* 迟到的那一份回来了: 收下它, 并且重新走起来 */
       r.meter.setLatency(1);
@@ -3257,7 +3257,7 @@ static void test_meterlog()
       r.run(2000);
       /* 不补采: 2000ms 的 hold 里"欠下"的十个间隔, 放开之后只按正常节奏走 */
       check(r.log.count() - held_ms <= 12,
-            "欠下的那些**没有**被补采回来 (补出来的是编的)");
+            "欠下的那些没有被补采回来 (补出来的是编的)");
       checkEq(r.meter.overlaps(), 0, "全程没有重叠请求");
    }
 
@@ -3323,7 +3323,7 @@ static void test_meterlog()
          check(f.open(QIODevice::ReadOnly | QIODevice::Text), "read it back again");
          const QString text = QString::fromUtf8(f.readAll());
          const QStringList lines = text.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
-         check(text.count(QStringLiteral("unix_ms")) == 1, "第二段**没有**再写一个表头");
+         check(text.count(QStringLiteral("unix_ms")) == 1, "第二段没有再写一个表头");
          checkEq(lines.size(), n1 + 1 + r.log.count() - n1, "第二段的数接着写在同一份后面");
          check(lines.size() > n1 + 1, "文件确实变长了, 而不是被截断重来");
       }
@@ -3337,7 +3337,7 @@ static void test_meterlog()
       }
       QString why;
       check(!r.log.beginRecord(blocker + QStringLiteral("/no.csv"), &why),
-            "路径写不进去 -> beginRecord 返回 false");
+            "路径写不进去 → beginRecord 返回 false");
       check(!why.isEmpty(), "并且给了一句原因", why.toStdString());
       check(!r.log.recording(), "失败之后没有半开的文件");
 
@@ -3361,14 +3361,14 @@ static void test_meterlog()
 
       log.setSource(&shut);
       QString err;
-      check(!log.start(200, &err), "源没打开 -> start 拒绝");
+      check(!log.start(200, &err), "源没打开 → start 拒绝");
       check(!err.isEmpty(), "给了原因", err.toStdString());
       check(!log.running(), "没有半开着");
 
       /* 一个请求都没发出去 —— 拒绝必须是"什么都没干", 不是"发了一半才发现" */
       checkEq(shut.readings(), 0, "被拒绝时一个请求都没发");
 
-      check(!log.beginRecord(QString(), &err), "空路径 -> false");
+      check(!log.beginRecord(QString(), &err), "空路径 → false");
       check(!err.isEmpty(), "也给了原因", err.toStdString());
    }
 }

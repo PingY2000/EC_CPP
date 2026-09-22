@@ -138,7 +138,7 @@ bool fitsRange(const Params &p, std::string *why)
       {
          char buf[320];
          std::snprintf(buf, sizeof(buf),
-            "区域超出量程: 最远点 X=%lld / Y=%lld 脉冲, 而量程只有 ±%lld。"
+            "区域超出量程: 最远点 X=%lld / Y=%lld pul, 而量程只有 ±%lld。"
             "超出部分会被静默夹掉 —— 永远扫不到那几条边。"
             "把区域改小, 或者重新连接 (量程是按连接时的区域参数设的)",
             (long long)pulseOf(std::max(std::fabs(xs.front()), std::fabs(xs.back())), p.pulses_per_unit),
@@ -443,7 +443,7 @@ std::string csvParseForResume(const std::string &text, const Params &p,
    };
    noteDiff("区域X(mm)", a_x, p.area_x_unit);
    noteDiff("区域Y(mm)", a_y, p.area_y_unit);
-   noteDiff("分辨率(mm)", r_u, p.res_unit);
+   noteDiff("分辨率 (mm)", r_u, p.res_unit);
    noteDiff("每 mm 脉冲数", ppu, p.pulses_per_unit);
 
    if (!diff.empty())

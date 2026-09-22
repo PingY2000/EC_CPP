@@ -86,7 +86,7 @@ class RandomMeter : public PowerMeter
 public:
    explicit RandomMeter(QObject *parent = nullptr);
 
-   QString kind() const override { return QStringLiteral("随机(噪声)"); }
+   QString kind() const override { return QStringLiteral("随机 (噪声)"); }
    QString tag()  const override { return QStringLiteral("random"); }
 
    bool open(QString *) override { m_open = true; return true; }
