@@ -45,3 +45,8 @@ Thumbs.db
 # scan 记的参数 (exe 旁边的 scan.ini)。里面存着**这台机器**上次用的网卡,
 # 换一台机器那份 GUID 就没有意义了 —— 不入库。
 /bin/scan.ini
+
+# scan 的界面样式表 (exe 旁边的 scan.qss)。它是**出厂那一份的副本** (第一次跑自动写出),
+# 属"本地调外观"的东西: 谁想改谁在自己机器上改, 改出来的效果不该当源码提交。
+# 想改所有人的外观要改的是 scan/scanstyle.cpp 里那份缺省。
+/bin/scan.qss

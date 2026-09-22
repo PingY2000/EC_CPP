@@ -139,6 +139,18 @@ PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
 
 它只链 `Qt6Core`, 所以上面那条 `windeployqt6` (照 `bin/hmi.exe` 跑) 搬来的 DLL 就够它用了。
 
+> **`scan` 运行时在 exe 旁边放两个文件, 两个都不入库** (`.gitignore` 里各占一条):
+> `bin/scan.ini` (记的参数与上次连的那张网卡, 见下) 和 **`bin/scan.qss` (界面样式表)**。
+> 样式表是 2026-09-23 从 `scan/main.cpp` 里搬出来的 (见
+> [docs/scan_sweep.md](docs/scan_sweep.md) §31.7): 程序里那份
+> (`scan/scanstyle.cpp` 的 `kDefaultSheet`) 是**缺省, 不是备份** —— exe 旁边没有
+> `scan.qss` 时启动会照它写出去一份, 文件**在的时候从不覆盖**。改那个文件, 界面上按
+> **F5** 重新读一遍就算数, **不用重编译** (改坏了想回出厂样子就把它删掉)。
+> 它能改的是"长什么样" (颜色 / 边框 / 内边距 / 按钮大小 / 灰掉时的样子);
+> **"谁摆在哪儿"改不了** —— 位置、行顺序、拉伸比例都在 `scan/scanwindow.cpp` 里。
+> 两个最容易改坏的地方 (标题那一行按钮的 `padding`、`QGroupBox` 的 `margin-top`)
+> 连同各自的症状写在文件开头那一段注释里。
+
 > **`bin/scan.exe` 跟 `bin/hmi.exe` 是并存的两个程序, 不是两种模式。**
 > `hmi` 是手动调试台 (点哪里走哪里, 自己不会动); `scan` 管自动采集 (会自己走完一个
 > 区域, 一两个小时)。两者**编的是同一份 `hmi/ecatworker.cpp`** —— 2ms 的 CSP 插补循环、

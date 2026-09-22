@@ -196,6 +196,8 @@ private:
    void placePanelBar(int pi);
    void placePanelBars();
    bool eventFilter(QObject *o, QEvent *e) override;
+   /* F5: 重读 exe 旁边那个 scan.qss 并套上去 (外观不用重编译, 见 scanstyle.h) */
+   void reloadStyle();
    /* 基线 = 控件此刻的值。三处调: 建完界面 (ini 里那一份)、「保存」之后、连接/关窗落盘之后 */
    void panelCapture(int pi);
    bool panelDiffers(int pi) const;              /* 逐项与基线比对 (幂等: 改回原值就落下去) */

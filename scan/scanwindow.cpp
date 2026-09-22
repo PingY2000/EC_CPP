@@ -5,6 +5,7 @@
 #include "mapcanvas.h"
 #include "metercurve.h"
 #include "meterlog.h"
+#include "scanstyle.h"
 
 #include <QAbstractSpinBox>
 #include <QApplication>
@@ -32,6 +33,7 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSet>
+#include <QShortcut>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSpinBox>
@@ -238,6 +240,24 @@ bool ScanWindow::eventFilter(QObject *o, QEvent *e)
             break;
          }
    return QMainWindow::eventFilter(o, e);
+}
+
+/* F5: 把 exe 旁边那个 scan.qss 重新读一遍 (见 scanstyle.h)。外观调一次编一次太慢, 这条是
+ * 给"改文件 -> 按一下 -> 看"用的。
+ *
+ * 换完样式**要重摆 [保存][取消] 那一行**: 它的高度 (以及框标题那一行的高度) 都是样式算出来
+ * 的, 改了 padding 或字号就变了。立刻摆一次, 再等这一拍的 polish 走完补一次 —— 框自己因此
+ * 收到的 Resize 也会走 eventFilter, 三条路随便哪条先到都不吃亏。 */
+void ScanWindow::reloadStyle()
+{
+   qApp->setStyleSheet(styleLoad());
+   placePanelBars();
+   QTimer::singleShot(0, this, [this] { placePanelBars(); });
+
+   /* 说一句做了什么: 这个键不弹窗、也没有菜单项, 不给回话就分不出"读到了"和"没反应" */
+   hint(QStringLiteral("已重新载入界面样式: %1")
+           .arg(QDir::toNativeSeparators(stylePath())),
+        false);
 }
 
 void ScanWindow::panelCapture(int pi)
@@ -1143,6 +1163,13 @@ void ScanWindow::buildUi()
    statusBar()->addPermanentWidget(lampUnit(this, m_lampX, m_lLimX));
    statusBar()->addPermanentWidget(lampUnit(this, m_lampY, m_lLimY));
    statusBar()->addPermanentWidget(m_lWkc);
+
+   /* F5 = 重读 exe 旁边那个 scan.qss。改外观不用重编译, 这是做样式表外置的全部理由
+    * (见 scanstyle.h)。挂在窗口上而不是某个控件上: 焦点在哪个输入框里都该能按。
+    * **界面上不写这条**: 它是一次性的调试入口, 不是操作流程 (按住 ctrl 滚轮那条闸同理)。 */
+   QShortcut *scStyle = new QShortcut(QKeySequence(Qt::Key_F5), this);
+   scStyle->setContext(Qt::WindowShortcut);
+   connect(scStyle, &QShortcut::activated, this, &ScanWindow::reloadStyle);
 }
 
 /* 把横幅摆到"画布顶上那一层"去。它不在任何布局里 (见 buildUi 里 m_banner 那段),

@@ -39,7 +39,8 @@
 ```
 scan/
   CMakeLists.txt          两个目标: scan (界面) 与 scan_selftest (自检)
-  main.cpp                em_console_init + QApplication + 字体/夜间配色
+  main.cpp                em_console_init + QApplication + 字体/夜间配色 + setStyleSheet
+  scanstyle.h/.cpp        界面样式表 (exe 旁边的 scan.qss) 的读盘 + 出厂那一份, 见 §31.7
   scanwindow.h/.cpp       主窗口: 顶栏 + 二维面板 + 参数面板 + 状态栏
   mapcanvas.h/.cpp        二维画布: 区域框 / 热力图 / 滑台位置 / 点击手动定位
   busview.h               控制器对总线的**全部**需求, 只有四个方法 (见 §2)
@@ -49,7 +50,7 @@ scan/
   powermeter.h/.cpp       PowerMeter 抽象 + 三个模拟实现
   scanlog.h/.cpp          CSV 追加写 + 读回
   scanprefs.h/.cpp        参数的记忆 (exe 旁边的 scan.ini)。**只链 Qt6::Core**, 见 §16
-  selftest.cpp            **不需要硬件也不需要界面**的自检 (597 条断言, 见 §13)
+  selftest.cpp            **不需要硬件也不需要界面**的自检 (833 条断言, 见 §13)
 ```
 
 `scanplan` **不 include 任何 Qt**(`std::vector` + POD + `std::string`)。
@@ -3487,8 +3488,10 @@ PCIe 链接状态电源管理、处理器最低状态 —— 空闲时 NIC/CPU �
 
 ## 31. 参数框:撤掉「编辑」,装回 `[保存][取消]`(2026-09-23)
 
-这一节记的是同一天的三趟改动, **以 §31.4 为最终形状**: ①三个按钮全撤; ②`[保存][取消]`
-装回来; ③这两个按钮从"框里的一行"挪到"框标题那一行的右端"。
+这一节记的是同一天的四趟改动, **按钮那一块以 §31.4 为最终形状**: ①三个按钮全撤;
+②`[保存][取消]` 装回来; ③这两个按钮从"框里的一行"挪到"框标题那一行的右端";
+④界面样式表搬出源码、放进 exe 旁边的 `scan.qss` 并加了个 F5 热重载(§31.7 ——
+这一趟**不碰**上面那三趟的结论, 改的是"外观怎么调"这件事本身)。
 
 ### 31.1 现场那两句话
 
@@ -3662,6 +3665,9 @@ PCIe 链接状态电源管理、处理器最低状态 —— 空闲时 NIC/CPU �
 
 **`scan/main.cpp` 也动了**(这一轮唯一一次): 样式表里加了一条
 `QPushButton#panelbar { padding:0 9px; }` —— 理由见 §31.4 最后一段。
+(那条规则连同整个样式表当天稍后又搬出了 `main.cpp`, 见 §31.7 —— 现在它在
+`scan/scanstyle.cpp` 的 `kDefaultSheet` 里; `main.cpp` 只剩
+`app.setStyleSheet(styleLoad());` 这一行。)
 
 文档: 本文 §16.2 / §18.7 / §19.4~19.6 的**现状标注**、`README.md`(参数那一条、
 滚轮那一条、回零框那一格)。
@@ -3702,4 +3708,79 @@ PCIe 链接状态电源管理、处理器最低状态 —— 空闲时 NIC/CPU �
 | 扫描跑起来 | `lock_running` 那几项灰掉; 「扫描参数」那一框的「取消」同时灰掉(撬不开锁), 「保存」仍可按 |
 | 扫描跑起来 -> 「回零」「高级选项」「色标」 | 这三框里没有 `lock_running` 项, 它们的「取消」照旧可用 |
 | 「功率计」那一框 | 框里**没有**保存/取消, 与 §21 一样 |
+| 按 **F5** | 状态栏/横幅报出刚读的那个 `scan.qss` 路径, 界面外观照文件里写的变 |
+
+### 31.7 样式表外置 + F5 热重载(2026-09-23, 紧接上一节)
+
+**起因是上一节逼出来的一个不方便**: §31.4 里那两次"按钮被挤成一条缝"、以及标题那一行
+到底多高, 只能靠"改一个数 -> 编 -> 看"来试。样式表本来在 `scan/main.cpp` 里写死, 而
+*外观这件事恰恰只能靠眼睛调* —— 颜色深一点浅一点、内边距多一点少一点, 编一次看一次的
+周期太长。于是把它搬到 **exe 旁边那个文件**里, 改完在界面上按一下键就换过来。
+
+**做法**(新增 `scan/scanstyle.{h,cpp}`, 只依赖 `Qt6::Core`):
+
+| 函数 | 干什么 |
+|---|---|
+| `stylePath()` | exe 旁边那个 `scan.qss` —— 取 `applicationDirPath()`, 与 `prefsPath()` 同一个目录, 从哪儿启动都找得到 |
+| `styleDefault()` | **出厂那一份** (源码里的 `kDefaultSheet`) |
+| `styleLoad()` | 读文件; 没有 / 只有空白 -> `styleDefault()` |
+
+四条规矩, 每一条都是有意选的:
+
+- **程序里那份是"缺省", 不是"备份"。** 只有 exe 旁边**没有** `scan.qss` 时才把它写出去,
+  文件在的时候**一个字节都不碰** —— 否则"改文件"这件事会在下一次启动被悄悄撤销。
+  想回出厂样子就**删掉文件**, 与 `bin/scan.ini` 同一条规矩。
+- **文件是空的 -> 当成没有。** 空样式表会把整个界面打回系统默认样子 (浅色、方角),
+  那不是谁要的效果, 多半是存盘存坏了。这一条只在**返回值**上兜底, **不去改盘上那个文件**。
+- **读不到不是错误。** 只读目录 / 没权限写不出文件也照样返回出厂那份, 界面正常开机。
+  样式表是外观, 不该成为起不来的理由。
+- **写到盘上的是 CRLF**(写的时候带了 `QIODevice::Text`)。读回来也带 `Text`, Qt 会把
+  CRLF 折回 LF, 所以**往返无损**: 没改过的文件读回来与 `styleDefault()` 逐字节相等
+  (探针验过, 见下)。Windows 文本编辑器打开它就是正常样子。
+
+**F5**: `buildUi()` 末尾挂一个 `QShortcut(Qt::Key_F5)` (`WindowShortcut`, 焦点在哪个
+输入框里都能按) 连到 `ScanWindow::reloadStyle()`。那个函数做三件事 ——
+`qApp->setStyleSheet(styleLoad())`、立刻 `placePanelBars()`、再用 `QTimer::singleShot(0, …)`
+补摆一次。
+
+**为什么换完样式要重摆 [保存][取消] 那一行**: 那一行的高度、以及框标题那一行的下沿,
+**都是样式算出来的** (§31.4: 标题那一行的下沿 = `contentsRect().top()`, 而它由
+`QGroupBox` 的 `margin-top` 与 `::title` 的 `padding` 决定)。改了 `padding` 或字号它们全变。
+补摆的那一次是等 `polish` 走完; 框自己因此收到的 `Resize` 也会走 `eventFilter()`,
+三条路随便哪条先到都不吃亏。
+
+**界面上不写"按 F5"这句话**: 它是一次性的调试入口, 不是操作流程 —— 与"按住 Ctrl 才改值"
+那条闸同一个待遇(那条写成 tooltip, 因为它是**用起来会撞上**的)。知道这条键的途径是
+`scan.qss` 自己的文件头注释、`scan/scanstyle.h` 顶部、以及 `README`。按下去会有一句回话
+(横幅/状态栏报出刚读的路径) —— 那个键既不弹窗也没有菜单项, 不报一声就分不出
+"读到了"与"没反应"。
+
+**文件头注释里写了两处最容易改坏的地方**, 连同各自的症状: 标题那一行按钮的
+`padding` (删掉那两个字会被挤成一条缝, 就是 §31.4 那个 bug) 与 `QGroupBox` 的
+`margin-top` (改到比标题字还矮, 标题会被切掉一截)。文件里还写明它能改的是"长什么样",
+**"谁摆在哪儿"改不了** —— 位置、行顺序、拉伸比例都在 `scan/scanwindow.cpp` 里。
+
+**动到的文件**: 新增 `scan/scanstyle.{h,cpp}`; `scan/main.cpp`(样式表整段搬走,
+只剩 `app.setStyleSheet(styleLoad());` + 一句 include); `scan/scanwindow.{h,cpp}`
+(`reloadStyle()` 声明与实现、`buildUi()` 末尾那个 `QShortcut`、两个 include);
+`scan/CMakeLists.txt`(**只进 GUI 目标**, 不进 `SCAN_COMMON_SRC` —— 自检那边没有界面,
+放进去只是多一次磁盘访问); `.gitignore`(加 `/bin/scan.qss`, 与 `/bin/scan.ini` 并排);
+`README.md`(`scan` 那一节加一段"exe 旁边那两个文件")。
+
+**验到什么程度**:
+
+- 全量重建 **0 warning 0 error**;`scan_selftest` **833 passed / 0 failed / 1 skipped**
+  (与本节之前逐条相同)。
+- **`styleLoad()` 的三条分支用一个临时探针真跑过** (探针建在 `out/styleprobe/`, 验完已删):
+  文件不在 -> 返回出厂那份**并且**写出去一份; 文件在(手改过) -> 原样读回、**没被出厂那份
+  盖掉**; 只有空白 -> 退回出厂**且没去动盘上那个文件**; 加上"盘上每一行都是 CRLF"与
+  "二次读回与 `styleDefault()` 逐字节相等"两条。十条全过。
+  (第一遍跑时"写出去的内容 == 返回的内容"是**红的** —— 原因就是上面那条 CRLF, 是探针
+  测得比契约更严, 不是代码错; 把那条改成"往返无损"之后才对上。)
+- **真机路径走了一遍**: 起一次 `bin/scan.exe`, `bin/scan.qss` 出现在 exe 旁边、
+  2780 字节、头一行就是那句文件说明、`file` 认它是 UTF-8 + CRLF; 进程杀掉后干净退出。
+  `git check-ignore` 确认它被 `.gitignore` 挡住了。
+- **没验**: F5 那一下本身 —— 需要一个真按键盘的人。现在能保证的是"这个键建出来了、
+  连到了 `reloadStyle`、那个函数编译通过、它调的那两条路 (`styleLoad` 读盘、
+  `setStyleSheet`) 都验过"。剩下的就是按下 F5 看外观变不变。
 

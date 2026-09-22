@@ -35,6 +35,9 @@ set(CMAKE_AUTOUIC OFF)
 # ophircom/ophirmeter 是 PD300R + Juno+ 那条真机路 (见 ophircom.h 顶部)。它们也在这里,
 # 是因为自检要能回答"这台机器上 COM 对象注册了没有、能不能建出来、没插表头时能不能
 # 干净地报错" —— 那正是**不需要硬件**的那部分。两个目标因此都要链 ole32/oleaut32。
+#
+# scanstyle 是界面样式表 (scan.qss) 的读盘, **只在 GUI 目标里**: 它虽然只依赖 Qt6::Core,
+# 但自检那边没有界面, 读了也没人用 —— 放进来只会让自检多一次磁盘访问。
 set(SCAN_COMMON_SRC
   scanplan.cpp      scanplan.h
   scanarrive.cpp    scanarrive.h
@@ -54,6 +57,7 @@ set(SCAN_COMMON_SRC
 qt_add_executable(scan
   main.cpp
   scanwindow.cpp    scanwindow.h
+  scanstyle.cpp     scanstyle.h
   mapcanvas.cpp     mapcanvas.h
   metercurve.cpp    metercurve.h
   ${SCAN_COMMON_SRC}
