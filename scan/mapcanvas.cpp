@@ -2,6 +2,7 @@
 
 #include "axisutil.h"
 #include "scancontroller.h"
+#include "scanplan.h"      /* kCanvasHalfUnits: 画布半宽, 也是软量程的下限 */
 
 #include <QFont>
 #include <QMouseEvent>
@@ -254,10 +255,13 @@ void MapCanvas::clearSelection()
 /* ---------------------------------------------------------------- 坐标 */
 
 /*
- * 画布视野固定 30×30 单位 (每边 ±15 = kViewHalfUnits=16 减 1 单位余量), 不跟区域参数缩放:
- * 1 单位恒等于固定的一格, 区域框成了图里的一个量 (默认 27×27)。网格线每 5 单位一条。
+ * 画布视野固定 32×32 单位 (每边 ±kCanvasHalfUnits = ±16: 标尺画到 ±15, 多出的 1 单位是
+ * 边距), 不跟区域参数缩放: 1 单位恒等于固定的一格, 区域框成了图里的一个量 (默认 27×27)。
+ * 网格线每 5 单位一条。
+ *
+ * **这个数只定义在 scanplan.h 一处** (2026-09-22 改, 原来是这里私有的一个 kViewHalfUnits) ——
+ * 因为软量程的下限就是它 (见 autoRangePul), 两处各写一个 16 就是迟早对不上的那种坑。
  */
-static const double kViewHalfUnits = 16.0;
 
 /*
  * 画图区四周的留白 (像素)。标尺 / 色标条 / 超量程红字各占一条, 四个数写在一处 ——
@@ -272,7 +276,7 @@ static const double kPadB = 38.0;   /* 下边: X 标尺的刻度与数字, 再�
 
 double MapCanvas::viewHalfUnits() const
 {
-   return kViewHalfUnits;
+   return kCanvasHalfUnits;   /* 定义在 scanplan.h: 软量程的下限也是它, 只有那一份 */
 }
 
 QRectF MapCanvas::plotRect() const
@@ -648,6 +652,14 @@ void MapCanvas::drawMarkers(QPainter &p)
    if (!(ppu > 0.0))
       return;
 
+   /* 下面三个标记的位置都来自**驱动器**(目标 / 点击目标 / 实测位置), 不来自网格 —— 它们可以
+    * 落在画布视野之外: 区域比 32 mm 大时软量程就超过 ±kCanvasHalfUnits, 于是目标可以是
+    * 20 个单位那么远。全文没有别的地方设过裁剪区, 不夹的话那个白点会画到标尺上去。
+    * 夹到 plotRect() 是**留着**而不是不画 —— 看点没了操作员会问"我的点哪去了"; 完全跑到
+    * 视野外这件事由 drawHud 末尾那行字说明。 */
+   p.save();
+   p.setClipRect(plotRect());
+
    /* 插值目标 tgt: 绿色虚线十字 (与 hmi 的一维轨道同义) */
    {
       const QPointF q = pxOf((double)t.ax[0].tgt / ppu, (double)t.ax[1].tgt / ppu);
@@ -708,6 +720,8 @@ void MapCanvas::drawMarkers(QPainter &p)
                     Qt::AlignCenter, s);
       }
    }
+
+   p.restore();   /* 解除上面那道 plotRect 裁剪 */
 }
 
 /* 刻度数字的步长 (1/2/5 × 10^k)。2026-09-22 起在 scan/axisutil.h 里, 与功率计那条曲线共用
@@ -830,6 +844,27 @@ void MapCanvas::drawHud(QPainter &p)
                  .arg(q.area_x_unit, 0, 'f', 2)
                  .arg(q.area_y_unit, 0, 'f', 2));
 
+   /* 第四行: 位置跑到面板外了。软量程可以比视野大(区域一超过 2×kCanvasHalfUnits 就是),
+    * 而标记在 drawMarkers 里被裁剪贴在边框上 —— 不说一句的话, 操作员看到的是"我的点卡在
+    * 边上不动了"。**留着不画比画到标尺上更糟**, 所以是"贴边 + 写出来"这两下一起做。 */
+   if (m_bus != nullptr)
+   {
+      const BusTelem t   = m_bus->telemetry();
+      const double  ppu  = q.pulses_per_unit;
+      if (ppu > 0.0)
+      {
+         const double px = (double)t.ax[0].pos / ppu;
+         const double py = (double)t.ax[1].pos / ppu;
+         if (std::fabs(px) > kCanvasHalfUnits || std::fabs(py) > kCanvasHalfUnits)
+         {
+            p.setPen(C_WANT);
+            p.drawText(QRect(x, (int)r.top() + 51, w, 15), Qt::AlignLeft | Qt::AlignVCenter,
+                       QStringLiteral("位置在面板外 (%1, %2) mm —— 白色标记被贴在边框上")
+                          .arg(px, 0, 'f', 2).arg(py, 0, 'f', 2));
+         }
+      }
+   }
+
    /* 下沿: 悬停读数 (mm + 脉冲) */
    if (m_hover && m_ctl != nullptr)
    {
@@ -915,16 +950,18 @@ void MapCanvas::mousePressEvent(QMouseEvent *e)
       return;
 
    /*
-    * 夹在实际生效的量程之内: 画布上有一圈是扫描区外、也超出量程的地方, 在那一圈点一下
-    * 就是一次走到量程尽头的长动作。量程还没读到 (range <= 0) 时不夹。
+    * 边界就写在**点击发生的地方**: 面板上一共只有 ±half 这么多地方, 上面那道 |xu| > half
+    * 已经把框外的点击丢掉了, 所以这一夹实际夹不到东西 —— 留着是为了让"能点到哪"这条规矩
+    * 与画布本身摆在一起, 而不是只藏在 scanplan.h 那个常量里。
+    *
+    * **它按的不再是量程**(2026-09-22 改, 原来是 min(half, 量程/脉冲当量))。两条理由:
+    *   1. 软量程的下限现在就是 half (见 autoRangePul), 所以量程这一侧本来就 ≥ half;
+    *   2. 量程是异步跟上的(参数一变就重投, 要等工作线程转一圈), 在这儿再按量程夹一遍,
+    *      就会让面板边缘"有时候点得到有时候点不到", 而界面上完全看不出原因。
+    * 真正的夹取在 EcatThread::setTarget → interpolate (都在 ±m_range) —— 画出来的橙色三角
+    * 就是夹过之后的那个值: 万一真有够不到的地方, 看三角落在哪就知道。
     */
-   double lim = half;
-   if (m_bus != nullptr)
-   {
-      const BusTelem t = m_bus->telemetry();
-      if (t.range > 0)
-         lim = std::min(lim, (double)t.range / ppu);
-   }
+   const double lim = half;
    xu = std::max(-lim, std::min(lim, xu));
    yu = std::max(-lim, std::min(lim, yu));
 

@@ -96,13 +96,18 @@ void EcatThread::postFaultReset()
    m_cmds.enqueue(c);
 }
 
-void EcatThread::postHome(int axis, int method, uint32_t vel_fast)
+void EcatThread::postHome(int axis, int method, uint32_t vel_fast, int tmo_s)
 {
    QMutexLocker lk(&m_mtx);
    Cmd c; c.type = CMD_HOME; c.axis = axis; c.method = method;
    c.value = (int32_t)vel_fast;
+   c.tmo_s = tmo_s;
    m_cmds.enqueue(c);
 }
+
+/* 只有 scan/ 会调。默认 false 就是本类自己的老行为 (连接那一刻即零点), 所以 hmi 不开这个
+ * 开关时行为逐字节不变。理由全在头文件里。 */
+void EcatThread::setKeepOrigin(bool on) { m_keep_origin = on; }
 
 /* 「停止」在回零期间走这一个 —— **全程序唯一一处 GUI 线程直呼 motor_api**。
  * 安全: em_request_stop() 只往一个 `static volatile sig_atomic_t` 里存 1, 不碰总线/网卡。
@@ -352,10 +357,10 @@ void EcatThread::drainCommands()
             break;
 
          case CMD_HOME:
-            /* 本程序里最长的一次阻塞 (最长 HMI_HOME_TMO_MS = 30 秒 + 收尾): 使能灯、三个
-             * 开关灯、位置、状态栏都在这一段里要跟着动。找限位时尤其 —— 那一趟的目的就是
-             * 去压那个开关, 灯不跟着亮就没有任何东西能说明它压上了 */
-            { BlockTick tk(this); doHome(c.axis, c.method, (uint32_t)c.value); }
+            /* 本程序里最长的一次阻塞 (回零超时那个值 + 收尾; 缺省 120 s, 上限 600 s):
+             * 使能灯、三个开关灯、位置、状态栏都在这一段里要跟着动。找限位时尤其 ——
+             * 那一趟的目的就是去压那个开关, 灯不跟着亮就没有任何东西能说明它压上了 */
+            { BlockTick tk(this); doHome(c.axis, c.method, (uint32_t)c.value, c.tmo_s); }
             break;
       }
    }
@@ -581,7 +586,13 @@ void EcatThread::doEnable()
    for (int i = 0; i < m_naxis; i++)
       readModeDisp(i);
 
-   /* 使能成功了。把界面侧的目标值也钉在"现在这里", 于是**使能那一帧不会产生任何运动** */
+   /* 使能成功了。把界面侧的目标值也钉在"现在这里", 于是**使能那一帧不会产生任何运动**。
+    *
+    * **这一行是"零点跨重连保留"能不能成立的关键, 而且它故意不夹取**(与 interpolate() 每周期
+    * 把 m_tgt 夹进 ±m_range 那一道正相反)。保留零点之后 m_origin[] 可以离当前位置任意远,
+    * 而这里写的 `pos - origin` 不管多远都照写 —— 于是"使能那一帧原地不动"仍然成立。
+    * 要是这里也夹一道, 滑台一使能就会朝零点方向窜回来。**改这一处之前先读 ecatcmd::origin_keep_ok
+    * 的注释**: 不夹取的安全性靠的是"只在与量程相容时才沿用零点"那个前置条件, 不是靠这里。 */
    {
       QMutexLocker lk(&m_mtx);
       for (int i = 0; i < m_naxis; i++)
@@ -691,7 +702,7 @@ void EcatThread::doFaultReset()
  * 三段顺序不能动: **闸 (一个字节都不写) -> 宣告 -> 动作 + 无条件收尾**, 因为 em_home() 的
  * 五条返回路径留下的状态没有一条可以不管 (后三条举着 bit4 返回, 驱动器那一刻还在找)。
  * 17/18 多一道闸 (两道否决) 与一句分支预告, 位置在两道现有闸之后、宣告之前。 */
-void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
+void EcatThread::doHome(int axis, int method, uint32_t vel_fast, int tmo_s)
 {
    if (axis < 0 || axis >= EM_MAX_AXES)
       return;                    /* 编程错误, 不是操作员的事 */
@@ -785,6 +796,11 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
    /* **acc 必须跟着速度一起算** (见 home_accel_for); offset 保持 0, 界面上没有它的控件 */
    cfg.acc      = ecatcmd::home_accel_for(cfg.vel_fast);
 
+   /* 回零超时的第二道夹取 (第一道是界面那个 spin box 的 setRange), 顺手把秒换算成毫秒。
+    * **全程序唯一一次 `* 1000`** —— 单位在 ini/界面/Cmd 里一律是秒, 换算点只有这一处。 */
+   const int      tmo_s2 = ecatcmd::home_tmo_s_clamp(tmo_s);
+   const uint32_t tmo_ms = (uint32_t)tmo_s2 * 1000u;
+
    /* ★ 先失能。6098h/6099h/609Ah/607Ch **只在未使能时可写** —— 这一刻该轴失去保持力矩,
     * 竖直轴可能下滑, 这件事躲不掉。 */
    int rc_disable = 0;
@@ -792,7 +808,7 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
       rc_disable = em_disable(ax);
 
    /* 0 = 到位 / 1 = 被停止请求中止 / 负 = 失败。比字面量, 不比 EM_R_OK (那是内部宏) */
-   const int rc_home = em_home(ax, &cfg, HMI_HOME_TMO_MS);
+   const int rc_home = em_home(ax, &cfg, tmo_ms);
 
    /* 收尾。**无条件, 顺序不能动。** */
 
@@ -827,6 +843,12 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
       QMutexLocker lk(&m_mtx);
       m_want[axis] = 0;
    }
+   /* 零点搬了 —— 世代 +1。**无条件**: 这一步在上面那几条失败路上也跑 (超时/bit3/bit13
+    * 都是举着 bit4 返回的), 而无论成败, m_origin[] 确实换了一个值。
+    * 同时把"这份零点归本次运行所有"重新盖一次章: 回零之后任何时候断开重连, 沿用的都是它。 */
+   m_origin_gen++;
+   m_origin_kept  = true;
+   m_origin_naxis = m_naxis;
 
    /* ---- 4b. 读一次 6061h: 手册 §3.7 把「6061h 读回 6」当作 HM 的前提。
     * 收尾之后应当是 8 (CSP), 不是 8 就得在结论句里喊出来; 读失败 (-1) 也照实写。 */
@@ -893,7 +915,7 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast)
    }
 
    s += QStringLiteral(" [6099h:01 = %1, :02 = %2 pul/s, 609Ah = %3, 上限 %4 s]")
-           .arg(cfg.vel_fast).arg(cfg.vel_slow).arg(cfg.acc).arg(HMI_HOME_TMO_MS / 1000);
+           .arg(cfg.vel_fast).arg(cfg.vel_slow).arg(cfg.acc).arg(tmo_s2);
 
    note(s);
 }
@@ -995,6 +1017,10 @@ void EcatThread::doZero(int axis)
       QMutexLocker lk(&m_mtx);
       m_want[axis] -= disp;
    }
+   /* 零点搬了 —— 世代 +1 (只搬了一根轴也算: 世代说的是"这一套显示坐标还作不作数") */
+   m_origin_gen++;
+   m_origin_kept  = true;
+   m_origin_naxis = m_naxis;
 
    note(QStringLiteral("轴%1: 当前位置已设为 0 点 (物理目标未动)").arg(axis));
 }
@@ -1051,9 +1077,54 @@ void EcatThread::tryInitOrigin()
       if (!em_mirror_ok(m_ax[i]))
          return;
 
+   /* 每根轴**只读一次** 6064h: 下面既要拿它判"能不能沿用", 又要拿它算显示坐标, 读两次就是让
+    * 这两件事看两个不同的位置。(而且判据那一路算的是 int64 差, 直接 int32 相减会回绕。) */
+   int32_t pos[EM_MAX_AXES];
+   for (int i = 0; i < m_naxis; i++)
+      pos[i] = em_pos(m_ax[i]);
+
+   /* 量程只在**循环外**读一次, 理由同 publish() 那条 di_invert: 同一个决定不许看两个量程。 */
+   const int32_t rng = m_range.load();
+
+   /* 沿用上一份零点的全部条件。m_keep_origin 缺省 false —— 那正是 hmi 保持原样的机制:
+    * 它不开这个开关, keep 永远是 false, 下面走的和改动前逐字节相同。 */
+   bool keep = m_keep_origin && m_origin_kept && m_naxis == m_origin_naxis;
+   for (int i = 0; i < m_naxis && keep; i++)
+      if (!ecatcmd::origin_keep_ok(pos[i], m_origin[i], rng))
+         keep = false;
+
+   if (keep)
+   {
+      /* 沿用: **m_origin[] 一个字节都不动** —— 这就是本次改动的全部内容。
+       * m_tgt / m_want 要重新对齐一次 (零点没变、位置变了), 做法与失能那条尾巴同一套:
+       * m_tgt 不持锁、m_want 持锁。这里 `pos - m_origin` 不会溢出 —— origin_keep_ok 刚验过
+       * 它落在 ±rng 里。 */
+      int32_t d[EM_MAX_AXES];
+      for (int i = 0; i < m_naxis; i++)
+      {
+         d[i]     = pos[i] - m_origin[i];
+         m_tgt[i] = d[i];
+      }
+      {
+         QMutexLocker lk(&m_mtx);
+         for (int i = 0; i < m_naxis; i++)
+            m_want[i] = d[i];
+      }
+
+      m_origin_ready = true;
+      /* **不加世代**: 零点没搬, 前面那些 CSV 里的坐标仍然作数。 */
+
+      QString disp;
+      for (int i = 0; i < m_naxis; i++)
+         disp += (i ? QStringLiteral(", ") : QString()) + QString::number(d[i]);
+      note(QStringLiteral("沿用上次的零点(连接不再重设, 界面正中仍是上次那个物理位置)。"
+                          "滑台现在显示在 (%1) pul。要重设用「设为区域中心」").arg(disp));
+      return;
+   }
+
    for (int i = 0; i < m_naxis; i++)
    {
-      m_origin[i] = em_pos(m_ax[i]);
+      m_origin[i] = pos[i];
       m_tgt[i]    = 0;
    }
    {
@@ -1063,10 +1134,25 @@ void EcatThread::tryInitOrigin()
    }
 
    m_origin_ready = true;
-   note(QStringLiteral("零点是连接时读到的位置: 界面正中 = 现在这里, 可点范围 ±%1 pul "
-                       "(50000 pul/rev, 即 ±%2 rev)。换个零点用「把当前位置设为 0」")
-           .arg(m_range.load())
-           .arg(m_range.load() / 50000.0, 0, 'f', 1));
+   m_origin_kept  = true;
+   m_origin_naxis = m_naxis;
+   m_origin_gen++;          /* 零点真搬了 */
+
+   /* 重取这一支有两个成因, 文案必须分开 —— 它们说的是两件事:
+    *   (a) 以前就没定过零点(或这不是 scan): 常规, 说清"界面正中 = 现在这里"就够了;
+    *   (b) 有旧零点但不敢沿用(滑台跑出量程 / 轴数变了): 这是关于**机器状态**的一句警告 ——
+    *       屏幕上的 0 换了一个物理位置, 而操作员按老习惯会以为它还是刚才那个。
+    * hmi 永远走 (a): 它 m_keep_origin 是 false, "连接即零点"本来就是它要的, 不是意外。
+    * 这句里**不出现 50000 pul/rev** —— scan 的脉冲当量操作员可改, 写死就是一句迟早会假的话。 */
+   if (m_keep_origin && m_origin_kept)
+      note(QStringLiteral("重新取零点: %1。界面正中 = 现在这里, 可点范围 ±%2 pul")
+              .arg(m_naxis != m_origin_naxis
+                      ? QStringLiteral("轴数变了, 上一份零点作废")
+                      : QStringLiteral("滑台已跑出上次零点所在的量程, 不敢沿用"))
+              .arg(rng));
+   else
+      note(QStringLiteral("零点是连接时读到的位置: 界面正中 = 现在这里, 可点范围 ±%1 pul。"
+                          "换个零点用「把当前位置设为 0」").arg(rng));
 }
 
 void EcatThread::interpolate(uint32_t dt_ms)
@@ -1144,7 +1230,7 @@ void EcatThread::publish(int wkc)
    /* 与 m_busy 同一个写法。**它不是界面"正在复位…"能亮起来的原因** —— 真正让界面看到
     * 的是 doFaultReset 里那两次加锁直写 (同线程, 阻塞期间这一句跑不到); 这一句负责自洽。 */
    t.resetting    = m_resetting;
-   /* 回零同一套, 而且它更长 (回零能跑满 30 秒) */
+   /* 回零同一套, 而且它更长 (回零能跑满整个回零超时; 缺省 120 s, 可改到 600 s) */
    t.homing        = m_homing;
    t.homing_axis   = m_homing_axis;
    t.homing_method = m_homing_method;
@@ -1152,6 +1238,9 @@ void EcatThread::publish(int wkc)
    t.wkc          = wkc;
    t.expected_wkc = (m_bus != nullptr) ? em_expected_wkc(m_bus) : 0;
    t.range        = m_range.load();
+   /* 零点世代。从成员拷而不是从电文里攒: teardown() 会把 m_telem 清成默认值, 而这里是
+    * 每圈重算的 —— 断开之后这个值仍然新鲜, 界面也就不会漏发下一代。 */
+   t.origin_gen   = m_origin_gen;
    /* 界面靠它知道"现在生效的是哪一条判据"。**一次 load 成局部量**: 不能在循环里一轴
     * load 一次, 否则同一次 publish 里会一半轴按老值、一半按新值算。 */
    const bool di_invert = m_di_invert.load();
@@ -1254,6 +1343,11 @@ void EcatThread::teardown()
    m_in_op        = false;
    m_naxis        = 0;
    m_origin_ready = false;
+   /* **故意不清 m_origin[] / m_origin_kept / m_origin_naxis / m_origin_gen** —— 断开→连接用的是
+    * 同一个 EcatThread 对象(每个程序只 new 一次), 所以"零点丢了吗"从来不是对象没了, 而是
+    * tryInitOrigin() 每次把它覆盖掉。这份零点留在内存里是免费的, 重连时才有东西可沿用。
+    * (m_origin_gen 更必须留着: 下面把 m_telem 清成默认值, 世代计数要是也住在电文里就会跟着归零,
+    * 界面那侧"只许往前"的同步就会**漏掉**下一次真正的零点变更 —— 正是危险的那个方向。) */
    m_fault_latched = false;
    m_resetting     = false;   /* 连接断了, "正在复位"这个状态跟着一起没了 */
    m_homing        = false;   /* 同上。真在回零时走到这里, 调用方应当先 requestMotionStop() */

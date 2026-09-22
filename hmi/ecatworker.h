@@ -37,9 +37,17 @@
  * 不写死一个加速度, 写死一个斜坡时间 —— 见 ecatcmd::home_accel_for()。 */
 #define HMI_HOME_ACC_MAX   500000u
 
-/* 等 6041h bit12 (Homing attained) 的上限, 同时是"一次回零最多能找多远"的上限:
- * 速度 × 这个时间 = 最远距离 (缺省 50000 pul/s => 1500000 脉冲 = 30 圈)。 */
-#define HMI_HOME_TMO_MS    30000
+/* 等 6041h bit12 (Homing attained) 的上限, **同时是"一次回零最多能找多远"的上限**:
+ * 速度 × 这个时间 = 最远距离。缺省 120 s 配缺省速度 50000 pul/s = 6000000 脉冲 ≈ 120 mm,
+ * 是缺省扫描区域(27 mm)的 4.4 倍 —— 所以够不着开关时**先挪滑台**, 把超时调长等于把
+ * 撞上去的行程一起调长。让滑台停下的始终是硬件限位开关, 这个数只管"找不到还不肯停"。
+ *
+ * 做成可改是因为它原来只对缺省速度成立: 速度下限 100 pul/s 时 30 s 只走 0.06 圈。
+ * 单位一律用**秒** (ini 键 / 界面 / Cmd 都叫 *_s), 只在 doHome() 里乘一次 1000 ——
+ * 每一个换算点都是一次写错数的机会。界面 setRange 与工作线程的夹取都读这三个宏。 */
+#define HMI_HOME_TMO_MIN_S      5
+#define HMI_HOME_TMO_MAX_S    600
+#define HMI_HOME_TMO_DEF_S    120
 
 /* AxisTelem::mode_disp 里"工作线程还没为这根轴读过 6061h"的哨兵值。
  * 不能拿 -1 兼这个语义 (em_get_mode 读失败也返回 -1), 也不能借 0 (合法模式号: 未定义)。 */
@@ -102,9 +110,9 @@ struct BusTelem
    bool     fault     = false;
    /* 正在做故障复位 (逐轴阻塞, 每轴最多 1 秒)。复位不可中断, 界面只能把它按住不动 */
    bool     resetting = false;
-   /* 正在回零 (逐轴阻塞, 最长 HMI_HOME_TMO_MS + 收尾)。界面据此把四个回零按钮按住、
-    * 把「停止」换成立即中止。与 resetting 同一个坑: 必须由 doHome() 加锁直写一次,
-    * 再由 publish() 从 m_homing 拷一份, 两处都要。 */
+   /* 正在回零 (逐轴阻塞, 最长一次回零的超时 + 收尾; 超时可改, 见 HMI_HOME_TMO_*_S)。
+    * 界面据此把四个回零按钮按住、把「停止」换成立即中止。与 resetting 同一个坑:
+    * 必须由 doHome() 加锁直写一次, 再由 publish() 从 m_homing 拷一份, 两处都要。 */
    bool     homing    = false;
    int      homing_axis   = -1;   /* -1 = 没在回零 */
    int      homing_method = 0;    /* 6098h 的方式号 (24/29/18/17), 只为显示给人看 */
@@ -113,6 +121,12 @@ struct BusTelem
    int      expected_wkc = 0;
    /* 当前生效的量程 (脉冲)。默认 HMI_RANGE; scan/ 会经 postRange() 改 */
    int32_t  range     = HMI_RANGE;
+
+   /* 零点世代: **零点真被搬过一次就 +1**, 由工作线程在写 m_origin[] 的那三处维护。
+    * 界面从它同步 (只许往前, 见 origin_epoch_sync), 只进 CSV 表头。
+    * 它在 m_origin[] 旁边而不是只在电文里 —— teardown() 会把整份电文清成默认值,
+    * 清掉了界面就会漏发下一代, 而漏发那一侧正是危险的。 */
+   int      origin_gen = 0;
    QString  note;                /* 最后一条给操作员看的话 */
 
    /* 「上位机侧取反」当前是否真的生效。**总线级**: 接线方式是整台机器的性质。
@@ -470,6 +484,51 @@ inline uint32_t home_vel_from_pref(int v)
    return home_vel_clamp(v);
 }
 
+/* 回零超时 (s) 的第二道夹取; 第一道是界面上那个 spin box 的 setRange。
+ * 与 home_vel_clamp 同一个理由: 界面显示的数就是线上发的数, 两处读同一组宏, 不许漂移。 */
+inline int home_tmo_s_clamp(int v)
+{
+   if (v < HMI_HOME_TMO_MIN_S) return HMI_HOME_TMO_MIN_S;
+   if (v > HMI_HOME_TMO_MAX_S) return HMI_HOME_TMO_MAX_S;
+   return v;
+}
+
+/* 从 scan.ini 读回来的回零超时: <= 0 = 没记过 (用 HMI_HOME_TMO_DEF_S), 其余夹进 [MIN, MAX]。
+ * 夹取放在这里而不是界面里 —— 与 home_vel_from_pref 同一条理由: 被手改坏的 ini
+ * (写成 0 或 1e9) 不该让回零用一个没验过的超时, 而超时是回零唯一兜底的那条线。
+ * 下界 ≥ 1 是硬要求: doHome() 那一次 "秒 × 1000" 不能得 0。 */
+inline int home_tmo_s_from_pref(int v)
+{
+   if (v <= 0)
+      return HMI_HOME_TMO_DEF_S;
+   return home_tmo_s_clamp(v);
+}
+
+/* 沿用上一轮的零点安不安全 —— 只有滑台仍在**当前量程**内才许沿用。
+ * 量程未知 (<= 0) 一律不沿用: 不知道就别赌。
+ *
+ * 为什么非有这条不可: doEnable() 的重新锚定写的是 pos - origin 且**不夹取**, 而
+ * interpolate() 每周期把 m_tgt 夹进 ±range。两处一撞就是一次没人按过按钮的全速运动 ——
+ * 滑台停在旧零点外 1200000 而量程 800000 时, 使能后驱动器会被命令从 origin+1200000
+ * 走到 origin+800000。而"重连时滑台不在零点附近"正是零点保留要支持的正常用法。 */
+inline bool origin_keep_ok(int32_t pos, int32_t origin, int32_t range)
+{
+   if (range <= 0)
+      return false;
+   const int64_t d = (int64_t)pos - (int64_t)origin;   /* 不许 int32 相减溢出 */
+   return d <= (int64_t)range && d >= -(int64_t)range;
+}
+
+/* 界面的零点世代只能往前。
+ * 工作线程是**唯一**知道零点真被搬过的那个, 所以世代从它同步过来; 但 teardown() 会把
+ * 整份遥测清成默认值 —— 一个只会赋值的界面会在那一刻把世代倒回去, 而倒回去等于给下一次
+ * 续扫发一张假的"世代对不上"红横幅。**漏发一代是危险的那一侧, 多发一代只是多问一次**,
+ * 所以这里取大。 */
+inline int origin_epoch_sync(int ui_epoch, int worker_gen)
+{
+   return (worker_gen > ui_epoch) ? worker_gen : ui_epoch;
+}
+
 /* 回零之前那道闸: nullptr = 可以发起, 否则是一句给操作员看的话。
  * **必须在任何写动作之前** —— doHome() 的第一件事是 em_disable(), 它真的会撤掉保持力矩
  * (竖直轴当场会滑)。传入的必须是刚读到的状态; mirror_ok 排在 fault 前面。 */
@@ -749,8 +808,20 @@ public:
    /* 回零 —— 驱动器自带的 HM 模式。method 只收这四个 (用 home_method_for /
     * home_lim_method_for 算): 24/29 = 找原点 (原点开关 X0), 18/17 = 找限位 (以正/负限位
     * 开关为原点)。vel_fast: 6099h:01, 内部还夹一道。本程序里最长的阻塞命令。
-    * ⚠️ 它会**先失能**: 6098h/6099h/609Ah/607Ch 只能在未使能时写, 竖直轴失去保持力矩。 */
-   void postHome(int axis, int method, uint32_t vel_fast);
+    * tmo_s: 等 6041h bit12 的上限 (秒), 内部还夹一道。
+    * ⚠️ 它会**先失能**: 6098h/6099h/609Ah/607Ch 只能在未使能时写, 竖直轴失去保持力矩。
+    *
+    * tmo_s **不给缺省实参** —— 本程序只有一个调用点, 逼每个将来的调用方都把话说出来。 */
+   void postHome(int axis, int method, uint32_t vel_fast, int tmo_s);
+
+   /* 断开重连时沿不沿用上一份零点。**默认 false, 也就是本类自己的老行为**: 连接那一刻的
+    * 位置就是零点。`scan/` 在构造之后调一次 true。
+    *
+    * 这是两个程序**产品上的差别**, 不是同一件事的两种实现: scan 的操作模型里零点该跨重连
+    * 连续 (同一个显示坐标必须还是同一个物理位置), hmi 的是"连接即零点"。做成成员而不是给
+    * hmi 也改, 是因为 hmi 那一侧的界面文案与操作习惯全是围着后者写的。
+    * 沿用还有一道硬条件 (见 ecatcmd::origin_keep_ok): 滑台必须仍在当前量程内。 */
+   void setKeepOrigin(bool on);
 
    /* 「停止」在回零期间用这一个 —— **立即**让 em_home 的轮询看见 (≤ 它的 2ms 轮询周期)。
     * 全程序唯一一处 GUI 线程直呼 motor_api; 队列救不了正在找原点的轴 (回零阻塞着
@@ -812,6 +883,7 @@ private:
       int     axis   = -1;
       int     method = 0;     /* CMD_HOME 用: 6098h 方式号 (24/29/18/17) */
       int32_t value  = 0;     /* CMD_RANGE 用; CMD_HOME 用它装 6099h:01 */
+      int     tmo_s  = 0;     /* CMD_HOME 用: 等 6041h bit12 的上限 (s) */
       QString text;
    };
 
@@ -847,7 +919,7 @@ private:
    void doConnectInner(const QString &ifname);   /* m_busy 由外面的壳一个人管 */
    void doEnable();
    void doFaultReset();
-   void doHome(int axis, int method, uint32_t vel_fast);
+   void doHome(int axis, int method, uint32_t vel_fast, int tmo_s);
    void doStop();
    /* 把该轴的实际运行模式 6061h 读一次存进 m_mode_disp[axis] (SDO 读)。
     * **只许在本来就阻塞、或本来就便宜的时刻调** —— publish() / interpolate() 不许调。 */
@@ -881,6 +953,16 @@ private:
    bool       m_in_op = false;
    bool       m_busy  = false;      /* 见 BusTelem::busy */
    bool       m_origin_ready = false;
+
+   /* ---- 零点跨重连保留 (只有 scan/ 会打开, 见 setKeepOrigin) ----
+    * 下面四个**故意不被 teardown() 清**: m_origin[] 留在内存里, 重连时才有东西可沿用。
+    * (断开→连接用的是同一个 EcatThread 对象, 所以这是免费的 —— 位置从来不是"对象没了"
+    * 才丢的, 是 tryInitOrigin() 每次覆盖掉。) */
+   bool       m_keep_origin  = false;   /* scan/ 打开; 默认 false = 老行为 */
+   bool       m_origin_kept  = false;   /* m_origin[] 里那份零点还在不在 */
+   int        m_origin_naxis = 0;       /* 存下那份零点时总线报了几根轴 */
+   int        m_origin_gen   = 0;       /* 见 BusTelem::origin_gen */
+
    int32_t    m_origin[EM_MAX_AXES] = {0};
    int32_t    m_tgt   [EM_MAX_AXES] = {0};
    /* 6061h 的**上次读到值**。构造里整体置 HMI_MODE_DISP_UNREAD —— 聚合初始化剩下的会

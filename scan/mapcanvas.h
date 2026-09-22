@@ -10,8 +10,9 @@
  * 格子三态: 未扫到 = 只有底色; 读数失败 = 紫红实心块 (C_NODATA, 避开色标那头的红); 有数 = 顺序色标。
  * 右侧色标条高度封顶 320px, 两端 + 中间整数刻度都写数字 (drawScaleBar)。
  *
- * 视野: 固定 30×30 单位 (每边 ±15, 再各留 1 单位余量, kViewHalfUnits), 量程是常数,
- * 窗口改变只改这块方形的像素边长。所有图元按单位存, 绘制时才换算成像素。
+ * 视野: 固定 32×32 单位 (每边 ±kCanvasHalfUnits = ±16: 标尺画到 ±15, 再各留 1 单位余量),
+ * 量程是常数, 窗口改变只改这块方形的像素边长。所有图元按单位存, 绘制时才换算成像素。
+ * 那个常量定义在 scanplan.h —— 软量程的下限也是它 (见 autoRangePul), 只有一份。
  * 下边 X 标尺、左边 Y 标尺: 每 1 单位小刻度, 每 5 单位带数字。
  *
  * 交互: 左键 = 查看那一格 (只读, 扫描中可用); Shift+左键 = 手动定位到该点, 走显示坐标,
@@ -94,7 +95,7 @@ protected:
 
 private:
    /* ---- 坐标换算 (单位 <-> 像素) ---- */
-   double viewHalfUnits() const;      /* 可视半宽 (单位) */
+   double viewHalfUnits() const;      /* 可视半宽 (单位) = scan::kCanvasHalfUnits, 见那个常量的注释 */
    QRectF plotRect() const;           /* 画图区 (已经是正方形) */
    QPointF pxOf(double xu, double yu) const;
    void    unitAt(const QPoint &p, double *xu, double *yu) const;

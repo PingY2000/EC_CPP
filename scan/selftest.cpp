@@ -455,7 +455,45 @@ static void test_grid()
    caseBegin("grid: 单位换算与量程");
    checkEq(pulseOf(-13.5, 50000.0), -675000, "pulseOf(-13.5)");
    checkNear(unitOf(-675000, 50000.0), -13.5, "unitOf(round trip)");
-   checkEq(autoRangePul(p), 725000, "auto range = (13.5 + 1) * 50000");
+   /* 缺省 27 mm 区域: 区域那条下限是 14.5, 画布那条是 16 —— 取大的, 所以是 16 * 50000。
+    * (2026-09-22 之前是 14.5 * 50000 = 725000) */
+   checkEq(autoRangePul(p), 800000, "auto range = max(13.5 + 1, 16) * 50000");
+
+   /* ---- 软量程的两条下限: 全域不变式 + 两个方向各钉一条 (2026-09-22) ----
+    * 不变式把"面板上看得见的地方必须点得到"这条耦合变成机械的: 软量程永远不许小于
+    * 画布半宽 × 脉冲当量 (点击那一路传进去的数就是它)。形状照 home_vel_slow 那个全域循环。
+    * 少了这条, 一个 3 mm 的区域只放行 ±2.5 mm, 而画布仍然画到 ±16 —— 点面板边缘会被
+    * setTarget / interpolate 悄悄夹回来, 界面上完全看不出。 */
+   {
+      static const double kPpu[] = { 100.0, 1000.0, 50000.0, 123456.0, 1000000.0 };
+      static const double kArea[] = { 0.5, 3.0, 27.0, 32.0, 40.0, 200.0 };
+      bool ok = true;
+      for (size_t a = 0; a < sizeof(kArea) / sizeof(kArea[0]); a++)
+         for (size_t u = 0; u < sizeof(kPpu) / sizeof(kPpu[0]); u++)
+         {
+            Params q = p;
+            q.area_x_unit = kArea[a];
+            q.area_y_unit = kArea[a];
+            q.pulses_per_unit = kPpu[u];
+            /* 用 (long long) 比, 免得 ceil 那一步在 double 上抖 */
+            const long long rng = (long long)autoRangePul(q);
+            const long long lom = (long long)std::ceil(kCanvasHalfUnits * kPpu[u]);
+            ok = ok && rng >= lom;
+         }
+      check(ok, "autoRangePul >= ceil(kCanvasHalfUnits * ppu) 全域成立");
+   }
+
+   /* 「取两者大的那个」两个方向各一条: 区域小的时候是画布说了算, 区域大的时候是区域说了算 */
+   {
+      Params small = p;
+      small.area_x_unit = small.area_y_unit = 3.0;    /* 区域那条只有 2.5, 画布那条 16 */
+      checkEq(autoRangePul(small), 800000, "3 mm 区域 → 画布下限说了算 (16 * 50000)");
+
+      Params big = p;
+      big.area_x_unit = big.area_y_unit = 40.0;       /* 区域那条 21 > 画布那条 16 */
+      checkEq(autoRangePul(big), 1050000, "40 mm 区域 → 区域说了算 (21 * 50000)");
+   }
+
    checkEq(posTolPul(p), 1250, "pos tol = step/20");
 
    /* 小步长时容差不该大到"允许偏一整个格子" */
@@ -483,10 +521,15 @@ static void test_grid()
 
    check(validate(p).empty(), "the default parameters pass", validate(p));
 
+   /* fitsRange: 界面这条路上它现在**恒真** (currentParams 总把 range_pul 设成 autoRangePul),
+    * 所以下面那个显式塞 range_pul 的假分支是**唯一**走得到的一条 —— 那也正是留着它的理由。 */
    std::string why;
+   check(fitsRange(p, &why), "默认参数在量程之内 (界面路径)", why);
+
+   std::string why2;
    Params narrow = p;
    narrow.range_pul = 100000;                            /* 只有 ±2 单位 */
-   check(!fitsRange(narrow, &why), "area outside the range rejected", why);
+   check(!fitsRange(narrow, &why2), "area outside the range rejected", why2);
 }
 
 static void test_csv()
@@ -1492,6 +1535,9 @@ static void test_advprefs()
       check(p.npn_write_drive, "缺 adv/npn_write_drive 必须回落到默认开");
       check(!p.npn_sw_invert,  "缺 adv/npn_sw_invert 回落到默认关");
       checkEq(p.home_vel, -1,  "缺 ui/home_vel 回落到「没记过」");
+      /* 现存那个 scan.ini 就是这么一份"老 ini" —— 缺项 → -1 → HMI_HOME_TMO_DEF_S = 120,
+       * 正是要的缺省, 所以这次改动**不需要迁移任何文件** */
+      checkEq(p.home_tmo_s, -1, "缺 ui/home_tmo_s 回落到「没记过」(= 120 s)");
    }
 
    caseBegin("advprefs: 四项反着设, 存进去再读回来逐项相等");
@@ -1504,6 +1550,7 @@ static void test_advprefs()
       p.npn_write_drive = false;
       p.npn_sw_invert   = true;
       p.home_vel        = 30000;
+      p.home_tmo_s      = 300;
       prefsSave(ini, p);
 
       const Prefs b = prefsLoad(ini);
@@ -1511,6 +1558,7 @@ static void test_advprefs()
       check(!b.npn_write_drive, "npn_write_drive=false 存得住");
       check(b.npn_sw_invert,    "npn_sw_invert=true 存得住");
       checkEq(b.home_vel, 30000, "回零速度存得住");
+      checkEq(b.home_tmo_s, 300, "回零超时存得住");
    }
 
    /* 「色标上下限不记, 但『是不是自动跟随』要记」—— 前者是一个数 (套到下一趟数据上就是错的),
@@ -1550,6 +1598,30 @@ static void test_advprefs()
       checkEq(ecatcmd::home_vel_from_pref(30000), 30000, "正常值原样用");
       checkEq(ecatcmd::home_vel_from_pref(1), HMI_HOME_VEL_MIN, "太小 → 夹到下限");
       checkEq(ecatcmd::home_vel_from_pref(999999999), HMI_HOME_VEL_MAX, "太大 → 夹到上限");
+   }
+
+   caseBegin("advprefs: 回零超时 (2026-09-22)");
+   {
+      const Prefs p;
+      checkEq(p.home_tmo_s, -1, "回零超时: 还没记过");
+
+      /* 存进去的与读回来的都得是**秒** —— 单位在 ini/界面/Cmd 里一律秒, 只在 doHome() 里
+       * 乘一次 1000。这一条钉的就是"换算点只有那一处" */
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+      Prefs q;
+      q.home_tmo_s = 300;
+      prefsSave(ini, q);
+      checkEq(prefsLoad(ini).home_tmo_s, 300, "回零超时往返 (秒)");
+   }
+
+   caseBegin("advprefs: 被手改坏的超时不许直接拿去用");
+   {
+      checkEq(ecatcmd::home_tmo_s_from_pref(-1), HMI_HOME_TMO_DEF_S, "-1 = 没记过 → 缺省");
+      checkEq(ecatcmd::home_tmo_s_from_pref(0),  HMI_HOME_TMO_DEF_S, "0 也算没记过");
+      checkEq(ecatcmd::home_tmo_s_from_pref(300), 300, "正常值原样用");
+      checkEq(ecatcmd::home_tmo_s_from_pref(1), HMI_HOME_TMO_MIN_S, "太小 → 夹到下限");
+      checkEq(ecatcmd::home_tmo_s_from_pref(999999999), HMI_HOME_TMO_MAX_S, "太大 → 夹到上限");
    }
 }
 
@@ -2236,6 +2308,30 @@ static void test_homing()
             "缺省值落在上下限之内");
    }
 
+   /* ---- 回零超时 (2026-09-22) ------------------------------------ */
+   caseBegin("回零: 超时的夹取, 与那条产品决定的钉子");
+   {
+      /* 夹取测的是**边界关系**, 不是某一个数 (上面那条注解同样适用) */
+      checkEq(ecatcmd::home_tmo_s_clamp(HMI_HOME_TMO_MIN_S - 1), HMI_HOME_TMO_MIN_S, "MIN-1 → 下限");
+      checkEq(ecatcmd::home_tmo_s_clamp(0),                      HMI_HOME_TMO_MIN_S, "0 → 下限");
+      checkEq(ecatcmd::home_tmo_s_clamp((int)HMI_HOME_TMO_MAX_S + 1), HMI_HOME_TMO_MAX_S,
+              "MAX + 1 → 上限");
+      checkEq(ecatcmd::home_tmo_s_clamp(2147483647), HMI_HOME_TMO_MAX_S, "INT32_MAX → 上限");
+
+      /* "界面上显示的数就是线上发的数": spin box 的 setRange 与这道夹取读的是同一对宏 */
+      checkEq(ecatcmd::home_tmo_s_clamp(HMI_HOME_TMO_MAX_S), HMI_HOME_TMO_MAX_S,
+              "clamp(MAX) == MAX —— range 与夹取没有漂移");
+      checkEq(ecatcmd::home_tmo_s_clamp(HMI_HOME_TMO_MIN_S), HMI_HOME_TMO_MIN_S, "clamp(MIN) == MIN");
+
+      /* 产品决定: 缺省 120 秒。**这条唯一的作用就是让"缺省值被悄悄改掉"当场响** */
+      checkEq(HMI_HOME_TMO_DEF_S, 120, "缺省回零超时 = 120 s (产品决定, 2026-09-22)");
+      check(HMI_HOME_TMO_DEF_S >= HMI_HOME_TMO_MIN_S && HMI_HOME_TMO_DEF_S <= HMI_HOME_TMO_MAX_S,
+            "缺省值落在上下限之内");
+      /* doHome() 里那一次 * 1000 不许溢出: uint32 装得下 MAX_S 秒对应的毫秒数 */
+      check((long long)HMI_HOME_TMO_MAX_S * 1000LL <= 2147483647LL,
+            "MAX_S * 1000 装得进 int32");
+   }
+
    /* ---- 加减速 -------------------------------------------------- */
    caseBegin("回零: 609Ah 由速度派生 —— 斜坡时间 0.1 s, 加速度封顶");
    {
@@ -2541,6 +2637,61 @@ static void test_homing()
       check(r.startScan(QDir::tempPath() + "/hm2.csv", &err), "回零结束 → 放行",
             err.toStdString());
       r.ctrl.abort(QString());
+   }
+}
+
+/* ------------------------------------------------- 零点跨重连保留 (2026-09-22) */
+
+/* 这两条判据是这次改动里**唯一**测得到的部分。保留/重取那个决定、世代计数、doEnable 的重钉,
+ * 三样都住在 ecatworker.cpp 里, 而 scan_selftest 不编那个文件 (见 CMakeLists), FakeBus 里也
+ * 没有 origin 的概念 —— 那三样只有硬件能验。所以判据必须写成纯函数, 见 ecatworker.h。 */
+static void test_origin()
+{
+   /* 「沿用上一份零点安不安全」。**它存在的原因是两条互相反着的写法撞在一起**:
+    * interpolate() 每周期把 m_tgt 夹进 ±m_range, 而 doEnable() 的重钉写的是
+    * `em_pos - m_origin` 且**不夹** —— 零点离当前位置越远, 这一撞就是一次没人按过按钮的
+    * 全速运动。所以"只在与量程相容时才沿用"是硬条件, 不是优化。 */
+   caseBegin("origin: 沿用上一份零点的前置条件");
+   {
+      const int32_t R = 800000;
+
+      check(ecatcmd::origin_keep_ok(0, 0, R),          "位置就在零点上");
+      check(ecatcmd::origin_keep_ok(R, 0, R),          "正侧正好到量程 (边界**含**)");
+      check(ecatcmd::origin_keep_ok(-R, 0, R),         "负侧正好到量程");
+      check(ecatcmd::origin_keep_ok(R + 5, 5, R),      "零点不在原处时看的是差值, 不是绝对值");
+      check(ecatcmd::origin_keep_ok(-R - 5, -5, R),    "负侧同理");
+
+      check(!ecatcmd::origin_keep_ok(R + 1, 0, R),     "正侧超出量程 1 个脉冲 → 不沿用");
+      check(!ecatcmd::origin_keep_ok(-R - 1, 0, R),    "负侧超出 1 个脉冲 → 不沿用");
+
+      /* 量程未知一律不沿用: 不知道就别赌 */
+      check(!ecatcmd::origin_keep_ok(0, 0, 0),         "量程 = 0 → 不沿用");
+      check(!ecatcmd::origin_keep_ok(0, 0, -1),        "量程 < 0 → 不沿用");
+
+      /* **不许回绕**: 差值是 int64 算的。改成 int32 相减的话, 这一对会算出一个"在量程内"
+       * 的小正数, 于是滑台在最远的那一头反而被判定成"可以沿用" —— 正好反过来。 */
+      check(!ecatcmd::origin_keep_ok(2147483647, -2147483647 - 1, R),
+            "INT32_MAX vs INT32_MIN → 假 (int64 差值不回绕)");
+      check(!ecatcmd::origin_keep_ok(-2147483647 - 1, 2147483647, R),
+            "反着来也是假");
+   }
+
+   /* 「只许往前」。倒回去等于给下一次续扫发一张**假的**"世代对不上"红横幅 ——
+    * 那个横幅是用来拦"两份坐标拼在一张图上"的, 报假警报多了就没人看了。 */
+   caseBegin("origin: 界面侧的世代只许往前");
+   {
+      checkEq(ecatcmd::origin_epoch_sync(0, 1), 1, "界面 0 / 线程 1 → 1 (第一次取零点)");
+      checkEq(ecatcmd::origin_epoch_sync(5, 5), 5, "相等 → 不动");
+      checkEq(ecatcmd::origin_epoch_sync(5, 7), 7, "线程在前 → 跟上");
+      checkEq(ecatcmd::origin_epoch_sync(5, 0), 5, "线程归零了 → **不倒退**, 守住 5");
+      checkEq(ecatcmd::origin_epoch_sync(5, 4), 5, "线程落后一格 → 还是守住 5");
+   }
+
+   /* 新电文的世代从 0 起 —— 窗口那侧的 m_epoch 也从 0 起, 两者必须同一个起点 */
+   caseBegin("origin: BusTelem 的世代初值");
+   {
+      const BusTelem t;
+      checkEq(t.origin_gen, 0, "BusTelem{}.origin_gen == 0");
    }
 }
 
@@ -3393,6 +3544,7 @@ int main(int argc, char **argv)
    test_faultreset();
    test_limitsw();
    test_homing();
+   test_origin();
    test_meter_sources();
    test_meter_meta();
    test_meterlog();

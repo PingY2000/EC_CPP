@@ -279,6 +279,9 @@ private:
    /* ---- 原点模式 ---- */
    /* 6099h:01 找原点速度 (八个按钮共用)。上下限 = 与工作线程夹取共用的那一对宏; 正文在 tooltip */
    QSpinBox    *m_edHomeVel = nullptr;
+   /* 等 6041h bit12 的超时, 单位**秒**, 八个按钮共用。上下限 = 与工作线程夹取共用的那一对宏;
+    * 正文在 tooltip。它不是驱动器参数, 是上位机的耐心 —— 所以它没有 6099h 那种"哪一份在生效" */
+   QSpinBox    *m_edHomeTmo = nullptr;
    /* 「原点模式」框里就是这两组按钮, 一行一根轴: [轴][0/1] 找原点开关 (方式 24/29),
     * 左边两个按钮; 右边两个找限位开关 (方式 18/17)。文字见 kHomeBtnText */
    QPushButton *m_btnHome[2][2] = {};   /* [轴][方向] 0 = 正向回零, 1 = 反向回零 */
@@ -409,7 +412,10 @@ private:
    /* 上次用的网卡 (从 scan.ini 读回, 可能已不在机器上)。适配器清单异步到, 故先存着等 adaptersListed */
    QString        m_savedNic;
 
-   int  m_epoch     = 0;      /* 零点世代。每次连接 / 每次「设为区域中心」+1, 进 CSV 表头 */
+   /* 零点世代。**由工作线程维护**(它在真写 m_origin[] 的那三处 +1), 这里只跟着遥测往前同步
+    * (ecatcmd::origin_epoch_sync, 在 refresh() 里)。只有出 CSV 表头这一个用处。
+    * 连接**不再**推它 —— scan 现在跨重连沿用零点, 连接本身不动零点。 */
+   int  m_epoch     = 0;
    /* 上次递给工作线程的量程。只在数值真变了才 postRange, 否则状态栏会被逐个按键的回执刷屏 */
    int32_t m_last_range = 0;
    bool m_connected = false;

@@ -83,9 +83,7 @@ static QString fmtWatts(double v)
 static const QString &readOnceTip()
 {
    static const QString s = QStringLiteral(
-      "向当前取样源要一个数, 结果显示在按钮下面那一行 (与扫描同一条路)。\n"
-      "报出来的是实测往返时延, 要远小于扫描参数里的读数超时。\n"
-      "扫描或连续读数跑着时它是灰的 —— 同一时刻只允许一个未决请求。");
+      "向当前取样源要一个数, 结果显示在按钮下面那一行 (与扫描同一条路)。");
    return s;
 }
 
@@ -227,9 +225,7 @@ QWidget *ScanWindow::gateBar(int gi, QWidget *parent)
    for (QPushButton *b : { g.btnEdit, g.btnSave, g.btnCancel })
       b->setFixedHeight(22);
 
-   g.btnEdit->setToolTip(QStringLiteral("平时只读 —— 点它才能改。改动当场生效; 「保存」记进 scan.ini, 「取消」退回上次保存的值。扫描/回零中几何类参数仍锁着。"));
-   g.btnSave->setToolTip(QStringLiteral("把这一框的值记进 scan.ini (改动早就生效了, 保存只是记住它)。色标上下限不进 ini; 色标是不是自动跟随会记。\n功率计那一框不在这儿 —— 它整个露在外面, 改了就记。"));
-   g.btnCancel->setToolTip(QStringLiteral("退回上次保存的值 (不是程序缺省值), 并立刻重新下推。"));
+
    connect(g.btnEdit,   &QPushButton::clicked, this, [this, gi] { onGateEdit(gi); });
    connect(g.btnSave,   &QPushButton::clicked, this, [this, gi] { onGateSave(gi); });
    connect(g.btnCancel, &QPushButton::clicked, this, [this, gi] { onGateCancel(gi); });
@@ -366,8 +362,7 @@ void ScanWindow::refreshMeterPanel()
    {
       m_cbMeter->setEnabled(!rec);
       m_cbMeter->setToolTip(rec
-         ? QStringLiteral("连续读数正在跑 —— 先「停止」再换源 "
-                          "(换了的话同一条曲线上会是两个不同的东西采的数)")
+         ? QStringLiteral("连续读数正在跑 —— 先「停止」再换源 ")
          : QStringLiteral("扫描与连续读数共用这一个源。不需要连滑台或总线: 选真机就能读数。\n"
                           "选真机要装 Ophir 的 StarLab; 界面其余部分与此无关。"));
    }
@@ -881,6 +876,11 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
    setWindowTitle(QStringLiteral("滑台蛇形扫描采集 —— YKD2205PE / SOEM"));
 
    m_thr = new EcatThread(this);
+   /* **本程序这里开一个分叉**(2026-09-22): 断开重连时沿用上次那份零点, 显示坐标跨重连连续。
+    * hmi 不开这个开关, 它保持"连接那一刻即零点"。这是两个程序**产品上的差别**, 不是同一件事
+    * 的两种实现 —— 理由全在 EcatThread::setKeepOrigin 的注释里。
+    * 必须在这里 (构造后立刻、任何连接之前) 调: 它是给 tryInitOrigin 看的旗标。 */
+   m_thr->setKeepOrigin(true);
    m_busv = new EcatBusView(m_thr);
 
    m_manual = new ManualMeter(this);
@@ -1192,7 +1192,8 @@ QWidget *ScanWindow::buildTopBar()
    connect(m_btnNic, &QPushButton::clicked, m_thr, &EcatThread::postListAdapters);
 
    m_btnConn = new QPushButton(QStringLiteral("连接 (进 OP)"), w);
-   m_btnConn->setToolTip(QStringLiteral("打开发帧、进 OP。电机仍不带电 —— 使能才带电。当前位置被重设为显示坐标 0。"));
+   m_btnConn->setToolTip(QStringLiteral("打开发帧、进 OP。电机仍不带电 —— 使能才带电。\n"
+                                        "零点沿用本次运行里已定的那个, 断开重连不重设。"));
    connect(m_btnConn, &QPushButton::clicked, this, &ScanWindow::onConnectClicked);
 
    m_btnEnable = new QPushButton(QStringLiteral("使能"), w);
@@ -1214,7 +1215,8 @@ QWidget *ScanWindow::buildTopBar()
    connect(m_btnCenter, &QPushButton::clicked, this, &ScanWindow::onCenterAllClicked);
 
    m_btnZero = new QPushButton(QStringLiteral("设为区域中心"), w);
-   m_btnZero->setToolTip(QStringLiteral("把当前位置定为显示坐标 0, 也就是扫描区域的中心。零点世代 +1。"));
+   m_btnZero->setToolTip(QStringLiteral("把当前位置定为显示坐标 0, 也就是扫描区域的中心。\n"
+                                        "断开重连之后它仍然有效(只在本次运行内)。"));
    connect(m_btnZero, &QPushButton::clicked, this, &ScanWindow::onZeroHereClicked);
 
    QHBoxLayout *bar = new QHBoxLayout(w);
@@ -1399,9 +1401,10 @@ static const char *kHomeBtnText[4] = { "正向回零", "反向回零", "找正�
  * 且是本程序里唯一"按下之后滑台会带电自己走"的按钮。回零会先失能再走 (6098h 只能在未
  * 使能时写), 竖直轴在这期间失去保持力矩, 所以"只回我这一根"必须点得出来。
  *
- * 版面 = 一个速度值 + 两行按钮。**一行一根轴, 四个按钮**: 第 0/1 列找原点开关 X0 (方式
- * 24/29), 第 2/3 列找限位开关 (方式 18/17)。八个按钮**共用上面那个速度值** —— 6099h:01/:02
- * 与 609Ah 是同一对参数, 两个速度框会出现"哪个在生效"这种看不出来的组合。
+ * 版面 = 一个速度值 + 一个超时值 + 两行按钮 (2026-09-22 加超时)。**一行一根轴, 四个按钮**:
+ * 第 0/1 列找原点开关 X0 (方式 24/29), 第 2/3 列找限位开关 (方式 18/17)。八个按钮**共用上面
+ * 那两个值** —— 6099h:01/:02 与 609Ah 是同一对参数, 两个速度框会出现"哪个在生效"这种看不出来
+ * 的组合; 超时同理, 它压根不是驱动器参数, 是上位机等 6041h bit12 的耐心。
  * 出处只有两处, 都在 tooltip 与顶部那条横幅里 (事前 / 事中), 框里不再写说明文字。 */
 QWidget *ScanWindow::buildHomePanel()
 {
@@ -1421,27 +1424,49 @@ QWidget *ScanWindow::buildHomePanel()
    m_edHomeVel->setValue(HMI_HOME_VEL_DEF);
    /* 「够不着开关请先把滑台挪近, 不要为了够得着去调高速度」原本写在框里那行小字上, 那行
     * 删了之后搬到这里 —— 它是这个值唯一的一句事后提醒 */
-   /* 这个数有两层意思: 表面是速度, 实际是「能找多远」的上限 (速度 × 30 s)。够不着开关时
-    * 该挪滑台 —— 调高速度等于把撞上去的动能一起调高 */
+   /* 这个数有两层意思: 表面是速度, 实际是「能找多远」的其中一个因子 (速度 × 超时, 超时是
+    * 下面那个框)。够不着开关时该挪滑台 —— 调高速度等于把撞上去的动能一起调高 */
    m_edHomeVel->setToolTip(QStringLiteral(
       "八个找原点按钮共用的速度 6099h:01 (返回速度是它的 1/4)。\n"
-      "它同时是「能找多远」的上限: 速度 × 30 s —— 够不着开关请先把滑台挪近, 不要为够得着去调高速度。\n"
+      "它也是「能走多远」的因子: 速度 × 超时。\n"
+      "够不着开关请先把滑台挪近, 不要调高速度或超时。\n"
       "第一次在陌生机器上试方向, 压到下限 100。"));
+
+   /* ---- 回零超时 (2026-09-22 加) ----
+    * 做成可改是因为原来的常量 30 s 只对缺省速度成立: 速度下限 100 pul/s 时 30 s 只走 0.06 圈。
+    * 八个按钮共用。上下限就是 HMI_HOME_TMO_*_S, 工作线程里还夹同一道 (两处夹取必须一致,
+    * 自检里有一对断言钉着这件事)。值进 scan.ini 的 ui/home_tmo_s。 */
+   m_edHomeTmo = new QSpinBox(box);
+   m_edHomeTmo->setRange(HMI_HOME_TMO_MIN_S, HMI_HOME_TMO_MAX_S);
+   m_edHomeTmo->setSingleStep(10);
+   m_edHomeTmo->setSuffix(QStringLiteral(" s"));
+   /* 缺省显式设, 理由同上面那个速度框 (新建的 QSpinBox 是 0, setRange 会把它夹到下限) */
+   m_edHomeTmo->setValue(HMI_HOME_TMO_DEF_S);
+   /* **tooltip 里一个数字都不写**(除了下限那句): 写了必然会过期 —— 原来那句「速度 × 30 s」
+    * 就是这么变成假话的。 */
+   m_edHomeTmo->setToolTip(QStringLiteral(
+      "这一框八个按钮共用的超时: 等 6041h bit12 的上限。\n"
+      "它和速度一起决定「一次回零最远能找多远」。\n"
+      "够不着开关请先挪滑台 —— 让它停下的是硬件限位, 不是这个数。"));
 
    g->addWidget(new QLabel(QStringLiteral("速度"), box), 0, 0);
    g->addWidget(m_edHomeVel, 0, 1, 1, 2);   /* 占 1~2 列 */
 
-   /* 门控行 [编辑][保存][取消] 就摆在**速度右边那一行**(2026-09-21 改, 原先是框底单独
-    * 一行)。这一框里只有速度是参数, 那三个按钮管的也就是它 —— 摆在同一行一眼能看出
-    * "这三个按钮管的是这个数"; 单独一行时中间隔着两行按钮, 且白占一行高。
+   g->addWidget(new QLabel(QStringLiteral("超时"), box), 1, 0);
+   g->addWidget(m_edHomeTmo, 1, 1, 1, 2);   /* 与速度同一列, 一眼看出是两个同类的数 */
+
+   /* 门控行 [编辑][保存][取消] 就摆在右边那一格(2026-09-21 改, 原先是框底单独一行)。
+    * 这一框里的参数就是速度和超时两个, 那三个按钮管的就是它们俩 —— 摆在两行旁边一眼能
+    * 看出"这三个按钮管的是这两个数"; 单独一行时中间隔着两行按钮, 且白占一行高。
     *
     * **靠右**: 传 Qt::AlignRight 让这一格里的 [编辑] 顶着框的右边界 (不传的话它填满
     * 格子、按钮就贴在速度框后面, 右边空一大块)。那一格是 3~4 列, 宽度够同时放两个
     * 按钮 —— 编辑态里 [编辑] 是藏起来的, 可见的永远最多两个, 所以不会挤出去。 */
-   g->addWidget(gateBar(GI_HOME, box), 0, 3, 1, 2, Qt::AlignRight);
+   g->addWidget(gateBar(GI_HOME, box), 0, 3, 2, 2, Qt::AlignRight);
    addGate(GI_HOME, box,
-           /* 只有「速度」是参数; 八个按钮是动作, 不进表 (它们不归编辑态管, 归连接态管) */
-           QList<GateItem>{ GateItem{ m_edHomeVel, false, false } });
+           /* 速度与超时是参数; 八个按钮是动作, 不进表 (它们不归编辑态管, 归连接态管) */
+           QList<GateItem>{ GateItem{ m_edHomeVel, false, false },
+                            GateItem{ m_edHomeTmo, false, false } });
 
    /* 一行一根轴: 行首一个轴名 (同上面「轴信号」那块表的行标签), 右边四个按钮。
     * 轴名放在行首而不是按钮文字里 —— 四个按钮挤在一行, 每个再带个 "X " 就排不下了,
@@ -1452,7 +1477,7 @@ QWidget *ScanWindow::buildHomePanel()
    {
       QLabel *nm = new QLabel(QStringLiteral("轴%1").arg(i == 0 ? 'X' : 'Y'), box);
       nm->setStyleSheet(QStringLiteral("color:#9aa3ae;"));
-      g->addWidget(nm, i + 1, 0);
+      g->addWidget(nm, i + 2, 0);   /* i + 2: 上面有「速度」「超时」两行 */
 
       for (int d = 0; d < 2; d++)
       {
@@ -1472,7 +1497,7 @@ QWidget *ScanWindow::buildHomePanel()
             connect(m_btnHome[i][d], &QPushButton::clicked, this,
                      [this, i, d] { onHomeClicked(i, d, false); });
 
-            g->addWidget(m_btnHome[i][d], i + 1, 1 + d);
+            g->addWidget(m_btnHome[i][d], i + 2, 1 + d);
          }
 
          /* ---- 找限位开关 (方式 18 / 17, 手册叫"以限位开关为原点") ----
@@ -1493,7 +1518,7 @@ QWidget *ScanWindow::buildHomePanel()
             connect(m_btnLim[i][d], &QPushButton::clicked, this,
                      [this, i, d] { onHomeClicked(i, d, true); });
 
-            g->addWidget(m_btnLim[i][d], i + 1, 3 + d);
+            g->addWidget(m_btnLim[i][d], i + 2, 3 + d);
          }
       }
    }
@@ -2325,8 +2350,9 @@ void ScanWindow::applyDefaults()
    m_cbDiInvert ->setChecked(pd.npn_sw_invert);
    m_cbShadeAuto->setChecked(pd.shade_auto);   /* 色标自动跟随 ("恢复默认"也回到这一档) */
 
-   /* 回零速度刻意不在这里: 「恢复默认」会把 applyDefaults 再跑一遍, 会把为试回零特意
-    * 压小的速度抬回去。它的缺省设在 buildHomePanel 里, 之后由 loadSettings 覆盖。 */
+   /* 回零速度与回零超时刻意不在这里: 「恢复默认」会把 applyDefaults 再跑一遍, 会把为试回零
+    * 特意压小的速度、或者特意调长的超时抬回去。这两个的缺省设在 buildHomePanel 里,
+    * 之后由 loadSettings 覆盖。 */
 }
 
 /* 记忆: 读回上次的参数 (见 scanprefs.h)。只覆盖 ini 里真有的项, 缺的留在 applyDefaults
@@ -2366,6 +2392,10 @@ void ScanWindow::loadSettings()
     * 没验过的速度 (夹取规则在 ecatcmd::home_vel_from_pref, 被自检钉着) */
    m_edHomeVel->setValue((int)ecatcmd::home_vel_from_pref(pf.home_vel));
 
+   /* 回零超时: 同一套 (-1 = 没记过 → HMI_HOME_TMO_DEF_S; 越界的夹回 [MIN_S, MAX_S])。
+    * **现存的那个 scan.ini 不需要迁移**: 缺这一项就是 -1, 落到 120 s, 正是要的缺省 */
+   m_edHomeTmo->setValue(ecatcmd::home_tmo_s_from_pref(pf.home_tmo_s));
+
    /* 网卡此刻还选不了 (适配器清单是异步到的), 先存着, 到了再选 */
    m_savedNic = pf.nic;
 }
@@ -2382,6 +2412,7 @@ void ScanWindow::saveSettings()
    pf.nic = nic.isEmpty() ? m_savedNic : nic;   /* 清单还没到 / 卡被拔了: 别把记住的抹掉 */
    pf.manual_speed = m_edManSpeed->value();
    pf.home_vel     = m_edHomeVel->value();
+   pf.home_tmo_s   = m_edHomeTmo->value();
    pf.want_dig_in     = m_cbWantDigIn->isChecked();
    pf.npn_write_drive = m_cbNpnWrite->isChecked();
    pf.npn_sw_invert   = m_cbDiInvert->isChecked();
@@ -2684,21 +2715,21 @@ void ScanWindow::onHomeClicked(int axis, int dir, bool find_limit)
    const int      meth = find_limit ? ecatcmd::home_lim_method_for(neg)
                                     : ecatcmd::home_method_for(neg);
    const uint32_t vel  = ecatcmd::home_vel_clamp(m_edHomeVel->value());
+   /* 超时同样夹一道再传 (工作线程里还有一道, 两处读同一对宏 —— 自检里有一对断言钉着这件事) */
+   const int      tmo  = ecatcmd::home_tmo_s_clamp(m_edHomeTmo->value());
    const QString  ax   = (axis == 0) ? QStringLiteral("X") : QStringLiteral("Y");
    /* 动作名: 找限位那两个方式号本身就带方向, 找原点要把方向补进去才分得清 */
    const QString  act  = find_limit
       ? QString::fromUtf8(ecatcmd::home_method_short(meth))
       : QStringLiteral("%1回零").arg(QString::fromUtf8(ecatcmd::home_dir_text(neg)));
 
-   /* 零点世代 +1, 在 postHome 之前且无条件。放 GUI 是因为它无法知道工作线程那道闸是拦还是
-    * 放, 而两个方向的代价不对称: 多发一代最多让续扫多问一次 (无害); 漏发一代则续扫把回零
-    * 前后的两半坐标静默拼在一起 —— 那正是这套机制存在的全部理由。
-    * 所以往保守那边偏: GUI 每次派发都 +1。找限位同样重定义零点 (0 落在开关释放点上),
-    * 所以这里一个字都不用改。 */
-   m_epoch++;
-   m_ctl->setZeroEpoch(m_epoch);
+   /* **这里不再手工推进零点世代**(2026-09-22 改)。回零确实会搬零点, 但"这次到底搬没搬"只有
+    * 工作线程知道: 它那道闸可能把命令拦掉, 命令也可能一直躺在队列里。在 GUI 猜是猜不准的,
+    * 而且猜错的方向不对称 —— 多发一代最多让续扫多问一次, 漏发一代却会把回零前后的坐标静默
+    * 拼在一起。现在世代由工作线程在**真写 m_origin[] 的那三处**维护, 界面在 refresh() 里从
+    * 遥测同步 (只许往前, 见 ecatcmd::origin_epoch_sync)。 */
 
-   m_thr->postHome(axis, meth, vel);
+   m_thr->postHome(axis, meth, vel, tmo);
 
    /* 这一句只在**命令没被那道闸接住**时才留得住 (真开始回零的话, 最多 33ms 之后
     * refresh 就会用"轴X 正在回零…"那条**状态**横幅把它盖掉 —— 那是设计如此)。 */
@@ -2713,15 +2744,14 @@ void ScanWindow::onZeroHereClicked()
       return;
    }
 
-   /* 零点一动, 同一个显示坐标指的就不是同一个物理位置了, 所以世代 +1 (续扫时对不上
-    * 会要求操作员确认, 这一句就是那个确认的依据) */
-   m_epoch++;
-   m_ctl->setZeroEpoch(m_epoch);
+   /* 零点一动, 同一个显示坐标指的就不是同一个物理位置了 —— 世代由工作线程自己 +1, 界面在
+    * refresh() 里从遥测同步 (只许往前)。这里不再手工推, 也不再把那个数报给操作员:
+    * 它现在是异步跟上的, 说一个当场就过期的数不如不说 (§26 已经把世代从界面上拿掉了)。 */
 
    m_thr->postZeroHere(0);
    m_thr->postZeroHere(1);
 
-   hint(QStringLiteral("当前位置已设为显示坐标 0 (= 区域中心), 零点世代 → %1").arg(m_epoch), false);
+   hint(QStringLiteral("当前位置已设为显示坐标 0 (= 区域中心), 断开重连也沿用。"), false);
    m_canvas->update();
 }
 
@@ -2743,7 +2773,7 @@ void ScanWindow::onMeterChanged(int idx)
     * 下拉框本身在 refreshMeterPanel() 里已经灰了, 这里是兜底 (键盘/程序设值也能到这儿) */
    if (m_mlog != nullptr && m_mlog->running())
    {
-      hint(QStringLiteral("连续读数正在跑 —— 先「停止」再换取样源"), false);
+      hint(QStringLiteral("正在连续读数"), false);
       QSignalBlocker b(m_cbMeter);
       m_cbMeter->setCurrentIndex(m_cbMeter->findText(m_meter->kind()));
       return;
@@ -2928,8 +2958,7 @@ void ScanWindow::onReadOnceClicked()
       return;
    if (m_mlog != nullptr && m_mlog->running())
    {
-      hint(QStringLiteral("连续读数正在跑 —— 它那儿已经按间隔一个数一个数地读了, "
-                          "不用再手动读一次"), false);
+      hint(QStringLiteral("正在连续读数"), false);
       return;
    }
 
@@ -2991,7 +3020,7 @@ void ScanWindow::onMtrStartClicked()
 
    if (m_meter == nullptr || !m_meter->isOpen())
    {
-      hint(QStringLiteral("取样源没打开 —— 先在上面选一个能用的"), true);
+      hint(QStringLiteral("取样源未打开"), true);
       return;
    }
 
@@ -3009,8 +3038,8 @@ void ScanWindow::onMtrStartClicked()
          hint(err, true);
          return;
       }
-      hint(QStringLiteral("扫描正在跑 —— 切到跟随: 曲线画扫描采到的那些点, "
-                          "这里不向功率计发请求, 也不写文件 (那份数据在扫描的 CSV 里)"),
+      hint(QStringLiteral("正在扫描 —— 切到跟随: 曲线画扫描采到的那些点, "
+                          "不向功率计发请求, 不写文件 "),
            false);
       refresh();
       return;
@@ -3133,7 +3162,7 @@ void ScanWindow::onMtrExportClicked()
 {
    if (m_mlog == nullptr || m_mlog->count() == 0)
    {
-      hint(QStringLiteral("曲线上还没有点, 没什么可导的"), false);
+      hint(QStringLiteral("没有数据点"), false);
       return;
    }
 
@@ -3170,7 +3199,7 @@ void ScanWindow::onStartClicked()
     * 两个请求撞在同一个源上不报错, 只会让 CSV 悄悄少一个点。 */
    if (m_readPending)
    {
-      hint(QStringLiteral("「读一次」还在等回话 —— 等它回来再开始 (一个源同时只允许一个未决请求)"),
+      hint(QStringLiteral("「读一次」在等回话"),
            true);
       return;
    }
@@ -3251,7 +3280,7 @@ void ScanWindow::onOpenCsvClicked()
    if (m_ctl->resume(f, false, &err, &why))
    {
       m_banner->setVisible(false);
-      hint(QStringLiteral("续扫: 已读回 %1, 补剩下的点").arg(QDir::toNativeSeparators(f)), false);
+      hint(QStringLiteral("续扫: 已读回 %1").arg(QDir::toNativeSeparators(f)), false);
       refresh();
       return;
    }
@@ -3276,7 +3305,7 @@ void ScanWindow::onOpenCsvClicked()
       return;
    }
 
-   hint(QStringLiteral("续扫 (已按「允许零点世代不同」继续): %1\n%2")
+   hint(QStringLiteral("续扫: %1\n%2")
            .arg(QDir::toNativeSeparators(f), mismatch), true);
    refresh();
 }
@@ -3284,7 +3313,7 @@ void ScanWindow::onOpenCsvClicked()
 void ScanWindow::onPauseClicked()
 {
    m_ctl->pause();
-   hint(QStringLiteral("已暂停 —— 目标冻在当前位置, 保持力矩。「继续」会重新走完当前点并重采"), false);
+   hint(QStringLiteral("已暂停 —— 保持力矩。"), false);
    refresh();
 }
 
@@ -3297,7 +3326,7 @@ void ScanWindow::onResumeRunClicked()
 void ScanWindow::onAbortClicked()
 {
    m_ctl->abort(QStringLiteral("操作员按了「中止」"));
-   hint(QStringLiteral("已中止。已采的数据在 %1 里 —— 可以「打开 CSV 续扫」接着跑")
+   hint(QStringLiteral("已中止。已采的数据在 %1 ")
            .arg(QDir::toNativeSeparators(m_ctl->csvPath())), false);
    refresh();
 }
@@ -3521,6 +3550,25 @@ void ScanWindow::refresh()
 
    const BusTelem t = m_thr->telemetry();
 
+   /* 零点世代的唯一同步点 (2026-09-22 改)。工作线程在**真写 m_origin[] 的那三处**各 +1
+    * (第一次取零点 / 回零 / 设为区域中心), 界面只在这里跟一发。
+    *
+    * **只许往前** (ecatcmd::origin_epoch_sync): 倒回去等于给下一次续扫发一张假的"世代对不上"
+    * 红横幅。真会倒的场合只有一个 —— 断开时工作线程把 teardown 跑了, 但那条路必经连接,
+    * 而连接要么沿用(不加世代)要么重取(+1), 所以实测不会倒; 这条规矩是防将来改出来的。
+    *
+    * 为什么不需要再同步别的: 起扫的前提是两轴已使能, 而使能拒绝在零点就绪之前 —— 所以
+    * "第一行 CSV 写在零点定下来之前"不可能发生, CSV 里那一代的坐标永远是那一代自己的。
+    * 回零与「设为区域中心」在运行中都被拒, 跑起来的那一趟零点不会动。 */
+   {
+      const int gen = ecatcmd::origin_epoch_sync(m_epoch, t.origin_gen);
+      if (gen != m_epoch)
+      {
+         m_epoch = gen;
+         m_ctl->setZeroEpoch(m_epoch);
+      }
+   }
+
    /* 按钮形态只看遥测, 不看"点过哪个按钮" —— 后者会与线程的真实状态错开。
     * in_op = 正在发帧 (真连上了), busy = 正在连接或正在收尾; 两者任一为真就是占着总线 */
    const bool onair = t.in_op || t.busy;
@@ -3638,7 +3686,7 @@ void ScanWindow::refresh()
 
          if (t.ax[ai].dig_known &&
              ecatcmd::home_lim_target_active(m, t.ax[ai].dig_pos, t.ax[ai].dig_neg))
-            s += QStringLiteral(" [%1信号此刻有效 —— 碰到它是这一趟的目的, 不是故障]")
+            s += QStringLiteral(" [%1信号有效]")
                     .arg(QString::fromUtf8(ecatcmd::home_lim_switch_name(m)));
       }
       else
@@ -3672,7 +3720,7 @@ void ScanWindow::refresh()
     * 按钮按不动"。没故障时按下去可证无害 (工作线程那道闸会拦住并说明一个字节都没写)。 */
    m_btnFaultRst->setEnabled(m_connected && !running && !t.resetting);
    m_btnFaultRst->setText(t.resetting ? QStringLiteral("正在复位…")
-                                      : QStringLiteral("故障复位"));
+                                      : QStringLiteral("复位"));
 
    /* 高级选项那三个勾的可用性归 refreshEditability(), 它不跟 onair 走 (理由在
     * buildAdvPanel 的注释里)。这里只重申那条**不能回灌勾选状态**的规矩:
@@ -3806,14 +3854,11 @@ void ScanWindow::refresh()
 
 void ScanWindow::setConnected(bool on)
 {
-   /* 连接会把零点重设为当时所在的位置 (tryInitOrigin), 同一个显示坐标可能已经是另一个
-    * 物理位置 —— 世代 +1, 续扫时这一条会被查出来 */
-   if (on && !m_connected)
-   {
-      m_epoch++;
-      m_ctl->setZeroEpoch(m_epoch);
-   }
-
+   /* **这里不再 +1**(2026-09-22 改)。从前"连接会把零点重设为当时所在的位置"(tryInitOrigin
+    * 无条件重取), 所以每次连接都得算换了一代; 现在 scan 开着 setKeepOrigin, 连接**沿用**上次
+    * 那份零点, 显示坐标跨重连连续 —— 连接本身不再动零点, 也就不该推世代。
+    * 真动了零点的那几处 (回零 / 设为区域中心 / 第一次取零点 / 沿用不了只好重取) 由工作线程
+    * 各自 +1, 界面在 refresh() 里同步。 */
    m_connected = on;
    m_nic->setEnabled(!on);
    m_btnNic->setEnabled(!on);
@@ -3849,8 +3894,7 @@ void ScanWindow::showFault(const QString &why)
       m_autoStop = 0;
       QMessageBox::critical(this, QStringLiteral("扫描已自动中止"),
          QStringLiteral("%1\n\n"
-                        "已经采到的数据都在 CSV 里 (%2), 没有丢。\n\n"
-                        "查清原因、把滑台处理妥当之后, 可以「打开 CSV 续扫」接着跑。")
+                        "已经采到的数据都在 CSV 里 (%2)。\n\n")
             .arg(why, QDir::toNativeSeparators(m_ctl->csvPath())));
    });
 }
@@ -3859,17 +3903,16 @@ void ScanWindow::warnMaybeLive()
 {
    QMessageBox::critical(this, QStringLiteral("电机可能仍带电"),
       QStringLiteral(
-         "收尾时未能确认所有轴都失能 (同控制台退出码 10)。\n\n"
-         "立即断开驱动器的动力电源, 不要只依赖软件。\n\n"
-         "常见原因是收尾中途总线掉了 —— 那时驱动器还带着力矩, 已经没有通道去撤它。"));
+         "收尾时未能确认所有轴都失能 (控制台退出码 10)。\n\n"));
 }
 
 /* ---------------------------------------------------------------- 收尾 */
 
 void ScanWindow::disconnectAndStop()
 {
-   /* 回零进行中先掐掉它: 这条断开路径是同步等的 (下面 12 秒), 而回零单次能阻塞到 30 秒 ——
-    * 不掐的话 12 秒空转到底, 最后 QThread 会在 em_home 还在泵帧时被拆掉。
+   /* 回零进行中先掐掉它: 这条断开路径是同步等的 (下面 12 秒), 而回零单次能阻塞到**整个回零
+    * 超时**(缺省 120 s, 上限 600 s) —— 不掐的话 12 秒空转到底, 最后 QThread 会在 em_home 还在
+    * 泵帧时被拆掉。
     * requestMotionStop() 只往一个标志里存 1, 与「停止」按钮直呼的是同一个。
     * 必须先于下面的 postDisconnect: 命令排队, 队列要等回零退出来才轮到。 */
    if (m_thr->isRunning() && m_thr->telemetry().homing)
@@ -3888,12 +3931,21 @@ void ScanWindow::disconnectAndStop()
 
    /* 等它真的收完: 条件是"不在发帧且不在忙", 不是"点过断开" —— teardown 排队执行,
     * 从投递到开跑之间有一小段, 只看 in_op 会在那一段误判成收完了。
-    * 每根轴的失能确认与状态机迁移都有超时, 所以给到 12 秒 */
+    * 每根轴的失能确认与状态机迁移都有超时, 所以给到 12 秒。
+    *
+    * **那一道"先掐掉"有一个窄缝**(2026-09-22 补): 上面判 homing 时 CMD_HOME 可能还在队列里,
+    * 于是 homing 还是 false、标志没置上, 而线程随后要阻塞**整个回零超时**才轮到
+    * postDisconnect —— 超时调到 600 s 时就是在这里卡 10 分钟外加一个"工作线程 15 s 没退出来"
+    * 的模态框。所以在等待循环里补一次: 一旦 homing 真的变真就再掐一下。
+    * 这时 requestMotionStop 落在 doHome 直接写 m_telem.homing = true **之后**, 也就是
+    * em_clear_stop() 之后, 所以不会被清掉。这样这条路的时长就与超时值无关了。 */
    for (int i = 0; i < 600; i++)
    {
       const BusTelem t = m_thr->telemetry();
       if (!t.in_op && !t.busy)
          break;
+      if (t.homing)
+         m_thr->requestMotionStop();   /* 幂等: 只往标志里存 1 */
       QThread::msleep(20);
    }
 

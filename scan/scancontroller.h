@@ -118,8 +118,10 @@ public:
    QString csvPath() const { return m_log.path(); }
    int     csvLines() const { return m_log.written(); }
 
-   /* 零点世代, 由窗口维护 (每次连接 / 每次「设为区域中心」+1)。只进 CSV 表头,
-    * 续扫时对不上就要求操作员确认 —— 连接时零点会被重设为当时所在的位置。 */
+   /* 零点世代: 零点真被搬过一次就 +1。**由工作线程计, 窗口从遥测同步** (只许往前), 这里只收。
+    * 只进 CSV 表头, 续扫时对不上就要求操作员确认。
+    * **连接不再推它** (2026-09-22 改): scan 现在跨重连沿用零点, 连接本身不动零点; 真搬零点的
+    * 是回零 / 「设为区域中心」/ 第一次取零点 / 沿用不了只好重取, 那四处都在工作线程里。 */
    void setZeroEpoch(int epoch) { m_zero_epoch = epoch; }
    int  zeroEpoch() const { return m_zero_epoch; }
 

@@ -97,7 +97,12 @@ std::vector<Point> buildPlan(const Params &p)
 int32_t autoRangePul(const Params &p)
 {
    double half = std::max(p.area_x_unit, p.area_y_unit) / 2.0;
-   double rng_u = half + 1.0;            /* 留 1 单位余量, 便于在区域外手动对位 */
+   /* 两条下限, 取大的那个:
+    *   half + 1.0        —— 区域外留 1 单位余量, 便于在区域外手动对位 (原来唯一的那条);
+    *   kCanvasHalfUnits  —— **画布半宽** (2026-09-22 加)。少了它, 在面板边缘点一下会被
+    *                        setTarget / interpolate 夹回来, 而界面上完全看不出这件事。
+    * ceil 保证结果 ≥ llround(kCanvasHalfUnits * 脉冲当量) —— 正是点击那一路传进去的数。 */
+   double rng_u = std::max(half + 1.0, kCanvasHalfUnits);
    double pul   = rng_u * p.pulses_per_unit;
    if (pul < 1.0)
       return 1;
@@ -140,7 +145,8 @@ bool fitsRange(const Params &p, std::string *why)
          std::snprintf(buf, sizeof(buf),
             "区域超出量程: 最远点 X=%lld / Y=%lld pul, 而量程只有 ±%lld。"
             "超出部分会被静默夹掉 —— 永远扫不到那几条边。"
-            "把区域改小, 或者重新连接 (量程是按连接时的区域参数设的)",
+            "把区域改小 (量程是每次改参数就重算的, 它自己会跟上; 走到这一步说明这个区域"
+            "本身就不该跑)",
             (long long)pulseOf(std::max(std::fabs(xs.front()), std::fabs(xs.back())), p.pulses_per_unit),
             (long long)pulseOf(std::max(std::fabs(ys.front()), std::fabs(ys.back())), p.pulses_per_unit),
             (long long)rng);

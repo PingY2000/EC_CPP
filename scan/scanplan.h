@@ -62,13 +62,32 @@ std::vector<Point> buildPlan(const Params &p);
 int32_t pulseOf(double unit, double pulses_per_unit);
 double  unitOf(int32_t pul,  double pulses_per_unit);
 
-/* 软量程 (脉冲) = 区域半宽 + 1 单位余量; 给 EcatThread::postRange() 用 */
+/* 画布视野的半宽, 单位与 Params 的长度量**同一种** (mm)。
+ *
+ * 它同时是软量程的**下限**(见 autoRangePul), 这是 2026-09-22 特意加上的一条耦合:
+ * 面板上看得见的地方必须点得到。原来只有"区域半宽 + 1 单位"那一条下限, 于是一个 3 mm 的
+ * 区域只放行 ±2.5 mm 的手动定位, 而画布仍然画到 ±16 —— Shift+左键点面板边缘会被
+ * EcatThread::setTarget / interpolate 悄悄夹回来, 界面上完全看不出"我要的是 16, 实际只走到 2.5"。
+ *
+ * 16 而不是 15: 标尺画到 ±15, 多出的 1 单位是边距, 而画布本来就**接受** |x| ≤ 16 的点击
+ * (超出才丢)。取 16 才真的没有够不到的一圈。
+ *
+ * **只有这一份**: mapcanvas.cpp 换算像素、判点击都读它, 不许再抄一个数 —— 两个数"必须一致"
+ * 正是这个文件开头 VEL_MIN/VEL_MAX 那段已经在防的坑。 */
+constexpr double kCanvasHalfUnits = 16.0;
+
+/* 软量程 (脉冲) = max(区域半宽 + 1 单位余量, kCanvasHalfUnits); 给 EcatThread::postRange() 用 */
 int32_t autoRangePul(const Params &p);
 
 /* 到位容差 (脉冲) = 步长/20, 夹在 [50, 步长/4]; 由步长推出, 不暴露给操作员 */
 int32_t posTolPul(const Params &p);
 
-/* 自环: 扫描是否会走出量程之外 (会被 EcatThread 夹掉, 于是永远扫不到边)。 */
+/* 自环: 扫描是否会走出量程之外 (会被 EcatThread 夹掉, 于是永远扫不到边)。
+ *
+ * **2026-09-22 起在界面这条路上它恒为真**: currentParams() 总是把 range_pul 设成
+ * autoRangePul(), 而后者按构造就大于网格最远点。留着它是因为它仍是"有人显式塞了一个
+ * range_pul"时的唯一那道闸 —— 自检里就有这样两处 (显式设 100000 / setRange(1000)),
+ * 那是现在唯一走得到假分支的路径。别删。 */
 bool fitsRange(const Params &p, std::string *why);
 
 /* 几何是否一致 (区域 X/Y、分辨率、每单位脉冲数)。这四项一改, CSV 里的 (ix,iy) 与现在的

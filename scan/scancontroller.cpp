@@ -295,8 +295,9 @@ bool ScanController::armRun(QString *err)
       return fail(err, QStringLiteral("工作计数器不足 (%1/%2) —— 过程数据不完整, 别开始")
                             .arg(t.wkc).arg(t.expected_wkc));
 
-   /* 量程用 telemetry 里的真值, 不用参数算的: 量程是按连接时的参数设进 EcatThread 的,
-    * 之后放大区域就对不上, 最外圈的点会被静默夹掉 */
+   /* 量程用 telemetry 里的**真值**, 不用参数算的 —— 这里防的是"遥测里的量程还没跟上参数"
+    * 那个时间差 (量程是每次参数一变就重投的, 但投过去要等工作线程转一圈), 这个窗口很窄但
+    * 真的存在: 刚把区域放大、立刻按开始, 最外圈的点就会被静默夹掉。 */
    int32_t far = 0;
    for (size_t k = 0; k < m_order.size(); k++)
    {
@@ -308,7 +309,8 @@ bool ScanController::armRun(QString *err)
       return fail(err, QStringLiteral(
          "最远的网格点是 %1 pul, 而当前量程只有 ±%2。\n"
          "超出量程的目标会被静默夹掉 —— 那几条边永远扫不到, 而且不报错。\n"
-         "区域改小一点, 或者断开重连一次 (量程是在连接时按区域参数设的)。")
+         "参数刚改过就按「开始」时可能撞上这个 (量程要等工作线程转一圈才跟上), 等一下再按;\n"
+         "一直是这样的话把区域改小一点。")
          .arg(far).arg(t.range));
 
    m_run_p   = m_p;
@@ -430,15 +432,16 @@ bool ScanController::resume(const QString &csv_path, bool accept_zero_epoch_chan
    if (!diff.empty())
       return fail(why != nullptr ? why : err, fromStd(diff));
 
-   /* 零点世代对不上 = 中间重连过, 不静默继续。比法刻意不对称: 文件里写了世代 (>=0) 且
-    * 与现在不同才拦, 自己这边 -1 也算不同; 没写世代的老文件不拦 */
+   /* 零点世代对不上 = 中间零点被搬过 (回零 / 「设为区域中心」), 不静默继续。比法刻意不对称:
+    * 文件里写了世代 (>=0) 且与现在不同才拦, 自己这边 -1 也算不同; 没写世代的老文件不拦。
+    * **连接不算搬零点**了 (2026-09-22 起 scan 跨重连沿用零点), 所以那句报错里不再提连接。 */
    if (csv_epoch >= 0 && csv_epoch != m_zero_epoch && !accept_zero_epoch_change)
    {
       return fail(why != nullptr ? why : err,
          QStringLiteral(
             "这个 CSV 是在另一次零点下采的 (文件里是第 %1 次, 现在是第 %2 次)。\n\n"
-            "连接与回零都会把零点搬走 —— 之后同一个坐标指的可能已是另一个物理位置,\n"
-            "接着扫会把两份拼在一张图上, 而看不出异常。\n\n"
+            "回零与「设为区域中心」都会把零点搬走 (连接不会) —— 之后同一个坐标指的可能\n"
+            "已是另一个物理位置, 接着扫会把两份拼在一张图上, 而看不出异常。\n\n"
             "先确认滑台现在的位置与上次零点确立时是同一个物理位置 (同一个机械靠块 /\n"
             "对位标记), 再选「继续」。\n\n"
             "文件: %3 (开始于 %4)")
