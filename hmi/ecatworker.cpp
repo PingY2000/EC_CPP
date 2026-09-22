@@ -256,7 +256,12 @@ void EcatThread::run()
       {
          /* 故障码 603Fh: publish() 只挂牌子, SDO 读在这里做 (见 serviceFaultCodeReads)。
           * 摆在插补之前 —— 牌子是上一圈 publish() 挂的, 而"故障"这件事比"这一帧的目标"
-          * 更急。这一趟读到之前, 界面看到的 fault_code 是 UNREAD, 它自己会说"正在读" */
+          * 更急。这一趟读到之前, 界面看到的 fault_code 是 UNREAD, 它自己会说"正在读"。
+          *
+          * **刻意不套 BlockTick** (曾经套过, 2026-09-22 撤掉): 它的 tick 只在 em__cycle
+          * 收完一帧时被调, 而 SDO 事务期间**一帧都不发** —— 那个钩子一次都不会响, 套了等于
+          * 没套, 却让人以为这块有保护。真正管这件事的是 serviceFaultCodeReads 里那三条
+          * (映射里有码就不发 / 短超时 60ms / 帧不健康就不发), 见头文件 HMI_OP_SDO_TMO_US。 */
          serviceFaultCodeReads();
 
          qint64 now = clk.elapsed();
@@ -270,7 +275,25 @@ void EcatThread::run()
          if (m_origin_ready)
             interpolate(dt);
 
+         /* 发帧前后各取一次表: 相邻两次的间隔就是"多久没发过帧"。
+          * 它把上面那条 SDO、被阻塞的命令、以及本机的调度延迟**全都算进去** ——
+          * 这正是要量的东西 (见 BusTelem::max_gap_ms) */
+         const qint64 svc_t0 = clk.elapsed();
+
          int wkc = em_service(m_bus);   /* 每周期都要发帧: 断了驱动器会掉出 OP */
+
+         const qint64 svc_t1 = clk.elapsed();
+
+         if (m_svc_prev_ms >= 0)
+         {
+            const qint64 gap = svc_t0 - m_svc_prev_ms;
+
+            if (gap > m_max_gap_ms)
+               m_max_gap_ms = (int)gap;
+            if (gap > HMI_GAP_WARN_MS)
+               m_gaps_over++;
+         }
+         m_svc_prev_ms = svc_t1;
 
          if (!m_origin_ready)
             tryInitOrigin();
@@ -280,6 +303,7 @@ void EcatThread::run()
       else
       {
          last = clk.elapsed();
+         m_svc_prev_ms = -1;   /* 没在发帧, 别把"连接前的空档"算成一个帧间隔 */
 
          /* 没进 OP 也要刷遥测: 界面的按钮形态从遥测推出来, 而连接期不发帧 */
          publish(0);
@@ -452,6 +476,22 @@ void EcatThread::doConnectInner(const QString &ifname)
       em_require_dig_in(m_bus, m_want_dig_in ? 1 : 0);
    }
 
+   /* 603Fh 也在 setup 之前设, 但**默认就是开**(em_bus_new 里置的), 这里只是把话说出来。
+    * 刻意不做成一个新的设置项: 它是一个只读监视量 (与 60FDh 同类), 而这一轮要修的正是
+    * "上位机对驱动器报警只有一扇窗" —— 再加一个默认关的开关等于把同一件事再关上一次。
+    * 控制台会打出它到底补上没有 (em_setup 里那段) */
+   em_require_err_code(m_bus, 1);
+
+   /* 这一趟的帧间隔统计从这里重新开始 (上一个连接的数不该混进来) */
+   m_svc_prev_ms = -1;
+   m_max_gap_ms  = 0;
+   m_gaps_over   = 0;
+   m_bad_wkc_run = 0;
+   m_comm_bad    = false;
+   m_al_state    = 0;
+   m_al_code     = 0;
+   m_al_checked  = false;
+
    if (em_setup(m_bus, cfg, n, /*allow_remap=*/1) != 0)
    {
       note(QStringLiteral("em_setup 失败 —— 上面有具体原因 (缺映射 / 偏移证不出来 / "
@@ -520,6 +560,16 @@ void EcatThread::doConnectInner(const QString &ifname)
    }
 
    m_in_op = true;
+
+   /* ---- 从这里往下, 每一条 SDO 读都在**停过程数据** ----
+    * SOEM 的 SDO 事务期间一帧过程数据都不发 (ecx_SDOread 走邮箱轮询, 见 public 头
+    * em_sdo_read 那段说明), 所以"超时"就是"这次读最多把总线静默多久"。默认 700ms 是
+    * 配置期的值; 进了 OP 就该压到正常应答的几倍 —— 否则驱动器刚报警、最可能不应答的那一刻
+    * 上位机正好静默它 700ms, 自己把看门狗喂掉一次 (2026-09-22 实机量到一次 1638ms 的静默,
+    * 就是两根轴各 700ms)。下面 readModeDisp (6061h) 与那三个同步对象都走这条超时。
+    * 配置期 (em_setup / 写映射 / 使能之前那些读) 不受影响 —— 那时没有过程数据可静默。 */
+   em_set_sdo_timeout(m_bus, HMI_OP_SDO_TMO_US);
+
    m_naxis = em_axis_count(m_bus);
    for (int i = 0; i < m_naxis; i++)
       m_ax[i] = em_axis(m_bus, i);
@@ -529,6 +579,49 @@ void EcatThread::doConnectInner(const QString &ifname)
    /* 刚进 OP 时读一次 6061h —— 读到的是驱动器上电后自己认的模式 */
    for (int i = 0; i < m_naxis; i++)
       readModeDisp(i);
+
+   /* ---- 只读报一次"同步方式"相关的三个对象 ----
+    * 为什么值得查: 本程序**不上 DC** (上面 em_enter_op 的 use_dc=0), 而驱动器那边
+    * 2217h「同步帧阈值」= 20 是手册里的一行字 —— **从没在真机上读过**。如果它被配成等
+    * SYNC0, 那个计数就是按时钟自己走的, 与上位机在干什么无关, 于是
+    * 「挂着没动也报通讯报警」「要断电/按故障复位才清」两件事同时对上。
+    * 1C32h:01 才是作数的那个数: 0 自由运行 / 1 SM 同步 / 2 DC 同步。
+    * **一个字节都不写**, 只报; 这一轮不加开 DC 的开关。
+    * 只读轴 0 —— 同一台机器上驱动器型号与配置相同, 三根轴读三遍是三次往返换一个重复的答案。 */
+   if (m_naxis > 0 && m_ax[0] != nullptr)
+   {
+      static const struct
+      {
+         uint16_t    idx;
+         uint8_t     sub;
+         const char *name;
+      } kSync[] = {
+         { 0x1C32, 0x01, "1C32h:01 同步方式 (0 自由运行 / 1 SM 同步 / 2 DC 同步)" },
+         { 0x1C32, 0x02, "1C32h:02 同步周期 (ns)" },
+         { 0x2217, 0x00, "2217h    同步帧阈值 (手册 V2.4 p84 附近)" },
+      };
+      const int slave = em_axis_slave(m_ax[0]);
+
+      for (int k = 0; k < (int)(sizeof(kSync) / sizeof(kSync[0])); k++)
+      {
+         uint32_t v  = 0;
+         int      sz = 0;
+
+         if (em_rd_any(m_bus, slave, kSync[k].idx, kSync[k].sub, &v, &sz) == 0)
+            consoleNote(QStringLiteral("同步: %1 = %2 (0x%3, %4 字节)")
+                           .arg(QString::fromUtf8(kSync[k].name))
+                           .arg(v)
+                           .arg(v, 0, 16)
+                           .arg(sz));
+         else
+            consoleNote(QStringLiteral("同步: %1 读不到 (驱动器不支持这个对象?)")
+                           .arg(QString::fromUtf8(kSync[k].name)));
+      }
+
+      consoleNote(QStringLiteral(
+         "同步: 本程序不上 DC (SM 同步 / 自由运行)。上面 1C32h:01 若报 2, "
+         "说明驱动器在等 SYNC0 —— 那类报警与上位机发不发帧无关, 需要另配驱动器"));
+   }
 
    {
       QMutexLocker lk(&m_mtx);
@@ -934,12 +1027,26 @@ void EcatThread::readModeDisp(int axis)
  * 通讯/传感器在界面上长得一模一样, 而处置办法完全不同, 所以必须把 603Fh 读出来。
  *
  * 分工: publish() 每帧扫 bit3, 看见某个轴报故障就给它挂一块牌子 (m_fault_read_want);
- * 真正那条 SDO 读在**这里**做 —— publish() 是每帧跑的, 里面不许有 SDO (一条 603Fh 的
- * SDO 读就是几毫秒, 挂在 2ms 的圈里等于把圈期交给 SDO 的往返时间, 插补会抖)。
+ * 真正那条 SDO 读在**这里**做 —— publish() 是每帧跑的, 里面不许有 SDO。
+ *
+ * ⚠️ 这条 SDO 的代价**不是"几毫秒"**(2026-09-22 更正; 原来这里就是这么写的, 写错了):
+ * SOEM 的 SDO 事务期间**完全不发过程数据帧** —— ecx_SDOread 走 ecx_mbxreceive
+ * (SOEM/src/ec_coe.c:117 -> ec_main.c:1600), 那里只有邮箱轮询 + osal_usleep, 超时是
+ * EC_TIMEOUTRXM = 700ms。所以它不是"让圈期变长", 是**把圈停掉**; 驱动器不应答时尤其糟,
+ * 而"驱动器不应答"正是它刚报警时的常态。
+ *
+ * **2026-09-22 实机复现了这条推论**: 界面报 `最长 1638ms 没发出一帧`, 正好是这条 SDO 在
+ * 两根轴上各自超时 700ms (加邮箱发送上限)。也就是说驱动器报警之后, 上位机自己又把它
+ * 按了一次 —— 这就是「隔一阵子就通讯报警」里"上位机"那一半的成因。为此三条措施:
+ *   ① 603Fh 进 TxPDO 之后**根本不发这条 SDO** (publish() 每帧就有码, 见 run()/doConnectInner);
+ *   ② 真要发时用短超时 HMI_OP_SDO_TMO_US (60ms), 不是 700ms;
+ *   ③ **过程数据帧不健康时一条 SDO 都不发** —— 牌子留着, 帧回来了再说。
+ * 曾经以为"调用点套 BlockTick 就行", 那是错的: BlockTick 的 tick 只在 em__cycle 收完
+ * 一帧时被调, 而 SDO 事务期间**根本没有帧**, 那个钩子一次都不会响。
  *
  * **一个故障回合只读一次**: 读到就存值, 读不到就存 FAIL, 然后摘牌。故障每 2ms 重挂一次
- * 的话就成了每 2ms 一条 SDO —— 驱动器不应答时尤其糟 (要等 SDO 超时)。bit3 掉了之后
- * publish() 会把 m_fault_code 置回 UNREAD, 于是下一次故障会重新读。
+ * 的话就成了每 2ms 一条 SDO。bit3 掉了之后 publish() 会把 m_fault_code 置回 UNREAD,
+ * 于是下一次故障会重新读。
  *
  * **安全性**: 走到这里 bit3 已经是 1, 驱动器自己早就退电了, 没有运动需要维持; 这一条读
  * 与 doConnect/doEnable 里的那些 SDO 读同序 (同一根从站、同一个邮箱通道, 只有本线程用)。
@@ -958,12 +1065,41 @@ void EcatThread::serviceFaultCodeReads()
          continue;
       }
 
+      /* 闸门是**静态**的"603Fh 在不在生效映射里" —— **不能用 em_err_code_known**:
+       * 那个还要 mirror_ok, 而链路一坏 mirror_ok 就降 0, 于是这个闸门正好在**最不该
+       * 发 SDO** 的一刻打开 (上面 1638ms 那一次就是这么来的)。映射里就有码 -> 每帧
+       * 已经拿到, 一个字节都不必发; 牌子照摘, 留着下一圈还得再走到这里判一次 */
+      if (em_err_code_offset(m_ax[i]) >= 0)
+      {
+         m_fault_read_want[i] = false;
+         continue;
+      }
+
+      /* ③ 帧已经不健康: **一条 SDO 都不发**, 牌子留着 (帧回来了下一圈再走)。
+       * 读不到的可能性最高的时候正是静默最伤的时候 —— 驱动器那边多半已经在报通讯
+       * 报警, 再静默几十上百毫秒就是把它按实。宁可拿不到码: 界面那句"还没读到"配着
+       * 「通讯」灯与横幅, 已经说清楚发生了什么。 */
+      if (em_mirror_ok(m_ax[i]) == 0 || m_bad_wkc_run > 0)
+         continue;
+
       /* 牌子摘掉再读: 无论成败都只试一次 (理由见上面"一个回合只读一次") */
       m_fault_read_want[i] = false;
 
+      /* ② 短超时 —— 这条 SDO 阻塞多久 = 过程数据被静默多久。超时是**进 OP 时**统一压短的
+       * (见 doConnectInner 里的 em_set_sdo_timeout), 这里把耗时量出来打到控制台:
+       * 那个数就是"这一下把总线静默了多久", 下一次实跑的证据 */
       uint16_t v = 0;
 
-      if (em_rd_u16(m_bus, em_axis_slave(m_ax[i]), EM_OID_ERROR_CODE, 0, &v) == 0)
+      QElapsedTimer t;
+      t.start();
+      const int rc   = em_rd_u16(m_bus, em_axis_slave(m_ax[i]), EM_OID_ERROR_CODE, 0, &v);
+      const qint64 took = t.elapsed();
+
+      consoleNote(QStringLiteral("[603Fh] 轴%1 回退 SDO (映射里没有) 耗时 %2 ms -> %3")
+                      .arg(i).arg(took)
+                      .arg(rc == 0 ? QStringLiteral("拿到码") : QStringLiteral("失败")));
+
+      if (rc == 0)
       {
          m_fault_code[i] = (int)v;
          note(ecatcmd::fault_code_line(i, (int)v));
@@ -1256,12 +1392,23 @@ void EcatThread::publish(int wkc)
       /* 只是搬一份**上次读到**的 6061h —— 这里不做 SDO 读 */
       a.mode_disp = m_mode_disp[i];
       a.frames    = em_mirror_frames(ax);
+      a.bad_frames = em_bad_frames(ax);
       a.sw        = em_sw(ax);
       a.state     = QString::fromUtf8(em_sw_state_str(a.sw));
       a.enabled   = em_is_enabled(ax) != 0;
       a.fault     = (a.sw & EM_SW_FAULT) != 0;
-      /* 只是搬一份**上次读到**的 603Fh —— 这里不做 SDO 读 (理由见 serviceFaultCodeReads) */
-      a.fault_code = m_fault_code[i];
+      /* 603Fh: **两条路挑哪一条只由 err_code_from() 一处决定** ——
+       * ① 在生效 TxPDO 里 (默认就是) -> em_err_code() 那一帧的读数, 与 bit3 同帧;
+       * ② 不在 -> 搬 m_fault_code[i] (SDO 那条路读到的"上次值"), 且只在 bit3 立着时作数。
+       * 这里都不做 SDO 读 (理由见 serviceFaultCodeReads)。
+       *
+       * err_code_mapped 问的是**静态**的"映射里有没有" (em_err_code_offset), **不是**
+       * em_err_code_known —— 后者还要求 mirror_ok, 链路一断就变 false, 于是同一件事
+       * 在界面上会从"0x0000 无错误"翻成"读不到", 而下面挂不挂牌子也跟着翻:
+       * 那正是 1638ms 静默那次的成因 (牌子在最不该发 SDO 的一刻挂上)。 */
+      a.err_code_mapped = em_err_code_offset(ax) >= 0;
+      a.fault_code = ecatcmd::err_code_from(a.err_code_mapped, em_err_code(ax),
+                                           m_fault_code[i], a.fault);
       a.pos       = em_pos(ax) - m_origin[i];
       a.tgt       = m_tgt[i];
       a.want      = want[i];
@@ -1289,25 +1436,85 @@ void EcatThread::publish(int wkc)
       a.limit_active = ecatcmd::limit_hit(a.sw, a.dig_known, a.dig_pos, a.dig_neg,
                                           di_invert);
 
-      if (a.fault)
-      {
+      /* 报警 (含只有码、bit3 没立起来的那一种)。**冻结目标与红横幅都走这一个判据** ——
+       * 只看 a.fault 的话, 一个不置 bit3 的报警在界面上仍然不存在 */
+      if (ecatcmd::axis_alarm(a.fault, a.fault_code))
          t.fault = true;
 
-         /* 挂"还欠它一次 603Fh 读"的牌子。**一挂一次**: 读到之后
-          * serviceFaultCodeReads 会把牌子摘掉、把值写进 m_fault_code, 于是这里不再挂 ——
-          * 牌子挂着的意思永远是"还没读到", 不会退化成每 2ms 一条 SDO。 */
-         if (m_fault_code[i] == HMI_FAULT_CODE_UNREAD)
+      if (a.fault)
+      {
+         /* 挂"还欠它一次 603Fh 读"的牌子。**只有不在过程数据里时才挂**: 在的话上面已经
+          * 每帧读到码了, 再挂就是每圈白跑一趟 serviceFaultCodeReads。**一挂一次**:
+          * 摘牌由那次读负责, 牌子挂着的意思永远是"还没读到", 不会退化成每 2ms 一条 SDO。
+          *
+          * 判据是**静态**的 err_code_mapped (§ 上面那一段): 用 em_err_code_known 的话,
+          * 链路一坏这个条件就成真 —— 恰好在最不该发 SDO 的一刻把牌子挂上。 */
+         if (!a.err_code_mapped && m_fault_code[i] == HMI_FAULT_CODE_UNREAD)
             m_fault_read_want[i] = true;
       }
       else
       {
-         /* 故障没了就把码也放下 (下一次故障重新读)。**留着旧的才是坑**: 一根健康的轴旁边
-          * 挂着一句 "0xFF02 (过压)" 等于在说它现在过压。要留痕看控制台 —— note() 那条在
-          * 那儿, 不会被这里擦掉。 */
+         /* 故障没了就把 SDO 那条路的码也放下 (下一次故障重新读)。**留着旧的才是坑**:
+          * 一根健康的轴旁边挂着一句 "0xFF02 (过压)" 等于在说它现在过压。
+          * 要留痕看控制台 —— note() 那条在那儿, 不会被这里擦掉。 */
          m_fault_code[i]       = HMI_FAULT_CODE_UNREAD;
          m_fault_read_want[i]  = false;
       }
    }
+
+   /* ---- (B) 帧够不够: 计数在工作线程里, 判据在 ecatcmd::comm_bad_from 一处 ----
+    * 只在**进了 OP** 时才数: 连接期 publish(0) 与 not-in-op 那一支的 wkc 恒为 0,
+    * 拿它当"不足帧"会把每次连接都记成一串坏帧。 */
+   if (m_in_op && t.expected_wkc > 0 && wkc < t.expected_wkc)
+      m_bad_wkc_run++;
+   else
+      m_bad_wkc_run = 0;
+
+   t.bad_wkc_run  = m_bad_wkc_run;
+   t.comm_bad     = ecatcmd::comm_bad_from(wkc, t.expected_wkc, m_bad_wkc_run,
+                                           HMI_BAD_WKC_LIMIT);
+   t.max_gap_ms   = m_max_gap_ms;
+   t.gaps_over_ms = m_gaps_over;
+   t.al_state     = m_al_state;
+   t.al_code      = m_al_code;
+   t.al_checked   = m_al_checked;
+
+   if (t.comm_bad && !m_comm_bad)
+   {
+      /* **上升沿这一次**才读 AL 状态: em_al_status 内部是 ecx_readstate (BRD 广播读,
+       * 不走邮箱), 一次往返 —— 但它也是额外流量, 健康时不发才是对的。
+       * 这里在写锁外, 与 doConnect 里那些 SDO 读同序 (只有本线程用邮箱通道)。 */
+      int st = 0, alcode = 0, slave = 1;
+
+      if (m_ax[0] != nullptr)
+         slave = em_axis_slave(m_ax[0]);
+
+      m_al_state   = 0;
+      m_al_code    = 0;
+      m_al_checked = false;
+
+      if (m_bus != nullptr && em_al_status(m_bus, slave, &st, &alcode) == 0)
+      {
+         m_al_state   = st;
+         m_al_code    = alcode;
+         m_al_checked = true;
+      }
+
+      /* note 是**覆盖写**, 会顶掉先前那条 —— 与 fault_code_line 同一个用法。
+       * 措辞走 (B) 家族: 这条讲的是"我这边的帧不够", 不是驱动器自报的 0xFF06。 */
+      QString s = QStringLiteral("过程数据帧连续 %1 帧不足 (工作计数器 %2/%3) —— "
+                                 "位置与状态是陈值, 目标已冻结。")
+                     .arg(m_bad_wkc_run).arg(wkc).arg(t.expected_wkc);
+
+      if (m_al_checked)
+         s += QStringLiteral("  ") + ecatcmd::al_code_text(m_al_state, m_al_code)
+              + QStringLiteral("。");
+
+      s += QStringLiteral(" 本程序最长 %1 ms 没发出一帧。")
+              .arg(m_max_gap_ms);
+      note(s);
+   }
+   m_comm_bad = t.comm_bad;
 
    if (t.fault && !m_fault_latched)
    {
@@ -1318,9 +1525,9 @@ void EcatThread::publish(int wkc)
             m_want[i] = m_tgt[i];
       }
       /* 不写 0x0000: 故障时驱动器自己会退电, 这里只停止下发新目标。
-       * 这一句只是"先占住状态栏" —— 603Fh 的码要下一圈才读得回来, 读到后
+       * 这一句只是"先占住状态栏" —— 码要是走 SDO 那条路, 得下一圈才读得回来, 读到后
        * serviceFaultCodeReads 会用带码的那一句把它顶掉 (note 是覆盖写)。 */
-      note(QStringLiteral("6041h bit3 = Fault → 已冻结目标。故障码 603Fh 正在读 —— "
+      note(QStringLiteral("驱动器自报故障 (6041h bit3 或 603Fh) → 已冻结目标。"
                           "码出来按码处置, 再用「故障复位」清故障位"));
    }
    else if (!t.fault)

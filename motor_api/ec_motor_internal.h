@@ -53,19 +53,32 @@ struct em_axis
    int off_act_pos;     /* 6064h 实际位置 (TxPDO) */
    int off_act_vel;     /* 606Ch 实际速度 (TxPDO) */
 
-   /* 60FDh 数字输入 (TxPDO)。只绑不补: 在生效映射里才用, 否则 -1。
+   /* 60FDh 数字输入 (TxPDO)。默认只绑不补: 在生效映射里才用, 否则 -1。
     * 本机实测生效的 1A00h 只有 6041h/6064h/606Ch 三项 10 字节, 没有 60FDh */
    int      off_dig_in;
    uint32_t dig_in;     /* 最新一帧完整过程数据里的 60FDh */
+
+   /* 603Fh 驱动器故障码 (TxPDO)。与 off_dig_in 同一套, 区别是**默认就要求补进去**
+    * (em_require_err_code, 由上位机在 setup 之前打开): 6041h bit3 只说"有故障",
+    * 说不了是哪一个, 而把它放进过程数据之后报警码与 bit3 落在**同一帧**里 ——
+    * 不必等一条 SDO(那条 SDO 会把过程数据整个停掉, 见 em_sdo_read 上面那段)。
+    * -1 = 不在生效映射里, 此时上位机只能退回 SDO 读。 */
+   int      off_err_code;
+   uint16_t err_code;   /* 最新一帧完整过程数据里的 603Fh */
 
    /* 最新一帧完整过程数据里的采样 */
    uint16_t sw;
    int32_t  pos;
    int32_t  vel;
-   int      mirror_ok;  /* 是否收到过至少一帧完整的过程数据 */
+   int      mirror_ok;  /* **现在**还有完整帧 (连续短帧到 EM_SHORT_FRAMES_LIMIT 就降 0) */
    uint32_t frames;     /* 收到过多少个完整帧 */
 
-   uint32_t short_frames;  /* 连续短帧计数 (判"过程数据未落地") */
+   uint32_t short_frames;  /* **连续**短帧计数; 收到一帧完整的就归零 */
+
+   /* 只增不减: 只要在整帧里见过一次 bit2 (Operation enabled) 就置 1, 之后永不清。
+    * em_shutdown() 靠它决定"要不要试写 6040h=0x0000" —— 那一步**不能**问 mirror_ok:
+    * 链路一断 mirror_ok 就降 0, 而"链路断了"恰恰是最需要试一把的时候 (见该函数注释)。 */
+   int      ever_enabled;
 
    int32_t  csp_target;    /* CSP 插值目标的当前值 */
 
@@ -107,9 +120,23 @@ struct em_bus
     * 连接期参数, 必须由 em_require_dig_in() 在 em_setup 之前设 */
    int want_dig_in;
 
+   /* 是否主动把 603Fh 追加进 TxPDO; **默认 1** —— 与 want_dig_in 相反。
+    * 6041h bit3 只说"有故障"、说不了是哪一个, 603Fh 才是那个"哪一个";
+    * 放在过程数据里它就与 bit3 同帧到达, 不必等 SDO(那条 SDO 会把过程数据停掉)。
+    * 连接期参数, 必须由 em_require_err_code() 在 em_setup 之前设 */
+   int want_err_code;
+
    /* 是否授权改驱动器参数 (目前只有 2300h); 默认 0 = 一个字节都不写。
     * 与 want_dig_in 分开两道门: 改 PDO 映射是通信配置 (掉电即回), 改参数是驱动器行为 */
    int allow_param;
+
+   /* 所有 SDO 读的超时 (微秒)。**它不只是"等多久算失败"**: 一条 SDO 事务期间过程数据帧
+    * 一帧都不发 (SOEM 的 SDO 走邮箱轮询, 见 em_sdo_read 的说明), 所以它就是"这次读最多把
+    * 总线静默多久"。默认 EC_TIMEOUTRXM (700ms) 适合还没进 OP 的配置期 (那时没有过程数据,
+    * 等久一点反而更容易读到); 进了 OP 之后必须由调用方用 em_set_sdo_timeout 压短 ——
+    * 静默够长就会被驱动器看门狗抓住 (AL 0x001B), 而那正是我们要避免的事。
+    * 连接期默认值由 em_bus_new 给, 所以每次连接都从 700ms 重新开始。 */
+   int sdo_tmo_us;
 
    /* 2300h 快照, 下标 = 轴序号。sz 是驱动器自报的宽度 —— 手册 V2.4 p84 写 U16, 而当时那份
     * 现场基线表把它记成 U8 (那份表与记它的工具 2026-09-21 一起从仓库移除了), 两处对不上,

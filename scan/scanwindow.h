@@ -427,6 +427,11 @@ private:
    bool m_limShown[2] = {false, false};   /* 限位横幅的上升沿防重入, 一根轴一个 */
    /* 我们发出去的那条限位横幅原文。下降沿靠它认现在挂着的是不是我们自己那条: 是才清, 不是不能动 */
    QString m_limBanner[2];
+   /* 「通讯」红横幅 (t.comm_bad)。**总线级, 不是一根轴一个** —— 帧不够是整条总线的事,
+    * 所以不像限位那样按轴存两份。与限位同一套做法: 上升沿弹一次 (不自动消失),
+    * 下降沿按原文比对撤掉自己那一条 */
+   bool    m_commShown = false;
+   QString m_commBanner;
    bool m_warnedLive = false;
    int  m_autoStop   = 0;     /* 自动中止弹窗的防重入 */
    QString m_last_dir;

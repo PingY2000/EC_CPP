@@ -339,8 +339,11 @@ void MainWindow::refresh()
       m_faultShown = true;
       hint(ecatcmd::fault_banner_text(t) + QStringLiteral("  查清原因再「失能」重来"), true);
 
+      /* 判据用 axis_alarm 与 fault_banner_text 一致: bit3 **或** 603Fh 非 0 ——
+       * 通讯报警 (0xFF06) 不保证把 bit3 立起来 */
       for (int i = 0; i < 2; i++)
-         if (t.ax[i].valid && t.ax[i].mirror_ok && t.ax[i].fault)
+         if (t.ax[i].valid && t.ax[i].mirror_ok
+             && ecatcmd::axis_alarm(t.ax[i].fault, t.ax[i].fault_code))
             m_faultCodeShown[i] = t.ax[i].fault_code;
    }
    else if (!t.fault)
@@ -358,7 +361,8 @@ void MainWindow::refresh()
       {
          const AxisTelem &a = t.ax[i];
 
-         if (!m_connected || !a.valid || !a.mirror_ok || !a.fault)
+         if (!m_connected || !a.valid || !a.mirror_ok
+             || !ecatcmd::axis_alarm(a.fault, a.fault_code))
             continue;
          if (a.fault_code == m_faultCodeShown[i])
             continue;

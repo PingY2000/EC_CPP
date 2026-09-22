@@ -340,11 +340,13 @@ void AxisPanel::refresh(const AxisTelem &t)
 
    /* 走没走完用下发目标判: CSP 下驱动器没有"到位"信号可等 */
    QString st = t.state;
-   if (t.fault)
-      /* 6041h bit3 只说"有故障", **是哪一种看 603Fh** (过流/过压/欠压/动力线/通讯/传感器
-       * 的处置办法完全不搭界)。它是 SDO 读的, 所以故障沿那一拍还没到 —— 那两种情况
-       * fault_code_text 自己会说清 ("还没读到" / "读不到"), 不会编一个码出来 */
-      st = QStringLiteral("故障: ") + st + QStringLiteral(" · 故障码 ")
+   /* 判据用 alarm (6041h bit3 **或** 603Fh 读到非 0 的码), 不是只用 bit3:
+    * 通讯报警 (0xFF06) 不保证把 bit3 立起来, 只判 bit3 会让那种故障在这行字上不出现。
+    * 是哪一种看 603Fh (过流/过压/欠压/动力线/通讯/传感器的处置办法完全不搭界) ——
+    * 现在它多半就在过程数据里, 与 bit3 同帧到达; 退回 SDO 读的那条路会晚一拍,
+    * 那两种情况 fault_code_text 自己会说清 ("还没读到" / "读不到"), 不会编一个码出来 */
+   if (ecatcmd::axis_alarm(t.fault, t.fault_code))
+      st = QStringLiteral("报警: ") + st + QStringLiteral(" · 故障码 ")
              + ecatcmd::fault_code_text(t.fault_code);
    else if (t.enabled && !t.at_target)
       st += QStringLiteral(" · 运动中");
@@ -352,5 +354,9 @@ void AxisPanel::refresh(const AxisTelem &t)
       st += QStringLiteral(" · 已到位");
    m_lState->setText(st);
 
-   m_lBus->setText(QStringLiteral("帧 %1").arg(t.frames));
+   /* 帧数与丢帧数摆在一格: 单看"帧 12345"看不出链路出过事, 而丢帧数只在非 0 时才值得说
+    * (它是**当前这段连续短帧**的数, 收到一帧完整的就归零 —— 常态是 0) */
+   m_lBus->setText(t.bad_frames > 0
+                      ? QStringLiteral("帧 %1 · 丢 %2").arg(t.frames).arg(t.bad_frames)
+                      : QStringLiteral("帧 %1").arg(t.frames));
 }

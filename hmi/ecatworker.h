@@ -62,9 +62,9 @@
 struct AxisTelem
 {
    bool     valid     = false;
-   bool     mirror_ok = false;   /* 收到过完整帧 (否则下面的 sw/pos 是陈值) */
+   bool     mirror_ok = false;   /* **现在**还有完整帧 (否则下面的 sw/pos 是陈值) */
    bool     enabled   = false;   /* 6041h bit2 = 电机带电 */
-   bool     fault     = false;   /* 6041h bit3 */
+   bool     fault     = false;   /* 6041h bit3 —— **只这一个**, 「故障复位」挑轴就靠它 */
    bool     at_target = false;   /* 插值目标已到 want */
    int32_t  pos       = 0;       /* 6064h - origin */
    int32_t  want      = 0;       /* 点击给出的目标 */
@@ -72,6 +72,9 @@ struct AxisTelem
    uint32_t vel       = HMI_VEL_DEF;
    uint16_t sw        = 0;
    uint32_t frames    = 0;
+   /* 当前这段**连续**短帧有几帧 (收到一帧完整的就归零)。只在非 0 时值得显示:
+    * 它是"链路正在丢帧"的即时量, 与 frames 那个只增的累计数不是一回事 */
+   uint32_t bad_frames = 0;
    QString  state;               /* em_sw_state_str(sw) 的中文名 */
 
    /* ---- 60FDh 三个开关 (原点 / 正限位 / 负限位) ----
@@ -94,11 +97,18 @@ struct AxisTelem
     * 0x0000 无错误 / 0xFF01 过流 / 0xFF02 过压 / 0xFF03 欠压 / 0xFF04 动力线报警 /
     * 0xFF06 通讯报警 / 0xFF08 传感器告警 (手册 §报警)。
     *
-    * 与 mode_disp 同一个道理: 603Fh 不在生效的 TxPDO 映射里 (本机只有 6041h/6064h/606Ch,
-    * 60FDh 是可选的第四项), 只能 SDO 读, 而 publish() 不许做 SDO —— 于是它是**故障沿之后
-    * 才到**的一份数据, 三个取值: 上面那两个哨兵, 或 0..0xFFFF 的实测值。
-    * 只对**报故障的那一根**读; 故障清掉后置回 UNREAD, 于是下一次故障会重新读。 */
+    * 两个来源, 挑哪一个由 ecatcmd::err_code_from() **一处**决定:
+    *   ① 603Fh 在生效 TxPDO 里 -> 每帧与 bit3 同帧到达 (em_require_err_code 默认就要求补);
+    *   ② 不在映射里 -> 只能 SDO 读, 而那条路**故障沿之后才走**(publish() 不许做 SDO) ——
+    *      三个取值: 那两个哨兵, 或 0..0xFFFF 的实测值。故障清掉后置回 UNREAD。
+    * 只对**报故障的那一根**读。 */
    int      fault_code = HMI_FAULT_CODE_UNREAD;
+   /* 上面的码是从**过程数据**里来的 (603Fh 在生效 TxPDO 里)。
+    * 与 dig_known 同一个坑: "映射里没有, 退回 SDO 读" 与 "过程数据里读到 0x0000 无错误"
+    * 必须分得开 —— 前者要靠一条 SDO (那条 SDO 期间主站一帧过程数据都不发), 后者不用。
+    * ⚠️ 它问的是**静态**的"映射里有没有" (em_err_code_offset), **不是** em_err_code_known
+    * —— 后者还要 mirror_ok, 拿它当闸门会使"发不发那条 SDO"正好在链路最差时打开。 */
+   bool     err_code_mapped = false;
 };
 
 struct BusTelem
@@ -121,6 +131,26 @@ struct BusTelem
    int      expected_wkc = 0;
    /* 当前生效的量程 (脉冲)。默认 HMI_RANGE; scan/ 会经 postRange() 改 */
    int32_t  range     = HMI_RANGE;
+
+   /* ---- (B) 上位机自己看到的通讯健康 ----
+    * bad_wkc_run: **连续**多少帧 WKC 不足 (好帧归零)。由工作线程自己数, 不由界面数 ——
+    *   scan/ 的 ScanController 早就有一份自己的 m_bad_wkc, 那是它的中止判据; 这一份是
+    *   电文里的, 两个程序 (scan 与 hmi) 共用同一个数。
+    * comm_bad: 上面那个数到了 HMI_BAD_WKC_LIMIT (ecatcmd::comm_bad_from 一处算出)。
+    * max_gap_ms / gaps_over_ms: 本程序自己**最长多久没发出过一帧** / 超过 HMI_GAP_WARN_MS
+    *   的次数。这是"是不是这台 PC 的锅"唯一可对账的数: 空闲时最大值只有几 ms ⇒ 与上位机
+    *   无关 (查线缆/干扰/驱动器设置); 几百 ms ⇒ 网卡或电源管理在拖延。 */
+   int      bad_wkc_run  = 0;
+   bool     comm_bad     = false;
+   int      max_gap_ms   = 0;
+   int      gaps_over_ms = 0;
+
+   /* AL 状态与 AL 状态码 (只有 al_checked 为真时才作数)。
+    * **只在异常时读**(ecatcmd::comm_bad_from 立起来那一下), 不在健康路径上每秒读一次 ——
+    * 健康时判"够不够帧"靠每帧免费的 wkc, 正常运行时一个字节的额外流量都不发。 */
+   int      al_state    = 0;
+   int      al_code     = 0;
+   bool     al_checked  = false;
 
    /* 零点世代: **零点真被搬过一次就 +1**, 由工作线程在写 m_origin[] 的那三处维护。
     * 界面从它同步 (只许往前, 见 origin_epoch_sync), 只进 CSV 表头。
@@ -147,6 +177,23 @@ namespace ecatcmd
 inline bool axis_needs_reset(bool valid, bool mirror_ok, bool fault)
 {
    return valid && mirror_ok && fault;
+}
+
+/* 驱动器**自报**有报警 —— 灯与横幅用这一个, 不是只看 bit3。
+ *
+ * 为什么必须多这一条: 通讯报警 (603Fh = 0xFF06) 不保证把 6041h bit3 立起来, 而故障灯
+ * 只读 bit3 —— 那就正是现场报的那件事「隔一阵子就会驱动器通讯报警, 且上位机这里故障
+ * 信号灯没有更新」: 驱动器面板上亮着灯, 界面上却什么都不亮。
+ *
+ * 判据就是一行 (bit3 **或** 一个非 0 的码), **做成纯函数而不是电文里再存一个 bool**:
+ * 存一份字段就有"造遥测的人忘了设它"的那天, 而这里的两个输入本来就都在电文里。
+ * 0x0000 是"无错误"这个真实读数, 那两个负数是"不知道", 都不算报警。
+ *
+ * **只给显示用**。要写驱动器的那条路 (axis_needs_reset -> em_fault_reset, 会真的写
+ * 6040h = 0x0000 卸力) 仍按 bit3 —— 判据不跟着放宽。 */
+inline bool axis_alarm(bool fault, int fault_code)
+{
+   return fault || fault_code > 0;
 }
 
 /* 从一份遥测里挑出该复位的轴 (返回条数, out 里是轴号); 返回 0 = 一个字节都不该写 */
@@ -729,14 +776,17 @@ inline QString fault_code_line(int i, int code)
    return s;
 }
 
-/* 哪几根轴报了故障、各自的码是多少, 拼成一句 (没有轴报故障时是空的)。
- * 用于自动中止那句结论: 6041h 只说得清"有故障", 说清"是哪一个"要靠它。 */
+/* 哪几根轴报了报警、各自的码是多少, 拼成一句 (没有轴报警时是空的)。
+ * 用于自动中止那句结论: 6041h 只说得清"有故障", 说清"是哪一个"要靠它。
+ * **判据是 alarm 不是 fault**: 通讯报警 (0xFF06) 不保证把 bit3 立起来, 走 fault 的话
+ * 那种报警在这里会一个字都不说。 */
 inline QString faulted_axes_text(const BusTelem &t)
 {
    QStringList parts;
 
    for (int i = 0; i < t.naxis && i < EM_MAX_AXES; i++)
-      if (t.ax[i].valid && t.ax[i].mirror_ok && t.ax[i].fault)
+      if (t.ax[i].valid && t.ax[i].mirror_ok
+          && axis_alarm(t.ax[i].fault, t.ax[i].fault_code))
          parts << fault_axis_text(t.ax[i], i);
 
    return parts.join(QStringLiteral(", "));
@@ -745,36 +795,199 @@ inline QString faulted_axes_text(const BusTelem &t)
 /* 故障横幅那一整句。**两拍都用它**: 第一拍码还没到 (那时 fault_code = UNREAD, 这一句说
  * "还没读到"), 第二拍码到了。同一条模板发两次 —— 界面上每次写的都是"眼下知道的那一份",
  * 而不是"我刚知道的那一点", 于是迟一拍的那次不会把先前那句顶掉半截。
- * 有真实码时把"下一步查哪儿"也带上 (fault_code_action): 红横幅是无人值守时唯一还在看的东西。 */
+ * 有真实码时把"下一步查哪儿"也带上 (fault_code_action): 红横幅是无人值守时唯一还在看的东西。
+ *
+ * 标题写"bit3 或 603Fh"而不是只写 bit3: alarm 把"只有码、bit3 没立"那一类也收进来了,
+ * 只写 bit3 的话界面会指着一条根本没立的位说事。 */
 inline QString fault_banner_text(const BusTelem &t)
 {
-   QString s = QStringLiteral("6041h bit3 = 故障 —— 目标已冻结, 电机状态请以驱动器面板为准。");
+   QString s = QStringLiteral("驱动器自报故障 (6041h bit3 或 603Fh) —— 目标已冻结, "
+                              "电机状态请以驱动器面板为准。");
 
    const QString codes = faulted_axes_text(t);
 
    if (!codes.isEmpty())
       s += QStringLiteral("  ") + codes + QStringLiteral("。");
 
-   /* 只对**真实读数**说处置办法: UNREAD/FAIL 那两拍本来就没东西可查 */
+   /* 只对**真实读数**说处置办法: UNREAD/FAIL 那两拍本来就没东西可查。
+    * **同一个码只说一遍**: 两根轴同时报同一个码时, 逐轴再说一次就是同一句话连着出现两遍
+    * (2026-09-22 实机: 两根轴都是 "0x0000 (无错误)", 处置那句就重了两遍)。"是哪些轴"
+    * 已经由上面那段逐轴说清了, 处置办法是按码给的, 不按轴给。 */
    QStringList act;
 
    for (int i = 0; i < t.naxis && i < EM_MAX_AXES; i++)
    {
       const AxisTelem &a = t.ax[i];
 
-      if (!a.valid || !a.mirror_ok || !a.fault)
+      if (!a.valid || !a.mirror_ok || !axis_alarm(a.fault, a.fault_code))
          continue;
       if (a.fault_code == HMI_FAULT_CODE_UNREAD || a.fault_code == HMI_FAULT_CODE_FAIL)
          continue;
 
       const char *p = fault_code_action((uint16_t)(a.fault_code & 0xFFFF));
 
-      if (p != nullptr)
-         act << QString::fromUtf8(p);
+      if (p == nullptr)
+         continue;
+
+      const QString one = QString::fromUtf8(p);
+
+      if (!act.contains(one))
+         act << one;
    }
 
    if (!act.isEmpty())
       s += QStringLiteral("  ") + act.join(QStringLiteral("; ")) + QStringLiteral("。");
+
+   return s;
+}
+
+/* ---- (B) 家族: 上位机**自己看到**的通讯健康 ----
+ * 与上面那一族 (驱动器自报的 603Fh) 是**两件不同的事**, 措辞也刻意不共用:
+ * 603Fh = 0xFF06 是"驱动器说它跟我断了", 这里的 comm_bad 是"我这边的帧不够了"。
+ * 处置不一样 (前者查驱动器设置与干扰, 后者查网线/网卡/上位机负载), 所以不能说成同一句话。 */
+
+/* 连续多少帧 WKC 不足就认总线出事。与 ScanController::healthProblem 那个 10 同源 ——
+ * 单帧抖动不值得报, 30Hz 下 10 帧约 1/3 秒。 */
+#define HMI_BAD_WKC_LIMIT 10
+
+/* 单帧间隔超过它就算"卡了一下", 计数并记最大值。50ms 是量出来的量级:
+ * 本机 2ms 圈期的实测抖动是几 ms 级, 而 SDO 事务造成的静默是 700ms 级 ——
+ * 取 50 正好把"抖动"与"真卡住"分开。 */
+#define HMI_GAP_WARN_MS     50
+
+/* **进了 OP 之后**所有 SDO 读的超时 (微秒) —— 进 OP 那一刻由 doConnectInner 用
+ * em_set_sdo_timeout 装上, 之后 6061h / 1C32h / 2217h / 603Fh 那几条诊断读全走它。
+ *
+ * 为什么不是 EC_TIMEOUTRXM (700ms): **SOEM 的 SDO 事务期间过程数据帧一帧都不发**
+ * (ecx_SDOread -> ecx_mbxreceive, 只有邮箱轮询, 见 public 头 em_sdo_read 那段), 所以
+ * 超时就是"总线被静默多久"。2026-09-22 实机量到一次 1638ms 的静默, 就是两根轴各超时
+ * 700ms —— 而那一刻驱动器正因为收不到帧在报通讯报警, 于是上位机自己把报警按实了一次。
+ * 正常应答 1~3ms 就到, 60ms 已经是它的二十来倍; 实际最长阻塞还要加邮箱发送的
+ * EC_TIMEOUTTXM (20ms)。
+ *
+ * 光靠压超时不够 —— 发不发某条 SDO 本身另有判据 (见 serviceFaultCodeReads: 帧不健康时
+ * 一条都不发)。 */
+#define HMI_OP_SDO_TMO_US 60000
+
+/* 上位机的帧够不够。四条判据, 边界逐条可测:
+ * expected <= 0 = SOEM 还没算出期望值 (没进 OP / 没建映射) —— 不能拿它当"期望 0 帧";
+ * limit <= 0 同理, 是个非法阈值而不是"永不报警"; wkc >= expected 就是好帧, 不管 bad_run 多少。 */
+inline bool comm_bad_from(int wkc, int expected, int bad_run, int limit)
+{
+   if (expected <= 0 || limit <= 0)
+      return false;
+   if (wkc >= expected)
+      return false;
+   return bad_run >= limit;
+}
+
+/* 603Fh 那两条路的**唯一**一处挑选规则。两个来源:
+ *   mapped = 603Fh **在生效 TxPDO 里** (静态判据: AxisTelem::err_code_mapped /
+ *            em_err_code_offset) -> field_raw 就是那一帧的读数, 与 6041h bit3 **同帧**到达。
+ *            含 0x0000 —— 那是"无错误"这个真实读数, 不许当成"没读到"。
+ *            (读不到时那个 accessor 自己返回 UNREAD, 所以这一支照样说得出"还没读到"。)
+ *   不在映射里时只剩 SDO 那一条路, 而那条路**只在 bit3 立起时才走**:
+ *            sdo_fallback 是 HMI_FAULT_CODE_UNREAD / _FAIL / 或上一次读到的码。
+ * bit3 = 0 且不在映射里 -> UNREAD。这一支不能把 sdo_fallback 原样放出去: 那多半是**上一次**
+ * 故障留下的陈值, 显示出来就是"已经清掉的故障还在报"。
+ * 返回值的语义与 AxisTelem::fault_code 一致: 真实读数 / UNREAD / FAIL。 */
+inline int err_code_from(bool mapped, int field_raw, int sdo_fallback, bool bit3)
+{
+   if (mapped)
+      return field_raw;
+   if (bit3)
+      return sdo_fallback;
+   return HMI_FAULT_CODE_UNREAD;
+}
+
+/* AL 状态码说人话。表照 SOEM/src/ec_print.c 的 ec_ALstatuscodelist 手抄 ——
+ * **selftest 不链 SOEM**, 用不了 ec_ALstatuscode2string, 所以判据这边必须自带一份。
+ * 只抄这台机器真可能撞上的那几条; 认不出的回落到十六进制, 不猜成"未知错误"。
+ * 返回 nullptr = 不在这一份表里。 */
+inline const char *al_code_meaning(int alcode)
+{
+   switch (alcode)
+   {
+      case 0x0000: return "无错";
+      case 0x0011: return "被要求的状态迁移不合法";
+      case 0x0012: return "不认识被要求的状态";
+      case 0x0017: return "同步管理器配置不合法";
+      case 0x001A: return "同步错误";
+      /* 这一条是「主站喂帧超时」在从站侧的对应物: 驱动器嫌主站发过程数据太慢/太少。
+       * 与 603Fh = 0xFF06 说的是同一件事, 一个在从站侧报、一个在驱动器侧报 */
+      case 0x001B: return "同步管理器看门狗 (主站喂帧超时)";
+      case 0x001C: return "同步管理器类型不合法";
+      case 0x001D: return "输出配置不合法";
+      case 0x001E: return "输入配置不合法";
+      case 0x001F: return "看门狗配置不合法";
+      case 0x0020: return "从站需要冷启动";
+      case 0x0021: return "从站需要回到 INIT";
+      case 0x0022: return "从站需要回到 PREOP";
+      case 0x0023: return "从站需要回到 SAFEOP";
+      case 0x0024: return "输入映射不合法";
+      case 0x0025: return "输出映射不合法";
+      case 0x0028: return "不支持同步";
+      case 0x002A: return "后台看门狗";
+      case 0x0030: return "DC 同步配置不合法";
+      case 0x0034: return "DC 同步超时";
+      case 0x0036: return "DC SYNC0 周期不合法";
+   }
+   return nullptr;
+}
+
+/* AL 状态名 (EC_STATE_*, SOEM/soem/ethercattype.h) + 状态码, 合成一句给状态栏看。
+ * state <= 0 = 还没读到, 直接说"没读到" —— 不把 0 说成 INIT (0 不是合法 AL 状态)。 */
+inline QString al_code_text(int state, int alcode)
+{
+   if (state <= 0)
+      return QStringLiteral("AL 状态没读到");
+
+   const char *st = nullptr;
+
+   switch (state)
+   {
+      case 0x01: st = "INIT";    break;
+      case 0x02: st = "PRE-OP";  break;
+      case 0x03: st = "BOOT";    break;
+      case 0x04: st = "SAFE-OP"; break;
+      case 0x08: st = "OP";      break;
+   }
+
+   QString head = QStringLiteral("AL %1")
+                     .arg(st != nullptr ? QLatin1String(st)
+                                        : QStringLiteral("0x%1").arg(state, 0, 16));
+   /* 码 0 是"无错", 不必跟着报 —— 只想说状态时那一截不该出现 */
+   if (alcode == 0)
+      return head;
+
+   const char  *mean = al_code_meaning(alcode);
+   const QString hex  = QString::number((uint)(alcode & 0xFFFF), 16).toUpper()
+                           .rightJustified(4, QLatin1Char('0'));
+
+   return head + QStringLiteral(" / 0x%1 (%2)")
+                    .arg(hex, QString::fromUtf8(mean != nullptr ? mean : "表外码"));
+}
+
+/* 「通讯」灯与那条不自动消失的红横幅说的一整句。**走 (B) 措辞** ——
+ * 这条横幅讲的是"我这边的帧不够", 不能借 fault_code_action(0xFF06) 那句
+ * ("查通讯线、干扰源与站号配置"): 那句话的前提是驱动器自报通讯报警, 是另一件事。
+ * max_gap_ms/gaps_over_ms: 本程序自己最长多久没发出过一帧 (见 EcatThread 的帧间隔统计)。
+ *   0 = 还没量到 / 量的是"没有超阈值"; > 0 时把最大值说出来 —— 它是"这台 PC 有没有份"
+ *   唯一可对账的数: 几 ms = 与上位机无关, 几百 ms = 就是这台 PC。 */
+inline QString comm_banner_text(int wkc, int expected, int bad_run,
+                                int max_gap_ms, int gaps_over_ms)
+{
+   QString s = QStringLiteral(
+      "过程数据帧连续 %1 帧不足 (工作计数器 %2/%3) —— 位置与状态是陈值, 目标已冻结。\n"
+      "这一条是**上位机自己看到的**: 主站没能按时把过程数据发出去, 驱动器那边多半"
+      "已经在报通讯报警了。")
+      .arg(bad_run).arg(wkc).arg(expected);
+
+   if (max_gap_ms > 0)
+      s += QStringLiteral("\n本程序最长 %1 ms 没发出一帧 (超过 %2 ms 的有 %3 次) —— "
+                          "这是判定「是不是这台 PC 的锅」的依据: 只有几 ms 就查线缆 / 干扰 / "
+                          "驱动器设置, 几百 ms 就是本机的网卡或电源管理在拖延。")
+              .arg(max_gap_ms).arg(HMI_GAP_WARN_MS).arg(gaps_over_ms);
 
    return s;
 }
@@ -984,6 +1197,26 @@ private:
    bool       m_homing    = false;
    int        m_homing_axis   = -1;
    int        m_homing_method = 0;
+
+   /* ---- 帧间隔统计 (见 BusTelem::max_gap_ms) ----
+    * 每次 em_service() 前后各取一次 clk, 相邻两次的间隔就是"多久没发帧"。
+    * 不加任何计时器: 那对 elapsed() 本来就在算 dt。
+    * m_svc_prev_ms < 0 = 这一趟还没发过帧 (连接那一拍), 不能拿它当一个间隔 */
+   qint64     m_svc_prev_ms = -1;
+   int        m_max_gap_ms  = 0;
+   int        m_gaps_over   = 0;
+
+   /* 连续不足帧数。**工作线程自己数**: scan/ 的 ScanController 有一份自己的中止判据,
+    * 这一份是要进电文给两个程序共用的 (见 BusTelem::bad_wkc_run) */
+   int        m_bad_wkc_run = 0;
+   bool       m_comm_bad    = false;
+
+   /* 最近一次读到的 AL 状态 (只在 comm_bad 的**上升沿**读一次, 见 publish())。
+    * 存成员而不是只在那一圈的电文里: 用户真正遇到的是**闩锁**的报警 —— 报警过去之后
+    * 那一次读到的 AL 码正是最该留在屏幕上的东西。连接时清掉。 */
+   int        m_al_state   = 0;
+   int        m_al_code    = 0;
+   bool       m_al_checked = false;
 
    /* 当前量程 (脉冲)。postRange 在工作线程里改它, setTarget 在 GUI 线程里读它 (夹取用),
     * 所以用原子量, 不另加锁。默认 HMI_RANGE。 */

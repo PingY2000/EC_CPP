@@ -58,6 +58,15 @@ extern "C" {
 #define EM_STEP_TMO_MS    1000    /* 使能状态机单步超时 */
 #define EM_SDO_TMO_MOTION  200    /* 运动期的 SDO 超时 (非运动期用 EC_TIMEOUTRXM) */
 
+/* 连续多少个短帧就把 mirror_ok 降回 0 (收到一帧完整的就归零)。取 20:
+ * 按本机实测 ~3ms/圈约 60ms —— 单帧抖动不会误判, 而链路真断了 60ms 内就认账。
+ * 与 ScanController 那边"WKC 连续不足 10 帧"同一量级 (30Hz ≈ 1/3 秒)。 */
+#define EM_SHORT_FRAMES_LIMIT 20
+
+/* 603Fh 没有读数时的返回值 (映射里没有, 或还没收到过完整帧)。
+ * 与 0x0000 必须分得开 —— 0 是驱动器在说"我没有故障"。 */
+#define EM_ERR_CODE_UNREAD (-1)
+
 /* YKD2205PE 身份集合 */
 #define EM_YKD_VENDOR_ID 0x0994UL
 #define EM_YKD_PRODUCT_1 0x2000UL
@@ -323,9 +332,35 @@ void em_shutdown(em_bus_t *bus, int restore_mapping, int *motor_maybe_live);
 
 /* 只读诊断 —— 这里全是读, 没有裸写函数 */
 
-/* 读一个对象, *size 传入传出 (必须先用缓冲大小初始化)。返回 0 / -1 */
+/* 读一个对象, *size 传入传出 (必须先用缓冲大小初始化)。返回 0 / -1
+ *
+ * ⚠️ **一条 SDO 事务期间, 过程数据帧一帧都不发** (2026-09-22 实测确认, 这不是"让圈期
+ * 变长", 是**把圈停掉**)。SOEM 的 SDO 走邮箱: ecx_SDOread -> ecx_mbxreceive
+ * (SOEM/src/ec_coe.c:117 -> SOEM/src/ec_main.c:1600), 那里只有邮箱状态轮询
+ * (ecx_readmbxstatus / FPRD) 与 osal_usleep, **没有任何 processdata 调用**。
+ * 也就是说: 在 OP 里做一条 SDO, 等于对驱动器说"我这一段时间不喂你了" —— 而驱动器
+ * 的 SM 看门狗照样在数 (AL 状态码 0x001B Sync manager watchdog 就是它踢出来的)。
+ *
+ * 因此这个函数只适合两种地方: ① 还没进 OP 的连接/配置期 (那时没有过程数据可静默,
+ * 上面那件事也就不成立); ② 已经用 em_set_sdo_timeout() 把超时压短了的时期。
+ * 周期循环里"顺手读一个监视量"是最危险的一种用法 —— 越是驱动器不正常的时候,
+ * 越读不到, 静默就越长。 */
 int em_sdo_read(em_bus_t *bus, int slave, uint16_t index, uint8_t sub,
                 void *p, int *size);
+
+/* 把本连接**所有** SDO 读的超时改成 tmo_us (微秒; <= 0 被忽略)。作用范围包含
+ * em_rd_u8/u16/u32/i8/i32/any —— 它们最后都走 em_sdo_read。
+ *
+ * 为什么需要它: 超时 = "这次读最多把过程数据静默多久" (见上), 而 OP 期间的过程数据正是
+ * 驱动器看门狗在盯的东西。默认 EC_TIMEOUTRXM (700ms) 是配置期的值; **进了 OP 就该压短**,
+ * 按"正常应答的几倍"取 (实测正常应答 1~3ms, 60ms 已是二十来倍)。实际最长阻塞 ≈ 超时 +
+ * 邮箱发送上限 EC_TIMEOUTTXM (20ms)。
+ *
+ * 什么时候调: 进 OP 之后、任何一次读之前。事后不必调回去 —— 一次连接一个 bus,
+ * 关掉就没了, 下一次 em_bus_new 又是默认值。
+ * 失败时驱动器那条迟到的应答不会被下一次读当成自己的结果: ecx_SDOread 发请求前会把
+ * 邮箱里的残包丢掉, 收下之后还会比对 Index。 */
+void em_set_sdo_timeout(em_bus_t *bus, int tmo_us);
 
 int em_rd_u8 (em_bus_t *bus, int slave, uint16_t index, uint8_t sub, uint8_t  *v);
 int em_rd_i8 (em_bus_t *bus, int slave, uint16_t index, uint8_t sub, int8_t   *v);
@@ -394,8 +429,13 @@ int em_disable_all(em_bus_t *bus);
 uint16_t em_sw (const em_axis_t *ax);   /* 6041h */
 int32_t  em_pos(const em_axis_t *ax);   /* 6064h */
 int32_t  em_vel(const em_axis_t *ax);   /* 606Ch */
+
+/* mirror_ok = "**现在**还有完整帧": 收到一帧完整的就置 1, 连续短帧到 EM_SHORT_FRAMES_LIMIT
+ * 就降回 0 (2026-09-22 之前它只置不清, 于是所有 !mirror_ok 判据都是死代码 ——
+ * 链路断了位置冻住, 界面照样显示"正常")。 */
 int      em_mirror_ok(const em_axis_t *ax);
-uint32_t em_mirror_frames(const em_axis_t *ax);  /* 收到过多少个完整帧 */
+uint32_t em_mirror_frames(const em_axis_t *ax);  /* 收到过多少个完整帧 (累计, 只增) */
+uint32_t em_bad_frames(const em_axis_t *ax);     /* 当前这段连续短帧有几帧; 0 = 刚收到整帧 */
 
 /* ---- 60FDh 三个开关 (原点 / 正限位 / 负限位) ----
  * 先问 em_dig_in_known(), 再问下面三个: 60FDh 不在生效 TxPDO 里时 (本机 1A00h 只有
@@ -412,6 +452,27 @@ int      em_dig_in_offset(const em_axis_t *ax); /* 字节偏移; -1 = 不在生�
  * 代价: SM3 从 10 字节变 14 字节; 只写 RAM, 崩在收尾之前会把改动留在驱动器里直到断电重启;
  * 需要 allow_remap 授权。连接期参数, 必须在 em_setup 之前调。 */
 void em_require_dig_in(em_bus_t *bus, int on);
+
+/* ---- 603Fh 驱动器故障码 ----
+ * 6041h bit3 只说"有故障", 说不了是哪一个 (0xFF01 过流 / 0xFF02 过压 / 0xFF03 欠压 /
+ * 0xFF04 动力线 / 0xFF06 通讯报警 / 0xFF08 传感器); 603Fh 才是那个"哪一个"。
+ * 它在生效 TxPDO 里时与 bit3 **同帧到达** —— 不必等 SDO, 而那条 SDO 会把过程数据
+ * 整个停掉最多 EC_TIMEOUTRXM = 700ms (见上面 em_sdo_read 那段说明)。
+ * 先问 em_err_code_known(), 再问 em_err_code()。
+ *
+ * ⚠️ 两个问题别问错函数: "**映射里有吗**" 问 em_err_code_offset (静态, 连接期就定了);
+ * em_err_code_known 还要求 mirror_ok —— 链路一坏它就变 0, 拿它当"映射里有吗"会使
+ * "发不发那条 SDO"的闸门恰好在链路最差时打开 (2026-09-22 实机踩过: 1638ms 静默)。 */
+int em_err_code_known(const em_axis_t *ax);  /* 映射里有且收到过完整帧 */
+int em_err_code(const em_axis_t *ax);        /* 无读数时返回 EM_ERR_CODE_UNREAD */
+int em_err_code_offset(const em_axis_t *ax); /* 字节偏移; -1 = 不在生效映射里 */
+
+/* 让下一次 em_setup 把 603Fh 追加进 TxPDO (RAM only, 收尾时还原)。**默认就是开** ——
+ * 它是一个只读监视量, 而"上位机对驱动器报警只有一扇窗"正是这一轮要修的病;
+ * 再加一个默认关的开关等于把同一件事再关上一次。代价与 em_require_dig_in 相同
+ * (SM3 长 2 字节, 只写 RAM, 崩在收尾之前会把改动留到断电重启, 需要 allow_remap 授权)。
+ * 连接期参数, 必须在 em_setup 之前调。 */
+void em_require_err_code(em_bus_t *bus, int on);
 
 /* 授权改驱动器参数 (目前只有 2300h 输入端子有效电平逻辑)。默认不授权。
  * 与 em_setup 的 allow_remap 是**分开**的两道门: 改 PDO 映射是通信配置 (掉电即回),
@@ -431,6 +492,13 @@ int em_di_set_logic(em_bus_t *bus, uint16_t want);
  * 真机上 1C12h 指的是 1601h, 不是默认的 1600h。 */
 uint16_t em_rx_pdo(const em_axis_t *ax);
 uint16_t em_tx_pdo(const em_axis_t *ax);
+
+/* 该从站现在的 AL 状态 (state) 与 AL 状态码 (alstatuscode)。0 = 成功 / -1 = 失败。
+ * 内部走 ecx_readstate (BRD 广播读, 不走邮箱), **只在异常时调** —— 健康路径上判
+ * "够不够帧"靠每帧免费的 wkc, 不必也不能每周期发这一次额外往返。
+ * 典型值: state 8 = OP; alstatuscode 0x001B = Sync manager watchdog (主站喂帧超时),
+ * 0x001E = 非法 SM 配置。判据表见 hmi/ecatworker.h 的 ecatcmd::al_code_text。 */
+int em_al_status(em_bus_t *bus, int slave, int *state, int *alcode);
 
 int em_is_enabled(const em_axis_t *ax);
 

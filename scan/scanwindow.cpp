@@ -1238,7 +1238,7 @@ QWidget *ScanWindow::buildTopBar()
 
 /* 两组信号的列号。列号 = 本组信号数, 两组相加就是那张表的列数 (SIGN_NCOL) ——
  * 单独写错一次就会凭空多出一个空列, 把前面几列挤成一个字宽。 */
-enum { AX_ENABLED = 0, AX_FAULT = 1, AX_NCOL = 2 };
+enum { AX_ENABLED = 0, AX_FAULT = 1, AX_COMM = 2, AX_NCOL = 3 };
 enum { LIM_HOME = 0, LIM_POS = 1, LIM_NEG = 2, LIM_NCOL = 3 };
 
 /* 那张表一共五列 = 上面两组信号相加。表头、tooltip、格子都照它建满 */
@@ -1272,15 +1272,24 @@ QWidget *ScanWindow::buildAxisPanel()
    /* 表头 与 tooltip 一列一个, 次序就是格子的次序: 使能/故障/原点/正限位/负限位。
     * 每格只有一盏灯, 所以 tooltip 要自己说清"这一列亮/灭各是什么意思" —— 表头只有个名字,
     * 灯只会亮灭, 而"亮"在五列里不是同一件事 (绿亮 = 使能带电, 红亮 = 撞限位) */
-   static const char *kHead[SIGN_NCOL] = { "使能", "故障", "原点", "正限位", "负限位" };
+   static const char *kHead[SIGN_NCOL] = { "使能", "故障", "通讯", "原点", "正限位", "负限位" };
    static const char *kTip[SIGN_NCOL] = {
       "6041h bit2 —— 电机带电。绿亮 = 已使能, 灭 = 未使能。\n"
       "未使能时点画布不会动: 这是「这个轴现在能不能走」的答案。",
 
-      "6041h bit3 —— 驱动器故障位。红亮 = 有故障。\n"
+      "**驱动器自报**有故障: 6041h bit3, **或** 603Fh 读到一个非 0 的码。红亮 = 有。\n"
       "扫描中置起会自动中止; 用右边那格「故障复位」清掉再启扫。\n"
       "是哪一种故障看 603Fh 故障码 (过流/过压/欠压/动力线/通讯/传感器各不相同)。\n"
-      "它不在过程数据里, 是故障后再读一次的, 所以横幅上那句码会晚一拍。",
+      "603Fh 现在进 TxPDO (连接时补写, 收尾还原), 与 bit3 同一帧到达, 不再晚一拍;\n"
+      "补不上时才退回 SDO 读, 那一次会晚一拍。\n"
+      "注意与右边「通讯」那盏分开看: 这盏是**驱动器说**它有事, 那盏是**我们这边**的帧不够。",
+
+      "**上位机自己看到**的通讯健康 —— 与「故障」那盏是两件事。\n"
+      "红亮 = 连续 10 帧工作计数器 (WKC) 不足: 主站没能按时把过程数据发出去。\n"
+      "这时位置与状态都是陈值 (冻结在最后一次完整帧上), 界面上的数不再可信。\n"
+      "处置: 先看状态栏那句「最长多少 ms 没发帧」——只有几 ms 就查线缆/干扰/驱动器设置,\n"
+      "几百 ms 就是本机的网卡或电源管理在拖延。\n"
+      "驱动器那边多半同时在报 603Fh = 0xFF06 (通讯报警), 那盏「故障」灯会一起亮。",
 
       /* 原点灯是绿的, 所以要说出声来 */
       "60FDh bit2 —— 原点开关现在压着没有 (2310h X0 = 原点)。\n"
@@ -3401,7 +3410,18 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
        * 想知道灯亮说的是什么, 挂在灯上的 tooltip 里写着 (kTip + kLampRule),
        * 以及表头上那一列的名字 */
       setSignalCell(m_axGrid, i, AX_ENABLED, known, a.enabled, Lamp::Ok);
-      setSignalCell(m_axGrid, i, AX_FAULT, known, a.fault, Lamp::Bad);
+      /* 「故障」用 ecatcmd::axis_alarm 而不是 a.fault: 它 = bit3 **或** 603Fh 读到非 0 的码。
+       * 通讯报警 (0xFF06) 不保证把 bit3 立起来, 只看 bit3 就会出现"驱动器报警了而故障灯不亮" ——
+       * 那正是这一轮要修的那件事。**只是显示放宽**: 「故障复位」挑哪根轴仍按 bit3
+       * (ecatcmd::axis_needs_reset), 那条路会真的写 6040h = 0x0000 卸力 */
+      setSignalCell(m_axGrid, i, AX_FAULT, known,
+                    ecatcmd::axis_alarm(a.fault, a.fault_code), Lamp::Bad);
+      /* 「通讯」是**上位机自己看到的**帧够不够 (t.comm_bad 是总线级, 两根轴同一件事)。
+       * 判据刻意**不用上面那个 known**: 帧不够到一定程度 mirror_ok 就降 0, 用 known 的话
+       * 这盏灯会在事情变糟的那一刻从红变成灰 —— 恰好相反。这里只要求"连着且有这根轴",
+       * 而 comm_bad 本身就是"我们知道出事了" */
+      const bool live = m_connected && a.valid;
+      setSignalCell(m_axGrid, i, AX_COMM, live, t.comm_bad, Lamp::Bad);
 
       /* ---- 「限位开关」那三盏: 三个开关本身压着没有 (60FDh) ----
        * known 要再与 a.dig_known: 少了它, 读不到 60FDh 时那三位是 0, 界面会显示"三个都没
@@ -3518,6 +3538,44 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
          m_limBanner[i] = QString();
       }
    }
+
+   /* ---- 「通讯」那条红横幅 (总线级, 在轴的循环之外) ----
+    * 照限位那条现成的"持续状态"范式: 上升沿弹一次 (hint 的 fault 那一支会
+    * m_bannerTimer->stop(), 也就是**不自动消失**), 下降沿按原文比对撤掉自己那一条。
+    * 为什么值得不自动消失: 用户报的就是"驱动器报警了而我没看见" —— 一条会自动消失的
+    * 提示正好会在没人看着屏幕的那几分钟里消失。 */
+   if (t.comm_bad && !m_commShown)
+   {
+      m_commShown = true;
+
+      /* stdout 留证据: 30Hz 的灯与横幅会一闪而过, 而"当时最长多久没发帧"是这一整件事
+       * 唯一能对账的数 —— 现场回来只看这一个数就知道该查线还是查这台 PC */
+      std::printf("[scan] 过程数据帧连续不足: WKC=%d/期望 %d  最长 %d ms 没发帧"
+                  " (超 %d ms 共 %d 次)  AL: %s\n",
+                  t.wkc, t.expected_wkc, t.max_gap_ms, HMI_GAP_WARN_MS, t.gaps_over_ms,
+                  t.al_checked
+                     ? ecatcmd::al_code_text(t.al_state, t.al_code).toUtf8().constData()
+                     : "(没读到)");
+      std::fflush(stdout);
+
+      /* 措辞全在 ecatcmd::comm_banner_text 里 (**(B) 家族**: 讲的是"我这边的帧不够",
+       * 与驱动器自报的 0xFF06 那套 fault_code_action 分开) */
+      m_commBanner = ecatcmd::comm_banner_text(t.wkc, t.expected_wkc, t.bad_wkc_run,
+                                               t.max_gap_ms, t.gaps_over_ms);
+      hint(m_commBanner, true);
+   }
+   else if (!t.comm_bad)
+   {
+      m_commShown = false;
+
+      if (!m_commBanner.isEmpty() && m_banner->isVisible()
+          && m_banner->text() == m_commBanner)
+      {
+         m_banner->setVisible(false);
+         m_bannerTimer->stop();
+      }
+      m_commBanner = QString();
+   }
 }
 
 /* 一格 = 一盏灯, 状态全在这四种样子里 (一列一个 lit 颜色: 使能/原点用 Ok 绿, 故障/限位
@@ -3577,10 +3635,30 @@ void ScanWindow::refresh()
 
    if (t.in_op)
    {
-      m_lWkc->setText(QStringLiteral("WKC %1 / 期望 %2").arg(t.wkc).arg(t.expected_wkc));
-      m_lWkc->setStyleSheet(t.wkc >= t.expected_wkc
-                               ? QStringLiteral("color:#7b8391")
-                               : QStringLiteral("color:#ffb020; font-weight:bold"));
+      QString s = QStringLiteral("WKC %1 / 期望 %2").arg(t.wkc).arg(t.expected_wkc);
+      bool    bad = (t.wkc < t.expected_wkc);
+
+      /* 帧够的时候这一截**不出现** —— 状态栏是给异常留的地方, 常态多一串数只是噪声。
+       * 出现过一次 (comm_bad 或读到过 AL) 之后就常驻: 用户遇到的是**闩锁**的报警,
+       * 报警过去之后那个 AL 码正是最该留在屏幕上的东西。 */
+      if (t.comm_bad || t.al_checked)
+      {
+         s += QStringLiteral("   ");
+         s += t.al_checked ? ecatcmd::al_code_text(t.al_state, t.al_code)
+                           : QStringLiteral("AL 状态没读到");
+
+         if (t.max_gap_ms > 0)
+            s += QStringLiteral(" · 最长 %1 ms 没发帧").arg(t.max_gap_ms);
+      }
+      if (t.comm_bad)
+      {
+         s += QStringLiteral(" · 连续 %1 帧不足").arg(t.bad_wkc_run);
+         bad = true;
+      }
+
+      m_lWkc->setText(s);
+      m_lWkc->setStyleSheet(bad ? QStringLiteral("color:#ffb020; font-weight:bold")
+                                : QStringLiteral("color:#7b8391"));
    }
    else
    {
@@ -3808,9 +3886,11 @@ void ScanWindow::refresh()
       hint(ecatcmd::fault_banner_text(t), true);
 
       /* 这一句里已经把**此刻**那份码写进去了 (可能已经有值, 也可能还是"还没读到")。
-       * 记下来, 免得下面第二拍同一帧再弹一遍同样的字 */
+       * 记下来, 免得下面第二拍同一帧再弹一遍同样的字。
+       * 判据用 alarm 与 fault_banner_text 一致 —— 只挑报警的轴 */
       for (int i = 0; i < 2; i++)
-         if (t.ax[i].valid && t.ax[i].mirror_ok && t.ax[i].fault)
+         if (t.ax[i].valid && t.ax[i].mirror_ok
+             && ecatcmd::axis_alarm(t.ax[i].fault, t.ax[i].fault_code))
             m_faultCodeShown[i] = t.ax[i].fault_code;
    }
    else if (!t.fault)
@@ -3831,7 +3911,8 @@ void ScanWindow::refresh()
       {
          const AxisTelem &a = t.ax[i];
 
-         if (!m_connected || !a.valid || !a.mirror_ok || !a.fault)
+         if (!m_connected || !a.valid || !a.mirror_ok
+             || !ecatcmd::axis_alarm(a.fault, a.fault_code))
             continue;
          if (a.fault_code == m_faultCodeShown[i])
             continue;

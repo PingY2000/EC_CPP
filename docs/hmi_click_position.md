@@ -38,6 +38,15 @@ while (!quit):
 teardown()
 ```
 
+> **那"一帧"也会被 SDO 停掉** (2026-09-22 补): 一条 SDO 事务期间 SOEM **一帧过程数据都
+> 不发**（`ecx_SDOread` 走 `ecx_mbxreceive`: `SOEM/src/ec_coe.c:117` → `ec_main.c:1600`,
+> 那里只有邮箱轮询, 没有任何 `processdata` 调用）。所以 OP 里做一条 SDO 不等于"这一圈
+> 长一点", 而是**连着好几圈一帧都不发** —— 超时多长就停多久（默认 `EC_TIMEOUTRXM` =
+> 700 ms；实机量到过 1638 ms）。驱动器那边就把这当成主站掉线, SM 看门狗踢它出 OP /
+> 报通讯报警。因此: **OP 里的诊断读一律用 `em_set_sdo_timeout()` 把超时压短**
+> （`hmi/ecatworker.cpp` 进 OP 时统一装 60 ms），而且能不读就不读 —— 603Fh 就是这么被
+> 追加进 TxPDO 的, 与 `6041h` bit3 同帧到达, 一个字节的 SDO 都不发。
+
 命令由**一个命令队列**在 `drainCommands()` 里串行执行, 不引入嵌套事件循环,
 命令之间的顺序因此是确定的。
 

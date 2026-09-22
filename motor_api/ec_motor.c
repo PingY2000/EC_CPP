@@ -198,6 +198,13 @@ void em__pin_ramp(em_axis_t *ax)
       em__put_u32(ax->out, ax->off_prof_dec, ax->prof_dec);
 }
 
+/* 当前配置的 SDO 超时。bus 没建成 / 没设过时回落到 EC_TIMEOUTRXM (700ms) —— 那个值适合
+ * 配置期, 而配置期正是唯一"没有过程数据可静默"的时期。见 em_bus::sdo_tmo_us 的说明 */
+static int em__sdo_tmo(const em_bus_t *bus)
+{
+   return (bus != NULL && bus->sdo_tmo_us > 0) ? bus->sdo_tmo_us : EC_TIMEOUTRXM;
+}
+
 int em_sdo_read(em_bus_t *bus, int slave, uint16_t index, uint8_t sub,
                 void *p, int *size)
 {
@@ -212,7 +219,7 @@ int em_sdo_read(em_bus_t *bus, int slave, uint16_t index, uint8_t sub,
    /* 读之前必须清 ctx.ecaterror: 它是粘滞位, 上一次的失败会污染下一次的判定 */
    bus->ctx.ecaterror = FALSE;
    if (ecx_SDOread(&bus->ctx, (uint16_t)slave, index, sub, FALSE, &psize, buf,
-                   EC_TIMEOUTRXM) <= 0 || bus->ctx.ecaterror)
+                   em__sdo_tmo(bus)) <= 0 || bus->ctx.ecaterror)
       return EM_R_FAIL;
 
    /* psize 是传入传出: 必须先用缓冲大小初始化。这里按 4 字节读进内部缓冲, 再按驱动器自报宽度拷出 */
@@ -224,6 +231,14 @@ int em_sdo_read(em_bus_t *bus, int slave, uint16_t index, uint8_t sub,
    if (p != NULL && psize > 0)
       memcpy(p, buf, (size_t)psize);
    return EM_R_OK;
+}
+
+void em_set_sdo_timeout(em_bus_t *bus, int tmo_us)
+{
+   if (bus == NULL || tmo_us <= 0)
+      return;
+
+   bus->sdo_tmo_us = tmo_us;
 }
 
 /* 固定宽度的读取包装: 宽度不符就算失败 —— 宽度不足时高位补零会解出一个看着正常的值 */
@@ -437,6 +452,13 @@ static const em_field_t EM_NEED_TX[] = {
  * 它只是只读监视量。默认由 em__find_field() 在生效映射里才绑, 强制追加要 em_require_dig_in() */
 static const em_field_t EM_FIELD_DIG_IN[] = {
    { EM_OID_DIG_IN,     0, 32, "60FDh 数字输入"  },
+};
+
+/* 603Fh 驱动器故障码 —— 同上, 也只读监视量, 走同一条"默认不补、要补得明说"的路。
+ * 宽度是 **16** 不是 32: 手册里 603Fh 是 U16 (真机上它同时出现在 TPDO 里的样子也是 2 字节),
+ * 按 32 位映射会把后一帧的 2 字节吃进来。 */
+static const em_field_t EM_FIELD_ERR_CODE[] = {
+   { EM_OID_ERROR_CODE, 0, 16, "603Fh 驱动器故障码" },
 };
 #define EM_NEED_RX_N ((int)(sizeof(EM_NEED_RX) / sizeof(EM_NEED_RX[0])))
 #define EM_NEED_TX_N ((int)(sizeof(EM_NEED_TX) / sizeof(EM_NEED_TX[0])))
@@ -992,9 +1014,17 @@ int em__cycle(em_bus_t *bus)
          if (ax->off_act_vel >= 0)
             ax->vel = em__get_i32(ax->in, ax->off_act_vel);
          /* 60FDh: 不在映射里 (off_dig_in < 0) 就一直是 0, 而 0 看着就像"三个开关都没压住" ——
-          * 调用方必须先问 em_dig_in_known()。 */
+          * 调用方必须先问 em_dig_in_known()。603Fh 同理 (em_err_code_known / em_err_code)。
+          * 问"映射里到底有没有"要问 em_*_offset —— 那两个 known 还要求 mirror_ok */
          if (ax->off_dig_in >= 0)
             ax->dig_in = em__get_u32(ax->in, ax->off_dig_in);
+         if (ax->off_err_code >= 0)
+            ax->err_code = em__get_u16(ax->in, ax->off_err_code);
+
+         /* bit2 = Operation enabled。只增不减的闩锁: 收尾那一步要用它决定
+          * "这台轴到底使能过没有" (见 em_shutdown 里那段)。 */
+         if ((ax->sw & EM_SW_OP_ENABLED) != 0)
+            ax->ever_enabled = 1;
 
          ax->mirror_ok = 1;
          ax->frames++;
@@ -1003,8 +1033,18 @@ int em__cycle(em_bus_t *bus)
    }
    else
    {
+      /* 连续短帧到限额就把 mirror_ok 降回 0 —— 这一支以前只 ++, 于是 mirror_ok 只置不清,
+       * 下游所有 !mirror_ok 判据都是死代码, 丢帧时位置冻住而界面照样显示"正常"。
+       * 降级之后 em_shutdown / em__check_motion_ready 那几处才真的会拦住。 */
       for (i = 0; i < bus->naxis; i++)
-         bus->axis[i]->short_frames++;
+      {
+         em_axis_t *ax = bus->axis[i];
+
+         if (ax->short_frames < EM_SHORT_FRAMES_LIMIT)
+            ax->short_frames++;
+         if (ax->short_frames >= EM_SHORT_FRAMES_LIMIT)
+            ax->mirror_ok = 0;
+      }
    }
 
    /* 回调放在**镜像更新之后**: 它读的就是这些镜像, 早一步就会拿到上一帧的值。
@@ -1060,7 +1100,15 @@ em_bus_t *em_bus_new(void)
    em__console_init();
    bus = (em_bus_t *)calloc(1, sizeof(em_bus_t));
    if (bus != NULL)
+   {
       bus->verbose = 0;
+      /* 603Fh 是**默认就要求**补进 TxPDO 的 (与 want_dig_in 相反, 那个默认关)。
+       * calloc 给的是 0, 所以这一句不能省 —— 它就是"默认开"的全部实现。 */
+      bus->want_err_code = 1;
+      /* SDO 超时: 配置期用 700ms (那时没有过程数据, 等久一点更容易读到)。
+       * **进 OP 之前**调用方必须用 em_set_sdo_timeout 压短, 见那个函数的说明。 */
+      bus->sdo_tmo_us = EC_TIMEOUTRXM;
+   }
    return bus;
 }
 
@@ -1188,6 +1236,27 @@ int em_slave_info(const em_bus_t *bus, int slave, em_slave_info_t *out)
    return EM_R_OK;
 }
 
+/* AL 状态与 AL 状态码 —— 只在**异常**时调, 不在健康路径上每周期调。
+ * 健康靠 wkc < expected_wkc 这个每帧免费的量判, 不够了才来这里读一次:
+ * ecx_readstate 是 BRD 广播读 (不走邮箱), 一次往返, 但它毕竟是额外流量,
+ * 正常运行时不发才是对的。 */
+int em_al_status(em_bus_t *bus, int slave, int *state, int *alcode)
+{
+   const struct ec_slave *s;
+
+   if (bus == NULL || !bus->opened || slave < 1 || slave > bus->nslaves)
+      return EM_R_FAIL;
+
+   (void)ecx_readstate(&bus->ctx);
+
+   s = (const struct ec_slave *)&bus->ctx.slavelist[slave];
+   if (state != NULL)
+      *state = s->state;
+   if (alcode != NULL)
+      *alcode = s->ALstatuscode;
+   return EM_R_OK;
+}
+
 int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap)
 {
    int i;
@@ -1269,9 +1338,11 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
       ax->off_cw = ax->off_target_pos = ax->off_target_vel = -1;
       ax->off_sw = ax->off_act_pos = ax->off_act_vel = -1;
       /* 必须显式置 -1: calloc 给的是 0, 而 0 是输入镜像的字节 0 (6041h 状态字的位置),
-       * 会把状态字当成 60FDh 读 */
+       * 会把状态字当成 60FDh / 603Fh 读 */
       ax->off_dig_in = -1;
       ax->dig_in = 0;
+      ax->off_err_code = -1;
+      ax->err_code = 0;
       /* 同上必须置 -1: calloc 给的 0 是个合法偏移 (输出镜像字节 0 正是 6040h 低字节),
        * 会把运行模式写进控制字里 */
       ax->off_modes = -1;
@@ -1304,14 +1375,17 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
                         "RxPDO") != EM_R_OK)
          return EM_R_FAIL;
 
-      /* TxPDO 的需项表在这里拼: 常规三项, 只有 em_require_dig_in() 明确要求过才把 60FDh
-       * 拼进去 (不拼就是"只绑不补"的默认路径)。 */
-      em_field_t need_tx[EM_NEED_TX_N + 1];
+      /* TxPDO 的需项表在这里拼: 常规三项, 再加两个"明确要求过才补"的只读监视量 ——
+       * 60FDh (em_require_dig_in) 与 603Fh (em_require_err_code, 默认开)。
+       * 数组尺寸是 +2, 两条都用得上; 少改一处就是栈越界。 */
+      em_field_t need_tx[EM_NEED_TX_N + 2];
       int        n_need_tx = EM_NEED_TX_N;
 
       memcpy(need_tx, EM_NEED_TX, sizeof(EM_NEED_TX));
       if (bus->want_dig_in)
          need_tx[n_need_tx++] = EM_FIELD_DIG_IN[0];
+      if (bus->want_err_code)
+         need_tx[n_need_tx++] = EM_FIELD_ERR_CODE[0];
 
       if (em_map_ensure(bus, ax->slave, EM_OID_TXPDO_ASSIGN, ax->tx_pdo,
                         need_tx, n_need_tx, allow_remap,
@@ -1404,6 +1478,26 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
                 ? "在生效 TxPDO 里 (原点/正限位/负限位三个开关每周期可读)"
                 : "**不在生效 TxPDO 里** -> 三个开关的灯会显示灰/-- "
                   "(本函数按设计不去补映射; 要补见 em_require_dig_in)");
+
+      /* 603Fh 驱动器故障码 (U16 RO) —— 与 60FDh 同一套, 只是默认就要求补 (want_err_code)。
+       * 绑不上时退回 SDO 读, 那条路要等 bit3 立起来才动 (见 hmi serviceFaultCodeReads) */
+      ax->off_err_code = em__find_field(bus, ax->slave, ax->tx_pdo,
+                                        EM_OID_ERROR_CODE, 0, 16);
+      if (ax->off_err_code >= 0 && (uint32_t)ax->off_err_code + 2 > ax->Ibytes)
+      {
+         /* 偏移落在本轴输入镜像之外 = 会读到别的从站的数据 -> 降级, 不拒绝 */
+         em__warn("%s: 603Fh 算出的偏移 +%d 超出本轴输入镜像 (%u 字节) -> "
+                  "当作不在映射里 (故障码退回 SDO 读)",
+                  ax->label, ax->off_err_code, (unsigned)ax->Ibytes);
+         ax->off_err_code = -1;
+      }
+      printf("  %s: 603Fh 故障码 %s\n", ax->label,
+             (ax->off_err_code >= 0)
+                ? "在生效 TxPDO 里 (与 6041h bit3 同一帧到达)"
+                : (bus->want_err_code
+                      ? "**要求补进 TxPDO 但没落上** -> 故障码退回 SDO 读 "
+                        "(那条 SDO 期间主站不发过程数据帧 —— 见 em_sdo_read 的说明)"
+                      : "不在生效 TxPDO 里 (em_require_err_code 没开) -> 故障码退回 SDO 读"));
 
       /* 6040h 与 6041h 是硬要求 (没有它们连状态机都推不动); 其余四项缺了只是用它们的
        * 模式不能用, 由 em_csp_available()/em_pv_available() 说清楚, 不在这里整体拒绝。 */
@@ -1584,7 +1678,11 @@ void em_shutdown(em_bus_t *bus, int restore_mapping, int *motor_maybe_live)
       {
          em_axis_t *ax = bus->axis[i];
 
-         if (ax->mirror_ok && (ax->sw & EM_SW_OP_ENABLED) != 0)
+         /* 判据是 ever_enabled, **不是** mirror_ok + 当前 6041h:
+          * 链路一断 mirror_ok 就降 0、sw 冻在最后一次完整帧上, 拿它判会"连试都不试",
+          * 而链路断了恰恰是最该试一把的时候。这趟使能过的轴一律写 0x0000 ——
+          * 对本来就已失能的轴写 Disable voltage 是无害的, 漏写一个正在带电的轴不是。 */
+         if (ax->ever_enabled)
          {
             em__set_cw(ax, EM_CW_DISABLE_V);
             wrote = 1;
@@ -1594,7 +1692,7 @@ void em_shutdown(em_bus_t *bus, int restore_mapping, int *motor_maybe_live)
       {
          int k;
 
-         printf("  所有使能中的轴写 RxPDO[6040h]=0x0000 (Disable voltage), "
+         printf("  所有使能过的轴写 RxPDO[6040h]=0x0000 (Disable voltage), "
                 "继续打 250ms 过程数据\n");
          for (k = 0; k < 50; k++)
          {
@@ -1604,26 +1702,41 @@ void em_shutdown(em_bus_t *bus, int restore_mapping, int *motor_maybe_live)
       }
    }
 
-   /* ---- 2. 用 TxPDO 的 6041h 确认 bit2 已清 (这是"电机不带电"的正面证据) ---- */
+   /* ---- 2. 用 TxPDO 的 6041h 确认 bit2 已清 (这是"电机不带电"的正面证据) ----
+    * 镜像不可信**也要走这一轮**: 以前这里是 `if (!mirror_ok) continue;`, 而 mirror_ok
+    * 只置不清所以从不触发 —— 一旦它开始降级(2026-09-22), 那句 continue 就会让
+    * unconfirmed 永远是 0, 「未能确认所有轴失能」那条模态告警再也弹不出来。
+    * 链路断了要**报得更响**, 不是更轻。 */
    for (i = 0; i < bus->naxis; i++)
    {
       em_axis_t *ax = bus->axis[i];
-      int reads = 0, k;
+      const uint32_t f0 = ax->frames;
+      int k;
       uint16_t sw = 0;
 
-      if (!bus->in_op || !ax->mirror_ok)
-         continue;
+      if (!bus->in_op || !ax->ever_enabled)
+         continue;   /* 这趟没使能过, 就没有"确认失能"这回事 */
 
       for (k = 0; k < 200; k++)
       {
          (void)em__cycle(bus);
+         if (!ax->mirror_ok)
+            continue;   /* 这帧不完整, sw 是陈值, 不作数; 但继续打, 直到超时 */
          sw = ax->sw;
-         reads++;
          if ((sw & EM_SW_OP_ENABLED) == 0)
             break;
          em__sleep_ms(5);
       }
-      if (reads == 0 || (sw & EM_SW_OP_ENABLED) != 0)
+      if (ax->frames == f0 || !ax->mirror_ok)
+      {
+         em__err("%s: 失能无法确认 —— 收尾这段一帧完整的过程数据都没收到 "
+                 "(连续短帧 %u > %d, 最后读到的 6041h=0x%04X)。"
+                 "**不要当成已失能**: 按 README 那条立即断动力电源",
+                 ax->label, (unsigned)ax->short_frames, EM_SHORT_FRAMES_LIMIT,
+                 (unsigned)sw);
+         unconfirmed = 1;
+      }
+      else if ((sw & EM_SW_OP_ENABLED) != 0)
       {
          em__err("%s: 写了 0x0000 但 6041h 仍报 Operation enabled (0x%04X) —— "
                  "失能无法确认", ax->label, (unsigned)sw);
@@ -1757,6 +1870,7 @@ int32_t  em_pos(const em_axis_t *ax) { return ax ? ax->pos : 0; }
 int32_t  em_vel(const em_axis_t *ax) { return ax ? ax->vel : 0; }
 int      em_mirror_ok(const em_axis_t *ax) { return ax ? ax->mirror_ok : 0; }
 uint32_t em_mirror_frames(const em_axis_t *ax) { return ax ? ax->frames : 0; }
+uint32_t em_bad_frames(const em_axis_t *ax) { return ax ? ax->short_frames : 0; }
 
 uint16_t em_rx_pdo(const em_axis_t *ax) { return ax ? ax->rx_pdo : 0; }
 uint16_t em_tx_pdo(const em_axis_t *ax) { return ax ? ax->tx_pdo : 0; }
@@ -1790,6 +1904,28 @@ void em_require_dig_in(em_bus_t *bus, int on)
 {
    if (bus != NULL)
       bus->want_dig_in = on ? 1 : 0;
+}
+
+/* 603Fh: "映射里有" 与 "读数是 0000h" 必须分得开 —— 后者是驱动器在说"我没故障",
+ * 前者才是"这台驱动器根本不告诉我们"。与 em_dig_in_known 同一个坑。 */
+int em_err_code_known(const em_axis_t *ax)
+{
+   return (ax != NULL && ax->off_err_code >= 0 && ax->mirror_ok) ? 1 : 0;
+}
+
+int em_err_code(const em_axis_t *ax)
+{
+   if (ax == NULL || !em_err_code_known(ax))
+      return EM_ERR_CODE_UNREAD;
+   return (int)ax->err_code;
+}
+
+int em_err_code_offset(const em_axis_t *ax) { return ax ? ax->off_err_code : -1; }
+
+void em_require_err_code(em_bus_t *bus, int on)
+{
+   if (bus != NULL)
+      bus->want_err_code = on ? 1 : 0;
 }
 
 void em_allow_param_write(em_bus_t *bus, int on)
@@ -2079,7 +2215,10 @@ int em__cw_step(em_axis_t *ax, const char *name, uint16_t cw,
       wkc = em__cycle(ax->bus);
       if (ax->bus->expected_wkc > 0 && wkc < ax->bus->expected_wkc)
       {
-         if (ax->short_frames < 20)
+         /* 连续短帧到这个数才算"总线真出事了"; 之前只是抖动, 让步再打一帧。
+          * 这个数就是 EM_SHORT_FRAMES_LIMIT —— 与 em__cycle 里降级 mirror_ok 用的是同一个:
+          * 两处各写一个字面量, 就会有一处改了另一处没改的那天。 */
+         if (ax->short_frames < EM_SHORT_FRAMES_LIMIT)
          {
             em__sleep_ms(EM_POLL_MS);
             continue;

@@ -2586,9 +2586,12 @@ static void test_homing()
          t.ax[i].mirror_ok = true;
       }
 
-      /* 没故障: 这一句不许自己编出个码来 */
+      /* 没故障: 这一句不许自己编出个码来。**判据是"有没有十六进制码"而不是"提没提 603Fh"**:
+       * 横幅的标题现在固定写着"6041h bit3 或 603Fh" (报警可能只有码、bit3 没立), 拿
+       * 关键词当判据会把标题一起判掉 */
       check(ecatcmd::faulted_axes_text(t).isEmpty(), "没故障 → 不提码");
-      check(!hasq(ecatcmd::fault_banner_text(t), "603Fh"), "没故障 → 横幅里也不提 603Fh");
+      check(!hasq(ecatcmd::fault_banner_text(t), "0x"), "没故障 → 横幅里一个码都不许有");
+      check(!hasq(ecatcmd::fault_banner_text(t), "轴X"), "没故障 → 不提任何一根轴");
 
       /* 只有轴Y 报故障: 码只许说那一根 —— 说成两根会把操作员支到健康的那根上 */
       t.ax[1].fault      = true;
@@ -3524,6 +3527,185 @@ static void test_meterlog()
    }
 }
 
+/* ------------------------------------------------- 通讯健康 (2026-09-22) */
+
+/* 这一组测的是**上位机自己看到的东西**: 帧够不够 (comm_bad_from)、AL 码怎么念 (al_code_text)、
+ * 报警码从哪一路来 (err_code_from), 以及两族措辞不许混。
+ *
+ * 与 test_origin 同一个处境: 真正把这些数**算出来**的地方 (em__cycle 的短帧降级、TxPDO 追加、
+ * em_al_status 的取值、帧间隔统计) 全在 motor_api 的 .c 与 ecatworker.cpp 里, 而 scan_selftest
+ * 一个都不编 —— 这里能钉住的只有"给定这些数, 结论对不对"。哪一半只有硬件能验, 见
+ * docs/scan_sweep.md §30。 */
+static void test_bushealth()
+{
+   auto hasq = [](const QString &s, const char *w) {
+      return s.contains(QString::fromUtf8(w));
+   };
+
+   caseBegin("通讯: 帧够不够 (边界逐条钉住, 一个 >= 写成 > 就是永远不报警或一直报警)");
+   {
+      const int L = HMI_BAD_WKC_LIMIT;
+
+      /* 好帧: 不管累计了多少坏帧, 只要这一帧够就不是 comm_bad */
+      check(!ecatcmd::comm_bad_from(7, 7, 0, L),  "刚好够");
+      check(!ecatcmd::comm_bad_from(8, 7, 99, L), "够帧时坏帧计数不作数 (计数本身就该归零)");
+
+      /* 坏帧: 差一帧不算, 到限额才算 */
+      check(!ecatcmd::comm_bad_from(6, 7, L - 1, L), "限额减一 → 还不够");
+      check(ecatcmd::comm_bad_from(6, 7, L, L),      "正好到限额 → 报警 (边界**含**)");
+      check(ecatcmd::comm_bad_from(6, 7, L + 1, L),  "超过限额 → 报警");
+
+      /* expected <= 0 = SOEM 还没算出期望值 (没进 OP / 没建映射)。
+       * 这时 wkc 恒为 0, 拿它判会把**每一次连接**都记成一串坏帧 */
+      check(!ecatcmd::comm_bad_from(0, 0, 999, L),  "期望值未知 → 不报警");
+      check(!ecatcmd::comm_bad_from(0, -1, 999, L), "期望值是负数 → 也不报警");
+
+      /* 阈值 <= 0 是个非法值, 不是"永不报警"以外的任何意思 —— 但不能返回真 */
+      check(!ecatcmd::comm_bad_from(0, 7, 999, 0),  "阈值 0 → 不报警");
+      check(!ecatcmd::comm_bad_from(0, 7, 999, -5), "负阈值 → 不报警");
+   }
+
+   caseBegin("通讯: AL 状态码说人话 (0x001B 是「主站喂帧超时」, 认错就查错方向)");
+   {
+      check(hasq(ecatcmd::al_code_text(8, 0x001B), "看门狗"), "0x001B 点名看门狗");
+      check(hasq(ecatcmd::al_code_text(8, 0x001B), "帧"),     "并把「喂帧」这件事说出来");
+      check(hasq(ecatcmd::al_code_text(8, 0x001E), "输入配置"), "0x001E");
+      check(hasq(ecatcmd::al_code_text(4, 0x0030), "DC"),     "0x0030 提到 DC");
+
+      /* 码要照实写出来 (操作员拿它去对 SOEM 的打印), 且与相邻的码不许抄串 */
+      check(hasq(ecatcmd::al_code_text(8, 0x001B), "001B"), "十六进制照写");
+      check(!hasq(ecatcmd::al_code_text(8, 0x001B), "001E"), "相邻的码不许抄串");
+
+      /* 表外的码不许猜成"未知故障": 照实报十六进制 */
+      check(hasq(ecatcmd::al_code_text(8, 0x00AB), "00AB"), "表外码照实写");
+      check(!hasq(ecatcmd::al_code_text(8, 0x00AB), "看门狗"), "表外码不许借用别人的名字");
+
+      /* AL 状态名: 8 = OP。**state <= 0 是"没读到"**, 不许说成 INIT (0 不是合法 AL 状态) */
+      check(hasq(ecatcmd::al_code_text(8, 0), "OP"),       "8 = OP");
+      check(hasq(ecatcmd::al_code_text(4, 0), "SAFE-OP"),  "4 = SAFE-OP");
+      check(hasq(ecatcmd::al_code_text(0, 0), "没读到"),   "0 = 没读到");
+      check(!hasq(ecatcmd::al_code_text(0, 0), "INIT"),    "不许把「没读到」说成 INIT");
+
+      /* 码是 0 (无错) 时那一截不出现: 状态栏常态不该挂着 "0x0000 (无错)" */
+      check(!hasq(ecatcmd::al_code_text(8, 0), "0x0000"), "无错时不报码");
+   }
+
+   caseBegin("603Fh: 两条路挑哪一条 (err_code_from 是唯一一处规则)");
+   {
+      /* ① 603Fh 在生效 TxPDO 里 (默认就是) -> 那一帧的读数说了算, 与 bit3 同帧到达。
+       *    **0x0000 是真实读数**, 不许被当成"没读到" */
+      checkEq(ecatcmd::err_code_from(true, 0x0000, HMI_FAULT_CODE_UNREAD, false), 0x0000,
+              "映射里读到 0000 = 驱动器说无错");
+      checkEq(ecatcmd::err_code_from(true, 0xFF06, HMI_FAULT_CODE_UNREAD, false), 0xFF06,
+              "映射里读到 FF06");
+      /* 映射里有时 bit3 说什么都不作数 —— 它本来就可能不立 */
+      checkEq(ecatcmd::err_code_from(true, 0xFF06, 0xFF02, false), 0xFF06,
+              "映射里的读数优先于 SDO 的陈值");
+
+      /* ② 不在映射里 -> 只剩 SDO 那条路, 而它**只在 bit3 立起时才走** */
+      checkEq(ecatcmd::err_code_from(false, 0, 0xFF02, true), 0xFF02,
+              "不在映射里 + bit3 立着 -> 用 SDO 读到的");
+      checkEq(ecatcmd::err_code_from(false, 0, HMI_FAULT_CODE_UNREAD, true),
+              HMI_FAULT_CODE_UNREAD, "还没读回来 -> 照实说还没读到");
+      checkEq(ecatcmd::err_code_from(false, 0, HMI_FAULT_CODE_FAIL, true),
+              HMI_FAULT_CODE_FAIL, "读不到 -> 照实说读不到");
+
+      /* ③ bit3 = 0 且不在映射里: **不许**把 SDO 的陈值放出去 ——
+       *    那多半是上一次故障留下的, 显示出来就是"已经清掉的故障还在报" */
+      checkEq(ecatcmd::err_code_from(false, 0, 0xFF02, false), HMI_FAULT_CODE_UNREAD,
+              "故障位没了 -> 陈值必须作废");
+      check(!(ecatcmd::err_code_from(false, 0, 0xFF02, false) > 0),
+            "作废之后不许再是个正数 (正数 = 会被 axis_alarm 当成报警)");
+   }
+
+   caseBegin("报警判据: 只有码、bit3 没立起来的那一种也必须算报警");
+   {
+      /* 现场报的正是这一条: 驱动器面板亮着, 界面上什么都不亮。
+       * 若 0xFF06 不把 bit3 立起来, 只看 bit3 的灯就永远不会亮 */
+      check(ecatcmd::axis_alarm(true, 0xFF06),  "bit3 立着 → 报警");
+      check(ecatcmd::axis_alarm(false, 0xFF06), "只有码、bit3 没立 → **也算**报警");
+      check(ecatcmd::axis_alarm(true, 0x0000),  "bit3 立着而码是 0000 → 仍算 (故障位本身就是事)");
+
+      /* 0x0000 是"无错误"这个真实读数, 不是报警 */
+      check(!ecatcmd::axis_alarm(false, 0x0000), "无错 → 不报警");
+      /* 两个哨兵是"不知道", 不许被当成报警 (bit3 会自己说那一拍) */
+      check(!ecatcmd::axis_alarm(false, HMI_FAULT_CODE_UNREAD), "还没读到 → 不报警");
+      check(!ecatcmd::axis_alarm(false, HMI_FAULT_CODE_FAIL),   "读不到 → 不报警");
+   }
+
+   caseBegin("两族措辞不许混: (A) 驱动器自报 vs (B) 上位机自己的帧不够");
+   {
+      /* 这两件事处置完全不同 —— (A) 查驱动器设置与干扰, (B) 查网线/网卡/本机负载。
+       * 混起来就是把人支到错的地方, 而这是两个不同的函数, 很容易在改一处时抄到另一处 */
+      BusTelem t;
+      t.connected = true;
+      t.in_op     = true;
+      t.naxis     = 2;
+      for (int i = 0; i < 2; i++)
+      {
+         t.ax[i].valid     = true;
+         t.ax[i].mirror_ok = true;
+      }
+
+      const QString a = ecatcmd::fault_banner_text(t);      /* (A) */
+      const QString b = ecatcmd::comm_banner_text(0, 7, 12, 300, 4);   /* (B) */
+
+      check(!a.isEmpty() && !b.isEmpty(), "两条都出得来");
+      check(a != b, "两条横幅不是同一句话");
+
+      /* (A) 说的是驱动器的自报, 要指向驱动器那一侧 */
+      check(hasq(a, "6041h"), "(A) 指向驱动器的状态字/故障位");
+      /* (B) 说的是本机的帧, 要指向本机与线路那一侧 */
+      check(hasq(b, "工作计数器") || hasq(b, "帧"), "(B) 说的是帧");
+      check(hasq(b, "300"), "(B) 把最长多久没发帧这个数说出来 —— 它是唯一能对账的数");
+      /* (B) 不许借 (A) 的处置办法说话: "查通讯线、干扰源与站号配置" 那句的前提是
+       * 驱动器**自报**通讯报警, 而 (B) 讲的是主站自己没发出去 */
+      check(!hasq(b, "站号"), "(B) 不许抄 (A) 那句「查站号配置」");
+
+      /* (B) 的措辞要随帧数变 —— 写成常量就没有诊断价值了 */
+      const QString b2 = ecatcmd::comm_banner_text(1, 7, 12, 300, 4);
+      check(b != b2, "帧数变了, 句子跟着变");
+
+      /* 没量到帧间隔时 (max_gap_ms = 0) 那一截不出现: 不许编一个 0 ms 出来 */
+      const QString b3 = ecatcmd::comm_banner_text(0, 7, 12, 0, 0);
+      check(!hasq(b3, "0 ms"), "没量到就不提这个数");
+   }
+
+   caseBegin("两根轴同一个码: 处置那句只说一遍 (实机见过同一句连着出现两遍)");
+   {
+      BusTelem t;
+      t.connected = true;
+      t.in_op     = true;
+      t.naxis     = 2;
+      for (int i = 0; i < 2; i++)
+      {
+         t.ax[i].valid      = true;
+         t.ax[i].mirror_ok  = true;
+         t.ax[i].fault      = true;     /* bit3 立着 */
+         t.ax[i].fault_code = 0x0000;   /* 码是好的, 只是故障位还没清 —— 现场报的就是这一拍 */
+      }
+
+      const QString s   = ecatcmd::fault_banner_text(t);
+      const QString one = QString::fromUtf8(ecatcmd::fault_code_action(0x0000));
+
+      check(!one.isEmpty(), "0x0000 有处置那句话");
+      check(s.count(one) == 1, "两根轴同码 → 处置那句只出现一次");
+
+      /* dedupe 只该去掉重复的处置, **不许把"是哪些轴"也吃掉** */
+      check(hasq(s, "轴X"), "轴X 要点名");
+      check(hasq(s, "轴Y"), "轴Y 要点名");
+      check(s.count(QStringLiteral("603Fh")) >= 2, "每根轴各报一次自己的 603Fh");
+
+      /* 两根轴**不同**码时两句都要留下 (dedupe 不能退化成"只说第一根轴的") */
+      t.ax[1].fault_code = 0xFF02;
+      const QString s2    = ecatcmd::fault_banner_text(t);
+      const QString other = QString::fromUtf8(ecatcmd::fault_code_action(0xFF02));
+
+      check(!other.isEmpty(), "0xFF02 有处置那句话");
+      check(s2.count(one) == 1 && s2.count(other) == 1, "不同码 → 两句各一次");
+   }
+}
+
 int main(int argc, char **argv)
 {
    QCoreApplication app(argc, argv);
@@ -3545,6 +3727,7 @@ int main(int argc, char **argv)
    test_limitsw();
    test_homing();
    test_origin();
+   test_bushealth();
    test_meter_sources();
    test_meter_meta();
    test_meterlog();
