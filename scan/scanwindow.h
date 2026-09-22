@@ -115,8 +115,8 @@ private:
    void onResumeRunClicked();
    void onAbortClicked();
    void onRetestClicked();
-   /* 「取样源」。**不连总线也要能选真机**, 所以它不在任何编辑门控里 —— 那一整块框的判据
-    * 全在 refreshMeterPanel() 一处 (见它的注释) */
+   /* 「取样源」。**不连总线也要能选真机**, 所以它不受任何门管 —— 那一整块框的判据全在
+    * refreshMeterPanel() 一处 (见它的注释) */
    void onMeterChanged(int idx);
    /* 设备信息回来了: 真机那三行填选项表 / 当前选中项。**灰不灰与露不露都不归这里管**,
     * 那是 refreshMeterPanel() 每拍算的 */
@@ -151,49 +151,64 @@ private:
    /* 「停止」。回零期间它必须变成立即中止 (队列救不了回零) */
    void onStopClicked();
 
-   /* ---- 参数框的编辑门控 ----
-    * 一块框平时只读, 点这块框的「编辑」才能改, 改完「保存」(固化进 ini) 或「取消」(退回
-    * 上次保存的值并重新下推)。状态机在 scan/editgate.h, 这里只管控件。
+   /* ---- 参数框: 项表 + [保存][取消] ----
+    * 一块框里"什么时候不能改"的项登记在 m_panels 里: lock_running = 跑到一半改掉会让落进 CSV
+    * 的 (ix,iy) 跟滑台实际站的地方对不上, need_manual = 只在"色阶手动定标"时才可用。
+    * 表里没有的控件 (按钮这类动作) 各由刷新它那一处管。
     *
     * **控件的可用性只由 refreshEditability() 一处写** —— 它在 30Hz 的 refresh() 末尾被调,
-    * 别处再 setEnabled 会被下一拍覆盖 (写按钮槽里更是当场就被盖掉)。
-    * 功率计那一整块框不进门控, 它的判据在 refreshMeterPanel() 里, 由 refreshEditability()
-    * 转调 —— 仍然是"一处写", 只是那处自己又调了一个函数。 */
+    * 别处再 setEnabled 会被下一拍覆盖 (写按钮槽里更是当场就被盖掉)。标记与「取消」的灰不灰
+    * 也由那一处每拍重算。
+    * 功率计那一整块框不在这张表里, 它的判据在 refreshMeterPanel() 里, 由 refreshEditability()
+    * 转调 —— 仍然是"一处写", 只是那处自己又调了一个函数。
+    *
+    * 2026-09-23 撤掉了「编辑」: 控件平时就能改 (只有运行中锁那几项除外), 「保存」把这一框
+    * 固化进 ini, 「取消」退回**上次保存的那一份**。**没有编辑态就没有那层门**, 防滚轮误触
+    * 归"按住 Ctrl 才认滚轮"那条闸管 (见 WheelNeedsCtrl)。
+    * 状态机 (scan/editgate.h) 照旧用着, 只是 `gate.editing` 进门时 begin 一次、之后一直是真
+    * —— "这一框可以改"现在恒成立。装回「编辑」按钮时把 begin/drop 接回按钮即可。 */
    struct GateItem
    {
       QWidget *w = nullptr;
       bool     lock_running = false;  /* 运行中也锁住 (几何 / 输出路径这类) */
       bool     need_manual = false;   /* 只在"色阶手动定标"时才可用 (自动跟随时它是多余的) */
    };
-   struct PanelGate
+   struct PanelItems
    {
-      editgate::Gate  gate;
+      editgate::Gate  gate;             /* editing 恒真 (见上), dirty 由每拍比对算出来 */
       QGroupBox      *box = nullptr;
-      QPushButton    *btnEdit = nullptr;
+      QWidget        *bar = nullptr;    /* [保存][取消] 那一行 (框的孩子, 不进布局) */
       QPushButton    *btnSave = nullptr;
       QPushButton    *btnCancel = nullptr;
-      QString         title_base;
+      QString         title_base;       /* 框标题原文 (标记拼在它后面) */
       QList<GateItem> items;
-      QList<QVariant> snapshot;       /* 进编辑态那一刻的控件值 */
+      QList<QVariant> baseline;         /* 「上次保存」那一份 (= ini 里那一份) */
    };
 
    QWidget *buildAdvPanel();
-   /* 登记一块框: 造 [编辑][保存][取消] 那一行并记住成员。members 里**不放**这三个按钮 */
-   void addGate(int gi, QGroupBox *box, const QList<GateItem> &items);
-   QWidget *gateBar(int gi, QWidget *parent);
-   void gateSnapshot(int gi);       /* 拍快照 (进编辑态时) */
-   void gateRollback(int gi);       /* 控件 ← 快照, 不拦信号: 回滚要顺带重新下推 */
-   void gateRebase(int gi, QWidget *w);  /* 程序自己改了这个控件 -> 快照跟上 + 重算标记 */
-   void gateDirty(int gi);          /* 重算"有没有改动" (逐项与快照比对, 只影响标题标记) */
+   /* 登记一块框: 项表 + 标题原文, 并记住 [保存][取消] 那一行。**那两个按钮不进 items** */
+   void addPanel(int pi, QGroupBox *box, const QList<GateItem> &items);
+   /* 造 [保存][取消] 那一行。它是**框的孩子、不进框的布局**, 位置由 placePanelBar() 摆在
+    * 标题那一行的右端 (所以传的是 box 而不是某个布局) */
+   QWidget *panelBar(int pi, QGroupBox *box);
+   /* 把这一行的右上角对齐到框标题那一行的右端。标题那一行的下沿 = contentsRect().top()
+    * (样式自己留出来的), 所以不用去问样式; 框一变宽就得重摆 —— 见 eventFilter() */
+   void placePanelBar(int pi);
+   void placePanelBars();
+   bool eventFilter(QObject *o, QEvent *e) override;
+   /* 基线 = 控件此刻的值。三处调: 建完界面 (ini 里那一份)、「保存」之后、连接/关窗落盘之后 */
+   void panelCapture(int pi);
+   bool panelDiffers(int pi) const;              /* 逐项与基线比对 (幂等: 改回原值就落下去) */
+   void panelRevert(int pi);                     /* 控件 ← 基线, 不拦信号: 回退要顺带重新下推 */
+   /* 「保存」= 把**这一框**管的字段写进 ini。别的框还没保存的改动不被顺手固化 */
+   void panelSavePrefs(int pi);
+   void onPanelSave(int pi);
+   void onPanelCancel(int pi);
    void refreshEditability();
    /* 功率计那一块框的**全部**判据 (灰不灰 + 哪几行露出来)。只由 refreshEditability() 调 */
    void refreshMeterPanel();
    /* 那一框每拍要跟新的字 (状态行 / 统计 / 计数 / 曲线)。放 refresh() 里, 与可用性分开 */
    void refreshMeterReadout();
-   void gateTitle(int gi);          /* 框标题 = 标题 + 标记 */
-   void onGateEdit(int gi);
-   void onGateSave(int gi);
-   void onGateCancel(int gi);
    void refreshAdvWarn();           /* 双反相那行红字 */
 
    /* ---- 内部 ---- */
@@ -300,9 +315,8 @@ private:
    QLabel      *m_lTime     = nullptr;
 
    /* ---- 色标 ----
-    * 这一框**在编辑门控里** (GI_SHADE)。曾经有段时间把它摘出去过, 理由是"纯显示设置, 不必先点
-    * 编辑" —— 但那样「保存 / 取消」就没东西可存可退, 跟旁边几块框长得不一样, 反而别扭。
-    * 「保存」在这一框是做事的: 色标是不是自动跟随**记进 scan.ini** (上下限那两个数不记)。
+    * 这一框在可用性表里 (PI_SHADE): 里面有一个要记进 scan.ini 的模式 (「自动跟随」, 上下限
+    * 那两个数不记) 和一个只在手动定标时才该按的按钮 (「按数据定标」), 那两条判据得有个住处。
     *
     * 两个数是一对, 得一起保证 min < max, 规则是**推着走**: 改一个顶到另一个头上, 就把另一个
     * 一起推过去并保留原来的跨度 (见 onShadeLoChanged / onShadeHiChanged)。 */
@@ -316,8 +330,8 @@ private:
    QLabel         *m_lblAuto     = nullptr;
 
    /* ---- 功率计 ----
-    * **这一块框不进门控** (2026-09-22 起): 它里面没有"参数", 只有一台随时可以接上/断开的仪器,
-    * 而它的用处恰恰是"还没连总线, 先把真机选上"。所以它不需要先点「编辑」。判据全在
+    * **这一块框不在可用性表里** (2026-09-22 起): 它里面没有"参数", 只有一台随时可以接上/断开的
+    * 仪器, 而它的用处恰恰是"还没连总线, 先把真机选上"。所以它不需要先过一个门。判据全在
     * refreshMeterPanel() 一处, 与其余控件同一条规矩 (每拍重算, 不缓存)。
     *
     * 2026-09-22 曾经把这七样东西搬进一个独立的功率计窗口、参数栏只留一行取样源; 当天又搬回来
@@ -381,9 +395,12 @@ private:
    QCheckBox   *m_cbDiInvert = nullptr;
    QLabel      *m_lAdvWarn = nullptr;      /* 双反相那行红字 (见 refreshAdvWarn) */
 
-   /* ---- 编辑门控 ---- */
-   QList<PanelGate> m_gates;               /* 下标 = gate 号, 见 scanwindow.cpp 顶上那几个 GI_ */
-   QPushButton     *m_btnCsv = nullptr;    /* 「扫描参数」的 CSV「…」(进成员表, 故不能是局部量) */
+   /* ---- 参数框: 项表 + [保存][取消] ---- */
+   QList<PanelItems> m_panels;             /* 下标 = 框号, 见 scanwindow.cpp 顶上那几个 PI_ */
+   /* 「取消」正在回灌控件。回灌时那对色阶值会因为"先写 lo、此时 hi 还是新值"错配一下, 而
+    * 那条横幅说的是"操作员把数改坏了" —— 程序自己回灌不该弹它 (见 onShadeLoChanged) */
+   bool m_panelRevert = false;
+   QPushButton     *m_btnCsv = nullptr;    /* 「扫描参数」的 CSV「…」(进可用性表, 故不能是局部量) */
    /* 上一次推给工作线程的两个连接期参数: 只用来认出"勾了但本次连接不生效"这个情形 */
    bool m_advLastWantDig  = true;
    bool m_advLastNpnWrite = true;

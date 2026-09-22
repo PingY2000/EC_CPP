@@ -87,27 +87,29 @@ static const QString &readOnceTip()
    return s;
 }
 
-/* ---------------------------------------------------------------- 编辑门控 */
+/* ---------------------------------------------------------------- 参数框: 项表 + [保存][取消] */
 
-/* 框号。**顺序就是 buildUi 里 addGate 的顺序**, 一块框只在这里出现一次。
+/* 框号。**顺序就是 buildUi 里 addPanel 的顺序**, 一块框只在这里出现一次。
  *
- * 「色标 (功率)」也在这张表里, 虽然它是纯显示设置 —— 一度把它摘出去过, 理由是"改它不碰滑台
- * 也不碰总线, 何必先点「编辑」"。结果是: 那一框没有「保存 / 取消」, 屏幕上一块框跟旁边几块
- * 长得不一样, 而且「自动跟随」这个要记进 ini 的模式没有一处该按"保存"。
+ * 「色标 (功率)」也在这张表里, 虽然它是纯显示设置 —— 它里面有一个要记进 ini 的模式
+ * (「自动跟随」) 和一个要等手动模式的按钮 (「按数据定标」), 那两条判据也得有个住处,
+ * 而"哪一块框的控件归哪一处管"最好一眼能数清楚。
  *
- * 「功率计」**不在这张表里** (2026-09-22 起): 那一框整块露在外面 —— 一直看得见、一直改得动,
- * 里面没有"参数"要保存 (门控的意思是"这里有一份要记住的设置", 套上去反而是在骗人)。
- * 它的可用性判据因此不走这张表, 走 refreshMeterPanel() —— 仍然只有一处写 (见那儿)。 */
-enum GateIdx
+ * 「功率计」**不在这张表里** (2026-09-22 起): 那一整块框的判据是"当前选了哪个取样源"决定
+ * 的, 一个框里还带条件露不露的行, 用一张静态表反而说不清。它走 refreshMeterPanel() ——
+ * 仍然只有一处写 (见那儿)。 */
+enum PanelIdx
 {
-   GI_PARAM = 0,   /* 扫描参数 */
-   GI_HOME,        /* 回零 */
-   GI_ADV,         /* 高级选项 */
-   GI_SHADE,       /* 色标 (功率) */
-   GI_N
+   PI_PARAM = 0,   /* 扫描参数 */
+   PI_HOME,        /* 回零 */
+   PI_ADV,         /* 高级选项 */
+   PI_SHADE,       /* 色标 (功率) */
+   PI_N
 };
 
-/* 控件的值 <-> QVariant。按钮没有"值" (它触发动作, 不回滚), 返回无效 QVariant */
+
+/* 控件的值 <-> QVariant。按钮没有"值" (它触发动作, 不回退), 返回无效 QVariant ——
+ * 于是两个按钮永远不会让一框变"未保存" (见 panelDiffers) */
 static QVariant gateValue(const QWidget *w)
 {
    if (const auto *s = qobject_cast<const QSpinBox *>(w))
@@ -123,9 +125,8 @@ static QVariant gateValue(const QWidget *w)
    return QVariant();
 }
 
-/* 回滚一个控件。**刻意不挂 QSignalBlocker**: 「改动当场生效」就是靠 valueChanged /
- * currentIndexChanged 把值重新推给控制器与参数, 拦了信号就成了"界面回到旧值, 控制器还拿着
- * 新值"。每 set 一下都会经 markDirty, 所以调用方必须**先**退出编辑态 (见 onGateCancel)。 */
+/* 回退一个控件(← 基线)。**刻意不挂 QSignalBlocker**: 值改完要重新下推给控制器与参数, 靠的
+ * 就是 valueChanged / currentIndexChanged; 拦了信号就成了"界面回到旧值, 控制器还拿着新值"。 */
 static void gateSetValue(QWidget *w, const QVariant &v)
 {
    if (!v.isValid())
@@ -142,154 +143,154 @@ static void gateSetValue(QWidget *w, const QVariant &v)
       e->setText(v.toString());
 }
 
-void ScanWindow::addGate(int gi, QGroupBox *box, const QList<GateItem> &items)
+void ScanWindow::addPanel(int pi, QGroupBox *box, const QList<GateItem> &items)
 {
-   if (gi < 0 || gi >= m_gates.size())
+   if (pi < 0 || pi >= m_panels.size())
       return;
-
-   PanelGate &g = m_gates[gi];
-   g.box        = box;
-   g.items      = items;
-   g.title_base = box->title();
-   gateTitle(gi);
-
-   /* 改一下就重算标记 (只影响标题, 不拦「保存」)。在登记处一次性接上, 免得每个槽各记一次
-    * —— 漏一个的症状是"改了却没有未保存标记"。
-    *
-    * QLineEdit 用 textEdited 而不是 textChanged: 只有操作员敲字才算改。其余控件没有
-    * "只由用户触发"的版本 —— setValue/setCurrentIndex/setChecked 一样发信号, 而程序自己
-    * 也会改它们 (按数据定标 / 真机三项 / CSV 缺省名)。两件事挡住这种假标记: 标记本身是
-    * 逐项与快照比对算出来的 (gateDirty), 而程序改过的那一项会先经 gateRebase 把快照跟上。 */
-
-   for (const GateItem &it : g.items)
-   {
-      if (auto *s = qobject_cast<QSpinBox *>(it.w))
-         connect(s, &QSpinBox::valueChanged, this, [this, gi] { gateDirty(gi); });
-      else if (auto *d = qobject_cast<QDoubleSpinBox *>(it.w))
-         connect(d, &QDoubleSpinBox::valueChanged, this, [this, gi] { gateDirty(gi); });
-      else if (auto *c = qobject_cast<QComboBox *>(it.w))
-         connect(c, &QComboBox::currentIndexChanged, this, [this, gi] { gateDirty(gi); });
-      else if (auto *b = qobject_cast<QCheckBox *>(it.w))
-         connect(b, &QCheckBox::toggled, this, [this, gi] { gateDirty(gi); });
-      else if (auto *e = qobject_cast<QLineEdit *>(it.w))
-         connect(e, &QLineEdit::textEdited, this, [this, gi] { gateDirty(gi); });
-   }
+   PanelItems &p = m_panels[pi];
+   p.box        = box;
+   p.items      = items;
+   p.title_base = box->title();
+   /* 这一框的值随时都能改 —— 没有「编辑」这个动作了, 于是"在不在编辑态"这个变数消失。
+    * 状态机照旧用着 (标记的措辞只此一处, 自检钉着它) */
+   editgate::begin(&p.gate);
+   /* [保存][取消] 那一行要等这里才有 box 可用 (panelBar 先造出来, 位置在这儿才摆)
+    * —— 四块框的调用顺序都是 panelBar 紧接着 addPanel */
+   placePanelBar(pi);
 }
 
-/* "有没有改动"= 逐项与快照比出来的, 不是一个"改过没有"的布尔标记 —— 程序自己也会改控件值
- * (按数据定标 / 真机三项 / CSV 缺省名), 布尔标记分不出是谁改的, 而且改回原值也不会自己消失。
- * 比对是幂等的: 改回原值, 标记自己落下去。 */
-void ScanWindow::gateDirty(int gi)
+/* [保存][取消] 那一行。**它是框的孩子, 不进框的布局** —— 要跟标题排在同一行, 就只能自己
+ * 摆: 框标题不在任何布局里, 它是样式画出来的。
+ *
+ * 摆法见 placePanelBar()。这里只把那一行造出来, 尺寸按自己的 sizeHint (两个按钮 + 间距),
+ * 不 stretched 满宽 —— 满宽的那块空白会盖住左边标题那一带的命中区。 */
+QWidget *ScanWindow::panelBar(int pi, QGroupBox *box)
 {
-   if (gi < 0 || gi >= m_gates.size())
-      return;
-   PanelGate &g = m_gates[gi];
-   if (!g.gate.editing)     /* 「未保存」是编辑态里的东西, 非编辑态不碰标题 */
-      return;
-
-   bool diff = false;
-   for (int i = 0; i < g.items.size() && i < g.snapshot.size(); i++)
-      if (gateValue(g.items[i].w) != g.snapshot[i])
-      {
-         diff = true;
-         break;
-      }
-
-   if (diff)
-      editgate::markDirty(&g.gate);
-   else
-      editgate::undirty(&g.gate);
-   gateTitle(gi);
-}
-
-/* 框标题 = 原标题 + 标记。「未保存」只在这块框编辑态里出现 —— 别的框看不到别的框的标记 */
-void ScanWindow::gateTitle(int gi)
-{
-   if (gi < 0 || gi >= m_gates.size() || m_gates[gi].box == nullptr)
-      return;
-   PanelGate &g = m_gates[gi];
-   g.box->setTitle(g.title_base + QString::fromUtf8(editgate::titleMark(g.gate)));
-}
-
-QWidget *ScanWindow::gateBar(int gi, QWidget *parent)
-{
-   PanelGate &g = m_gates[gi];
-   QWidget *bar = new QWidget(parent);
+   PanelItems &p = m_panels[pi];
+   QWidget *bar = new QWidget(box);
    QHBoxLayout *h = new QHBoxLayout(bar);
    h->setContentsMargins(0, 0, 0, 0);
    h->setSpacing(6);
 
-   g.btnEdit   = new QPushButton(QStringLiteral("编辑"), bar);
-   g.btnSave   = new QPushButton(QStringLiteral("保存"), bar);
-   g.btnCancel = new QPushButton(QStringLiteral("取消"), bar);
-   for (QPushButton *b : { g.btnEdit, g.btnSave, g.btnCancel })
-      b->setFixedHeight(22);
+   p.btnSave   = new QPushButton(QStringLiteral("保存"), bar);
+   p.btnCancel = new QPushButton(QStringLiteral("取消"), bar);
+   for (QPushButton *b : { p.btnSave, p.btnCancel })
+      /* **不设固定高**, 让它按自己的 sizeHint 走 —— 但**必须先把这个 objectName 挂上**:
+       * main.cpp 那条 QPushButton 规则上的 padding 是按框里的大按钮定的 (上下各 5px), 照那个
+       * 算出来的自然高度是 28px, 硬压成标题那一行的高度就会把字挤成一条缝。样式表里
+       * QPushButton#panelbar 那条把内边距压掉了, 自然高度就成了"字高 + 边框" */
+      b->setObjectName(QStringLiteral("panelbar"));
+   p.btnSave->setToolTip(QStringLiteral("把本组各项写入 scan.ini。"));
+   p.btnCancel->setToolTip(QStringLiteral("恢复为上次保存的值并下发控制器。"));
 
+   connect(p.btnSave,   &QPushButton::clicked, this, [this, pi] { onPanelSave(pi); });
+   connect(p.btnCancel, &QPushButton::clicked, this, [this, pi] { onPanelCancel(pi); });
 
-   connect(g.btnEdit,   &QPushButton::clicked, this, [this, gi] { onGateEdit(gi); });
-   connect(g.btnSave,   &QPushButton::clicked, this, [this, gi] { onGateSave(gi); });
-   connect(g.btnCancel, &QPushButton::clicked, this, [this, gi] { onGateCancel(gi); });
+   h->addWidget(p.btnSave);
+   h->addWidget(p.btnCancel);
 
-   h->addWidget(g.btnEdit);
-   h->addWidget(g.btnSave);
-   h->addWidget(g.btnCancel);
-   h->addStretch(1);
+   /* 灰不灰只由 refreshEditability 一处改; 这里先摆成"没有改动"的样子 (两个都灰) */
+   p.btnSave->setEnabled(false);
+   p.btnCancel->setEnabled(false);
 
-   /* 可见性只由 refreshEditability 一处改; 这里先摆成"没在编辑"的样子 */
-   g.btnSave->setVisible(false);
-   g.btnCancel->setVisible(false);
+   p.bar = bar;
+   /* 框一变宽就得重摆 (它不在布局里, 不会自己跟): 窗口缩放、分隔条拖动、参数栏出滚动条
+    * 都会改框宽, 而**最后那个不会给 ScanWindow 发 resizeEvent** —— 只能挂在框自己身上。
+    * 位置由 addPanel() 摆 (那时 p.box 才填上) */
+   box->installEventFilter(this);
    return bar;
 }
 
-void ScanWindow::gateSnapshot(int gi)
+/* 那一行摆到框标题的右端, 与标题同一行。
+ *
+ * 标题那一行的下沿就是 contentsRect().top() —— 样式按标题字高在框顶上留出这么一条, 框里
+ * 的布局从它下面开始 (本程序带了样式表, 量出来是 18px, 与标题字齐平)。所以不需要去问样式
+ * 要几何, 也不需要改框的边距。
+ *
+ * **高度取那一行自己的 sizeHint**, 不从外面塞一个数进来: 它 = "字高 + 上下边框", 也就是
+ * QPushButton#panelbar 那条规则算出来的自然高度。字体被调大时它自己跟着长, 框也会跟着变高
+ * (框的标题那一行是按字高留的), 不会把字挤掉。 */
+void ScanWindow::placePanelBar(int pi)
 {
-   PanelGate &g = m_gates[gi];
-   g.snapshot.clear();
-   for (const GateItem &it : g.items)
-      g.snapshot.append(gateValue(it.w));
+   const PanelItems &p = m_panels[pi];
+   if (p.bar == nullptr || p.box == nullptr)
+      return;
+
+   const int w = p.bar->sizeHint().width();
+   p.bar->setGeometry(p.box->contentsRect().right() - w + 1, 0, w, p.bar->sizeHint().height());
+   /* 它跟框里的控件是兄弟: 后建的默认压在它上面。这一条是保险 (两边本来不重叠) */
+   p.bar->raise();
 }
 
-void ScanWindow::gateRollback(int gi)
+void ScanWindow::placePanelBars()
 {
-   PanelGate &g = m_gates[gi];
-   for (int i = 0; i < g.items.size() && i < g.snapshot.size(); i++)
-      gateSetValue(g.items[i].w, g.snapshot[i]);
+   for (int pi = 0; pi < m_panels.size(); pi++)
+      placePanelBar(pi);
 }
 
-/* 程序自己改了某个成员的值 -> 把快照里那一项跟上, 否则「取消」会把它滚回一份陈值 (而且
- * 滚完还会被程序再改一次, 两边打架)。只动这一个: 整框重拍会把同一框里别处的未保存改动
- * 一起"原谅"掉。快照跟上之后这一项就不算改动了 —— 顺手把标记重算一遍。 */
-void ScanWindow::gateRebase(int gi, QWidget *w)
+bool ScanWindow::eventFilter(QObject *o, QEvent *e)
 {
-   if (gi < 0 || gi >= m_gates.size())
-      return;
-   PanelGate &g = m_gates[gi];
-   if (!g.gate.editing)
-      return;
-   for (int i = 0; i < g.items.size(); i++)
-      if (g.items[i].w == w)
-      {
-         if (i < g.snapshot.size())
-            g.snapshot[i] = gateValue(w);
-         gateDirty(gi);
-         return;
-      }
+   if (e->type() == QEvent::Resize)
+      for (int pi = 0; pi < m_panels.size(); pi++)
+         if (m_panels[pi].box == o)
+         {
+            placePanelBar(pi);
+            break;
+         }
+   return QMainWindow::eventFilter(o, e);
+}
+
+void ScanWindow::panelCapture(int pi)
+{
+   PanelItems &p = m_panels[pi];
+   p.baseline.clear();
+   for (const GateItem &it : p.items)
+      p.baseline.append(gateValue(it.w));
+}
+
+/* "有没有改动"= **逐项与基线比对**算出来的, 不是一个"改过没有"的布尔标记 —— 程序自己也会改
+ * 控件值 (按数据定标 / 真机三项 / CSV 缺省名), 布尔标记分不出是谁改的, 而且改回原值也不会
+ * 自己消失。比对是幂等的: 改回原值, 标记自己落下去。 */
+bool ScanWindow::panelDiffers(int pi) const
+{
+   const PanelItems &p = m_panels[pi];
+   for (int i = 0; i < p.items.size() && i < p.baseline.size(); i++)
+      if (gateValue(p.items[i].w) != p.baseline[i])
+         return true;
+   return false;
+}
+
+/* 回灌 = 控件 ← 基线, 并且**不拦信号** —— 这一框的值下推给控制器/画布靠的正是那些
+ * valueChanged / currentIndexChanged。 */
+void ScanWindow::panelRevert(int pi)
+{
+   const PanelItems &p = m_panels[pi];
+   m_panelRevert = true;      /* 见 m_panelRevert 那条注 */
+   for (int i = 0; i < p.items.size() && i < p.baseline.size(); i++)
+      gateSetValue(p.items[i].w, p.baseline[i]);
+   m_panelRevert = false;
+
+   /* 色标那一对**在回灌途中是被让开的** (见 onShadeLoChanged): lo 先落地时 hi 还是旧值,
+    * 那一瞬的区间是反的。两个都退完了在这里补一次, 画布拿到的才是最后那对 */
+   if (pi == PI_SHADE && m_edShadeLo != nullptr && m_edShadeHi != nullptr)
+      m_canvas->setShadeRange(m_edShadeLo->value(), m_edShadeHi->value());
 }
 
 /* 全部参数控件 setEnabled 的**唯一写点**。由 refresh() 每拍调用。
- * enabled = 这块框在编辑态 && 这一项在运行期没被锁住。 */
+ * 每拍顺手把"有没有改动"重算一遍 (比对是幂等的, 每拍重算比在信号里点灯更难写错)。 */
 void ScanWindow::refreshEditability()
 {
    const bool running = m_ctl->running();
 
-   for (int gi = 0; gi < m_gates.size(); gi++)
+   for (int pi = 0; pi < m_panels.size(); pi++)
    {
-      PanelGate &g = m_gates[gi];
-      const bool editing = g.gate.editing;
+      PanelItems &p = m_panels[pi];
+      bool any_locked = false;
 
-      for (const GateItem &it : g.items)
+      for (const GateItem &it : p.items)
       {
-         bool ok = editing && !(running && it.lock_running);
+         bool ok = !(running && it.lock_running);
+         any_locked = any_locked || (running && it.lock_running);
          /* 空的下拉框打不开: 真机那三项在设备没报这一项时是空的 */
          if (ok)
             if (const auto *cb = qobject_cast<const QComboBox *>(it.w))
@@ -301,24 +302,33 @@ void ScanWindow::refreshEditability()
          it.w->setEnabled(ok);
       }
 
-      /* 「保存 / 取消」不在成员表里 (进了编辑态它们反而必须按得动), 所以单独定。
-       * 「编辑」在编辑态里藏起来 —— 再点一次没有意义 (重复点 begin 是 no-op) */
-      if (g.btnEdit != nullptr)
-      {
-         g.btnEdit->setVisible(!editing);
-         g.btnSave->setVisible(editing);
-         g.btnCancel->setVisible(editing);
-         g.btnSave->setEnabled(editing);
-         g.btnCancel->setEnabled(editing);
-      }
+      const bool dirty = panelDiffers(pi);
+      if (dirty)
+         editgate::markDirty(&p.gate);
+      else
+         editgate::undirty(&p.gate);
+
+      /* 标题只在不同的时候重设: 每拍 setTitle 就是每拍重排一次版面 */
+      const QString t = p.title_base + QString::fromUtf8(editgate::titleMark(p.gate));
+      if (p.box != nullptr && p.box->title() != t)
+         p.box->setTitle(t);
+
+      /* 这一框没改动时两个都按不动: 「保存」写下去的就是盘上已经有的那一份, 「取消」要退的
+       * 就是此刻屏幕上的这一份 —— 两个都是空动作, 亮着只会让人以为还有事没做完。
+       * 「取消」另有一条: 运行中且这一框有锁住的项时也按不动 —— 那几项正是"跑到一半不能动"
+       * 的几何, 回退会把它们改掉, 而这个按钮不是给"绕过锁"用的。 */
+      if (p.btnSave != nullptr)
+         p.btnSave->setEnabled(dirty);
+      if (p.btnCancel != nullptr)
+         p.btnCancel->setEnabled(dirty && !any_locked);
    }
 
    /* 不是参数、但也只能在运行外按的动作按钮 (原先是跟着那张"扫描中锁住"的表走的) */
    if (m_btnOpen != nullptr)
       m_btnOpen->setEnabled(!running);
 
-   /* 「功率计」那一整块框。它不进门控, 判据全在 refreshMeterPanel() 里 —— 从这一处转过去,
-    * 于是"可用性只有一处写"这条规矩在这一块上也成立 */
+   /* 「功率计」那一整块框。它不在上面那张表里, 判据全在 refreshMeterPanel() 里 —— 从这一处
+    * 转过去, 于是"可用性只有一处写"这条规矩在这一块上也成立 */
    refreshMeterPanel();
 }
 
@@ -326,8 +336,8 @@ void ScanWindow::refreshEditability()
  * 「功率计」那一框的**全部判据**: 灰不灰 + 哪几行露出来。只由 refreshEditability() 调
  * (即 30Hz 的 refresh() 末尾), 与其余控件同一条规矩 —— **每拍重算, 不缓存**。
  *
- * 这一框不进门控, 因为它里面没有"参数", 只有一台随时可以接上/断开的仪器; 而它的用处恰恰是
- * "还没连总线, 先把真机选上" —— 套进门控就等于先要点「编辑」, 那正是当初要解决的问题。
+ * 这一框不在可用性表里, 因为它里面没有"参数", 只有一台随时可以接上/断开的仪器; 而它的用处
+ * 恰恰是"还没连总线, 先把真机选上" —— 归到那张表里就得先过一个门, 那正是当初要解决的问题。
  *
  * 三条判据:
  *   ① 连续读数正在跑 -> 取样源与各源参数都锁住 (一条曲线上不能换源), 能按的只有「停止」
@@ -596,77 +606,60 @@ void ScanWindow::refreshMeterReadout()
    }
 }
 
-void ScanWindow::onGateEdit(int gi)
+/* 「保存」= 把**这一框**管的字段写进 ini。先读回上次那份, 只覆盖自己管的键 —— 每块框各存
+ * 各的, 别的框里还没保存的改动不被顺手固化 (它们的「取消」因此照样退得回去)。
+ * 「连接」与关窗那两次落盘不受这条限制: 那两次是"整份都记" (见 saveSettings)。 */
+void ScanWindow::panelSavePrefs(int pi)
 {
-   if (gi < 0 || gi >= m_gates.size())
-      return;
+   Prefs pf = prefsLoad(prefsPath());
 
-   /* 同一时刻只允许一块框在编辑态。已经在编辑别块框 -> **静默丢弃**它: 不弹框拦人,
-   * 只把改动滚回去并在它的标题上留一个「已丢弃」。 */
-   for (int k = 0; k < m_gates.size(); k++)
+   switch (pi)
    {
-      if (k == gi)
-         continue;
-      PanelGate &o = m_gates[k];
-      if (!o.gate.editing)
-         continue;
-      const bool had = editgate::drop(&o.gate);
-      if (had)
-      {
-         gateRollback(k);
-         /* 说一声但**不弹框**: 改动没了却不吭声是更坏的做法。横幅会自己消失, 而那块框
-          * 标题上的「未保存 (已丢弃)」会一直留到它下次进编辑态 */
-         hint(QStringLiteral("「%1」的未保存改动已丢弃, 正在编辑「%2」。")
-                 .arg(o.title_base, m_gates[gi].title_base),
-              false);
-      }
-      gateTitle(k);
+   case PI_PARAM:
+      /* 过不了体检的参数不覆盖旧的 (规则在 scanprefs 里, 那里能被自检钉住) */
+      prefsMergeParams(&pf, currentParams());
+      pf.manual_speed = m_edManSpeed->value();
+      break;
+   case PI_HOME:
+      pf.home_vel   = m_edHomeVel->value();
+      pf.home_tmo_s = m_edHomeTmo->value();
+      break;
+   case PI_ADV:
+      pf.want_dig_in     = m_cbWantDigIn->isChecked();
+      pf.npn_write_drive = m_cbNpnWrite->isChecked();
+      pf.npn_sw_invert   = m_cbDiInvert->isChecked();
+      break;
+   case PI_SHADE:
+      pf.shade_auto = m_cbShadeAuto->isChecked();
+      break;
+   default:
+      return;      /* 「功率计」那一框不在表里, 没有「保存」 */
    }
 
-   PanelGate &g = m_gates[gi];
-   if (!editgate::begin(&g.gate))
+   prefsSave(prefsPath(), pf);
+}
+
+void ScanWindow::onPanelSave(int pi)
+{
+   if (pi < 0 || pi >= m_panels.size())
       return;
 
-   gateSnapshot(gi);      /* 快照 = 「取消」要退回的那一份 */
-   gateTitle(gi);
+   panelSavePrefs(pi);
+
+   /* 刚写下去的就是新的"上次保存值": 基线跟上, 「未保存」标记随之落下去 (下一句重算) */
+   panelCapture(pi);
+   hint(QStringLiteral("「%1」已保存至 scan.ini。").arg(m_panels[pi].title_base), false);
    refreshEditability();
 }
 
-void ScanWindow::onGateSave(int gi)
+void ScanWindow::onPanelCancel(int pi)
 {
-   if (gi < 0 || gi >= m_gates.size())
-      return;
-   PanelGate &g = m_gates[gi];
-   if (!g.gate.editing)
+   if (pi < 0 || pi >= m_panels.size())
       return;
 
-   /* 直接走现成那条路就够: 同一时刻最多一块框在编辑态, 别框此刻持有的必然是上次保存的值,
-    * 所以重写整份 ini 不丢东西。**静默丢弃因此不是界面上的客气, 是这条正确性的前提。** */
-   saveSettings();
-
-   editgate::save(&g.gate);
-   gateSnapshot(gi);      /* 刚保存的值就是新的"上次保存" */
-   gateTitle(gi);
-   hint(QStringLiteral("「%1」已保存至 scan.ini。").arg(g.title_base), false);
-   refreshEditability();
-}
-
-void ScanWindow::onGateCancel(int gi)
-{
-   if (gi < 0 || gi >= m_gates.size())
-      return;
-   PanelGate &g = m_gates[gi];
-   if (!g.gate.editing)
-      return;
-
-   /* 顺序不能反: 先退出编辑态, 再回灌。回灌的每一个信号都会经 gateDirty, 那时 editing
-    * 已经是 false -> 不会把框重新点脏 (反了的话「取消」永远清不干净那个标记) */
-   editgate::cancel(&g.gate);
-   gateRollback(gi);
-
-   gateTitle(gi);
-   hint(QStringLiteral("「%1」已取消, 恢复为上次保存的值并已下发控制器。")
-           .arg(g.title_base),
+   panelRevert(pi);
+   hint(QStringLiteral("「%1」已恢复为上次保存的值并下发控制器。")
+           .arg(m_panels[pi].title_base),
         false);
    refreshEditability();
 }
@@ -795,9 +788,9 @@ static QString fmtDur(int64_t ms)
  * 撞限位的。
  *
  * 判据原本是"点过它 (拿着焦点) 就认滚轮"。那个例外本身就是坑: 焦点停在下拉框上时, 那一滚
- * 既改了值又没滚成页面, 于是焦点一直留着, 接着滚接着改。而**一直使能的框只有「功率计」
- * 那一块** (其余几块不在编辑态时控件是禁用的, 禁用控件根本收不到滚轮), 于是误改全落在它
- * 身上。换成 Ctrl 这个一次性、明确的手势: 想用滚轮调值就按住, 不想动它就松开。
+ * 既改了值又没滚成页面, 于是焦点一直留着, 接着滚接着改。换成 Ctrl 这个一次性、明确的手势:
+ * 想用滚轮调值就按住, 不想动它就松开 —— 参数框里的控件平时都是能改的 (2026-09-23 撤掉编辑
+ * 门控之后更是全部能改), 靠"谁使能了"分不出哪一滚是故意的。
  *
  * 事件先落在 spin box 内部那个 QLineEdit 上, 所以过滤器要挂在输入框及其每一个子控件上
  * (见 guard()); 判"这一滚落在哪个输入框上"要从收到事件的控件往上找 —— 收到事件的不是被闸
@@ -1041,8 +1034,8 @@ void ScanWindow::buildUi()
    QWidget *side = new QWidget;
    side->setMinimumWidth(340);
 
-   /* 门控表按 gate 号建满, 后面每块框自己往里填 (下标 = .cpp 顶上那几个 GI_) */
-   m_gates.resize(GI_N);
+   /* 可用性表按框号建满, 后面每块框自己往里填 (下标 = .cpp 顶上那几个 PI_) */
+   m_panels.resize(PI_N);
 
    QVBoxLayout *sv = new QVBoxLayout(side);
    sv->setContentsMargins(0, 0, 0, 0);
@@ -1066,6 +1059,16 @@ void ScanWindow::buildUi()
    /* 高级选项摆在最底下: 它是"设好了就别再动"的东西, 平时不该占视线 */
    sv->addWidget(advPanel);
    sv->addStretch(1);
+
+   /* 基线 = **ini 里那一份**, 也就是此刻屏幕上的这些值 —— 六块框的控件到这里才全建齐
+    * (loadSettings 在上面 buildParamPanel 里已经跑完, 存下来的值都灌进去了), 早一步采就是
+    * 拿缺省值当基线, 一开门每块框都顶着「未保存」。「取消」退的就是这一份。 */
+   for (int pi = 0; pi < PI_N; pi++)
+      panelCapture(pi);
+
+   /* 框标题那一行右端的 [保存][取消] 再摆一遍: 上面那一串框建完之后才拿到真实宽度
+    * (addPanel 里摆的那一次用的是建框那一刻的尺寸)。之后每次变宽由 eventFilter 接手 */
+   placePanelBars();
 
    QScrollArea *sideScroll = new QScrollArea(central);
    sideScroll->setWidget(side);
@@ -1365,18 +1368,21 @@ QWidget *ScanWindow::buildAdvPanel()
    m_lAdvWarn->setStyleSheet(QStringLiteral("color:#ff8f8f;"));
    m_lAdvWarn->setVisible(false);
 
-   v->addWidget(gateBar(GI_ADV, box));
    v->addWidget(m_cbWantDigIn);
    v->addWidget(m_cbNpnWrite);
    v->addWidget(m_cbDiInvert);
    v->addWidget(m_lAdvWarn);
 
-   /* 三个都在成员表里 (不含按钮行)。运行中也可以改: 前两个要重连才生效, 第三个立刻生效,
-    * 都不影响已经跑起来的那一趟扫描的几何 */
-   addGate(GI_ADV, box,
-           QList<GateItem>{ GateItem{ m_cbWantDigIn, false, false },
-                            GateItem{ m_cbNpnWrite,  false, false },
-                            GateItem{ m_cbDiInvert,  false, false } });
+   /* [保存][取消] 摆在框标题那一行的右端, 不占这个布局的行 */
+   panelBar(PI_ADV, box);
+
+   /* 三个都在表里 (**不含标题上那两个按钮**)。
+    * **三个都不锁运行**: 前两个要重连才生效, 第三个立刻生效, 都不影响已经跑起来的那一趟
+    * 扫描的几何 */
+   addPanel(PI_ADV, box,
+            QList<GateItem>{ GateItem{ m_cbWantDigIn, false, false },
+                             GateItem{ m_cbNpnWrite,  false, false },
+                             GateItem{ m_cbDiInvert,  false, false } });
 
    connect(m_cbWantDigIn, &QCheckBox::toggled, this, &ScanWindow::onAdvToggled);
    connect(m_cbNpnWrite,  &QCheckBox::toggled, this, &ScanWindow::onAdvToggled);
@@ -1445,24 +1451,21 @@ QWidget *ScanWindow::buildHomePanel()
       "与速度共同决定单次回零的可达距离。\n"
       "该值不是停止条件; 触发硬件限位时运动即停止。"));
 
+   /* 这两个框占满第 1~4 列: 前两行上再没有别的东西了 ([保存][取消] 原来摆在 3~4 列, 现在
+    * 挪到框标题那一行) —— 不收满就会在速度框右边空出一块, 正对着下面那四个按钮的宽度 */
    g->addWidget(new QLabel(QStringLiteral("速度"), box), 0, 0);
-   g->addWidget(m_edHomeVel, 0, 1, 1, 2);   /* 占 1~2 列 */
+   g->addWidget(m_edHomeVel, 0, 1, 1, 4);
 
    g->addWidget(new QLabel(QStringLiteral("超时"), box), 1, 0);
-   g->addWidget(m_edHomeTmo, 1, 1, 1, 2);   /* 与速度同一列, 一眼看出是两个同类的数 */
+   g->addWidget(m_edHomeTmo, 1, 1, 1, 4);   /* 与速度同一列, 一眼看出是两个同类的数 */
 
-   /* 门控行 [编辑][保存][取消] 就摆在右边那一格(2026-09-21 改, 原先是框底单独一行)。
-    * 这一框里的参数就是速度和超时两个, 那三个按钮管的就是它们俩 —— 摆在两行旁边一眼能
-    * 看出"这三个按钮管的是这两个数"; 单独一行时中间隔着两行按钮, 且白占一行高。
-    *
-    * **靠右**: 传 Qt::AlignRight 让这一格里的 [编辑] 顶着框的右边界 (不传的话它填满
-    * 格子、按钮就贴在速度框后面, 右边空一大块)。那一格是 3~4 列, 宽度够同时放两个
-    * 按钮 —— 编辑态里 [编辑] 是藏起来的, 可见的永远最多两个, 所以不会挤出去。 */
-   g->addWidget(gateBar(GI_HOME, box), 0, 3, 2, 2, Qt::AlignRight);
-   addGate(GI_HOME, box,
-           /* 速度与超时是参数; 八个按钮是动作, 不进表 (它们不归编辑态管, 归连接态管) */
-           QList<GateItem>{ GateItem{ m_edHomeVel, false, false },
-                            GateItem{ m_edHomeTmo, false, false } });
+   /* [保存][取消] 摆在框标题那一行的右端 (同另外三块框), 不占这个网格的格子 */
+   panelBar(PI_HOME, box);
+   addPanel(PI_HOME, box,
+            /* 速度与超时是参数; 八个按钮是动作, 不进表 (它们要的是"连上了、不在回零中",
+             * 那条判据在 refresh() 里) */
+            QList<GateItem>{ GateItem{ m_edHomeVel, false, false },
+                             GateItem{ m_edHomeTmo, false, false } });
 
    /* 一行一根轴: 行首一个轴名 (同上面「轴信号」那块表的行标签), 右边四个按钮。
     * 轴名放在行首而不是按钮文字里 —— 四个按钮挤在一行, 每个再带个 "X " 就排不下了,
@@ -1605,7 +1608,7 @@ QWidget *ScanWindow::buildParamPanel()
 
    m_edCsv = new QLineEdit(box);
    m_edCsv->setPlaceholderText(QStringLiteral("scan_out/scan_YYYYmmdd_HHMMSS.csv"));
-   /* 成员而非局部量: 门控表要按它算可用性 (见 GateItem) */
+   /* 成员而非局部量: 可用性表要按它算 (见 GateItem) */
    m_btnCsv = new QPushButton(QStringLiteral("…"), box);
    m_btnCsv->setFixedWidth(28);
    connect(m_btnCsv, &QPushButton::clicked, this, &ScanWindow::onBrowseCsv);
@@ -1614,8 +1617,8 @@ QWidget *ScanWindow::buildParamPanel()
    csvRow->addWidget(m_edCsv, 1);
    csvRow->addWidget(m_btnCsv);
 
-   /* 门控行。QFormLayout 有 insertRow, 插到第 0 行 */
-   f->insertRow(0, gateBar(GI_PARAM, box));
+   /* [保存][取消] 摆在框标题那一行的右端, 不占这个表单的任何一行 */
+   panelBar(PI_PARAM, box);
 
    f->addRow(QStringLiteral("区域 X"), m_edAreaX);
    f->addRow(QStringLiteral("区域 Y"), m_edAreaY);
@@ -1677,26 +1680,26 @@ QWidget *ScanWindow::buildParamPanel()
    connect(m_cbDir,  &QComboBox::currentIndexChanged, this, &ScanWindow::pushParams);
    connect(m_cbMode, &QComboBox::currentIndexChanged, this, &ScanWindow::pushParams);
 
-   /* 门控成员表 (不含上面那行三个按钮)。
+   /* 可用性表。
     * lock_running = true 的都是"这一趟怎么走 / 往哪写": 跑到一半改掉, 落进 CSV 的 (ix,iy)
     * 就跟滑台实际站的地方对不上了 —— 那张表是按扫描开始时定的几何算出来的 */
-   addGate(GI_PARAM, box,
-           QList<GateItem>{
-              GateItem{ m_edAreaX,    true,  false },   /* 区域 X */
-              GateItem{ m_edAreaY,    true,  false },   /* 区域 Y */
-              GateItem{ m_edRes,      true,  false },   /* 分辨率 */
-              GateItem{ m_edPpu,      true,  false },   /* 1 mm = N 脉冲 */
-              GateItem{ m_edSpeed,    false, false },   /* 扫描速度: 下一次 start 才下发 */
-              GateItem{ m_edManSpeed, false, false },   /* 手动速度: 手工对位用, 与这趟无关 */
-              GateItem{ m_edDwell,    false, false },
-              GateItem{ m_edSettle,   false, false },
-              GateItem{ m_edSamples,  false, false },
-              GateItem{ m_cbDir,      true,  false },   /* 起始方向: 改的是轨迹 */
-              GateItem{ m_cbMode,     true,  false },   /* 扫描方式: 同上 */
-              GateItem{ m_edCsv,      true,  false },   /* 输出路径: 跑着的时候换文件没意义 */
-              GateItem{ m_btnCsv,     true,  false },
-              GateItem{ m_btnDef,     true,  false },   /* 恢复默认: 一按就是几何全变 */
-           });
+   addPanel(PI_PARAM, box,
+            QList<GateItem>{
+               GateItem{ m_edAreaX,    true,  false },   /* 区域 X */
+               GateItem{ m_edAreaY,    true,  false },   /* 区域 Y */
+               GateItem{ m_edRes,      true,  false },   /* 分辨率 */
+               GateItem{ m_edPpu,      true,  false },   /* 1 mm = N 脉冲 */
+               GateItem{ m_edSpeed,    false, false },   /* 扫描速度: 下一次 start 才下发 */
+               GateItem{ m_edManSpeed, false, false },   /* 手动速度: 手工对位用, 与这趟无关 */
+               GateItem{ m_edDwell,    false, false },
+               GateItem{ m_edSettle,   false, false },
+               GateItem{ m_edSamples,  false, false },
+               GateItem{ m_cbDir,      true,  false },   /* 起始方向: 改的是轨迹 */
+               GateItem{ m_cbMode,     true,  false },   /* 扫描方式: 同上 */
+               GateItem{ m_edCsv,      true,  false },   /* 输出路径: 跑着的时候换文件没意义 */
+               GateItem{ m_btnCsv,     true,  false },
+               GateItem{ m_btnDef,     true,  false },   /* 恢复默认: 一按就是几何全变 */
+            });
 
    return box;
 }
@@ -1757,7 +1760,7 @@ QWidget *ScanWindow::buildScanPanel()
 }
 
 /*
- * 参数栏里的「功率计」框 —— **一整个面板, 一直露在外面**, 而且不进门控。
+ * 参数栏里的「功率计」框 —— **一整个面板, 一直露在外面**。
  *
  * 这一块是"单独接一下功率计看看数"要用的东西: 选源 / 真机那三项 / 读一次 / 按间隔连续读数 /
  * 曲线 / 统计 / 存 CSV。它**一个 EtherCAT 帧都不发** (功率计走 Ophir 的 COM 接口), 所以不插
@@ -1885,8 +1888,8 @@ QWidget *ScanWindow::buildMeterPanel()
       h->addWidget(new QLabel(QStringLiteral("脚本"), m_scriptRow));
       m_edScript = new QLineEdit(m_scriptRow);
       m_edScript->setPlaceholderText(QStringLiteral("每行一个数值"));
-      /* 框里的文本与真正读的那份表是两份东西, 同步点只有 pushScriptPath() 一处。这一框
-       * 没有编辑态, 所以敲完立刻推 —— 这里没有"保存"那个时机可用 */
+      /* 框里的文本与真正读的那份表是两份东西, 同步点只有 pushScriptPath() 一处。敲完立刻推
+       * —— 这个框没有一个"确认"的时机可用 */
       connect(m_edScript, &QLineEdit::textEdited, this, [this] { pushScriptPath(); });
       h->addWidget(m_edScript, 1);
       m_btnScript = new QPushButton(QStringLiteral("…"), m_scriptRow);
@@ -2185,7 +2188,8 @@ QWidget *ScanWindow::buildShadePanel()
       l->setVisible(l == m_lblLocked);
    }
 
-   f->insertRow(0, gateBar(GI_SHADE, box));
+   /* [保存][取消] 摆在框标题那一行的右端, 不占这个表单的任何一行 */
+   panelBar(PI_SHADE, box);
 
    f->addRow(QStringLiteral("最小"), m_edShadeLo);
    f->addRow(QStringLiteral("最大"), m_edShadeHi);
@@ -2204,14 +2208,14 @@ QWidget *ScanWindow::buildShadePanel()
    f->addRow(m_lblAuto);
 
    /* 这一框没有"运行中锁住"的项 (改色阶不会把跑起来的那一趟弄歪), 也没有要等设备的项 */
-   addGate(GI_SHADE, box,
-           QList<GateItem>{
-              GateItem{ m_edShadeLo,   false, false },
-              GateItem{ m_edShadeHi,   false, false },
-              GateItem{ m_cbShadeAuto, false, false },
-              /* 定标按钮在自动跟随时灰掉 (need_manual), 这个勾本身**不能灰**: 关掉它得按得动 */
-              GateItem{ m_btnFit,      false, true },
-           });
+   addPanel(PI_SHADE, box,
+            QList<GateItem>{
+               GateItem{ m_edShadeLo,   false, false },
+               GateItem{ m_edShadeHi,   false, false },
+               GateItem{ m_cbShadeAuto, false, false },
+               /* 定标按钮在自动跟随时灰掉 (need_manual), 这个勾本身**不能灰**: 关掉它得按得动 */
+               GateItem{ m_btnFit,      false, true },
+            });
    return box;
 }
 
@@ -2226,13 +2230,15 @@ QWidget *ScanWindow::buildShadePanel()
  * 跨度取的是"上一次生效的那一份" (画布上还留着的那对值, 这两个槽是唯一的写入方)。两个框的
  * 读数与画布的色阶一直是一致的, 所以它就是要保留的跨度。
  *
- * **这两个槽也会被回灌走到**: 「取消」与"点别块框的编辑、这一框的改动被丢弃"都是把快照写回
- * 控件, 而不挂信号屏蔽 (回灌要顺带重新下推)。那两处写回的是一对合法值, 但如果中途经过一次
- * "先写 lo、此时 hi 还是新值" 的错配, 就会白推一下 —— 值错不了 (紧接着那一项就把 hi 写回),
- * 只是会弹一条**根本不是操作员干的**横幅。所以横幅只在编辑态里发: 那两个框平时是禁用的,
- * 编辑态 != 操作员在敲。 */
+ * 横幅只在**操作员敲的**那一次发。程序自己写这对值有三处: 自动跟随 syncShadeAuto 与按数据定标
+ * syncShadeEdits 都挂了 QSignalBlocker, 走不到这里; 「取消」的回灌**故意不屏蔽信号** (它要顺带
+ * 把新值下推给控制器), 于是它会走进来 —— 回灌是"先写 lo, 此时 hi 还是操作员敲的那个", 这一瞬
+ * 两个数看着就是反的, 那条横幅会白弹一次。所以这里看 m_panelRevert 让开。 */
 void ScanWindow::onShadeLoChanged(double lo)
 {
+   if (m_panelRevert)
+      return;
+
    double hi = m_edShadeHi->value();
    if (hi <= lo)
    {
@@ -2240,15 +2246,18 @@ void ScanWindow::onShadeLoChanged(double lo)
       hi = lo + ((span > 0.0) ? span : 1.0);
       QSignalBlocker b(m_edShadeHi);
       m_edShadeHi->setValue(hi);
-      if (m_gates[GI_SHADE].gate.editing)
-         hint(QStringLiteral("最小值超过最大值, 最大值已调整至 %1 (跨度不变)。")
-                 .arg(QString::number(hi, 'g', 6)), false);
+      hint(QStringLiteral("最小值超过最大值, 最大值已调整至 %1 (跨度不变)。")
+              .arg(QString::number(hi, 'g', 6)),
+           false);
    }
    m_canvas->setShadeRange(lo, hi);
 }
 
 void ScanWindow::onShadeHiChanged(double hi)
 {
+   if (m_panelRevert)      /* 同上: 回灌那一路自己把色阶重新推给画布 */
+      return;
+
    double lo = m_edShadeLo->value();
    if (hi <= lo)
    {
@@ -2268,9 +2277,9 @@ void ScanWindow::onShadeHiChanged(double hi)
          QSignalBlocker b(m_edShadeHi);
          m_edShadeHi->setValue(hi);
       }
-      if (m_gates[GI_SHADE].gate.editing)
-         hint(QStringLiteral("最大值低于最小值, 最小值已调整至 %1 (跨度不变, 下限 0)。")
-                 .arg(QString::number(lo, 'g', 6)), false);
+      hint(QStringLiteral("最大值低于最小值, 最小值已调整至 %1 (跨度不变, 下限 0)。")
+              .arg(QString::number(lo, 'g', 6)),
+           false);
    }
    m_canvas->setShadeRange(lo, hi);
 }
@@ -2294,8 +2303,8 @@ void ScanWindow::syncShadeAuto()
    const double lo = m_canvas->shadeLo();
    const double hi = m_canvas->shadeHi();
 
-   /* 没变就一句话都不做。这一句不是省事: 本函数由 refresh() 每拍 (30Hz) 调用, 而下面那句
-    * gateRebase 会重写框标题 —— 每拍重设一次标题就是每拍重排一次版面。 */
+   /* 没变就一句话都不做: 本函数由 refresh() 每拍 (30Hz) 调用, 值一样时下面那两次 setValue
+    * 是空转 */
    if (m_edShadeLo->value() == lo && m_edShadeHi->value() == hi)
       return;
 
@@ -2306,11 +2315,6 @@ void ScanWindow::syncShadeAuto()
       m_edShadeLo->setValue(lo);
       m_edShadeHi->setValue(hi);
    }
-
-   /* 同上: 这两个数现在是**程序在写**, 快照跟上, 否则「未保存」标记会一直亮着 ——
-    * 而这一框真正要保存的只有「自动跟随」那个勾 */
-   gateRebase(GI_SHADE, m_edShadeLo);
-   gateRebase(GI_SHADE, m_edShadeHi);
 }
 
 /* ---------------------------------------------------------------- 参数 */
@@ -2393,7 +2397,13 @@ void ScanWindow::loadSettings()
    m_savedNic = pf.nic;
 }
 
-/* 记忆: 把当前参数写回去。「连接」时与关窗时各一次 —— 连接那一次记的是真连过的那张卡 */
+/* 记忆: 把当前参数写回去。「连接」时与关窗时各一次 —— 连接那一次记的是真连过的那张卡。
+ *
+ * 写的是**整份** (六块框全带上), 不是某一块: 这两次是"这一轮到此为止, 屏幕上这些值就是往后
+ * 要用的"。各框的「保存」走另一条路 (见 panelSavePrefs), 那条只写自己管的字段。
+ *
+ * 落完盘顺手把每块框的基线换到当前值 —— 盘上那份跟屏幕一模一样了, 「取消」的承诺
+ * ("退回上次保存的那一份") 此刻兑现成"什么都不用退", 那些「未保存」标记也该跟着落下去。 */
 void ScanWindow::saveSettings()
 {
    Prefs pf = prefsLoad(prefsPath());     /* 先读回上次那份: 下面两处都是"覆盖不了就留着" */
@@ -2411,25 +2421,16 @@ void ScanWindow::saveSettings()
    pf.npn_sw_invert   = m_cbDiInvert->isChecked();
    pf.shade_auto      = m_cbShadeAuto->isChecked();
 
-   /* 功率计那两格也跟着落盘 (它不进门控, 所以是"改了就在这儿被记下", 没有「保存」可点)。
-    * 取样源本身**不记** —— 那是设备自己的状态, 理由见 scanprefs.h */
+   /* 功率计那两格也跟着落盘。取样源本身**不记** —— 那是设备自己的状态, 理由见 scanprefs.h */
    pf.meter_interval_ms = m_edMtrInterval->value();
    pf.meter_csv         = m_edMtrCsv->text().trimmed();
 
    prefsSave(prefsPath(), pf);
    m_savedNic = pf.nic;
 
-   /* 这一次落盘是「连接」/ 关窗顺手做的, 不是操作员点的「保存」—— 正在编辑、还没点保存的
-    * 那一框, 它的当前值刚刚被一起写进去了。快照跟上、标记清掉: 否则「取消」会退回一份已经
-    * 不在 ini 里的"上次保存值", 而那个按钮承诺的就是 ini 里那一份。 */
-   for (int gi = 0; gi < m_gates.size(); gi++)
-   {
-      if (!m_gates[gi].gate.editing)
-         continue;
-      gateSnapshot(gi);
-      m_gates[gi].gate.dirty = false;
-      gateTitle(gi);
-   }
+   /* 基线换到此刻的值; 标记与「取消」的灰不灰由下一拍 refreshEditability() 重算 */
+   for (int pi = 0; pi < PI_N; pi++)
+      panelCapture(pi);
 }
 
 void ScanWindow::onRestoreDefaults()
@@ -2532,11 +2533,6 @@ void ScanWindow::syncShadeEdits()
       m_edShadeLo->setValue(m_canvas->shadeLo());
       m_edShadeHi->setValue(m_canvas->shadeHi());
    }
-
-   /* 这是**程序自己**按数据定的标, 不是操作员改的。快照得跟上: 不然编辑态里按一下「按数据
-    * 定标」再按「取消」, 会把色阶滚回定标之前那一份 */
-   gateRebase(GI_SHADE, m_edShadeLo);
-   gateRebase(GI_SHADE, m_edShadeHi);
 }
 
 void ScanWindow::applyCsvDefaultName()
@@ -2549,10 +2545,6 @@ void ScanWindow::applyCsvDefaultName()
                            .arg(QDateTime::currentDateTime().toString(
                                    QStringLiteral("yyyyMMdd_HHmmss")));
    m_edCsv->setText(QDir(dir).filePath(name));
-
-   /* 这是程序自己起的名, 不是操作员改的 (同 syncShadeEdits 的理由): 快照跟上, 否则正在
-    * 编辑「扫描参数」时按一下「开始扫描」, 再按「取消」, 会把路径退成空的 */
-   gateRebase(GI_PARAM, m_edCsv);
 }
 
 void ScanWindow::onBrowseCsv()
@@ -2575,10 +2567,6 @@ void ScanWindow::onBrowseCsv()
 
    m_edCsv->setText(QDir::toNativeSeparators(f));
    m_last_dir = QFileInfo(f).absolutePath();
-
-   /* setText 不发 textEdited (那是"程序改的"), 所以手动补一次点脏 —— 否则从这里换的输出
-    * 路径不会在标题上留「未保存」, 点「取消」时也看不出它会被退回去 */
-   gateDirty(GI_PARAM);
 }
 
 /* ---------------------------------------------------------------- 总线操作 */
@@ -3654,8 +3642,8 @@ void ScanWindow::refresh()
 
    pushManualSpeed(t, running);
 
-   /* 参数控件的可用性**全部**归 refreshEditability(): 平时只读, 点了这一框的「编辑」才
-    * 放开; 几何那几项运行中仍然锁住 (改到一半, 落进 CSV 的 (ix,iy) 就和实际位置对不上)。
+   /* 参数控件的可用性**全部**归 refreshEditability(): 随时能改 (没有"编辑态"这道门了),
+    * 只有几何那几项运行中锁住 (改到一半, 落进 CSV 的 (ix,iy) 就和实际位置对不上)。
     * 原来那张"扫描中锁住"的表已经搬进各框的 GateItem.lock_running。 */
    refreshEditability();
 
@@ -3694,7 +3682,7 @@ void ScanWindow::refresh()
    /* 八个回零按钮逐轴判, 只看这一根; 另一根带不带电、有没有故障都与它无关。
     * 刻意不看 enabled: 未使能也能回零 (em_home 要求未使能才能写 6098h)。
     * fault / mirror_ok 这里再判一次: 工作线程那道闸才是权威, 但让按钮先按不动更好。
-    * 找限位那四个与这四个**同一判据** —— 归"连接态 + 不在运行 + 不在回零"管, 不进编辑门控
+    * 找限位那四个与这四个**同一判据** —— 归"连接态 + 不在运行 + 不在回零"管, 不在可用性表里
     * (它们是动作不是参数)。 */
    for (int i = 0; i < 2; i++)
    {

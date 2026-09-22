@@ -33,6 +33,11 @@ int main(int argc, char **argv)
       QGroupBox QLabel   { background:transparent; }
       QPushButton        { background:#262b33; border:1px solid #3c434e;
                            border-radius:4px; padding:5px 12px; }
+      /* 参数框标题那一行右端的那两个小按钮 (objectName = panelbar, 见 panelBar())。
+       * 上面那条 5px 的上下内边距是按"框里的大按钮"定的, 一个按钮最少要 28px 高; 标题那一行
+       * 只有 18px, 照那个尺寸做成 18px 高就会把字挤成一条缝。这里把内边距压掉, 按钮的自然高度
+       * 就成了"字高 + 边框" = 18px, 正好放进那一行。左右留着 9px, 不然两个字的按钮太挤。 */
+      QPushButton#panelbar { padding:0 9px; }
       QPushButton:hover  { background:#2f3640; }
       QPushButton:pressed{ background:#20252c; }
       QPushButton:disabled { color:#5b626c; background:#1d2126; border-color:#2a2f37; }
