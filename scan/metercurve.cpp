@@ -62,9 +62,9 @@ void MeterCurve::setUnit(const QString &u)
     * W 还是 J 的判据在 powermeter.h 的 unit(), 这里只是把它说不出来的那一格讲清楚。 */
    setToolTip(u.isEmpty()
       ? QStringLiteral(
-           "纵轴的单位不明 —— 真机报 W 还是 J 由探头与测量模式决定, 而 Ophir 的 COM "
-           "接口不给这个字段, 判不出来就画 「?」。\n"
-           "模拟源 (手动 / 随机 / 脚本) 按定义是 W。")
+           "纵轴单位不明: 真机报 W 还是 J 由探头与测量模式决定, "
+           "而 Ophir 的 COM 接口不提供该字段, 判不出来就画 「?」。\n"
+           "模拟源 (手动 / 随机 / 脚本) 为 W。")
       : QStringLiteral("纵轴: %1").arg(u));
 
    update();
@@ -105,7 +105,7 @@ void MeterCurve::paintEvent(QPaintEvent *)
    {
       p.setPen(QColor(C_MUTED));
       p.drawText(QRectF(0, 0, width(), height()), Qt::AlignCenter,
-                 m_placeholder.isEmpty() ? QStringLiteral("还没有数") : m_placeholder);
+                 m_placeholder.isEmpty() ? QStringLiteral("暂无数据") : m_placeholder);
       return;
    }
 
@@ -130,7 +130,7 @@ void MeterCurve::paintEvent(QPaintEvent *)
    {
       p.setPen(QColor(C_MUTED));
       p.drawText(QRectF(0, 0, width(), height()), Qt::AlignCenter,
-                 QStringLiteral("这一段一个数都没读回来"));
+                 QStringLiteral("该区间未读回任何数据"));
       return;
    }
 

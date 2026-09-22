@@ -118,7 +118,7 @@ bool MeterLog::start(int interval_ms, QString *err)
    if (m_src == nullptr || !m_src->isOpen())
    {
       if (err != nullptr)
-         *err = QStringLiteral("取样源没打开 —— 连续读数要采数, 不能没有源");
+         *err = QStringLiteral("取样源未打开, 连续读数需要取样源。");
       return false;
    }
 
@@ -203,8 +203,7 @@ void MeterLog::tick(int64_t now_ms)
       s.ok = false;
       record(s);
 
-      const QString why = QStringLiteral("等了 %1 ms 没有回话 —— 采集停在这儿, 等那一个回话 "
-                                         "(或者按「停止」重来)").arg(kTimeoutMs);
+      const QString why = QStringLiteral("已等待 %1 ms 无响应, 采集停在此处, 等待该请求返回。").arg(kTimeoutMs);
       m_err = why;
       emit failed(why);
       return;
@@ -428,7 +427,7 @@ bool MeterLog::beginRecord(const QString &path, QString *err)
    if (path.isEmpty())
    {
       if (err != nullptr)
-         *err = QStringLiteral("没给文件名");
+         *err = QStringLiteral("未指定文件名");
       return false;
    }
 
@@ -437,7 +436,7 @@ bool MeterLog::beginRecord(const QString &path, QString *err)
    if (!dir.exists() && !dir.mkpath(QStringLiteral(".")))
    {
       if (err != nullptr)
-         *err = QStringLiteral("建不了目录 %1").arg(QDir::toNativeSeparators(dir.absolutePath()));
+         *err = QStringLiteral("新建目录失败: %1").arg(QDir::toNativeSeparators(dir.absolutePath()));
       return false;
    }
 
@@ -526,7 +525,7 @@ bool MeterLog::appendCsv(const Sample &s)
    /* 每行 flush —— 崩了/断电只丢最后一个数 (ScanLog::append 同一个取舍) */
    if (!m_f->flush())
    {
-      m_err = QStringLiteral("刷 CSV 失败: %1").arg(m_f->errorString());
+      m_err = QStringLiteral("CSV 刷盘失败: %1").arg(m_f->errorString());
       return false;
    }
 
@@ -540,7 +539,7 @@ bool MeterLog::saveBuffer(const QString &path, QString *err) const
    if (!dir.exists() && !dir.mkpath(QStringLiteral(".")))
    {
       if (err != nullptr)
-         *err = QStringLiteral("建不了目录 %1").arg(QDir::toNativeSeparators(dir.absolutePath()));
+         *err = QStringLiteral("新建目录失败: %1").arg(QDir::toNativeSeparators(dir.absolutePath()));
       return false;
    }
 

@@ -143,10 +143,9 @@ bool fitsRange(const Params &p, std::string *why)
       {
          char buf[320];
          std::snprintf(buf, sizeof(buf),
-            "区域超出量程: 最远点 X=%lld / Y=%lld pul, 而量程只有 ±%lld。"
-            "超出部分会被静默夹掉 —— 永远扫不到那几条边。"
-            "把区域改小 (量程是每次改参数就重算的, 它自己会跟上; 走到这一步说明这个区域"
-            "本身就不该跑)",
+            "区域超出量程: 最远点 X=%lld / Y=%lld pul, 量程只有 ±%lld。"
+            "超出部分会被静默夹掉, 那几条边采不到。"
+            "请把区域改小。",
             (long long)pulseOf(std::max(std::fabs(xs.front()), std::fabs(xs.back())), p.pulses_per_unit),
             (long long)pulseOf(std::max(std::fabs(ys.front()), std::fabs(ys.back())), p.pulses_per_unit),
             (long long)rng);
@@ -164,10 +163,10 @@ std::string validate(const Params &p)
    if (!(p.res_unit > 0.0))
       return "分辨率必须是正数";
    if (!(p.pulses_per_unit > 0.0))
-      return "「1 mm = ? 脉冲」必须是正数";
+      return "「每 mm 脉冲数」必须是正数";
 
    if (p.res_unit > p.area_x_unit || p.res_unit > p.area_y_unit)
-      return "分辨率比区域还大 —— 网格只剩一个点, 调小分辨率或放大区域";
+      return "分辨率大于区域, 网格只剩一个点。请调小分辨率或放大区域。";
 
    int nx = axisCount(p.area_x_unit, p.res_unit);
    int ny = axisCount(p.area_y_unit, p.res_unit);
@@ -180,7 +179,7 @@ std::string validate(const Params &p)
    {
       char buf[200];
       std::snprintf(buf, sizeof(buf),
-                    "点数 %lld 太多 (上限 %lld) —— 先确认分辨率是不是少打了个零",
+                    "点数 %lld 超出上限 %lld。请确认分辨率是否少打一位。",
                     total, kMaxPlanPoints);
       return buf;
    }
@@ -192,13 +191,13 @@ std::string validate(const Params &p)
    if (p.samples_per_point < 1 || p.samples_per_point > 100)
       return "每点采样次数应在 1..100";
    if (p.meter_timeout_ms < 100 || p.meter_timeout_ms > 60000)
-      return "功率计超时应在 100..60000 ms";
+      return "取样源超时应在 100..60000 ms";
 
    if (p.speed_pul_s < VEL_MIN || p.speed_pul_s > VEL_MAX)
    {
       char buf[200];
       std::snprintf(buf, sizeof(buf),
-                    "速度应在 %u..%u pul/s 之间 (界面的速度是这两个值之间选的)",
+                    "速度应在 %u..%u pul/s 之间。",
                     VEL_MIN, VEL_MAX);
       return buf;
    }
@@ -407,7 +406,7 @@ std::string csvParseForResume(const std::string &text, const Params &p,
          if (nl == std::string::npos)
             break;
          char buf[160];
-         std::snprintf(buf, sizeof(buf), "CSV 第 %zu 行字段不足 (%zu 个) —— 文件损坏",
+         std::snprintf(buf, sizeof(buf), "CSV 第 %zu 行字段不足 (%zu 个), 文件已损坏。",
                        lineno, f.size());
          return std::string(buf);
       }
@@ -420,8 +419,7 @@ std::string csvParseForResume(const std::string &text, const Params &p,
       {
          char buf[200];
          std::snprintf(buf, sizeof(buf),
-                       "CSV 第 %zu 行的网格索引 (%d,%d) 超出 %d×%d —— "
-                       "多半是几何参数填错了", lineno, ix, iy, nx, ny);
+                       "CSV 第 %zu 行的网格索引 (%d, %d) 超出 %d×%d, 几何参数可能填错。", lineno, ix, iy, nx, ny);
          return std::string(buf);
       }
 
@@ -435,7 +433,7 @@ std::string csvParseForResume(const std::string &text, const Params &p,
    }
 
    if (!have_geom)
-      return "CSV 里没有几何参数 (表头被截掉了?) —— 没法确认它跟当前参数是不是同一片区域";
+      return "CSV 中没有几何参数 (表头不完整), 无法确认与当前参数是否为同一片区域。";
    (void)seen_data;
 
    std::string diff;
@@ -455,7 +453,7 @@ std::string csvParseForResume(const std::string &text, const Params &p,
    if (!diff.empty())
    {
       diff = "CSV 的几何参数与当前设置不一致: " + diff +
-             "。网格对不上就没法续扫 —— 要么把参数改回去, 要么另开一个新文件";
+             "。几何不一致无法续扫, 请把参数改回或另建文件";
    }
    return diff;
 }

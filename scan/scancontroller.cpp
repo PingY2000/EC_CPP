@@ -165,12 +165,12 @@ QString ScanController::stateText() const
 {
    switch (m_st)
    {
-   case State::Idle:     return QStringLiteral("空闲 —— 参数可改");
-   case State::Moving:   return settlingNow() ? QStringLiteral("到位中 (在稳定窗口里)")
+   case State::Idle:     return QStringLiteral("空闲, 参数可改");
+   case State::Moving:   return settlingNow() ? QStringLiteral("到位中 (已进稳定窗口)")
                                               : QStringLiteral("移动中");
-   case State::Dwelling: return QStringLiteral("停留 (等机械余振过去)");
+   case State::Dwelling: return QStringLiteral("停留 (等待机械余振衰减)");
    case State::Reading:  return QStringLiteral("读功率计…");
-   case State::Paused:   return QStringLiteral("已暂停 —— 目标冻在当前位置, 保持力矩");
+   case State::Paused:   return QStringLiteral("已暂停 (目标冻结, 保持力矩)");
    case State::Aborted:  return QStringLiteral("已中止");
    case State::Done:     return QStringLiteral("本轮结束");
    }
@@ -240,20 +240,20 @@ bool ScanController::armRun(QString *err)
    const BusTelem t = m_bus->telemetry();
 
    if (!t.connected)
-      return fail(err, QStringLiteral("没连上总线 —— 先点「连接」"));
+      return fail(err, QStringLiteral("未连接总线"));
    if (!t.in_op)
       return fail(err, QStringLiteral("总线不在 OP 状态"));
 
    /* 回零把轴留在使能 + HM: 自动中止判据抓不到它, 插补也不推进 (总线线程阻塞在 em_home
     * 里), 状态机会以为点到了而滑台没动 */
    if (t.homing)
-      return fail(err, QStringLiteral("总线正在回零 —— 等它做完再启扫"));
+      return fail(err, QStringLiteral("总线正在回零, 请等回零结束后再启动扫描。"));
 
    if (m_meter == nullptr || !m_meter->isOpen())
-      return fail(err, QStringLiteral("功率计没打开 —— 扫描要采数, 不能没有源"));
+      return fail(err, QStringLiteral("功率计未打开, 扫描无法采集数据。"));
 
    if (m_order.empty())
-      return fail(err, QStringLiteral("没有要扫的点"));
+      return fail(err, QStringLiteral("网格中没有要扫的点。"));
 
    QString pe = paramsError();
    if (!pe.isEmpty())
@@ -261,7 +261,7 @@ bool ScanController::armRun(QString *err)
 
    /* 轴数: 必须正好两根。扫描的语义就是 X=轴0 / Y=轴1, 少一根多的那根没意义 */
    if (t.naxis != 2)
-      return fail(err, QStringLiteral("总线报到 %1 根轴, 扫描需要正好两根 (轴0 = X, 轴1 = Y)")
+      return fail(err, QStringLiteral("总线报告 %1 根轴, 扫描需要正好两根 (轴0 = X, 轴1 = Y)。")
                             .arg(t.naxis));
 
    for (int i = 0; i < 2; i++)
@@ -269,12 +269,12 @@ bool ScanController::armRun(QString *err)
       const AxisTelem &a = t.ax[i];
 
       if (!a.valid || !a.mirror_ok)
-         return fail(err, QStringLiteral("轴%1 还没收到完整的过程数据帧 —— 位置不可信").arg(i));
+         return fail(err, QStringLiteral("轴%1 未收到完整过程数据帧, 位置不可信。").arg(i));
       if (!a.enabled)
          return fail(err, QStringLiteral(
-            "轴%1 没使能。「使能」或「回零」都会让电机带电, 得先按其中一个").arg(i));
+            "轴%1 未使能。请先「使能」或「回零」。").arg(i));
       if (a.fault || t.fault)
-         return fail(err, QStringLiteral("轴%1 有故障位 (6041h bit3) —— 先清故障再扫").arg(i));
+         return fail(err, QStringLiteral("轴%1 有故障位 (6041h bit3), 请先「故障复位」。").arg(i));
       if (a.limit_active)
          return fail(err, QStringLiteral(
             "%1。\n"
@@ -282,8 +282,7 @@ bool ScanController::armRun(QString *err)
             "%3。\n"
             /* 收尾只讲后果: 扫描期间限位成立就自动中止, 所以现在拒绝。
              * 不许说"会撞上去" —— %3 里有一种成因正是那限位根本不存在 (极性配反) */
-            "扫描期间它每 tick 都查, 成立就中止 —— 与其采到一半停在同一格, "
-            "不如这一趟就不开始。")
+            "扫描期间限位成立即自动中止, 本次扫描未启动。")
                .arg(QString::fromUtf8(ecatcmd::limit_hit_headline(t.di_invert)).arg(i))
                .arg(QString::fromUtf8(ecatcmd::limit_switch_text(
                        a.dig_known, a.dig_pos, a.dig_neg, t.di_invert)))
@@ -292,7 +291,7 @@ bool ScanController::armRun(QString *err)
    }
 
    if (t.expected_wkc > 0 && t.wkc < t.expected_wkc)
-      return fail(err, QStringLiteral("工作计数器不足 (%1/%2) —— 过程数据不完整, 别开始")
+      return fail(err, QStringLiteral("工作计数器不足 (%1/%2), 过程数据不完整, 扫描未启动。")
                             .arg(t.wkc).arg(t.expected_wkc));
 
    /* 量程用 telemetry 里的**真值**, 不用参数算的 —— 这里防的是"遥测里的量程还没跟上参数"
@@ -307,10 +306,10 @@ bool ScanController::armRun(QString *err)
    }
    if (t.range > 0 && far > t.range)
       return fail(err, QStringLiteral(
-         "最远的网格点是 %1 pul, 而当前量程只有 ±%2。\n"
-         "超出量程的目标会被静默夹掉 —— 那几条边永远扫不到, 而且不报错。\n"
-         "参数刚改过就按「开始」时可能撞上这个 (量程要等工作线程转一圈才跟上), 等一下再按;\n"
-         "一直是这样的话把区域改小一点。")
+         "最远的网格点是 %1 pul, 当前量程只有 ±%2。\n"
+         "超出量程的目标会被静默夹掉: 那几条边采不到, 且不报错。\n"
+         "参数刚改过时量程要等工作线程转一圈才跟上, 此时启扫会撞上这一条; \n"
+         "持续出现请把区域改小。")
          .arg(far).arg(t.range));
 
    m_run_p   = m_p;
@@ -367,7 +366,7 @@ void ScanController::startPoint(int plan_index)
 bool ScanController::start(const QString &csv_path, QString *err)
 {
    if (running())
-      return fail(err, QStringLiteral("扫描进行中 —— 先「中止」"));
+      return fail(err, QStringLiteral("扫描进行中, 请先「中止」。"));
 
    QString pe = paramsError();
    if (!pe.isEmpty())
@@ -375,7 +374,7 @@ bool ScanController::start(const QString &csv_path, QString *err)
 
    rebuildPlan();
    if (m_plan.empty())
-      return fail(err, QStringLiteral("网格是空的"));
+      return fail(err, QStringLiteral("网格为空。"));
 
    m_log.close();
 
@@ -406,7 +405,7 @@ bool ScanController::resume(const QString &csv_path, bool accept_zero_epoch_chan
                             QString *err, QString *why)
 {
    if (running())
-      return fail(err, QStringLiteral("扫描进行中 —— 先「中止」"));
+      return fail(err, QStringLiteral("扫描进行中, 请先「中止」。"));
 
    if (why != nullptr) why->clear();
 
@@ -439,11 +438,11 @@ bool ScanController::resume(const QString &csv_path, bool accept_zero_epoch_chan
    {
       return fail(why != nullptr ? why : err,
          QStringLiteral(
-            "这个 CSV 是在另一次零点下采的 (文件里是第 %1 次, 现在是第 %2 次)。\n\n"
-            "回零与「设为区域中心」都会把零点搬走 (连接不会) —— 之后同一个坐标指的可能\n"
-            "已是另一个物理位置, 接着扫会把两份拼在一张图上, 而看不出异常。\n\n"
-            "先确认滑台现在的位置与上次零点确立时是同一个物理位置 (同一个机械靠块 /\n"
-            "对位标记), 再选「继续」。\n\n"
+            "该 CSV 采于另一次零点 (文件为第 %1 次, 当前为第 %2 次)。\n\n"
+            "回零与「设为区域中心」都会搬动零点 (重新连接不会), 同一个坐标\n"
+            "可能已指向另一个物理位置, 续扫会把两份数据拼在同一张图上。\n\n"
+            "确认滑台当前位置与上次零点确立时是同一个物理位置 (同一机械靠块 /\n"
+            "对位标记) 后, 再选「继续」。\n\n"
             "文件: %3 (开始于 %4)")
             .arg(csv_epoch).arg(m_zero_epoch)
             .arg(csv_path, fromStd(started_iso)));
@@ -459,8 +458,8 @@ bool ScanController::resume(const QString &csv_path, bool accept_zero_epoch_chan
 
    if (m_order.empty())
       return fail(why != nullptr ? why : err,
-                  QStringLiteral("这个 CSV 里的点已经全采完了 —— 没有要补的。"
-                                 "要重来一轮就换个新文件"));
+                  QStringLiteral("该 CSV 中的点已全部采完, 没有要补的点。"
+                                 "要重来一轮请另建文件。"));
 
    /* 已有进度连数值一起装进结果网格, 续扫一开始图上就有上半场 */
    for (size_t i = 0; i < mask.size() && i < m_done.size(); i++)
@@ -486,20 +485,20 @@ bool ScanController::resume(const QString &csv_path, bool accept_zero_epoch_chan
 bool ScanController::retest(int ix, int iy, QString *err)
 {
    if (running())
-      return fail(err, QStringLiteral("扫描进行中 —— 单点重测要等它停下来"));
+      return fail(err, QStringLiteral("扫描进行中, 单点重测需等扫描停止。"));
 
    if (!m_log.isOpen())
       return fail(err, QStringLiteral(
-         "还没有在跑的一轮 —— 单点重测是往那个 CSV 里再追加一行, 没有文件可追加。\n"
-         "先「开始」或「续扫」。"));
+         "当前没有进行中的一轮, 单点重测需要已打开的 CSV 文件, 无文件可追加。\n"
+         "请先「开始」或「续扫」。"));
 
    if (!sameGeom(m_run_p, m_p))
       return fail(err, QStringLiteral(
-         "区域/分辨率/每 mm 脉冲数被改过 —— 现在这个 (ix,iy) 已不是 CSV 里那一点,\n"
-         "追加进去会把两个坐标混在一个文件里。把参数改回去, 或者另开一轮。"));
+         "区域 / 分辨率 / 每 mm 脉冲数已改动, 当前 (ix, iy) 已不是 CSV 中的那一点,\n"
+         "追加会在一份文件里混入两个坐标。请把参数改回, 或另开一轮。"));
 
    if (ix < 0 || iy < 0 || ix >= m_nx || iy >= m_ny)
-      return fail(err, QStringLiteral("格子 (%1,%2) 超出 %3×%4 的网格")
+      return fail(err, QStringLiteral("格子 (%1, %2) 超出 %3×%4 的网格。")
                             .arg(ix).arg(iy).arg(m_nx).arg(m_ny));
 
    int k = -1;
@@ -512,7 +511,7 @@ bool ScanController::retest(int ix, int iy, QString *err)
       }
    }
    if (k < 0)
-      return fail(err, QStringLiteral("网格里找不到 (%1,%2) —— 不该发生, 参数可能刚被改过")
+      return fail(err, QStringLiteral("网格中找不到 (%1, %2)。参数可能刚被改动。")
                             .arg(ix).arg(iy));
 
    m_order.assign(1, k);
@@ -625,7 +624,7 @@ void ScanController::finishPoint(bool ok, const std::string &flags)
 {
    if (m_cur < 0 || (size_t)m_cur >= m_plan.size())
    {
-      abortInternal(QStringLiteral("内部错误: 收尾时当前点下标越界"), true);
+      abortInternal(QStringLiteral("内部错误: 收尾时当前点下标越界。"), true);
       return;
    }
 
@@ -649,7 +648,7 @@ void ScanController::finishPoint(bool ok, const std::string &flags)
 
    if (!m_log.isOpen() || !m_log.append(r))
    {
-      abortInternal(QStringLiteral("CSV 写失败, 已自动中止 (后面的数据会丢): %1")
+      abortInternal(QStringLiteral("CSV 写入失败, 已自动中止 (此后数据丢失): %1")
                        .arg(m_log.lastError()), true);
       return;
    }
@@ -730,8 +729,8 @@ void ScanController::tick(int64_t now_ms)
       if (m_now_ms > m_move_deadline_ms)
       {
          abortInternal(QStringLiteral(
-            "走不到位: 下发目标 (%1, %2) 已等 %3 s, 实测位置 (%4, %5) 一直没进容差 ±%6。\n"
-            "多半是卡住、被限位挡住, 或者目标被量程夹掉了。")
+            "未到位: 下发目标 (%1, %2) 已等待 %3 s, 实测位置 (%4, %5) 始终未进入容差 ±%6。\n"
+            "可能原因: 机械卡住 / 被限位挡住 / 目标被量程夹掉。")
             .arg(m_issued[0]).arg(m_issued[1])
             .arg(m_state_ms >= 0 ? (m_now_ms - m_state_ms) / 1000 : 0)
             .arg(t.ax[0].pos).arg(t.ax[1].pos).arg(posTolPul(m_p)), true);
@@ -806,10 +805,10 @@ bool ScanController::externalWantChanged(const BusTelem &t, int axis, int32_t *s
 QString ScanController::healthProblem(const BusTelem &t)
 {
    if (!t.connected)
-      return QStringLiteral("总线已断开 —— 扫描自动中止");
+      return QStringLiteral("总线已断开, 扫描自动中止。");
 
    if (!t.in_op)
-      return QStringLiteral("掉出了 OP 状态 —— 过程数据已经不可信, 扫描自动中止");
+      return QStringLiteral("已退出 OP 状态, 过程数据不可信, 扫描自动中止。");
 
    if (t.fault)
    {
@@ -819,7 +818,7 @@ QString ScanController::healthProblem(const BusTelem &t)
        * 是常态, 不是异常; 后面红横幅上会补上。 */
       const QString codes = ecatcmd::faulted_axes_text(t);
 
-      return QStringLiteral("驱动器报故障 (6041h bit3) —— 目标已被冻结, 扫描自动中止%1")
+      return QStringLiteral("驱动器自报故障 (6041h bit3), 目标已冻结, 扫描自动中止%1")
                 .arg(codes.isEmpty() ? QString()
                                      : QStringLiteral("。故障码: ") + codes);
    }
@@ -829,7 +828,7 @@ QString ScanController::healthProblem(const BusTelem &t)
    {
       m_bad_wkc++;
       if (m_bad_wkc >= 10)
-         return QStringLiteral("工作计数器连续 %1 帧不足 (%2/%3) —— 检查网线与驱动器供电")
+         return QStringLiteral("工作计数器连续 %1 帧不足 (%2/%3), 过程数据不完整, 扫描自动中止。")
                    .arg(m_bad_wkc).arg(t.wkc).arg(t.expected_wkc);
    }
    else
@@ -842,19 +841,19 @@ QString ScanController::healthProblem(const BusTelem &t)
       const AxisTelem &a = t.ax[i];
 
       if (!a.valid || !a.mirror_ok)
-         return QStringLiteral("轴%1 丢了过程数据帧 —— 位置是陈值, 扫下去会采在错的地方").arg(i);
+         return QStringLiteral("轴%1 丢失过程数据帧, 位置为陈旧值, 扫描自动中止。").arg(i);
 
       if (!a.enabled)
-         return QStringLiteral("轴%1 掉使能 (6041h bit2) —— 扫描自动中止").arg(i);
+         return QStringLiteral("轴%1 掉使能 (6041h bit2), 扫描自动中止。").arg(i);
 
       /* 这一条最可能真触发。后两句是现场诊断: bit11 报的是硬件限位信号有效, 未必真有
-       * 个开关压着 (见 ecatworker.h) */
+       * 个开关触发 (见 ecatworker.h) */
       if (a.limit_active)
          return QStringLiteral(
             "%1。\n"
             "%2。\n"
             "%3。\n"
-            "扫描已自动中止。处理完之后用「续扫」接着采, 已经采过的点不会重采。")
+            "扫描已自动中止, 已采的点不会重采。")
                .arg(QString::fromUtf8(ecatcmd::limit_hit_headline(t.di_invert)).arg(i))
                .arg(QString::fromUtf8(ecatcmd::limit_switch_text(
                        a.dig_known, a.dig_pos, a.dig_neg, t.di_invert)))
@@ -864,8 +863,8 @@ QString ScanController::healthProblem(const BusTelem &t)
       int32_t seen = 0;
       if (externalWantChanged(t, i, &seen))
          return QStringLiteral(
-            "有人从别处改了轴%1 的目标 (现在 %2, 本点应该是 %3)。\n"
-            "扫描期间不允许手动干预 —— 已自动中止。要手动控制就先「中止」。")
+            "轴%1 的目标被外部改动 (当前 %2, 本点应为 %3)。\n"
+            "扫描期间不允许手动干预, 已自动中止。")
             .arg(i).arg(seen).arg(asClamped(m_issued[i], t.range));
    }
 

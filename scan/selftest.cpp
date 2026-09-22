@@ -1203,7 +1203,11 @@ static void test_preflight()
       r.bus.setEnabled(0, true);
       r.meter.close();
       check(!r.startScan(QDir::tempPath() + "/pf2.csv", &err), "no meter → refused");
-      check(err.contains(QStringLiteral("功率计")), "the reason mentions the meter", err.toStdString());
+      /* 那个源在界面上有两个名字: 设备本身是功率计, 而参数栏里那个下拉叫「取样源」。
+       * 这一句与 scanwindow 那句「取样源未打开」说的是同一件事, 所以钉的是"必须点名那个源",
+       * 不钉它用哪个名字。 */
+      check(err.contains(QStringLiteral("功率计")) || err.contains(QStringLiteral("取样源")),
+            "the reason mentions the meter", err.toStdString());
 
       r.meter.open(nullptr);
       r.bus.setLimit(1, true);
@@ -1759,7 +1763,7 @@ static void test_limitsw()
        && !limit_hit(LIM, true, false, false, true),
          "bit11 + switches released: hit without invert, NOT a hit with invert");
 
-   caseBegin("limitsw: 现场诊断那句话不许把「不知道」说成「都没压着」");
+   caseBegin("limitsw: 现场诊断那句话不许把「不知道」说成「都没触发」");
    {
       const char *unk = limit_switch_text(false, false, false, false);
       check(std::strstr(unk, "无从得知") != nullptr,
@@ -1771,7 +1775,7 @@ static void test_limitsw()
       check(std::strcmp(unk, unk_inv) != 0, "…and it is not the same sentence");
 
       const char *none_p = limit_switch_text(true, false, false, false);
-      check(std::strstr(none_p, "都没压着") != nullptr, "known + released says so", none_p);
+      check(std::strstr(none_p, "都没触发") != nullptr, "known + released says so", none_p);
       const char *pos = limit_switch_text(true, true, false, false);
       check(std::strstr(pos, "正限位") != nullptr, "positive limit is named", pos);
       const char *neg = limit_switch_text(true, false, true, false);
@@ -1783,15 +1787,19 @@ static void test_limitsw()
             limit_switch_text(true, true, false, true));
    }
 
-   /* 真机那条: X0~X3 接 NPN 传感器而 2300h 按常开配, 两个限位输入常年读成"压着"、bit11 恒置起,
-    * 而文案只说"先手动走离限位" —— 把人支去追一个不存在的限位。正负限位同时压着物理上不成立,
-    * 那句话说出口时必须带上"这多半不是真的"和"往 2300h 查"。这条钉的是措辞, 逻辑一个字没改。 */
-   caseBegin("limitsw: 正负限位同时压着 = 不可能, 文案必须点破并指向 2300h");
+   /* 真机那条: X0~X3 接 NPN 传感器而 2300h 按常开配, 两个限位输入常年读成"触发"、bit11 恒置起,
+    * 而文案只说"先手动走离限位" —— 把人支去追一个不存在的限位。正负限位同时触发物理上不成立。
+    * 成因与排查表按本轮决定移进 docs/scan_messages.md, 界面上只留"现在是什么状况";
+    * 因此这里钉的是**状态句只说状态** (两侧都点名、不许夹带出路), 不再是"必须出现 2300h"。 */
+   caseBegin("limitsw: 正负限位同时触发 = 不可能, 状态句只报状态");
    {
       const char *both = limit_switch_text(true, true, true, false);
-      check(std::strstr(both, "2300h") != nullptr,
-            "the impossible combination points at the polarity parameter", both);
       check(std::strstr(both, "同时") != nullptr, "it says the two are simultaneous", both);
+      check(std::strstr(both, "正限位") != nullptr && std::strstr(both, "负限位") != nullptr,
+            "both switches are named, so the sentence is not vague about which", both);
+      /* 出路 (那句「请…」) 属于 advice 那一支, 不许渗进状态句 */
+      check(std::strstr(both, "请") == nullptr,
+            "the status sentence carries no course of action — that is the advice's job", both);
 
       const char *adv = limit_hit_advice(true, true, true, false, false);
       check(std::strstr(adv, "2300h") != nullptr, "the advice names 2300h too", adv);
@@ -1801,12 +1809,12 @@ static void test_limitsw()
       /* 取反这个新出路也要点一下, 但必须连带说清它只治软件那一侧 */
       check(std::strstr(adv, "上位机侧取反") != nullptr, "the advice mentions the new way out",
             adv);
-      check(std::strstr(adv, "只治软件") != nullptr,
+      check(std::strstr(adv, "只作用于本程序") != nullptr,
             "…and says plainly that it only fixes this side", adv);
 
-      /* 真正的单边压着 —— 那句"走离限位"在**这一支**上仍然是对的 */
+      /* 真正的单边触发 —— 那句"移离限位"在**这一支**上仍然是对的 */
       const char *one = limit_hit_advice(true, true, false, false, false);
-      check(std::strstr(one, "走离") != nullptr, "a real single limit still says walk off it",
+      check(std::strstr(one, "移离") != nullptr, "a real single limit still says walk off it",
             one);
 
       /* 三种情形的建议必须彼此不同 —— 同一条建议套在四种成因上就是原来那个毛病 */
@@ -1823,7 +1831,7 @@ static void test_limitsw()
    /* ---- 反转开着时, 上面那几句的意思全变了, 必须是另外几句话 ----
     * dig_* 已是反相之后的值, 两路还同时为真与 2300h 无关 (极性错只会两边一起反相, 反相完就该
     * 松开), 所以那几句里不许再出现指向 2300h 的话。 */
-   caseBegin("limitsw: 反转开着时「同时压着」换了个意思, 文案必须跟着换");
+   caseBegin("limitsw: 反转开着时「同时触发」换了个意思, 文案必须跟着换");
    {
       const char *t_off = limit_switch_text(true, true, true, false);
       const char *t_on  = limit_switch_text(true, true, true, true);
@@ -1839,7 +1847,7 @@ static void test_limitsw()
       check(std::strstr(a_on, "供电") != nullptr,
             "it points at wiring / sensor power instead", a_on);
 
-      /* 反转开着时单边压着反而是可信的 —— 判定用的就是它, 措辞该更强 */
+      /* 反转开着时单边触发反而是可信的 —— 判定用的就是它, 措辞该更强 */
       const char *one_on  = limit_hit_advice(true, true, false, false, true);
       const char *one_off = limit_hit_advice(true, true, false, false, false);
       check(std::strcmp(one_on, one_off) != 0, "single limit: invert changes the wording");
@@ -1850,9 +1858,9 @@ static void test_limitsw()
       const char *u_on  = limit_hit_advice(false, false, false, false, true);
       const char *u_off = limit_hit_advice(false, false, false, false, false);
       check(std::strcmp(u_on, u_off) != 0, "unknown 60FDh: invert changes the advice");
-      check(std::strstr(u_on, "永远开不了") != nullptr,
+      check(std::strstr(u_on, "无法启动") != nullptr,
             "with invert on, unknown 60FDh means the scan can never start", u_on);
-      check(std::strstr(u_on, "关掉") != nullptr, "and one way out is to turn the invert off",
+      check(std::strstr(u_on, "关闭") != nullptr, "and one way out is to turn the invert off",
             u_on);
 
       /* 开场白也要跟着判据换: 反转开着时 limit_active 与 bit11 无关, 还说"bit11 置起"就是把人
@@ -2394,8 +2402,9 @@ static void test_homing()
 
       r = ecatcmd::home_refusal(true, true, true, false, true);
       check(has(r, "停止"), "还有轴在走 → 让人先按「停止」");
-      check(has(r, "回零期间插补器是停的") || has(r, "停在半途"),
-            "还要说明白为什么 —— 不然那句话看着像没道理的门槛");
+      /* 「为什么这算一条门槛」属于成因, 按本轮决定移进 docs/scan_messages.md。
+       * 界面上只留"现在是什么状况 + 一句请…", 所以这里钉的是那句出路本身。 */
+      check(has(r, "请"), "而且出路写成一句「请…」, 不再是解释");
    }
 
    /* ---- 收尾结局 ------------------------------------------------ */
@@ -2444,12 +2453,13 @@ static void test_homing()
       /* **被「停止」中止不是失败。** 那是人让它停的, 说成失败会让人去找一个不存在
        * 的毛病 (这条路径本来就是本功能的半个需求) */
       check(!has(ecatcmd::home_cause_text(1), "失败"), "被「停止」中止不许说成失败");
-      check(has(ecatcmd::home_cause_text(-1), "方向"), "真失败时给换方向的建议");
-      check(has(ecatcmd::home_cause_text(-1), "硬顶"),
-            "失败建议里写明别硬顶 —— 撞着开关还硬回, 才是真会伤机器的做法");
       /* 失败那一格混着至少五种原因 (方式越界 / 参数写不进 / 驱动器没接受 HM 模式 /
        * 等 bit12 超时 / bit3 或 bit13)。**它们是同一句话就必须告诉人上哪去分开** ——
-       * 否则操作员只会照着"方向不对"反复换按钮, 而真正的原因是"驱动器压根没进 HM"。 */
+       * 否则操作员只会照着"方向不对"反复换按钮, 而真正的原因是"驱动器压根没进 HM"。
+       * 按本轮决定, 那五种原因各自的样子与处置进 docs/scan_messages.md, 界面上不再替人
+       * 猜方向, 所以这里钉的是"必须把人指到控制台去分开", 不是"必须出现方向二字"。 */
+      check(!has(ecatcmd::home_cause_text(-1), "硬顶"),
+            "失败那句不再夹带行动建议 —— 出路只有「看控制台」这一条");
       check(has(ecatcmd::home_cause_text(-1), "控制台"),
             "失败那一格必须点明具体原因在控制台里 (五种原因在这里是同一句话)");
       check(has(ecatcmd::home_cause_text(-1), "6061h"),

@@ -214,7 +214,7 @@ inline int pick_faulted_axes(const BusTelem &t, int *out, int max)
 
 /* 撞限位 —— **只此一处定义**, 控制器 / 参数栏 / 画布都读它算出来的那一个字段。
  * 今天这条 = 6041h bit11 单独判定。手册 V2.4 (6041h 表): bit11 = "硬件限位信号有效时置 1",
- * 它是电平不是闩锁, 与 60FDh 的 bit0/bit1 同源。打开下面这个开关 = 再加 "且 60FDh 说压着"。 */
+ * 它是电平不是闩锁, 与 60FDh 的 bit0/bit1 同源。打开下面这个开关 = 再加 "且 60FDh 说触发"。 */
 #define kRefineLimitWithDigIn 0
 
 /* 三条判据 —— 哪一条生效由一条纯函数 (limit_rule_for) 决定, 不散在调用点。
@@ -222,7 +222,7 @@ inline int pick_faulted_axes(const BusTelem &t, int *out, int max)
 enum LimitRule
 {
    LIMIT_RULE_BIT11   = 0,   /* 6041h bit11 单独判定 —— 出厂默认, 也是所有退路 */
-   LIMIT_RULE_REFINED = 1,   /* bit11 **且** 60FDh 说正/负限位压着 (原点不算) */
+   LIMIT_RULE_REFINED = 1,   /* bit11 **且** 60FDh 说正/负限位触发 (原点不算) */
    LIMIT_RULE_INVERT  = 2    /* 输入已反相(NPN): 只看反相后的两个限位开关, 未知则中止 */
 };
 
@@ -271,95 +271,74 @@ inline bool limit_hit(uint16_t sw, bool dig_known, bool dig_pos, bool dig_neg,
 }
 
 /* 把 60FDh 那三位说成一句人话, 供「拒绝启扫」与「自动中止」的文案用。
- * 未知时说"状态未知", 不是"都没压住"。返回 UTF-8 常量, 调用方自己包成 QString。 */
+ * 未知时说"状态未知", 不是"都没触发"。
+ * **只说状态, 不说成因** —— 成因与排查步骤在 docs/scan_messages.md, 这里多说一句就
+ * 会在横幅上把那句"现在是什么状况"埋掉。返回 UTF-8 常量, 调用方自己包成 QString。 */
 inline const char *limit_switch_text(bool dig_known, bool dig_pos, bool dig_neg,
                                      bool di_invert)
 {
    if (!dig_known)
       return di_invert
-         ? "60FDh 不在生效映射里 —— 而「上位机侧取反」开着, 反相拿到的是全 0, "
-           "等于一条判据都没有"
-         : "60FDh 不在生效映射里, 三个开关的状态无从得知";
+         ? "60FDh 读不到, 而上位机侧取反已开启 —— 无可用限位判据"
+         : "60FDh 读不到, 三个开关的状态无从得知";
 
-   /* 正负限位同时读成压着, 物理上不成立 —— 现场是 X0~X3 接 NPN 传感器 (高电平表示
-    * 未触发) 而 2300h 按常开配着, 于是"没触发"被读成"触发"。反转开着时这一条含义整个
-    * 变了: 此时 dig_pos/dig_neg 已是反相之后的值, 同时为真 = 两路都被拉到低电平。 */
+   /* 正负限位同时为真, 物理上不成立 —— 成因见 docs/scan_messages.md。
+    * 反转开着时这一条含义整个变了: 此时 dig_pos/dig_neg 已是反相之后的值。 */
    if (dig_pos && dig_neg)
       return di_invert
-         ? "反相之后正限位与负限位仍然同时报压着 —— 极性已不是原因 (极性错只会两边"
-           "一起反相, 反相完就该松开)。这是两路同时被读到低电平: 查传感器供电、"
-           "输出有没有被拉到 0V、两路是不是接串了"
-         : "60FDh 说正限位与负限位同时都压着 —— 滑台不可能同时在两头, 这一条多半"
-           "不是真的。最可能的原因是 2300h (输入有效电平逻辑) 与接线不符: NPN 传感器"
-           "高电平表示未触发, 按常开配会把「没触发」读成「触发」";
+         ? "反相之后正限位与负限位同时触发"
+         : "正限位与负限位同时触发";
 
    if (dig_pos)
-      return di_invert ? "反相之后 60FDh 说正限位开关压着"
-                       : "60FDh 说正限位开关压着";
+      return di_invert ? "反相之后正限位触发" : "正限位触发";
    if (dig_neg)
-      return di_invert ? "反相之后 60FDh 说负限位开关压着"
-                       : "60FDh 说负限位开关压着";
-   return di_invert ? "反相之后 60FDh 说正/负限位开关都没压着"
-                    : "60FDh 说正/负限位开关都没压着 (与 bit11 不一致 —— 两者本是同一路"
-                      "信号的两个视图; 但若 2310h~2312h 功能码没配对, 这两位恒为 0, "
-                      "不足以推翻 bit11)";
+      return di_invert ? "反相之后负限位触发" : "负限位触发";
+   return di_invert ? "反相之后正/负限位都没触发"
+                    : "正/负限位都没触发";
 }
 
-/* bit11 置起时该去做什么 (与"是什么状态"分开)。措辞里不许出现"已撞上"这种话 ——
- * 只知道 6041h 报了这位、60FDh 说了什么, 剩下的说成"多半/可能"。 */
+/* bit11 置起时该去做什么 (与"是什么状态"分开)。只给一条出路, 措辞里不许出现"已撞上"
+ * 这种话 —— 只知道 6041h 报了这位、60FDh 说了什么, 剩下的说成"多半/可能"。
+ * **成因与完整排查表在 docs/scan_messages.md**, 这里只留"下一步按哪个"。 */
 inline const char *limit_hit_advice(bool dig_known, bool dig_pos, bool dig_neg,
                                     bool dig_home, bool di_invert)
 {
    if (!dig_known)
       return di_invert
-         ? "「上位机侧取反」开着, 而 60FDh 读不到 —— 反转生效时 bit11 不参与判定, "
-           "一条判据都没有, 限位信号一律按「有效」中止, 扫描永远开不了。出路: "
-           "勾「让 60FDh 进 TxPDO」再重新「连接」(或改 1A00h), 或者关掉这个反转"
-         : "读不到 60FDh, 分不清是原点还是限位。勾上「让 60FDh 进 TxPDO」再重新"
-           "「连接」(或用厂家上位机改一次 1A00h) 就能分清 —— 只读不写, 零代价";
+         ? "限位判据缺失, 扫描无法启动。请勾选「让 60FDh 进 TxPDO」并重新连接, "
+           "或关闭上位机侧取反"
+         : "请勾选「让 60FDh 进 TxPDO」并重新连接, 以区分原点与限位";
 
    if (dig_pos && dig_neg)
       return di_invert
-         ? "反相之后两个限位仍同时压着 —— 不是极性的事。两路被同时读到低电平: "
-           "查传感器供电, 以及输出是否被拉到 0V、两路是否接串了"
-         : "先别去走离限位 —— 正负限位同时压着, 那个限位不存在 (成因见上一条)。"
-           "查 2300h 的输入有效电平逻辑与 X0~X3 接线是否一致, 再看一眼 607Dh:01/:02 "
-           "软限位是不是 0/0, 两者都只读。「上位机侧取反」也能立刻解开上位机这一侧, "
-           "但它只治软件";
+         ? "请检查传感器供电与两路接线 (是否被拉到 0V / 是否接串)"
+         : "请检查 2300h 输入有效电平逻辑与 X0~X3 接线; 或启用「上位机侧取反」"
+           "(只作用于本程序)";
 
    if (dig_pos || dig_neg)
       return di_invert
-         ? "反相之后的读数是可信的 (反转开着时判定用的就是它) —— 真的有个开关压着, "
-           "先手动把它走离; 走离之后灯还亮着, 就是那一路的接线或传感器本身的问题"
-         : "先手动把它走离压着的那个开关。若确认没有开关压着而这一位仍然置起, "
-           "那就不是接线问题 —— 查 607Dh:01/:02 软限位是不是 0/0";
+         ? "读数可信, 请手动把滑台移离该限位"
+         : "请手动把滑台移离触发的限位, 再查 607Dh:01/:02 软限位";
 
    if (dig_home)
-      return "正/负限位都没压着, 压着的是原点开关。滑台要是正停在原点附近, 这一位"
-             "多半就是这么来的 —— 「任何开关压着就置起」本机还没实测过, 先按「它真的"
-             "会让扫描中止」对待";
+      return "请手动把滑台移离原点开关";
 
    /* 607Dh 那一支: CiA402 一般定义里软限位是另一路可能的来源, 本机实测它是开着的
     * (不是 0/0), 所以多半不指向它。它的实测值当初由 CLI 的只读诊断打出, 那个程序
     * 2026-09-21 从仓库移除了 —— 要复核得自己用 em_rd_i32() 临时加一行。 */
    return di_invert
-      ? "反相之后正/负限位都没压着 —— 而反转开着时 bit11 不参与判定, 按理这一位不该"
-        "让扫描停下。走到这里说明命中的是「60FDh 未知」那一支 (连接之后还没收到过完整"
-        "过程数据帧), 先把连接重做一次"
-      : "正/负限位都没压着而 bit11 置起了 —— 按手册这一位报的就是硬件限位信号有效, "
-        "而那两位是同一路信号经 2300h + 2310h 之后的结果, 这是个自相矛盾的读数。"
-        "先查 2310h~2312h 的功能码 (会不会正因为被改成 0, 60FDh 才说没压着), 再查 "
-        "2300h 与接线, 以及 607Dh:01/:02 软限位是不是 0/0";
+      ? "请重新连接总线"
+      : "请检查 2310h~2312h 功能码与 607Dh:01/:02 软限位";
 }
 
 /* 「这一位是怎么回事」的开场白, 带一个 %1 = 轴号。反转开着时 bit11 不参与判定,
- * 开场白必须跟着判据换。 */
+ * 开场白必须跟着判据换。
+ * 「硬件限位信号有效」是 6041h bit11 的原始定义, 照抄 —— 它是电平, 不是"撞上了"。 */
 inline const char *limit_hit_headline(bool di_invert)
 {
    return di_invert
-      ? "轴%1 的限位判据成立 —— 「上位机侧取反」开着, 判据是反相之后的正/负限位开关, "
-        "与 6041h bit11 无关"
-      : "轴%1 的 6041h bit11 置起 —— 手册对这一位的定义是「硬件限位信号有效」";
+      ? "轴%1 的限位判据成立 —— 判据是反相之后的正/负限位开关, 与 6041h bit11 无关"
+      : "轴%1 的 6041h bit11 置起 (硬件限位信号有效)";
 }
 
 /* 回零 (驱动器自带的 HM 模式)。能判的放这里, 因为 scan_selftest 不编 ecatworker.cpp;
@@ -384,8 +363,8 @@ inline const char *home_dir_text(bool negative) { return negative ? "反向" : "
 
 /* ---- 「找限位」: 把限位开关本身当机械基准 (6098h = 18 正限位 / 17 负限位) ----
  * 与 24/29 的区别是**基准不同**: 24/29 找的是原点开关 X0, 17/18 找的是那一侧的限位开关。
- * 手册 V2.4 p46~p48 给 17/18 各写了两条分支 —— a) 启动时目标开关没压着 (先朝它高速去,
- * 碰到再退开), b) 启动时已经压着 (直接朝反方向低速退开)。**两条分支的终点都是开关的
+ * 手册 V2.4 p46~p48 给 17/18 各写了两条分支 —— a) 启动时目标开关未触发 (先朝它高速去,
+ * 碰到再退开), b) 启动时已经触发 (直接朝反方向低速退开)。**两条分支的终点都是开关的
  * 释放点**, 也就是刚退开一点的那个位置。 */
 inline int home_lim_method_for(bool negative)
 {
@@ -420,7 +399,7 @@ inline const char *home_lim_switch_name(int m)
    return "限位开关";
 }
 
-/* 目标开关此刻压着没有 (只有 17/18 有"目标开关"; 24/29 的基准是原点开关, 不在这里判)。
+/* 目标开关此刻触发与否 (只有 17/18 有"目标开关"; 24/29 的基准是原点开关, 不在这里判)。
  * "哪一位是目标"由 EM_HOME_LIM_TARGET_BIT 定义 (在 ec_motor.h 里; 现在只有界面侧读它 ——
  * 信号灯的着色与下面这条判据共用同一份)。 */
 inline bool home_lim_target_active(int m, bool dig_pos, bool dig_neg)
@@ -432,7 +411,7 @@ inline bool home_lim_target_active(int m, bool dig_pos, bool dig_neg)
    return (mask & EM_DI_POS_LIMIT) ? dig_pos : dig_neg;
 }
 
-/* 另外那一侧的限位开关 (与目标相对)。与 target 同时压着 = 读数里至少有一个不是真的 */
+/* 另外那一侧的限位开关 (与目标相对)。与 target 同时触发 = 读数里至少有一个不是真的 */
 inline bool home_lim_other_active(int m, bool dig_pos, bool dig_neg)
 {
    const uint32_t mask = EM_HOME_LIM_OTHER_BIT(m);
@@ -442,7 +421,7 @@ inline bool home_lim_other_active(int m, bool dig_pos, bool dig_neg)
    return (mask & EM_DI_POS_LIMIT) ? dig_pos : dig_neg;
 }
 
-/* 这一趟回零的**首段方向**。tgt_active = "启动时目标那个开关已经压着" (手册的 b) 分支)。
+/* 这一趟回零的**首段方向**。tgt_active = "启动时目标那个开关已经触发" (手册的 b) 分支)。
  * 原来的写法是从"方式号等不等于 29"推方向 (scanwindow.cpp / ecatworker.cpp 各一处),
  * 那套对 24/29 够用, 对 17/18 会把 a) 说成 b) —— 而且 17 与 18 的首段方向本身就是反的。
  * 四个方式 × a/b 是一张真值表, 被 scan/selftest.cpp 钉死。 */
@@ -466,13 +445,11 @@ inline const char *home_method_first_dir(int m, bool tgt_active)
 inline const char *home_lim_refusal(bool dig_known, bool tgt_active, bool other_active)
 {
    if (!dig_known)
-      return "60FDh 读不到 (不在生效 TxPDO 里, 或还没收到过完整帧) → 分不出这一趟走手册"
-             "的 a) 还是 b) 分支, 拒绝找限位。出路: 在「高级选项」里勾上"
-             "「让 60FDh 进 TxPDO」再重新「连接」";
+      return "60FDh 读不到 → 分不出这一趟走 a) 还是 b) 分支, 拒绝找限位。"
+             "请勾选「让 60FDh 进 TxPDO」并重新连接";
    if (tgt_active && other_active)
-      return "正限位与负限位同时报有效 → 滑台不可能同时在两头, 这一对读数至少有一个不是"
-             "真的, 拒绝找限位。最可能的原因是 2300h (输入有效电平逻辑) 与接线不符: "
-             "NPN 传感器高电平表示未触发, 按常开配会把「没触发」读成「触发」";
+      return "正限位与负限位同时报有效 → 这一对读数至少有一个不是真的, 拒绝找限位。"
+             "请检查 2300h 输入有效电平逻辑与 X0~X3 接线";
    return nullptr;
 }
 
@@ -482,16 +459,16 @@ inline const char *home_lim_branch_text(int m, bool tgt_active)
 {
    if (m == EM_HOME_MODE_LIMIT_POS)
       return tgt_active
-         ? "轴%1 找正限位 (方式 18): 正限位压着, 走手册 b) 分支 —— 先反向低速退开, "
-           "遇到限位释放后停机 (落点 = 开关的释放点)"
-         : "轴%1 找正限位 (方式 18): 正限位没压着, 走手册 a) 分支 —— 先正向高速去找它, "
-           "碰到后减速停止, 再反向低速退开, 停在开关的释放点";
+         ? "轴%1 找正限位 (方式 18): 正限位已触发 → 走 b) 分支, 先反向低速退开, "
+           "停在开关的释放点"
+         : "轴%1 找正限位 (方式 18): 正限位未触发 → 走 a) 分支, 先正向高速寻找, "
+           "碰到后减速停止再反向低速退开, 停在开关的释放点";
    if (m == EM_HOME_MODE_LIMIT_NEG)
       return tgt_active
-         ? "轴%1 找负限位 (方式 17): 负限位压着, 走手册 b) 分支 —— 先正向低速退开, "
-           "遇到限位释放后停机 (落点 = 开关的释放点)"
-         : "轴%1 找负限位 (方式 17): 负限位没压着, 走手册 a) 分支 —— 先反向高速去找它, "
-           "碰到后减速停止, 再正向低速退开, 停在开关的释放点";
+         ? "轴%1 找负限位 (方式 17): 负限位已触发 → 走 b) 分支, 先正向低速退开, "
+           "停在开关的释放点"
+         : "轴%1 找负限位 (方式 17): 负限位未触发 → 走 a) 分支, 先反向高速寻找, "
+           "碰到后减速停止再正向低速退开, 停在开关的释放点";
    return "轴%1 找原点 (方式 %2)";
 }
 
@@ -589,10 +566,9 @@ inline const char *home_refusal(bool bus_ready, bool origin_ready, bool mirror_o
    if (!mirror_ok)
       return "这一根没收到过完整帧 → 6041h 状态未知, 拒绝回零";
    if (fault)
-      return "6041h bit3 = Fault —— 先点「故障复位」";
+      return "6041h bit3 = Fault, 请先「故障复位」";
    if (any_axis_moving)
-      return "还有轴在走 —— 回零期间插补器是停的, 那根轴会停在半途。"
-             "先点「停止」让所有轴都停稳";
+      return "还有轴在走, 请先「停止」";
    return nullptr;
 }
 
@@ -633,12 +609,9 @@ inline const char *home_cause_text(int rc)
       return "被「停止」中止";
    /* 这一格里至少混着五种原因: 方式越界 / 6098h~607Ch 写不进去 / 驱动器没接受 HM 模式
     * (6061h 没读回 6) / 等 bit12 超时 / bit3 或 bit13 报上来 —— 它们要人做的事不一样,
-    * 但在这里是同一句话。找限位还多一条: 撞上限位后驱动器按 2204h (超程停车方式) 停住,
-    * 手册没写 HM 期间它与 a)/b) 谁优先, 那时 bit11 举着而位置一步没变。 */
-   return "失败 —— 方向不对就换另一个方向按钮; 找不到原点开关, 先手动把滑台挪到开关附近"
-          "再回零 (别硬顶)。找限位还有两条: 走反 (a)/b) 首段方向相反, 发起前控制台会"
-          "预告走哪条), 以及撞上限位后驱动器按 2204h 停住 —— 那时 bit11 举着而位置一步"
-          "没变。哪一步失败看控制台 (6061h / bit12 / bit3 / bit13 那五行)";
+    * 但在这里是同一句话: 先看控制台那五行分清是哪一步。
+    * 完整的排查表 (方向不对 / 走反 / 撞限位后按 2204h 停住) 在 docs/scan_messages.md。 */
+   return "失败, 请查看控制台输出的那五行 (6061h / bit12 / bit3 / bit13)";
 }
 
 /* 6061h (实际运行模式) 的数字说成人话。手册 §3.7 只给了这几个值 (6060h 那张表:
@@ -664,12 +637,12 @@ inline const char *home_end_text(HomeEnd e)
    switch (e)
    {
       case HOME_END_NEVER_STARTED:
-         return "没有发起 (闸拦下了, 一个字都没写)";
+         return "未发起 (前置判据未通过)";
       case HOME_END_FAULTED:
-         return "该轴报了故障 (6041h bit3), 现在停在未使能 —— 处理完现场后点「故障复位」";
+         return "该轴报故障 (6041h bit3), 停在未使能。请处理后「故障复位」";
       case HOME_END_STRANDED:
-         return "收尾没能确认到「已使能 + CSP」 —— 电机可能仍带电, "
-                "看控制台里是哪一步失败; 拿不准就断开驱动器的动力电源";
+         return "收尾未确认「已使能 + CSP」, 电机可能仍带电。"
+                "请查看控制台输出并断开驱动器动力电源";
       case HOME_END_HOLDING:
          return "已切回 CSP 并保持使能, 停在落点带保持力矩";
    }
@@ -711,13 +684,13 @@ inline const char *fault_code_action(uint16_t code)
    {
       /* 0x0000 这一条是给"bit3 还立着但驱动器自报无错"那一拍用的 —— 它前面已经写了
        * "0000 (无错误)", 这里再说一遍就重复了, 所以只讲下一步 */
-      case 0x0000: return "码是好的, 只是故障位还没清 —— 点「故障复位」";
-      case 0xFF01: return "过流: 先查机械有没有卡死/堵转, 再查动力线 U V W";
-      case 0xFF02: return "过压: 母线电压偏高, 常见于减速太急或供电过高 —— 查供电, 减速放慢";
-      case 0xFF03: return "欠压: 母线电压偏低 —— 查供电与接触器, 功率级可能掉过电";
-      case 0xFF04: return "动力线报警: 查动力线接线与电机相间/对地";
-      case 0xFF06: return "通讯报警: 查通讯线、干扰源与站号配置";
-      case 0xFF08: return "传感器告警: 查编码器接线与信号 (5V 与编码器电缆)";
+      case 0x0000: return "码是好的, 只是故障位还没清, 请「故障复位」";
+      case 0xFF01: return "过流: 请查机械卡死 / 堵转与动力线 U V W";
+      case 0xFF02: return "过压: 请查供电电压与减速设置";
+      case 0xFF03: return "欠压: 请查供电与接触器";
+      case 0xFF04: return "动力线报警: 请查动力线接线与电机相间 / 对地";
+      case 0xFF06: return "通讯报警: 请查通讯线、干扰源与站号配置";
+      case 0xFF08: return "传感器告警: 请查编码器接线与信号";
    }
    return nullptr;
 }
@@ -801,8 +774,7 @@ inline QString faulted_axes_text(const BusTelem &t)
  * 只写 bit3 的话界面会指着一条根本没立的位说事。 */
 inline QString fault_banner_text(const BusTelem &t)
 {
-   QString s = QStringLiteral("驱动器自报故障 (6041h bit3 或 603Fh) —— 目标已冻结, "
-                              "电机状态请以驱动器面板为准。");
+   QString s = QStringLiteral("驱动器自报故障 (6041h bit3 或 603Fh), 目标已冻结。");
 
    const QString codes = faulted_axes_text(t);
 
@@ -978,15 +950,11 @@ inline QString comm_banner_text(int wkc, int expected, int bad_run,
                                 int max_gap_ms, int gaps_over_ms)
 {
    QString s = QStringLiteral(
-      "过程数据帧连续 %1 帧不足 (工作计数器 %2/%3) —— 位置与状态是陈值, 目标已冻结。\n"
-      "这一条是**上位机自己看到的**: 主站没能按时把过程数据发出去, 驱动器那边多半"
-      "已经在报通讯报警了。")
+      "过程数据帧连续 %1 帧不足 (工作计数器 %2/%3), 位置与状态为陈旧值, 目标已冻结。")
       .arg(bad_run).arg(wkc).arg(expected);
 
    if (max_gap_ms > 0)
-      s += QStringLiteral("\n本程序最长 %1 ms 没发出一帧 (超过 %2 ms 的有 %3 次) —— "
-                          "这是判定「是不是这台 PC 的锅」的依据: 只有几 ms 就查线缆 / 干扰 / "
-                          "驱动器设置, 几百 ms 就是本机的网卡或电源管理在拖延。")
+      s += QStringLiteral("\n本程序最长 %1 ms 未发出帧 (超过 %2 ms 的 %3 次)。")
               .arg(max_gap_ms).arg(HMI_GAP_WARN_MS).arg(gaps_over_ms);
 
    return s;

@@ -259,7 +259,7 @@ bool OphirMeter::open(QString *err)
    {
       /* 上一次没收干净就别再起一个: 两个线程抢同一个表头 */
       if (err)
-         *err = QStringLiteral("上一次的采集线程还没收掉");
+         *err = QStringLiteral("上一次的采集线程尚未结束");
       return false;
    }
 
@@ -297,7 +297,7 @@ bool OphirMeter::waitForOpen(QString *err)
    if (!p->open_done)
    {
       if (err)
-         *err = QStringLiteral("等功率计打开超过 %1 ms —— 设备或 USB 卡住了")
+         *err = QStringLiteral("打开功率计等待超过 %1 ms, 设备或 USB 无响应。")
                    .arg(k_open_timeout_ms);
       return false;
    }
@@ -350,7 +350,7 @@ void OphirMeter::runSession()
 
    if (!apt.owned)
    {
-      failOpen(QStringLiteral("在这个线程上起 COM 失败: %1")
+      failOpen(QStringLiteral("在该线程上初始化 COM 失败: %1")
                   .arg(OphirCom::errorText((long)apt.hr)));
       return;
    }
@@ -373,16 +373,15 @@ void OphirMeter::runSession()
    if (serials.isEmpty())
    {
       /* 手册的排查顺序: 线 / 供电 / Windows 认不认 / StarLab 认不认, 不是先改代码 */
-      failOpen(QStringLiteral("没找到 Ophir USB 设备 —— 确认 Juno+ 插好, "
-                              "并用 StarLab 看它认不认这块表头: StarLab 里也读不到功率, "
-                              "问题就在硬件或驱动, 不在这个程序里"));
+      failOpen(QStringLiteral("未找到 Ophir USB 设备。请确认 Juno+ 已插好, 并在 StarLab 中确认该表头是否被识别; "
+                              "StarLab 中也读不到功率时, 问题在硬件或驱动。"));
       return;
    }
 
    long h = 0;
    if (!com.openUsbDevice(serials.first(), &h, &err))
    {
-      failOpen(QStringLiteral("打开 %1 失败: %2").arg(serials.first(), err));
+      failOpen(QStringLiteral("打开设备 %1 失败: %2").arg(serials.first(), err));
       return;
    }
 
@@ -396,7 +395,7 @@ void OphirMeter::runSession()
    OphirCom::DeviceInfo dinfo;
    if (!com.getDeviceInfo(h, &dinfo, &err))
    {
-      failOpenWithDevice(QStringLiteral("读表头信息失败: %1").arg(err));
+      failOpenWithDevice(QStringLiteral("读取表头信息失败: %1").arg(err));
       return;
    }
    info.device_name   = dinfo.name;
@@ -407,15 +406,14 @@ void OphirMeter::runSession()
    bool sensor_ok = false;
    if (com.isSensorExists(h, k_channel, &sensor_ok, &err) && !sensor_ok)
    {
-      failOpenWithDevice(QStringLiteral("表头在, 但通道 %1 上没有探头 —— "
-                                        "确认 PD300R 插在 Juno+ 上").arg(k_channel));
+      failOpenWithDevice(QStringLiteral("表头已连接, 但通道 %1 上未检测到探头。请确认 PD300R 已插在 Juno+ 上。").arg(k_channel));
       return;
    }
 
    OphirCom::SensorInfo sinfo;
    if (!com.getSensorInfo(h, k_channel, &sinfo, &err))
    {
-      failOpenWithDevice(QStringLiteral("读探头信息失败: %1").arg(err));
+      failOpenWithDevice(QStringLiteral("读取探头信息失败: %1").arg(err));
       return;
    }
    info.sensor_name   = sinfo.name;
@@ -538,7 +536,7 @@ void OphirMeter::runSession()
             /* 配置没成功, 流是停着的: 得开回去, 否则后面每个点都会超时 */
             QString e3;
             if (!com.startStream(h, k_channel, &e3))
-               emit configFailed(QStringLiteral("%1; 而且重开流也失败了: %2").arg(e2, e3));
+               emit configFailed(QStringLiteral("%1; 重新启动数据流也失败: %2").arg(e2, e3));
             else
                emit configFailed(e2);
          }
@@ -555,7 +553,7 @@ void OphirMeter::runSession()
          if (!com.getData(h, k_channel, &data, &e2))
          {
             p->want.storeRelease(0);
-            emit readingFailed(QStringLiteral("读功率计失败: ") + e2);
+            emit readingFailed(QStringLiteral("读取功率计失败: ") + e2);
          }
          else
          {
@@ -588,7 +586,7 @@ void OphirMeter::runSession()
                   /* 过量程 / 饱和 / 过热: 手册 "Not every data item represents a valid
                    * measurement" —— 宁可报错也不把这个数记进 CSV */
                   p->want.storeRelease(0);
-                  emit readingFailed(QStringLiteral("这一读数不可用: %1")
+                  emit readingFailed(QStringLiteral("该读数不可用: %1")
                                         .arg(OphirCom::statusText(st)));
                }
             }
@@ -603,8 +601,7 @@ void OphirMeter::runSession()
                if (asked > 0 && nowMs() - asked > k_stale_ms)
                {
                   p->want.storeRelease(0);
-                  emit readingFailed(QStringLiteral("功率计 %1 ms 没有出新数 "
-                                                    "(设备在出数吗? 量程选对了吗?)")
+                  emit readingFailed(QStringLiteral("功率计 %1 ms 未出新数据 (请确认设备在出数、量程是否正确)。")
                                         .arg(k_stale_ms));
                }
             }
@@ -624,7 +621,7 @@ void OphirMeter::requestReading()
    if (!isOpen())
    {
       /* 必须回一个: 接口约定恰好回一次, 不回控制器会一直等到它自己的超时 */
-      emit readingFailed(QStringLiteral("功率计没打开"));
+      emit readingFailed(QStringLiteral("功率计未打开"));
       return;
    }
 

@@ -32,7 +32,7 @@ ArrivalJudge::Verdict ArrivalJudge::feed(const ArrivalObs &o, int64_t now_ms, st
     *   !in_op = 总线掉了 / fault = 6041h bit3 / !enabled = 插值目标不推进, want != tgt 恒成立 */
    if (!o.in_op)
    {
-      if (why) *why = "总线已掉出 OP";
+      if (why) *why = "总线已退出 OP";
       return Verdict::Faulted;
    }
    if (o.fault)
@@ -42,7 +42,7 @@ ArrivalJudge::Verdict ArrivalJudge::feed(const ArrivalObs &o, int64_t now_ms, st
    }
    if (!o.enabled)
    {
-      if (why) *why = "轴已被失能 —— 未使能时插值目标不会推进, 再等也不会到";
+      if (why) *why = "轴已失能: 未使能时插值目标不会推进, 不会到位。";
       return Verdict::Faulted;
    }
 

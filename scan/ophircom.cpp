@@ -132,25 +132,25 @@ QString OphirCom::errorText(long hresult)
       { (long)0x80004005, "未指明的失败" },
       { (long)0x80040200, "设备未打开" },
       { (long)0x80040201, "设备已经打开了" },
-      { (long)0x80040202, "驱动装不上" },
+      { (long)0x80040202, "驱动安装失败" },
       { (long)0x80040203, "缺少文件" },
       { (long)0x80040300, "设备故障" },
-      { (long)0x80040301, "设备固件版本不对" },
+      { (long)0x80040301, "设备固件版本不匹配" },
       { (long)0x80040302, "探头故障" },
-      { (long)0x80040303, "探头固件版本不对" },
+      { (long)0x80040303, "探头固件版本不匹配" },
       { (long)0x80040304, "设备句柄无效" },
       { (long)0x80040305, "探头通道号无效" },
-      { (long)0x80040306, "这个型号的探头不支持" },
-      { (long)0x80040307, "这个设备上没有这项功能" },
-      { (long)0x80040308, "设备已经不在了 (USB 被拔了?)" },
-      { (long)0x80040400, "存到探头里失败" },
+      { (long)0x80040306, "该型号探头不支持" },
+      { (long)0x80040307, "该设备不支持此功能" },
+      { (long)0x80040308, "设备已断开 (USB 已拔出)" },
+      { (long)0x80040400, "写入探头失败" },
       { (long)0x80040401, "参数错误" },
       { (long)0x80040402, "建安全数组失败" },
-      { (long)0x80040403, "这个探头上不适用" },
+      { (long)0x80040403, "该探头不适用" },
       { (long)0x80040404, "数值超出范围" },
       { (long)0x80040405, "命令失败" },
-      { (long)0x80040500, "流模式还没开始" },
-      { (long)0x80040501, "有个通道正处在流模式" },
+      { (long)0x80040500, "流模式尚未开始" },
+      { (long)0x80040501, "已有通道处于流模式" },
    };
 
    const long c = (long)(quint32)hresult;
@@ -218,7 +218,7 @@ QString makeError(HRESULT hr, const EXCEPINFO &ei)
 
    const QString dev = fromBstr(ei.bstrDescription);
    if (!dev.isEmpty() && !s.contains(dev))
-      s += QStringLiteral(" —— 设备原话: ") + dev;
+      s += QStringLiteral(" —— 设备返回: ") + dev;
    return s;
 }
 
@@ -247,7 +247,7 @@ struct OphirCom::Impl
       if (FAILED(hr) || mid == MEMBERID_NIL)
       {
          if (err)
-            *err = QStringLiteral("这个版本的 Ophir COM 对象没有 %1 这个方法 (0x%2)")
+            *err = QStringLiteral("该版本的 Ophir COM 对象不支持方法 %1 (0x%2)")
                       .arg(key, QString::number((quint32)hr, 16).toUpper());
          return MEMBERID_NIL;
       }
@@ -277,7 +277,7 @@ struct OphirCom::Impl
          if (!readStringArray(opts, options, &e2))
          {
             if (err)
-               *err = QStringLiteral("%1 回的选项表读不了: %2")
+               *err = QStringLiteral("读取 %1 返回的选项表失败: %2")
                          .arg(QString::fromLatin1(method), e2);
             VariantClear(&opts);
             return false;
@@ -368,7 +368,7 @@ bool loadInterfaceTypeInfo(const CLSID &clsid, const QString &dll,
    if (FAILED(hr) || !tl)
    {
       if (err)
-         *err = QStringLiteral("从 %1 里读不出类型库: %2")
+         *err = QStringLiteral("从 %1 读取类型库失败: %2")
                    .arg(dll, OphirCom::errorText((long)hr));
       return false;
    }
@@ -423,8 +423,7 @@ bool loadInterfaceTypeInfo(const CLSID &clsid, const QString &dll,
    {
       tl->Release();
       if (err)
-         *err = QStringLiteral("%1 里有类型库, 但没有 ICoLMMeasurement 接口 —— "
-                               "StarLab 的版本可能太老")
+         *err = QStringLiteral("%1 中含类型库, 但不含 ICoLMMeasurement 接口, StarLab 版本可能过低。")
                    .arg(dll);
       (void)clsid;
       return false;
@@ -470,7 +469,7 @@ bool arrayDims(const VARIANT &v, LONG *lb, LONG *ub, VARTYPE *elem, QString *err
        FAILED(SafeArrayGetUBound(v.parray, 1, ub)))
    {
       if (err)
-         *err = QStringLiteral("%1 取不到上下界").arg(QString::fromLatin1(what));
+         *err = QStringLiteral("%1 无法取得数组上下界").arg(QString::fromLatin1(what));
       return false;
    }
 
@@ -495,12 +494,12 @@ bool readDoubleArray(const VARIANT &v, QVector<double> *out, QString *err)
       {
          VARIANT t; VariantInit(&t);
          const HRESULT hr = SafeArrayGetElement(v.parray, &i, &t);
-         if (FAILED(hr)) { VariantClear(&t); if (err) *err = QStringLiteral("取数组元素失败"); return false; }
+         if (FAILED(hr)) { VariantClear(&t); if (err) *err = QStringLiteral("读取数组元素失败"); return false; }
          /* 元素也可能是别的数值类型, 让 OLE 去做转换 */
          VARIANT d; VariantInit(&d);
          const HRESULT c = VariantChangeType(&d, &t, 0, VT_R8);
          VariantClear(&t);
-         if (FAILED(c)) { VariantClear(&d); if (err) *err = QStringLiteral("数组元素不是数"); return false; }
+         if (FAILED(c)) { VariantClear(&d); if (err) *err = QStringLiteral("数组元素不是数值"); return false; }
          out->push_back(d.dblVal);
          VariantClear(&d);
       }
@@ -508,20 +507,20 @@ bool readDoubleArray(const VARIANT &v, QVector<double> *out, QString *err)
       {
          double d = 0.0;
          if (FAILED(SafeArrayGetElement(v.parray, &i, &d)))
-         { if (err) *err = QStringLiteral("取数组元素失败"); return false; }
+         { if (err) *err = QStringLiteral("读取数组元素失败"); return false; }
          out->push_back(d);
       }
       else if (elem == VT_I4)
       {
          LONG l = 0;
          if (FAILED(SafeArrayGetElement(v.parray, &i, &l)))
-         { if (err) *err = QStringLiteral("取数组元素失败"); return false; }
+         { if (err) *err = QStringLiteral("读取数组元素失败"); return false; }
          out->push_back((double)l);
       }
       else
       {
          if (err)
-            *err = QStringLiteral("数组元素类型不认识 (vt=%1)").arg((int)elem);
+            *err = QStringLiteral("数组元素类型未知 (vt=%1)").arg((int)elem);
          return false;
       }
    }
@@ -542,7 +541,7 @@ bool readLongArray(const VARIANT &v, QVector<int> *out, QString *err)
       {
          VARIANT t; VariantInit(&t);
          if (FAILED(SafeArrayGetElement(v.parray, &i, &t)))
-         { VariantClear(&t); if (err) *err = QStringLiteral("取数组元素失败"); return false; }
+         { VariantClear(&t); if (err) *err = QStringLiteral("读取数组元素失败"); return false; }
          VARIANT d; VariantInit(&d);
          const HRESULT c = VariantChangeType(&d, &t, 0, VT_I4);
          VariantClear(&t);
@@ -554,13 +553,13 @@ bool readLongArray(const VARIANT &v, QVector<int> *out, QString *err)
       {
          LONG l = 0;
          if (FAILED(SafeArrayGetElement(v.parray, &i, &l)))
-         { if (err) *err = QStringLiteral("取数组元素失败"); return false; }
+         { if (err) *err = QStringLiteral("读取数组元素失败"); return false; }
          out->push_back((int)l);
       }
       else
       {
          if (err)
-            *err = QStringLiteral("状态数组元素类型不认识 (vt=%1)").arg((int)elem);
+            *err = QStringLiteral("状态数组元素类型未知 (vt=%1)").arg((int)elem);
          return false;
       }
    }
@@ -581,7 +580,7 @@ bool readStringArray(const VARIANT &v, QStringList *out, QString *err)
       BSTR b = nullptr;
       if (FAILED(SafeArrayGetElement(v.parray, &i, &b)))
       {
-         if (err) *err = QStringLiteral("取选项失败");
+         if (err) *err = QStringLiteral("读取选项失败");
          return false;
       }
       out->push_back(fromBstr(b));
@@ -634,8 +633,8 @@ bool OphirCom::create(QString *err)
    if (!progIdToClsid(&clsid))
    {
       if (err)
-         *err = QStringLiteral("系统里没有注册 OphirLMMeasurement.CoLMMeasurement —— "
-                               "这个 COM 对象由 StarLab 的安装过程注册, 先确认它装了");
+         *err = QStringLiteral("系统中未注册 OphirLMMeasurement.CoLMMeasurement。该 COM 对象由 StarLab 安装程序注册, "
+                               "请确认 StarLab 已安装。");
       destroy();
       return false;
    }
@@ -646,7 +645,7 @@ bool OphirCom::create(QString *err)
    if (FAILED(hr) || !d->disp)
    {
       if (err)
-         *err = QStringLiteral("建 Ophir COM 对象失败: %1").arg(errorText((long)hr));
+         *err = QStringLiteral("创建 Ophir COM 对象失败: %1").arg(errorText((long)hr));
       destroy();
       return false;
    }
@@ -655,7 +654,7 @@ bool OphirCom::create(QString *err)
    if (dll.isEmpty())
    {
       if (err)
-         *err = QStringLiteral("注册表里 CLSID\\%1\\InprocServer32 没有服务端 dll 的路径")
+         *err = QStringLiteral("注册表 CLSID\\%1\\InprocServer32 中没有服务端 dll 路径")
                    .arg(clsidToText(clsid));
       destroy();
       return false;
@@ -692,7 +691,7 @@ bool OphirCom::isCreated() const
 bool OphirCom::scanUsb(QStringList *serial_numbers, QString *err)
 {
    serial_numbers->clear();
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    VARIANT out; VariantInit(&out);
    Args a;
@@ -705,7 +704,7 @@ bool OphirCom::scanUsb(QStringList *serial_numbers, QString *err)
       QString e2;
       if (!readStringArray(out, serial_numbers, &e2))
       {
-         if (err) *err = QStringLiteral("ScanUSB 回的东西读不了: %1").arg(e2);
+         if (err) *err = QStringLiteral("读取 ScanUSB 返回值失败: %1").arg(e2);
          VariantClear(&out);
          return false;
       }
@@ -719,7 +718,7 @@ bool OphirCom::scanUsb(QStringList *serial_numbers, QString *err)
 
 bool OphirCom::openUsbDevice(const QString &serial_number, long *h_device, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    long h = 0;
    Args a;
@@ -734,7 +733,7 @@ bool OphirCom::openUsbDevice(const QString &serial_number, long *h_device, QStri
 
 bool OphirCom::closeDevice(long h_device, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    Args a;
    a.inLong(h_device);
@@ -745,7 +744,7 @@ bool OphirCom::closeDevice(long h_device, QString *err)
 
 bool OphirCom::closeAll(QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    Args a;
    QString e;
@@ -755,7 +754,7 @@ bool OphirCom::closeAll(QString *err)
 
 bool OphirCom::isSensorExists(long h_device, long channel, bool *exists, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    VARIANT_BOOL b = VARIANT_FALSE;
    Args a;
@@ -771,7 +770,7 @@ bool OphirCom::isSensorExists(long h_device, long channel, bool *exists, QString
 
 bool OphirCom::getVersion(long *version, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    long v = 0;
    Args a;
@@ -784,7 +783,7 @@ bool OphirCom::getVersion(long *version, QString *err)
 
 bool OphirCom::getDriverVersion(QString *info, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    BSTR s = nullptr;
    Args a;
@@ -802,7 +801,7 @@ bool OphirCom::getDriverVersion(QString *info, QString *err)
 
 bool OphirCom::getDeviceInfo(long h_device, DeviceInfo *out, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    BSTR name = nullptr, rom = nullptr, sn = nullptr;
    Args a;
@@ -830,7 +829,7 @@ bool OphirCom::getDeviceInfo(long h_device, DeviceInfo *out, QString *err)
 
 bool OphirCom::getSensorInfo(long h_device, long channel, SensorInfo *out, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    BSTR sn = nullptr, type = nullptr, name = nullptr;
    Args a;
@@ -859,19 +858,19 @@ bool OphirCom::getSensorInfo(long h_device, long channel, SensorInfo *out, QStri
 
 bool OphirCom::getWavelengths(long h, long ch, long *index, QStringList *options, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
    return d->getOptionList("GetWavelengths", h, ch, index, options, err);
 }
 
 bool OphirCom::setWavelength(long h, long ch, long index, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
    return d->setIndex("SetWavelength", h, ch, index, err);
 }
 
 bool OphirCom::addWavelength(long h, long ch, long wavelength, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    Args a;
    a.inLong(h);
@@ -884,31 +883,31 @@ bool OphirCom::addWavelength(long h, long ch, long wavelength, QString *err)
 
 bool OphirCom::getRanges(long h, long ch, long *index, QStringList *options, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
    return d->getOptionList("GetRanges", h, ch, index, options, err);
 }
 
 bool OphirCom::setRange(long h, long ch, long index, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
    return d->setIndex("SetRange", h, ch, index, err);
 }
 
 bool OphirCom::getMeasurementMode(long h, long ch, long *index, QStringList *options, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
    return d->getOptionList("GetMeasurementMode", h, ch, index, options, err);
 }
 
 bool OphirCom::setMeasurementMode(long h, long ch, long index, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
    return d->setIndex("SetMeasurementMode", h, ch, index, err);
 }
 
 bool OphirCom::configureStreamMode(long h, long ch, long mode, long n_value, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    Args a;
    a.inLong(h);
@@ -922,7 +921,7 @@ bool OphirCom::configureStreamMode(long h, long ch, long mode, long n_value, QSt
 
 bool OphirCom::startStream(long h, long ch, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    Args a;
    a.inLong(h);
@@ -935,7 +934,7 @@ bool OphirCom::startStream(long h, long ch, QString *err)
 bool OphirCom::getData(long h, long ch, Data *out, QString *err)
 {
    out->clear();
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    VARIANT v_val, v_ts, v_st;
    VariantInit(&v_val); VariantInit(&v_ts); VariantInit(&v_st);
@@ -962,13 +961,13 @@ bool OphirCom::getData(long h, long ch, Data *out, QString *err)
       if (!a1 || !a2 || !a3)
       {
          if (err)
-            *err = QStringLiteral("GetData 回的东西读不了: %1").arg(!a1 ? e1 : (!a2 ? e2 : e3));
+            *err = QStringLiteral("读取 GetData 返回值失败: %1").arg(!a1 ? e1 : (!a2 ? e2 : e3));
          out->clear();
       }
       else if (vals.size() != tss.size() || vals.size() != out->statuses.size())
       {
          if (err)
-            *err = QStringLiteral("GetData 回的三个数组不等长 (%1/%2/%3) —— 不敢用")
+            *err = QStringLiteral("GetData 返回的三个数组长度不一致 (%1/%2/%3), 数据不可用。")
                       .arg(vals.size()).arg(tss.size()).arg(out->statuses.size());
          out->clear();
       }
@@ -990,7 +989,7 @@ bool OphirCom::getData(long h, long ch, Data *out, QString *err)
 
 bool OphirCom::stopStream(long h, long ch, QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    Args a;
    a.inLong(h);
@@ -1002,7 +1001,7 @@ bool OphirCom::stopStream(long h, long ch, QString *err)
 
 bool OphirCom::stopAllStreams(QString *err)
 {
-   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象还没建"); return false; }
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
 
    Args a;
    QString e;

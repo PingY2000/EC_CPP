@@ -91,8 +91,8 @@ inline const char *doubleInvertWarning(bool npn_write_drive, bool npn_sw_invert)
    if (!(npn_write_drive && npn_sw_invert))
       return nullptr;
 
-   return "双反相: 「写驱动器 2300h」与「上位机侧取反」都勾着 —— 判据恒成立, "
-          "扫描永远开不了。正确做法只有一个: 把「上位机侧取反」关掉。";
+   return "双反相: 「写驱动器 2300h」与「上位机侧取反」同时勾选 —— 限位判据恒成立, "
+          "扫描无法启动。请关闭「上位机侧取反」。";
 }
 
 }   /* namespace editgate */

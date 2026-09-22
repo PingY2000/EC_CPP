@@ -22,7 +22,7 @@ bool ScanLog::beginNew(const QString &path, const Params &p,
    {
       if (!QDir().mkpath(fi.absolutePath()))
       {
-         m_err = QStringLiteral("建不出目录: %1").arg(fi.absolutePath());
+         m_err = QStringLiteral("新建目录失败: %1").arg(fi.absolutePath());
          if (err) *err = m_err;
          return false;
       }
@@ -31,7 +31,7 @@ bool ScanLog::beginNew(const QString &path, const Params &p,
    m_f = new QFile(path);
    if (!m_f->open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text))
    {
-      m_err = QStringLiteral("打不开要写的文件: %1").arg(m_f->errorString());
+      m_err = QStringLiteral("打开写入文件失败: %1").arg(m_f->errorString());
       delete m_f;
       m_f = nullptr;
       if (err) *err = m_err;
@@ -72,7 +72,7 @@ bool ScanLog::beginAppend(const QString &path, QString *err)
 
    if (!QFile::exists(path))
    {
-      m_err = QStringLiteral("要续写的文件不存在: %1").arg(path);
+      m_err = QStringLiteral("续写目标文件不存在: %1").arg(path);
       if (err) *err = m_err;
       return false;
    }
@@ -83,7 +83,7 @@ bool ScanLog::beginAppend(const QString &path, QString *err)
    m_f = new QFile(path);
    if (!m_f->open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
    {
-      m_err = QStringLiteral("打不开要续写的文件: %1").arg(m_f->errorString());
+      m_err = QStringLiteral("打开续写文件失败: %1").arg(m_f->errorString());
       delete m_f;
       m_f = nullptr;
       if (err) *err = m_err;
@@ -101,7 +101,7 @@ bool ScanLog::trimTail(const QString &path, QString *err)
    QFile probe(path);
    if (!probe.open(QIODevice::ReadOnly))
    {
-      m_err = QStringLiteral("读不了 %1: %2").arg(path, probe.errorString());
+      m_err = QStringLiteral("读取 %1 失败: %2").arg(path, probe.errorString());
       if (err) *err = m_err;
       return false;
    }
@@ -128,7 +128,7 @@ bool ScanLog::trimTail(const QString &path, QString *err)
       QFile r(path);
       if (!r.open(QIODevice::ReadOnly))
       {
-         m_err = QStringLiteral("读不了 %1: %2").arg(path, r.errorString());
+         m_err = QStringLiteral("读取 %1 失败: %2").arg(path, r.errorString());
          if (err) *err = m_err;
          return false;
       }
@@ -140,13 +140,13 @@ bool ScanLog::trimTail(const QString &path, QString *err)
    QFile w(path);
    if (!w.open(QIODevice::ReadWrite))
    {
-      m_err = QStringLiteral("打不开 %1 去切尾巴: %2").arg(path, w.errorString());
+      m_err = QStringLiteral("打开 %1 以截断尾部失败: %2").arg(path, w.errorString());
       if (err) *err = m_err;
       return false;
    }
    if (!w.resize(cut + 1))
    {
-      m_err = QStringLiteral("切 %1 的尾巴失败: %2").arg(path, w.errorString());
+      m_err = QStringLiteral("截断 %1 失败: %2").arg(path, w.errorString());
       if (err) *err = m_err;
       return false;
    }
@@ -158,7 +158,7 @@ bool ScanLog::append(const Row &r)
 {
    if (m_f == nullptr)
    {
-      m_err = QStringLiteral("没有打开的文件");
+      m_err = QStringLiteral("当前没有打开的文件");
       return false;
    }
 
@@ -196,7 +196,7 @@ bool readCsvText(const QString &path, std::string *text, QString *err)
    QFile f(path);
    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
    {
-      if (err) *err = QStringLiteral("打不开 %1: %2").arg(path, f.errorString());
+      if (err) *err = QStringLiteral("打开 %1 失败: %2").arg(path, f.errorString());
       return false;
    }
 

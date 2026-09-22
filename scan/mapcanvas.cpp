@@ -377,7 +377,7 @@ void MapCanvas::paintEvent(QPaintEvent *)
    if (m_ctl == nullptr)
    {
       p.setPen(C_MUTED);
-      p.drawText(rect(), Qt::AlignCenter, QStringLiteral("没有扫描控制器"));
+      p.drawText(rect(), Qt::AlignCenter, QStringLiteral("未设置扫描控制器"));
       return;
    }
 
@@ -486,7 +486,7 @@ void MapCanvas::drawGrid(QPainter &p)
       p.setPen(C_FAIL);
       p.drawText(QRectF(r.left(), r.top() - 2, r.width(), 14),
                  Qt::AlignHCenter | Qt::AlignBottom,
-                 QStringLiteral("区域超出量程 —— 边缘会被静默夹掉"));
+                 QStringLiteral("区域超出量程, 边缘数据将被夹掉"));
    }
 }
 
@@ -825,7 +825,7 @@ void MapCanvas::drawHud(QPainter &p)
 
    /* 左上: 扫描进度 */
    p.setPen(C_TEXT);
-   const QString prog = QStringLiteral("%1 / %2 点   剩 %3")
+   const QString prog = QStringLiteral("%1 / %2 点, 剩 %3")
                            .arg(m_ctl->completedPoints())
                            .arg(m_ctl->totalPoints())
                            .arg(m_ctl->pendingPoints());
@@ -859,7 +859,7 @@ void MapCanvas::drawHud(QPainter &p)
          {
             p.setPen(C_WANT);
             p.drawText(QRect(x, (int)r.top() + 51, w, 15), Qt::AlignLeft | Qt::AlignVCenter,
-                       QStringLiteral("位置在面板外 (%1, %2) mm —— 白色标记被贴在边框上")
+                       QStringLiteral("位置在面板外 (%1, %2) mm, 白色标记已贴至边框")
                           .arg(px, 0, 'f', 2).arg(py, 0, 'f', 2));
          }
       }
@@ -881,8 +881,8 @@ void MapCanvas::drawHud(QPainter &p)
    /* 再下面一行: 操作提示。扫描中那句照实说 —— 查看还能用, 不能用的是手动定位 */
    p.setPen(m_manual_ok ? C_MUTED : C_WANT);
    const QString hint = m_manual_ok
-      ? QStringLiteral("左键 = 查看该格    Shift+左键 = 手动定位")
-      : QStringLiteral("扫描中 —— 查看随便点; 手动定位要先「中止」");
+      ? QStringLiteral("左键: 查看该格    Shift+左键: 手动定位")
+      : QStringLiteral("扫描中: 可查看任意格; 手动定位需先「中止」");
    p.drawText(QRect(x, (int)r.bottom() - 18, w, 15),
               Qt::AlignLeft | Qt::AlignVCenter, hint);
 }

@@ -40,7 +40,7 @@ void ManualMeter::requestReading()
 {
    if (!m_open)
    {
-      emit readingFailed(QStringLiteral("功率计没打开"));
+      emit readingFailed(QStringLiteral("功率计未打开"));
       return;
    }
 
@@ -54,7 +54,7 @@ void RandomMeter::requestReading()
 {
    if (!m_open)
    {
-      emit readingFailed(QStringLiteral("功率计没打开"));
+      emit readingFailed(QStringLiteral("功率计未打开"));
       return;
    }
 
@@ -80,7 +80,7 @@ bool ScriptMeter::setPath(const QString &path, QString *err)
    QFile f(path);
    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
    {
-      if (err) *err = QStringLiteral("打不开脚本文件: %1").arg(path);
+      if (err) *err = QStringLiteral("无法打开脚本文件: %1").arg(path);
       return false;
    }
 
@@ -106,7 +106,7 @@ bool ScriptMeter::setPath(const QString &path, QString *err)
 
    if (m_values.isEmpty())
    {
-      if (err) *err = QStringLiteral("脚本文件里没有一个数字: %1").arg(path);
+      if (err) *err = QStringLiteral("脚本文件中没有数字: %1").arg(path);
       return false;
    }
    return true;
@@ -116,7 +116,7 @@ bool ScriptMeter::open(QString *err)
 {
    if (m_path.isEmpty())
    {
-      if (err) *err = QStringLiteral("还没选脚本文件");
+      if (err) *err = QStringLiteral("未选择脚本文件");
       return false;
    }
    /* 打开时重读一遍: 改完脚本不必重启程序 */
@@ -133,12 +133,12 @@ void ScriptMeter::requestReading()
 {
    if (!m_open)
    {
-      emit readingFailed(QStringLiteral("功率计没打开"));
+      emit readingFailed(QStringLiteral("功率计未打开"));
       return;
    }
    if (m_values.isEmpty())
    {
-      emit readingFailed(QStringLiteral("脚本文件里没有值"));
+      emit readingFailed(QStringLiteral("脚本文件中没有值"));
       return;
    }
 
