@@ -43,7 +43,7 @@ class MeterLog;
 class MeterCurve;
 
 /* 滚轮闸, 定义在 .cpp 里 */
-class WheelNeedsFocus;
+class WheelNeedsCtrl;
 
 class ScanWindow : public QMainWindow
 {
@@ -407,7 +407,7 @@ private:
 
    /* 滚轮闸 (类体在 .cpp 里): 挂在参数输入框及其子控件上的事件过滤器。
     * 用具体类而非 QObject*, 因为装闸时要调它的 guard() */
-   WheelNeedsFocus *m_wheelGuard = nullptr;
+   WheelNeedsCtrl *m_wheelGuard = nullptr;
 
    /* 上次用的网卡 (从 scan.ini 读回, 可能已不在机器上)。适配器清单异步到, 故先存着等 adaptersListed */
    QString        m_savedNic;

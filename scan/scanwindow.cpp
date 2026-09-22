@@ -790,16 +790,22 @@ static QString fmtDur(int64_t ms)
 
 /* ---------------------------------------------------------------- 滚轮闸 */
 
-/* 只有已经选中的输入框才认滚轮 (先点它拿焦点, 滚轮才改值): 否则滚参数栏时一次翻页会把
- * 路过的那几个框各改一格 —— 而扫描区域算错一格是要撞限位的。没焦点时不吃这一滚。
+/* 滚轮只滚参数栏 —— **除非按住 Ctrl**。没按 Ctrl 时不吃这一滚, 让它去滚参数栏; 按住 Ctrl
+ * 才按 Qt 原来的规矩改值。理由是"一次翻页不能顺手改掉路过的参数" —— 扫描区域算错一格是要
+ * 撞限位的。
+ *
+ * 判据原本是"点过它 (拿着焦点) 就认滚轮"。那个例外本身就是坑: 焦点停在下拉框上时, 那一滚
+ * 既改了值又没滚成页面, 于是焦点一直留着, 接着滚接着改。而**一直使能的框只有「功率计」
+ * 那一块** (其余几块不在编辑态时控件是禁用的, 禁用控件根本收不到滚轮), 于是误改全落在它
+ * 身上。换成 Ctrl 这个一次性、明确的手势: 想用滚轮调值就按住, 不想动它就松开。
  *
  * 事件先落在 spin box 内部那个 QLineEdit 上, 所以过滤器要挂在输入框及其每一个子控件上
- * (见 guard()); 判"选中没有"要从收到事件的控件往上找到被闸的输入框, 再比焦点。
- * 参数栏一滚, 选中就作废 (见 buildUi 里那个 connect)。 */
-class WheelNeedsFocus : public QObject
+ * (见 guard()); 判"这一滚落在哪个输入框上"要从收到事件的控件往上找 —— 收到事件的不是被闸
+ * 的那个控件本身 (见 guardedAncestor)。 */
+class WheelNeedsCtrl : public QObject
 {
 public:
-   explicit WheelNeedsFocus(QObject *parent = nullptr) : QObject(parent) {}
+   explicit WheelNeedsCtrl(QObject *parent = nullptr) : QObject(parent) {}
 
    /* 把 w 以及它的每一个子控件都闸上 */
    void guard(QWidget *w)
@@ -823,14 +829,13 @@ protected:
       if (w == nullptr)
          return false;
 
-      QWidget *input = guardedAncestor(w);
-      if (input == nullptr)
+      if (guardedAncestor(w) == nullptr)
          return false;                 /* 这一滚不落在参数框上 (画布 / 滚动区自己) */
 
-      if (hasFocusInside(input))
-         return false;                 /* 选中过了 —— 按 Qt 原来的规矩改值 */
+      if (static_cast<QWheelEvent *>(e)->modifiers().testFlag(Qt::ControlModifier))
+         return false;                 /* 按住 Ctrl = 明确要用滚轮调这个值 */
 
-      e->ignore();                     /* 没选中: 不吃, 让父级 (参数栏滚动区) 去滚 */
+      e->ignore();                     /* 没按 Ctrl: 不吃, 让父级 (参数栏滚动区) 去滚 */
       return true;
    }
 
@@ -844,16 +849,6 @@ private:
             return qw;
       }
       return nullptr;
-   }
-
-   static bool hasFocusInside(const QWidget *w)
-   {
-      for (const QObject *o = QApplication::focusWidget(); o != nullptr; o = o->parent())
-      {
-         if (o == w)
-            return true;
-      }
-      return false;
    }
 
    QSet<QWidget *> m_guards;
@@ -1106,13 +1101,15 @@ void ScanWindow::buildUi()
    /* 滚轮闸: 名单是找出来的, 不是手写的表 (漏一个只是那个框还在被滚轮改, 不报错)。
     * 挂在最后 —— 这里才保证上面那六组框全都建出来了。
     * QLineEdit (CSV / 脚本路径) 不闸: 滚轮改不了它的文字, 那一滚照旧去滚参数栏。 */
-   m_wheelGuard = new WheelNeedsFocus(this);
+   m_wheelGuard = new WheelNeedsCtrl(this);
    for (QAbstractSpinBox *x : findChildren<QAbstractSpinBox *>())
       m_wheelGuard->guard(x);
    for (QComboBox *x : findChildren<QComboBox *>())
       m_wheelGuard->guard(x);
 
-   /* 参数栏一滚, 选中就作废 (另一半是 WheelNeedsFocus 那条"点过才认"): 只清滚动区里那个焦点 */
+   /* 参数栏一滚, 把滚动区里那个焦点清掉: 焦点留在一个已经滚出视线的框上时, 上下箭头与打字
+    * 会改到一个看不见的框 —— 滚轮那条闸管不到键盘。只清滚动区里面那个 (顶栏那张网卡表
+    * 在滚动区外面, 不受影响) */
    connect(sideScroll->verticalScrollBar(), &QScrollBar::valueChanged, this, [sideScroll](int) {
       QWidget *fw = QApplication::focusWidget();
       if (fw != nullptr && sideScroll->isAncestorOf(fw))

@@ -1472,11 +1472,18 @@ tooltip 里"期间按钮不可用"那句承诺全是死代码。
 状态栏给一句"上次用的网卡 (…) 不在列表里 —— 请重新选一块。(记在 exe 旁边的 scan.ini 里)"。
 **不弹模态框**。
 
-### 16.2 滚轮:先选中,再滚(`WheelNeedsFocus`)
+### 16.2 滚轮:按住 Ctrl 才认(`WheelNeedsCtrl`)
 
-规矩:**只有选中的那个输入框才认滚轮**;选中的意思就是它拿着焦点(点一下就有)。
-没有选中时,滚轮**不吃这一滚**,让它继续往上传给参数栏滚动区 —— 于是同一个滚轮
-在参数栏上照旧是滚动条。
+规矩:**滚轮只滚参数栏;按住 Ctrl 才按 Qt 原来的规矩改值**。没按 Ctrl 时,滚轮
+**不吃这一滚**,让它继续往上传给参数栏滚动区 —— 于是同一个滚轮在参数栏上照旧是滚动条。
+
+**这条判据在 2026-09-23 换过一次。** 原来是"点过它(拿着焦点)就认滚轮",而**那个例外本身
+就是坑**:焦点停在下拉框上时,那一滚**既改了值、又没滚成页面**,于是焦点一直留着,接着滚
+接着改。现场那句话("滚动菜单的时候容易误修改参数")就是这么来的 —— 而**一直使能的框只有
+「功率计」那一块**(其余几块不在编辑态时控件是禁用的,禁用控件根本收不到滚轮),误改全落在
+它身上。换成 Ctrl 这个**一次性、明确**的手势:想用滚轮调值就按住,不想动它就松开。
+程序里没有别处用 Ctrl+滚轮(画布不认滚轮),不打架。
+**这一换不是"多加一道闸",是去掉了那条例外** —— 判据从"焦点"换成"修饰键"。
 
 **错在"事件到底落在哪个控件上"。** 过滤器只装在 `QDoubleSpinBox` 这些外层控件上时,
 探针直接 `sendEvent` 给 spin box 是"过了",而真机上不是这么走的。
@@ -1506,9 +1513,10 @@ void guard(QWidget *w) {
 
 /* 收到事件的那个控件 -> 找到它属于哪个被闸的输入框 */
 QWidget *input = guardedAncestor(w);
-if (input == nullptr)      return false;   /* 这一滚不落在参数框上 */
-if (hasFocusInside(input)) return false;   /* 选中过了: 按 Qt 原来的规矩改值 */
-e->ignore();                               /* 没选中: 不吃, 交给父级去滚 */
+if (input == nullptr) return false;        /* 这一滚不落在参数框上 */
+if (static_cast<QWheelEvent *>(e)->modifiers().testFlag(Qt::ControlModifier))
+   return false;                           /* 按住 Ctrl: 按 Qt 原来的规矩改值 */
+e->ignore();                               /* 没按 Ctrl: 不吃, 交给父级去滚 */
 return true;
 ```
 
@@ -1517,20 +1525,19 @@ return true;
 `QAbstractSpinBox` 与 `QComboBox`,能漏的唯一方式是"新加了一个既不是
 `QAbstractSpinBox` 也不是 `QComboBox` 的输入控件"。
 
-**还有一条"翻页不作废选中"的坑。** 点过之后焦点一直留在那个框上,
-而人要滚参数栏时**鼠标正是从参数框上划过去的** —— 路过刚点过的那个,它照样改值。
-所以 `buildUi()` 里还接了一条:
+**焦点那一条仍然留着, 但理由换了。** 滚轮这条闸**管不到键盘**:焦点留在一个**已经滚出
+视线**的框上时, 上下箭头与打字会改到一个看不见的框。所以 `buildUi()` 里那条照旧接:
 
 ```cpp
 connect(sideScroll->verticalScrollBar(), &QScrollBar::valueChanged, this, [sideScroll](int) {
    QWidget *fw = QApplication::focusWidget();
    if (fw != nullptr && sideScroll->isAncestorOf(fw))
-      fw->clearFocus();       /* 人在翻页, 不是在改参数 -> 选中作废 */
+      fw->clearFocus();       /* 人翻页把框滚走了 -> 别让键盘改到一个看不见的框 */
 });
 ```
 
 只清**滚动区里面**那个焦点(顶栏那张网卡表在滚动区外面,不受影响)。
-加上这一条之后,"翻页"这个动作本身**永远改不了任何参数**。
+它从前是滚轮判据的另一半("翻页就作废选中"), 判据换成 Ctrl 之后只剩上面这个用途。
 
 两个实现细节:
 
@@ -1538,11 +1545,34 @@ connect(sideScroll->verticalScrollBar(), &QScrollBar::valueChanged, this, [sideS
   直到被接受";过滤器返回 `true` 就**吃掉了**这一次投递,父级 `QScrollArea` 再也收不到,
   参数栏就**滚不动了**。先 `ignore()`(于是 `accepted=false`)再把 `true` 返回,
   才是"我不改值,这一滚交给上面去滚页面"。
-- **不能用 `w->hasFocus()`**:焦点在内部那个 `QLineEdit`/`QDoubleSpinBox` 上,
-  谁是焦点跟"哪个是我要闸的输入框"是两件事,只能沿父链找。
+- **判 Ctrl 要读事件自己带的 `modifiers()`**,不能用"此刻键盘上按着没有"那类查询:
+  这一滚可能已经在队列里排了一会儿, 改的是**投递那一刻**的修饰键状态。
+- **不能用 `w->hasFocus()` 那类判据**:焦点在内部那个 `QLineEdit`/`QDoubleSpinBox` 上,
+  谁是焦点跟"哪个是我要闸的输入框"是两件事,只能沿父链找(`guardedAncestor`)。
 
 **范围**:只闸 `QAbstractSpinBox` 与 `QComboBox`,不是全局。
 `QLineEdit`(CSV 路径)不闸 —— 滚轮改不了它的文字,它那一滚照旧落给参数栏。
+
+**2026-09-23 换判据时重新量过一遍**(临时探针:offscreen,不连设备,用已经编好的目标文件
+链接而成,跑完即删):
+
+| 量的是 | 结果 |
+|---|---|
+| 不按 Ctrl, 滚在数字框上 | 值 `200 -> 200`(没动) |
+| 不按 Ctrl, 滚在下拉框上 | 取样源下标 `1 -> 1`(没动) |
+| **框已经拿着焦点**, 不按 Ctrl 滚过去 | `200 -> 200`(没动) ← **现场抱怨的正是这一条** |
+| 按住 Ctrl, 滚在数字框上 | `200 -> 190`(改到了), 页面 `0 -> 0`(没滚) |
+| 按住 Ctrl, 滚在下拉框上 | 下标 `1 -> 2`(改到了) |
+| 对照: 事件直接投给滚动区视口 | 页面 `0 -> 60`(滚起来了) |
+
+最后那条对照是**必须的**:它证明滚动区自己收得到滚轮、也真的会滚 —— 否则上面几行的
+"页面没滚"分不清是"闸把事件吃了"还是"这个测试环境根本滚不动"。
+
+**没量到的一条**(别把它当成已验):闸拦下那一滚**究竟有没有上传到滚动区**。
+合成投递(`sendEvent` 给控件)量到的是"事件停在输入框那一层, 视口一次都没收到";而真实滚轮
+走的是 `QWidgetWindow::handleWheelEvent` 那条路, 与合成投递不是同一段代码, 探针够不着它
+(要投真事件得引 Gui 的私有头)。真机上这一条的判据只有**手感**:滚参数栏时鼠标划过数字框
+与下拉框, 页面**应当照旧滚**。
 
 ### 16.3 卡死:点数上限 200000(`kMaxPlanPoints`)
 
@@ -1605,8 +1635,9 @@ if (nx <= 0 || ny <= 0 || total > kMaxPlanPoints)
 ### 16.4 这一轮动到的文件
 
 - **新增** `scan/scanprefs.h/.cpp`(只链 `Qt6::Core`);
-- `scan/scanwindow.h/.cpp`:`WheelNeedsFocus`(头里一行前置声明 + 成员写成具体类型,
-  因为装闸时要调它的 `guard()`)+ `nicShort()` + `loadSettings()` / `saveSettings()` +
+- `scan/scanwindow.h/.cpp`:`WheelNeedsCtrl`(头里一行前置声明 + 成员写成具体类型,
+  因为装闸时要调它的 `guard()`;2026-09-23 之前叫 `WheelNeedsFocus`)+ `nicShort()` +
+  `loadSettings()` / `saveSettings()` +
   `buildUi()` 末尾 `guard()` 遍历装闸 + 接滚动条那条"一滚就作废" + `adaptersListed`
   选回网卡 + `pushParams()` 里超限那一行;
 - `scan/scanplan.h`:`kMaxPlanPoints`;`scan/scanplan.cpp`:`validate()` 用它;
@@ -1623,7 +1654,7 @@ if (nx <= 0 || ny <= 0 || total > kMaxPlanPoints)
 - 参数记忆跨进程:第一次跑 → 第二次跑 `area_x = 12.5`(缺省是 27);
 - 网卡:把 ini 指到**第 10 块**(Intel I219-V)→ 起来停在 **index 9**;
   指到一个不存在的 GUID → **退回 index 0 不崩**;
-- **滚轮**:探针**不再直接 `sendEvent` 给 spin box**,
+- **滚轮(2026-09-21 那一轮, 判据还是"点过才认")**:探针**不再直接 `sendEvent` 给 spin box**,
   改成照 Qt 真实路径投递(先给 `childAt()` 那个控件,再沿父链走),
   12 个输入框逐个三列:
 
@@ -1639,6 +1670,12 @@ if (nx <= 0 || ny <= 0 || total > kMaxPlanPoints)
     但 `QComboBox::wheelEvent` 在弹出列表还没被创建过时会直接不吃滚轮;
   - **翻页清掉焦点 11/12**:那 1 个是顶栏的网卡表,它**在滚动区外面**,
     代码里用 `sideScroll->isAncestorOf()` 圈定了范围。
+
+  **这张读数只回答了"值有没有被改", 没回答"页面滚没滚"** —— 而 2026-09-23 换判据时量到:
+  合成投递下那一滚**不上传**(停在输入框那一层, 视口一次都没收到)。两轮的结论都见 §16.2
+  下面那张表。
+  另外上面那条"`QComboBox` 在弹出列表没被创建过时会直接不吃滚轮"**没复核住**:
+  换判据后按住 Ctrl 滚过去, 下标 `1 -> 2`, 而那时弹出列表还没建过。
 - 上限:400×500 建得出来、400×501 拒绝且「开始扫描」按不动。
 
 **没验**:
