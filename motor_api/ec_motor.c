@@ -205,6 +205,14 @@ static int em__sdo_tmo(const em_bus_t *bus)
    return (bus != NULL && bus->sdo_tmo_us > 0) ? bus->sdo_tmo_us : EC_TIMEOUTRXM;
 }
 
+/* 写那一半, 与上面读那一半**故意的不是同一个来源**: 读超时进 OP 之后一直被压短,
+ * 写超时平时是 0 (回落到 EC_TIMEOUTRXM), 只有回零的起手/收尾两段临时压短。
+ * 为什么分开见 em_bus::sdo_wr_tmo_us 与 EM_SDO_TMO_WRITE_SHORT_MS 的说明。 */
+static int em__sdo_wr_tmo(const em_bus_t *bus)
+{
+   return (bus != NULL && bus->sdo_wr_tmo_us > 0) ? bus->sdo_wr_tmo_us : EC_TIMEOUTRXM;
+}
+
 int em_sdo_read(em_bus_t *bus, int slave, uint16_t index, uint8_t sub,
                 void *p, int *size)
 {
@@ -344,7 +352,7 @@ static int em__verified_write(em_axis_t *ax, uint16_t index, uint8_t sub,
       return EM_R_FAIL;
 
    if (em__sdo_write_raw(ax->bus, ax->slave, index, sub, size, p,
-                         EC_TIMEOUTRXM) != EM_R_OK)
+                         em__sdo_wr_tmo(ax->bus)) != EM_R_OK)
    {
       em__err("写 %04Xh:%02X (%s) 未确认 (无响应 / SDO abort)",
               (unsigned)index, (unsigned)sub, why);
@@ -1130,6 +1138,9 @@ em_bus_t *em_bus_new(void)
       /* SDO 超时: 配置期用 700ms (那时没有过程数据, 等久一点更容易读到)。
        * **进 OP 之前**调用方必须用 em_set_sdo_timeout 压短, 见那个函数的说明。 */
       bus->sdo_tmo_us = EC_TIMEOUTRXM;
+      /* 写超时默认 0 = 也用 700ms, 但走的是另一个回落分支 —— 它平时不该被压短,
+       * 只有回零的起手/收尾两段会临时设, 设完自己复位。见 sdo_wr_tmo_us 的说明 */
+      bus->sdo_wr_tmo_us = 0;
    }
    return bus;
 }
@@ -1370,6 +1381,9 @@ int em_setup(em_bus_t *bus, const em_axis_cfg_t *cfg, int naxis, int allow_remap
       ax->off_modes = -1;
       /* 同上: +0 正是 6040h 控制字, em__pin_ramp 会把加减速度写进控制字里 */
       ax->off_prof_acc = ax->off_prof_dec = -1;
+      /* 回零那几个字段: hm_state = EM_HM_S_IDLE = 0 与 calloc 一致, 不必显式写。
+       * 只有 hm_lim_shown 必须显式置 -1 —— 理由见它在结构体里的注释。 */
+      ax->hm_lim_shown = -1;
       snprintf(ax->label, sizeof(ax->label), "轴%d(从站%d)", i, slave);
 
       bus->axis[i] = ax;

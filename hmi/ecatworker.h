@@ -88,6 +88,13 @@ struct AxisTelem
    /* 撞限位 —— **会不会中止扫描**。在 publish() 里由 ecatcmd::limit_hit() 一处算出 */
    bool     limit_active = false;
 
+   /* ---- 这一根正在回零 ----
+    * 与 BusTelem::homing 那个聚合量分开: 那是"本会话在跑", 这是"**我**在跑"。两轴并行时
+    * 一根到位、另一根还在找, 两个值就分岔了 —— 界面上"这根等对侧"的那种话全靠这一对。
+    * homing_method 只为显示给人看 (6098h 的方式号), 不在回零时无意义。 */
+   bool     homing        = false;
+   int      homing_method = 0;
+
    /* 驱动器自报的实际运行模式 6061h (em_get_mode), 或 HMI_MODE_DISP_UNREAD / -1 (读失败)。
     * 手册 §3.7 把「6061h 读回 6」当作 HM 的前提。它不是每周期刷新的: 6061h 不在 TxPDO 里,
     * 只能 SDO 读, 而 publish() 只读过程数据镜像 —— 由工作线程在连接 / 使能 / 回零收尾时读。 */
@@ -120,12 +127,17 @@ struct BusTelem
    bool     fault     = false;
    /* 正在做故障复位 (逐轴阻塞, 每轴最多 1 秒)。复位不可中断, 界面只能把它按住不动 */
    bool     resetting = false;
-   /* 正在回零 (逐轴阻塞, 最长一次回零的超时 + 收尾; 超时可改, 见 HMI_HOME_TMO_*_S)。
-    * 界面据此把四个回零按钮按住、把「停止」换成立即中止。与 resetting 同一个坑:
-    * 必须由 doHome() 加锁直写一次, 再由 publish() 从 m_homing 拷一份, 两处都要。 */
+   /* 正在回零。界面据此把四个回零按钮按住、把「停止」换成立即中止。与 resetting 同一个坑:
+    * 必须由 startHoming() 加锁直写一次, 再由 publish() 从 m_homing 拷一份, 两处都要。
+    *
+    * **它是"本会话在跑"这个聚合量**, 不是"某一根在跑" —— 一根到位之后另一根可能还在找,
+    * 这期间它一直是 true。逐轴的那一份在 AxisTelem::homing 里。
+    * 注意它撑得比以前长: 以前一次回零 = 一次阻塞调用, 现在覆盖"prepare 之前 -> 收尾之后"。 */
    bool     homing    = false;
-   int      homing_axis   = -1;   /* -1 = 没在回零 */
-   int      homing_method = 0;    /* 6098h 的方式号 (24/29/18/17), 只为显示给人看 */
+   /* 逐轴的"这一根正在回零"在 AxisTelem::homing / homing_method 里 —— **唯一的那一份**。
+    * 这里曾经有 homing_axis / homing_method 两个单数量给老读者过渡 (取"第一根"), 到 S3b
+    * 一并删掉: 两轴并行时它们只能说出其中一根, 而"只说一根"正是这次改造最不该出的错。
+    * 删掉是**编译期**打断, 不是静默改行为 —— 那是有意的。 */
    int      naxis     = 0;
    int      wkc       = 0;
    int      expected_wkc = 0;
@@ -721,6 +733,492 @@ inline const char *home_end_text(HomeEnd e)
    return "";
 }
 
+/* ---- 两轴并行回零 (整个 §33) ------------------------------------------------
+ *
+ * 与上面那一族同一个理由: `scan_selftest` **不编 `ecatworker.cpp`**, 所以判据必须住这里。
+ * 这一族只吃**纯数据** (掩码 + 逐轴的小数组 + 一个 POD), 不碰 `em_axis_t` / `EcatThread`,
+ * 于是自检能把它们直接喂进来 —— 会话本身 (真正碰总线的那部分) 仍然只能真机验 (§33.7)。
+ *
+ * 尺寸一律 `EM_MAX_AXES`; **掩码以外的位一律忽略**, 越界访问在这里一次都不该发生。 */
+
+/* ---- 1. 单根轴的步进结局说人话 -------------------------------------------- */
+
+/* `em_home_step()` 的结局 -> 一句。**八个结局八句话, 两两不同** —— 屏幕上分不出的两档
+ * 等于没有这一档, 而那八档要人做的事本来就不一样 (等超时是改参数, 报故障是查驱动器)。
+ *
+ * 两处措辞是**刻意**的, 不是随手写的:
+ *   · `NO_FRAMES` 必须说「状态未知」—— 那一档是"连一笔完整 6041h 都没取到", 上位机
+ *     **不知道**驱动器怎么了, 说成任何一种具体故障都是猜;
+ *   · `TIMEOUT` **不许**说「状态未知」—— 那一档期间取到过完整帧, 状态是已知的: 就是
+ *     "它没在超时之前报到位"。两句互换就等于把"去查总线"和"去调参数"指反了。
+ *
+ * `EM_HM_RUNNING` 也有一句 (它不是结局, 但传进来不该得到 nullptr)。 */
+inline const char *home_step_rc_text(int rc)
+{
+   switch (rc)
+   {
+      case EM_HM_RUNNING:   return "仍在回零";
+      case EM_HM_ATTAINED:  return "已到位 (6041h bit12)";
+      case EM_HM_ABORTED:   return "被「停止」中止";
+      case EM_HM_PEER:      return "被另一根轴带停";
+      case EM_HM_FAULT:     return "6041h bit3 = Fault";
+      case EM_HM_HM_ERROR:  return "6041h bit13 = Homing error";
+      case EM_HM_TIMEOUT:   return "等 6041h bit12 超时, 这一根没走到位";
+      case EM_HM_NO_FRAMES: return "等超时且一笔完整 6041h 都没取到, 状态未知";
+      case EM_HM_SETUP:     return "起手段就没跑起来, 驱动器未按本趟参数回零";
+   }
+   return "手册之外的结局码";
+}
+
+/* `em_home_step()` 的结局 -> 上面那三句 `home_cause_text()` 吃的 0 / 1 / 负。
+ * 这个映射只该有一份 (改造前它就是 `em_home()` 的返回码本身), 所以收口在这里。 */
+inline int home_step_rc_legacy(int rc)
+{
+   if (rc == EM_HM_ATTAINED)
+      return 0;
+   if (rc == EM_HM_ABORTED || rc == EM_HM_PEER)
+      return 1;
+   return -1;
+}
+
+/* ---- 2. 批级结局 --------------------------------------------------------- */
+
+/* 一次会话 (一根或两根) 最后落在哪一档。
+ * `HOME_BATCH_PARTIAL` **自成一档, 不许并进 SUCCESS**: 两根里一根到位一根没到位, 说成
+ * "成功"就是把一半失败藏起来 —— 而这次改造的全部意义就是让操作员知道是哪一根。
+ * `HOME_BATCH_STOPPED` 与 `FAILED` 也分开: 前者是操作员自己按的, 不是故障。 */
+enum HomeBatch
+{
+   HOME_BATCH_NONE = 0,   /* 掩码里一根都没有 */
+   HOME_BATCH_SUCCESS,    /* 每一根都到位 */
+   HOME_BATCH_STOPPED,    /* 每一根都是被「停止」中止 —— 没有人失败 */
+   HOME_BATCH_PARTIAL,    /* 有到位的, 也有没到位的 */
+   HOME_BATCH_FAILED      /* 一根都没到位, 而且不是"全被停止" */
+};
+
+inline HomeBatch home_batch_end(const int *rc, unsigned mask)
+{
+   int n = 0, ok = 0, bad = 0;
+
+   for (int i = 0; i < EM_MAX_AXES; i++)
+   {
+      if ((mask & (1u << i)) == 0)
+         continue;
+
+      n++;
+      if (rc[i] == EM_HM_ATTAINED)
+         ok++;
+      /* 没到位, 而且**不是**操作员按的「停止」。EM_HM_PEER 与 EM_HM_RUNNING 都算在这里:
+       * 前者是"对侧出事了", 后者是"我们根本不该在这时候来问" —— 两个都不是好消息。 */
+      else if (rc[i] != EM_HM_ABORTED)
+         bad++;
+   }
+
+   if (n == 0)              return HOME_BATCH_NONE;
+   if (ok == n)             return HOME_BATCH_SUCCESS;
+   if (ok == 0 && bad == 0) return HOME_BATCH_STOPPED;
+   if (ok == 0)             return HOME_BATCH_FAILED;
+   return HOME_BATCH_PARTIAL;
+}
+
+/* 元凶是**哪一根** —— 返回轴号, 找不到返回 -1。
+ *
+ * 两趟扫描, 顺序不能倒:
+ *   1. 第一个**自己**出错的 (`rc < 0`): 故障 / bit13 / 超时 / 帧断 / 起手失败。
+ *      `EM_HM_ABORTED` **不算** —— 那是操作员按的「停止」, 不是轴的错。
+ *   2. 兜底。**只在真有 `EM_HM_PEER` 时才走这一步**, 而且返回第一根**不是** PEER 的轴。
+ *
+ * 第 2 趟那两个条件都得在, 少一个就答错:
+ *   · 少了"真有 PEER"这个前提, `{到位, 到位}` 与 `{被停止, 被停止}` 都会被点出一根 ——
+ *     而那两个情形里**没有人出错**, 点名等于凭空怪罪一根好轴;
+ *   · 少了"不是 PEER"这个条件, 就正好点中被对侧带停的那一根 —— 那是受害者。
+ *
+ * 正常路径上第 1 趟就该有结果 (`PEER` 只在"已有 `rc < 0` 的那一根"存在时才被写上), 所以
+ * 第 2 趟实际是给"元凶认不出来"这种异常留的: 宁可点到另一根, 也不点被带停的那一根。 */
+inline int home_batch_blame(const int *rc, unsigned mask)
+{
+   for (int i = 0; i < EM_MAX_AXES; i++)
+      if ((mask & (1u << i)) != 0 && rc[i] < 0)
+         return i;
+
+   bool any_peer = false;
+   for (int i = 0; i < EM_MAX_AXES; i++)
+      if ((mask & (1u << i)) != 0 && rc[i] == EM_HM_PEER)
+         any_peer = true;
+
+   if (!any_peer)
+      return -1;
+
+   for (int i = 0; i < EM_MAX_AXES; i++)
+      if ((mask & (1u << i)) != 0 && rc[i] != EM_HM_PEER)
+         return i;
+
+   return -1;
+}
+
+/* 这一趟收尾之后, 电机**可能仍带电**吗 —— 任一根落在 STRANDED 就是。
+ * 与 `m_maybe_live` 是同一条规矩的另一处用法 (那个还要管 ec_shutdown), 所以判据共用:
+ * 落点是"没能确认已使能 + 已是 CSP", 而那正是"动力电源不确定"的意思。 */
+inline bool home_batch_maybe_live(const HomeEnd *end, unsigned mask)
+{
+   for (int i = 0; i < EM_MAX_AXES; i++)
+      if ((mask & (1u << i)) != 0 && end[i] == HOME_END_STRANDED)
+         return true;
+
+   return false;
+}
+
+/* ---- 3. 批级起手闸: **一根不动** ------------------------------------------ */
+
+/* 把掩码念出来: `轴X`, `轴X 轴Y`, 或空串 (掩码为 0)。
+ *
+ * 它的用处只有一个 —— 拒绝理由前面那个**点名**。单轴时它逐字等于
+ * `QString::fromUtf8(axis_label(axis))`, 所以把单轴那条路接过来之后,
+ * 屏幕上那句话与改造前**逐字相同** (§33.7 第 7 条要的就是这个)。
+ *
+ * 两根之间**只用空格**, 不写「与」「和」: 这个串后面紧跟"回零未发起", 加连词会把
+ * 句子读成"轴X 与轴Y回零未发起" —— 而"回零"是这台机器上的**动作**, 不能黏在轴名后面。 */
+inline QString home_axis_prefix(unsigned mask)
+{
+   QString s;
+   for (int i = 0; i < EM_MAX_AXES; i++)
+      if ((mask & (1u << i)) != 0)
+      {
+         if (!s.isEmpty())
+            s += QStringLiteral(" ");
+         s += QString::fromUtf8(axis_label(i));
+      }
+   return s;
+}
+
+/* 「能不能开这一趟」的两份答案。分开是因为它们回答的不是同一个问题:
+ *   · ok_mask: 要发起的那几根。**要么是全部, 要么是 0** —— 用户选的是"任一根过不了闸
+ *     就整体不动", 所以这里没有"只发一半"这种返回。
+ *   · bad_mask: 不过闸的是哪几根。**必须是个掩码, 不是"第一根"**: 两根都不合格时只说
+ *     第一根, 操作员修完再撞一次才轮到第二根 —— 那正是这次改造要消灭的来回。
+ *     总线级那几道不是任何一根轴的事, 那时 bad_mask = 0 而 reason 非空。 */
+struct HomeGate
+{
+   unsigned    ok_mask  = 0;
+   unsigned    bad_mask = 0;
+   const char *reason   = nullptr;   /* 可以发起时为 nullptr */
+};
+
+/* 起手预检。**必须在任何写动作之前** —— 起手第一件事是 em_disable(), 它真的会撤掉保持
+ * 力矩 (竖直轴当场会滑)。
+ *
+ * 文案**逐字复用 `home_refusal()`**(不复制字符串): 下面三次调用各问它一个子集, 所以
+ * 屏幕上单轴那条路与两轴这条路说的是同一份字。**传进去的那几个 dummy 实参就是"这一趟
+ * 别问这一项"**, 谁要是把它们改成真值, 等于把闸挪走了 —— 改之前先看这三段注释。
+ * 顺序也与 `home_refusal()` 逐行一致: 总线 → 位置 → 逐轴 → 还有轴在走。 */
+inline HomeGate home_batch_refusal(bool bus_ready, bool origin_ready, bool any_axis_moving,
+                                   unsigned mask, const bool *mirror_ok, const bool *fault)
+{
+   HomeGate g;
+
+   if (mask == 0)
+   {
+      g.reason = "这一趟没有指定任何轴";
+      return g;
+   }
+
+   /* ① 总线级前两道 (dummy 把逐轴两项与"还有轴在走"都关掉) */
+   g.reason = home_refusal(bus_ready, origin_ready, true, false, false);
+   if (g.reason != nullptr)
+      return g;
+
+   /* ② 逐轴两道 —— 与上面同一份字, 只是问一根。**每一根都问**, 不合格的全部记进
+    * bad_mask; reason 留第一句 (屏幕上一行只放得下一句, 点名由 bad_mask 补上)。 */
+   for (int i = 0; i < EM_MAX_AXES; i++)
+   {
+      if ((mask & (1u << i)) == 0)
+         continue;
+
+      const char *why = home_refusal(true, true, mirror_ok[i], fault[i], false);
+      if (why != nullptr)
+      {
+         if (g.reason == nullptr)
+            g.reason = why;
+         g.bad_mask |= (1u << i);
+      }
+   }
+   if (g.bad_mask != 0)
+      return g;
+
+   /* ③ 总线级第三道, 摆在最后 —— `home_refusal()` 里它就在最后 */
+   g.reason = home_refusal(true, true, true, false, any_axis_moving);
+   if (g.reason != nullptr)
+      return g;
+
+   g.ok_mask = mask;
+   return g;
+}
+
+/* ---- 4. 批级回零横幅 + 停止提示 ------------------------------------------ */
+
+/* 横幅要的逐轴输入: 方式号, 以及**驱动器自己那两位数字输入**(用来补 `[正限位信号有效]`)。
+ * 与单轴那段一样, 那两个布尔是驱动器侧的 (em_di_poslim / em_di_neglim), 不是界面反相后的 ——
+ * 但这里只把「信号此刻有效」当事实报出去, 不据此推断它正朝哪走 (见下)。 */
+struct HomeBannerIn
+{
+   int  axis      = 0;
+   int  method    = 0;
+   bool dig_known = false;
+   bool dig_pos   = false;
+   bool dig_neg   = false;
+};
+
+/* 回零进行中那条横幅。
+ *
+ * **`n == 1` 时与改造前 `scan/scanwindow.cpp` 里那一句逐字相同** (自检钉着): 单轴那条路
+ * 一个字都不该变, 否则 §33.7 第 9 条那个"逐字节回归"就没有基准了。两种形态分开写死, 不
+ * 去"统一格式" —— 单轴那份的措辞是被现场试出来的, 不是排版的结果。
+ *
+ * **n >= 2 那份必须短**: 横幅是 1 句 / 40 字 (CLAUDE.md §1.4), 而单轴那句光是
+ * "先向正向高速寻找" 就占了 10 个字。两轴时**方向那半句整段省掉** —— 两根的方向本来就可能
+ * 不一样, 写一句只可能说反, 所以只留轴名与方式号。
+ *
+ * 找限位**不在这句里声称它现在朝哪走**: "这一趟走 a) 还是 b)" 是发起那一刻按驱动器自己
+ * 那两位定下来的, 而这里手上只有界面反相之后的值 —— 「上位机侧取反」开着时两者正好相反,
+ * 说成"正在反向退开"会恰好说反。所以这里只报「信号此刻有效」这件事实 (与限位灯同一份量、
+ * 同一个措辞), 分支预告留在控制台里。 */
+inline QString home_batch_banner(const HomeBannerIn *in, int n)
+{
+   if (in == nullptr || n <= 0)
+      return QString();
+
+   /* 找原点那一族在横幅里说成「回零」(与单轴那句同一个说法); 找限位照抄简称 */
+   auto verb = [](int m) {
+      return home_method_is_limit(m) ? QString::fromUtf8(home_method_short(m))
+                                     : QStringLiteral("回零");
+   };
+   /* 单轴那句里的轴名是**不带「轴」字的** ("轴%1" 再拼上去), 两轴那份用全名 */
+   auto short_name = [](int axis) {
+      return (axis == 0) ? QStringLiteral("X") : QStringLiteral("Y");
+   };
+
+   if (n == 1)
+   {
+      const int m = in[0].method;
+      QString   s = home_method_is_limit(m)
+         ? QStringLiteral("轴%1 正在%2 (方式 %3), 按「停止」可立即中止。")
+              .arg(short_name(in[0].axis), verb(m))
+              .arg(m)
+         : QStringLiteral("轴%1 正在回零 (方式 %2, 先向%3高速寻找), 按「停止」可立即中止。")
+              .arg(short_name(in[0].axis))
+              .arg(m)
+              .arg(QString::fromUtf8(home_method_first_dir(m, false)));
+
+      if (home_method_is_limit(m) && in[0].dig_known &&
+          home_lim_target_active(m, in[0].dig_pos, in[0].dig_neg))
+         s += QStringLiteral(" [%1信号有效]")
+                 .arg(QString::fromUtf8(home_lim_switch_name(m)));
+
+      return s;
+   }
+
+   /* ---- n >= 2: 只留轴名与方式号 ---- */
+   bool same = true;
+   for (int k = 1; k < n; k++)
+      if (in[k].method != in[0].method)
+         same = false;
+
+   if (same)
+   {
+      /* **两根轴名都要在。** 两个方式号相同, 所以方式只写一次 —— 而轴名一次都不能省:
+       * 两根同时动、横幅只说一根, 是这次改造最不该出的错。 */
+      QString names;
+      for (int k = 0; k < n; k++)
+      {
+         if (k > 0)
+            names += QStringLiteral(" ");
+         names += QString::fromUtf8(axis_label(in[k].axis));
+      }
+
+      return QStringLiteral("%1 正在%2 (方式 %3), 按「停止」可立即中止。")
+         .arg(names, verb(in[0].method))
+         .arg(in[0].method);
+   }
+
+   /* 方式号不同: 逐根报 `轴X 回零 24` 样式的短条目 —— 带上"(方式 …)"就超 40 字了 */
+   QString s;
+   for (int k = 0; k < n; k++)
+   {
+      if (k > 0)
+         s += QStringLiteral(", ");
+      s += QStringLiteral("%1 %2 %3")
+              .arg(QString::fromUtf8(axis_label(in[k].axis)), verb(in[k].method))
+              .arg(in[k].method);
+   }
+   s += QStringLiteral(", 按「停止」可立即中止。");
+   return s;
+}
+
+/* 「停止」按下去那一刻的一句应答。两根会**在同一圈**一起被拉停 —— 这一句就是这件事在屏幕上
+ * 的说法, 所以 n >= 2 时必须说"两根", 而且要说清**停在哪里**: 保持使能, 不是卸力
+ * (竖直轴会不会滑下去, 操作员按下去的那一刻就得知道)。
+ *
+ * **不写「撤掉 6040h bit4」那类机制**: 那是成因, 按 CLAUDE.md §1.5 该搬进
+ * docs/scan_messages.md, 屏幕上只留"现在是什么状况"。 */
+inline const char *home_stop_hint_text(int n)
+{
+   if (n <= 0)  return "已请求停止。";
+
+   return (n > 1) ? "已请求停止, 两根轴都保持使能。"
+                  : "已请求停止, 该轴保持使能。";
+}
+
+/* ---- 5. 批级结论句 ------------------------------------------------------- */
+
+/* 一根轴这一趟落在哪个字上 —— 结论文里那个结果词。**只有三个词**:
+ *   到位   = 到达原点 (EM_HM_ATTAINED)
+ *   已停止 = 操作员按了「停止」(EM_HM_ABORTED) —— **不是故障**, 所以它不能与"未到位"合并
+ *   未到位 = 其余一切 (故障 / 超时 / 帧断 / 被对侧带停 / 起手失败)
+ * 分开的必要性: 一次"两根都被操作员按停"的收尾, 报成"两根都未到位"会让人去查一个不存在的
+ * 故障。反过来把失败说成"已停止"是更坏的一种。 */
+inline const char *home_step_result_text(int rc)
+{
+   if (rc == EM_HM_ATTAINED) return "到位";
+   if (rc == EM_HM_ABORTED)  return "已停止";
+   return "未到位";
+}
+
+/* 批结论那一句 (逐轴结论之后的收口)。
+ *
+ * **为什么它非有不可**: `note()` 是**覆盖写状态栏**, 逐轴那几句里只有最后一句留在屏幕上,
+ * 而"是哪一根出的问题"可能正好落在前面 —— 元凶被冲掉的那一半情形恰恰是最要紧的那一半。
+ * 这一句最后写, 所以状态栏上留下的是它。同 `doFaultReset()` 那个"点名所有轴"的写法。
+ *
+ * `n <= 1` 时返回空串: 单轴那一趟的屏幕必须与改造前**逐字节一致** (§33.7 第 7 条),
+ * 多一句就算改行为。
+ *
+ * **到位 / 全被停止时不点元凶**: 那两个情形里没有人出错, 点名等于凭空怪罪一根好轴
+ * (与 `home_batch_blame` 里那两条前提同一个道理)。 */
+inline QString home_batch_summary(const int *rc, unsigned mask)
+{
+   int n = 0;
+   for (int i = 0; i < EM_MAX_AXES; i++)
+      if ((mask & (1u << i)) != 0)
+         n++;
+
+   if (n <= 1)
+      return QString();
+
+   /* 每一根都念一遍 —— 这一句的全部意义就是让"是哪一根"活到状态栏上最后一行 */
+   QString each;
+   for (int i = 0; i < EM_MAX_AXES; i++)
+   {
+      if ((mask & (1u << i)) == 0)
+         continue;
+
+      if (!each.isEmpty())
+         each += QStringLiteral(", ");
+      each += QStringLiteral("%1 %2")
+                 .arg(QString::fromUtf8(axis_label(i)),
+                      QString::fromUtf8(home_step_result_text(rc[i])));
+   }
+
+   QString s = QStringLiteral("回零结果: %1。").arg(each);
+
+   const HomeBatch verdict = home_batch_end(rc, mask);
+   if (verdict == HOME_BATCH_SUCCESS || verdict == HOME_BATCH_STOPPED)
+      return s;
+
+   /* 出路只许一句「请……」 (CLAUDE.md §1.5)。这里指向**元凶那一根**: 修好它才是出路,
+    * 而"两根都查一遍"是把操作员的时间浪费在一条没出事的轴上。 */
+   const int blame = home_batch_blame(rc, mask);
+   if (blame >= 0)
+      s += QStringLiteral("请查 %1。").arg(QString::fromUtf8(axis_label(blame)));
+
+   return s;
+}
+
+/* 一根轴的结论句要的全部输入。做成一个 struct 而不是一长串实参: 十来个位置参数里
+ * 有两个 int 顺序写反是编译得过的, 而这里每个数都会出现在屏幕上。 */
+struct HomeReport
+{
+   int       axis       = 0;                 /* 轴号 */
+   int       method     = 0;                 /* 6098h 方式号 (24/29/18/17) */
+   int       rc_home    = -1;                /* home_step_rc_legacy(): 0/1/负 */
+   /* `em_home_step()` 的**原始**结局, 只为区分一件事: `EM_HM_PEER` ("被对侧带停") 在
+    * `rc_home` 那张三值表里与"操作员按了「停止」"**挤在同一格** (都是 1, 都为"非故障地没走到
+    * 位"), 只说得出「被「停止」中止」—— 而这两个情形要人做的事完全不同。默认
+    * `EM_HM_RUNNING` = "这一趟没有步进结局", 那时照旧按 `rc_home` 说 (单轴那条路永远走这里,
+    * 所以它逐字不变: PEER 只在"另一根出了事"时才会被写上)。 */
+   int       step_rc    = EM_HM_RUNNING;
+   HomeEnd   end        = HOME_END_NEVER_STARTED;
+   int       rc_disable = 0;                 /* 起手那次与收尾那次, 取第一个非零 */
+   int       rc_mode    = 0;
+   int       rc_enable  = 0;
+   int       mode_disp  = HMI_MODE_DISP_UNREAD;   /* 6061h */
+   uint32_t  vel_fast   = 0;
+   uint32_t  vel_slow   = 0;
+   uint32_t  acc        = 0;
+   int       tmo_s      = 0;
+};
+
+/* 一根轴的整句。**这一段的字是改造前 `doHome()` 就有的, 逐字搬过来 —— 一个字都不许改**
+ * (自检把它整句抄下来钉着, 那是"重构没改行为"唯一的自动证据)。
+ *
+ * 中段那个动作名有个细节: 找限位的两个方式号**本身就带方向** (正限位/负限位), 再叠一个
+ * "正向/反向"是重复的; 找原点的两个方式号同名, 方向必须补进去才分得清。 */
+inline QString home_axis_note(const HomeReport &r)
+{
+   const QString nm = QString::fromUtf8(axis_label(r.axis));
+   const QString what =
+      home_method_is_limit(r.method)
+         ? QString::fromUtf8(home_method_short(r.method))
+         : QStringLiteral("%1%2")
+              .arg(QString::fromUtf8(home_dir_text(
+                      r.method == home_method_for(true))),
+                   QString::fromUtf8(home_method_short(r.method)));
+
+   /* 措辞**与 `home_step_rc_text()` 里那一档同一份** —— 同一件事在屏幕上只许有一种说法。
+    * 其余各档照旧走 `home_cause_text(rc_home)` (那才是"0/1/负"那张表要说的话)。 */
+   const char *cause = (r.step_rc == EM_HM_PEER) ? home_step_rc_text(EM_HM_PEER)
+                                                 : home_cause_text(r.rc_home);
+
+   QString s = QStringLiteral("%1 %2 (方式 %3): %4 (rc = %5)。\n%6")
+                  .arg(nm, what, QString::number(r.method),
+                       QString::fromUtf8(cause),
+                       QString::number(r.rc_home),
+                       QString::fromUtf8(home_end_text(r.end)));
+
+   if (r.end == HOME_END_HOLDING)
+      s += QStringLiteral(" (显示坐标已把这里定为 0)");
+
+   if (r.end != HOME_END_HOLDING)
+      s += QStringLiteral(" [收尾: 失能 %1 / 切 CSP %2 / 使能 %3]")
+              .arg(r.rc_disable).arg(r.rc_mode).arg(r.rc_enable);
+
+   /* 6061h 单独一格, 并**把期望值写进去**: 它是"驱动器现在按哪种模式解释 607Ah"的唯一显示器 */
+   s += QStringLiteral(" [6061h = %1 (%2)%3]")
+           .arg(r.mode_disp)
+           .arg(QString::fromUtf8(mode_text(r.mode_disp)),
+                (r.mode_disp == EM_MODE_CSP)
+                   ? QString()
+                   : QStringLiteral(" <<< 当前不是 CSP(8): 607Ah 会按其他模式解释, 请勿继续下发位置。"));
+
+   s += QStringLiteral(" [6099h:01 = %1, :02 = %2 pul/s, 609Ah = %3, 上限 %4 s]")
+           .arg(r.vel_fast).arg(r.vel_slow).arg(r.acc).arg(r.tmo_s);
+
+   return s;
+}
+
+/* 批级结论: 逐轴那几句, 每根一行。`n == 1` 时就是那一句本身 (上面单轴的逐字保证)。
+ * **领头的批级那句话由调用方拼** —— 它要的是横幅、状态栏还是对话框, 是界面的事。 */
+inline QString home_batch_note(const HomeReport *r, int n)
+{
+   QString s;
+   for (int k = 0; k < n; k++)
+   {
+      if (k > 0)
+         s += QStringLiteral("\n");
+      s += home_axis_note(r[k]);
+   }
+   return s;
+}
+
 /* ---- 故障码 603Fh 的说人话 ----
  * 判据做成 inline 放这里, 与 mode_text 同一个理由: **scan_selftest 不编 ecatworker.cpp**,
  * 写在 .cpp 里就永远验不到。 */
@@ -1235,8 +1733,26 @@ public:
     * tmo_s: 等 6041h bit12 的上限 (秒), 内部还夹一道。
     * ⚠️ 它会**先失能**: 6098h/6099h/609Ah/607Ch 只能在未使能时写, 竖直轴失去保持力矩。
     *
-    * tmo_s **不给缺省实参** —— 本程序只有一个调用点, 逼每个将来的调用方都把话说出来。 */
+    * tmo_s **不给缺省实参** —— 本程序只有一个调用点, 逼每个将来的调用方都把话说出来。
+    *
+    * 这一条**内部就是两轴那一套** (`hm_mask = 1 << axis`), 单轴与两轴从此只有一条路可走 ——
+    * 于是"改造前后单轴行为一致"变成一条**可测的性质** (会话大小 = 1), 而不是靠两条代码路各写
+    * 一遍然后祈祷它们不漂移。 */
    void postHome(int axis, int method, uint32_t vel_fast, int tmo_s);
+
+   /* 一趟把 mask 上那几根**同时**发起回零 —— 「回零校准」按钮走这一条。
+    *
+    * **同时**是真的同时: 驱动器自己执行回零, 上位机只是把两根都启动起来、然后在一个循环里
+    * 同时轮询两根 (docs/scan_sweep.md §33)。串行从来不是硬件的限制, 是上位机那个阻塞循环
+    * 造成的。
+    *
+    * method[] / vel_fast[] 都是**逐根一个**, 下标即轴号; mask 上没圈到的那几格不读。
+    * 起手预检任一根过不了闸就**整体不动** (报出是哪一根、为什么), 一根出错则**两根一起停**
+    * 并一起收尾 —— 两条都是用户在权衡之后选的语义。
+    *
+    * ⚠️ 两轴同时带电运动在机械上是**要人先确认**的事 (§33.7 第 1 条): 若一根的行程穿过
+    * 另一根的位置, 这一趟就不能用, 软件兜不住。 */
+   void postHomeBoth(unsigned mask, const int *method, const uint32_t *vel_fast, int tmo_s);
 
    /* 断开重连时沿不沿用上一份零点。**默认 false, 也就是本类自己的老行为**: 连接那一刻的
     * 位置就是零点。`scan/` 在构造之后调一次 true。
@@ -1305,9 +1821,21 @@ private:
    {
       CmdType type   = CMD_STOP;
       int     axis   = -1;
-      int     method = 0;     /* CMD_HOME 用: 6098h 方式号 (24/29/18/17) */
+      int     method = 0;     /* CMD_HOME 用 (老那套): 6098h 方式号 (24/29/18/17) */
       int32_t value  = 0;     /* CMD_RANGE 用; CMD_HOME 用它装 6099h:01 */
-      int     tmo_s  = 0;     /* CMD_HOME 用: 等 6041h bit12 的上限 (s) */
+      int     tmo_s  = 0;     /* CMD_HOME 用: 等 6041h bit12 的上限 (s), 两轴共用 */
+
+      /* ---- CMD_HOME: 两轴那一套 ----
+       * `hm_mask == 0` 时走上面那三个老字段 (单轴, 等于"这一趟只要 axis 这一根");
+       * `hm_mask != 0` 时**只用下面这两组**, 与老字段**不混用** —— 两套同时有效的话就得回答
+       * "axis 与 hm_mask 不一致时听谁的", 而那种问题在回零上没有便宜的答案。
+       *
+       * `method[]` 是**每根一个**方式号: 界面上两轴本来就各有各的按钮, 而 24 与 29 的差别
+       * 就是滑台朝哪边走 —— 逼两根用同一个方式号会在下一次加"两轴都找负限位"时又改一遍。 */
+      unsigned hm_mask = 0;
+      int      hm_method[EM_MAX_AXES] = {};
+      uint32_t hm_vel[EM_MAX_AXES]    = {};
+
       QString text;
    };
 
@@ -1321,7 +1849,12 @@ private:
     * 挂的时机**只限会阻塞的那几条命令**: 平时那一圈自己每 2ms publish 一次, 挂着等于
     * 每帧白拷两遍 BusTelem (它里面有 QString)。
     *
-    * 做成 RAII 而不是前后两句: 摘不到就等于一直挂着, 而这里中间全是 return。 */
+    * 做成 RAII 而不是前后两句: 摘不到就等于一直挂着, 而这里中间全是 return。
+    *
+    * **可重入 (m_tick_depth 计数)**: 有真的嵌套 —— `startHoming()` 那条"起手就失败"的路是在
+    * CMD_HOME 的钩子底下调 `finishHoming()` 的, 而后者自己也要挂 (它那几级 SDO 同样静默
+    * 总线)。没有计数的话, 内层析构会把**外层的**钩子摘掉, 于是外层剩下的作用域里遥测断流 ——
+    * 而"摘早了"这种错不会报任何东西, 只会表现为界面莫名其妙停一拍。 */
    class BlockTick
    {
    public:
@@ -1336,6 +1869,9 @@ private:
       EcatThread *m_t = nullptr;
    };
 
+   /* BlockTick 的嵌套层数; 只有 0 <-> 1 的那两次才真的装/摘钩子。见上面那段。 */
+   int m_tick_depth = 0;
+
    /* 以下全部在工作线程里跑 */
    void drainCommands();
    void doListAdapters();
@@ -1343,7 +1879,17 @@ private:
    void doConnectInner(const QString &ifname);   /* m_busy 由外面的壳一个人管 */
    void doEnable();
    void doFaultReset();
-   void doHome(int axis, int method, uint32_t vel_fast, int tmo_s);
+   /* 回零起手: 三道闸 -> 宣告 -> 失能 -> 写参数 (em_home_prepare) -> 启动 (em_home_start)。
+    * **到这里就返回**: 轮询交给 serviceHoming(), 收尾交给 finishHoming()。
+    * 三道闸里任何一条不放行就一个字节都不写; prepare/start 失败则就地走收尾 (与改造前
+    * "无条件收尾"一致 —— 半途失败留下的状态没有一条可以不管)。 */
+   void startHoming(unsigned mask, const int *method, const uint32_t *vel_fast, int tmo_s);
+   /* 会话的每周期一步 (run() 主循环里调)。定局就记账, 一根出事就同一圈拉停其余的,
+    * 全部定局就在**这一圈内**做完收尾。 */
+   void serviceHoming();
+   /* 收尾 + 结论。**无条件、顺序不能动**: 逐轴 [收尾阶梯 -> 重新锚定零点 -> 读 6061h ->
+    * 判定并一次说完], 然后关掉会话。轴已经不在了也照走 (阶梯会自己报失败)。 */
+   void finishHoming();
    void doStop();
    /* 把该轴的实际运行模式 6061h 读一次存进 m_mode_disp[axis] (SDO 读)。
     * **只许在本来就阻塞、或本来就便宜的时刻调** —— publish() / interpolate() 不许调。 */
@@ -1408,10 +1954,29 @@ private:
     * doFaultReset 自己能在收尾时清干净 */
    bool       m_resetting = false;
 
-   /* 回零进行中 (同上, 见 BusTelem::homing) */
-   bool       m_homing    = false;
-   int        m_homing_axis   = -1;
-   int        m_homing_method = 0;
+   /* ---- 回零会话 (见 BusTelem::homing 与 docs/scan_sweep.md §33) ----
+    *
+    * **会话 = 从 prepare 之前到收尾之后一直真**, 横跨很多圈 —— 这与"一次阻塞调用"是两种
+    * 东西, 也是这次改造的全部内容: 原来那根轴占着整个工作线程, 现在它只占"每一圈的一步"。
+    *
+    * 逐轴的状态一律进数组, 不放进几个单数量: 两轴并行时"哪一根到点了 / 哪一根还在找"
+    * 是每一根自己的事, 用单数量表达必然要在某个时刻被覆盖掉。
+    *
+    * 下面这些**只有工作线程碰** (m_homing 例外: publish() 也读, 同 m_resetting 那个写法)。 */
+   bool       m_homing = false;
+   /* 本次会话有哪几根 (bit i = 轴 i)。0 = 没有会话 */
+   unsigned   m_homing_mask = 0;
+   /* 逐轴的结局 (em_home_step_rc)。**必须当场记下来**: em_home_step() 的结局只报一次,
+   * 定局之后再调就是安静的 no-op (见 ec_motor.h) —— 不记就等于没听见。 */
+   int        m_home_rc[EM_MAX_AXES]      = {};
+   bool       m_home_done[EM_MAX_AXES]    = {};
+   /* 起手时算好的参数, 收尾那一段要用它们写结论 (6099h:01/:02 / 609Ah / 上限) */
+   int        m_home_method[EM_MAX_AXES]  = {};
+   em_home_cfg_t m_home_cfg[EM_MAX_AXES];
+   int        m_home_tmo_s[EM_MAX_AXES]   = {};
+   /* 起手那次失能 (写 6098h 之前必须做的) 的返回码 —— 结论里那个「失能 %1」是它和收尾
+    * 那一次的**第一个非零值**, 与改造前那两句的合成规则一致。 */
+   int        m_home_disable_rc[EM_MAX_AXES] = {};
 
    /* ---- 帧间隔统计 (见 BusTelem::max_gap_ms) ----
     * 每次 em_service() 前后各取一次 clk, 相邻两次的间隔就是"多久没发帧"。

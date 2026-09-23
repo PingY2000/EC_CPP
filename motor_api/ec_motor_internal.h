@@ -12,6 +12,39 @@
 #define EM_R_FAIL (-1)
 #define EM_R_STOP  1
 
+/* 一次回零会话的相位 (em_home_prepare/start/step/finish 之间靠它衔接)。
+ * 0 = IDLE 与 calloc 一致 —— 于是"没 prepare 过就调 em_home_step"天然落在 IDLE 上,
+ * 那里是安静的 no-op, 不需要另加一个 have-inited 标志。
+ * DONE 覆盖全部四条出路 (到位/故障/超时/被拉停): 它们对**步进**而言是同一件事 ——
+ * 有结局了, 别再写镜像了。是哪一条出路看 em_axis::hm_rc。 */
+#define EM_HM_S_IDLE    0
+#define EM_HM_S_RUNNING 1   /* bit4 举着, 在等 bit12 */
+#define EM_HM_S_DONE    2   /* 已有结局, 等收尾 */
+
+/* em_home_prepare() 每笔 SDO 之间泵的帧数。
+ * **这不是性能调优, 是安全参数**: 写超时写死 700 ms (em__verified_write 的 EC_TIMEOUTRXM),
+ * 而一份短的写事务本身会静默几十毫秒 —— 没有这几帧, 五笔 SDO 连着写就是最长 3.5 s 的静默,
+ * 而本机实测 1.6 s 停顿就足以让从站的 SM 看门狗动作 (AL 0x001B), 之后 mirror_ok 降 0 且
+ * 升不回来, 唯一回程是重连。
+ * 每笔 2 帧 = 2 × EM_POLL_MS, 单次静默被压回"一笔写"的量级。
+ * 此刻该轴已失能 (6040h 镜像 = 0x0000), 这几帧不下任何命令 —— 泵帧本身是安全的。 */
+#define EM_HOME_PREP_PUMP_FRAMES 2
+
+/* 起手段与收尾段里, **SDO 写**的超时 (毫秒)。**这不是性能调优, 是安全参数** ——
+ * 写超时原来写死 EC_TIMEOUTRXM = 700 ms (em__verified_write), 那与读超时是同一件事的另一半:
+ * 它同样是"这次事务最多把过程数据静默多久"。§33.3 记的 1.6 s 看门狗阈值就架在这个值上。
+ *
+ * 为什么**只在这两段**压短, 不做成全局: 写与读的失败代价不同。一次读失败只是这一圈少一个
+ * 诊断量, 下一圈还能再来; 一次写失败会让调用方**当场中止** (em_set_mode / em_enable /
+ * PDO 映射全走这条路), 把一个本来会成功的写判死比多静默几十毫秒更坏。而这两段恰好是
+ * 唯一"已知会有连续多笔写、且不能失败"的地方 —— 起手那 5 笔决定这一趟能不能开, 收尾那
+ * 三级决定轴最后停在哪个状态。
+ *
+ * 取值依据: 实测正常应答 1~3 ms (见 em_set_sdo_timeout 的说明), 读那边取 60 ms 已是二十来倍;
+ * 写多一条回读 (em__verified_write 写完必读回比对), 所以给到 150 ms = 正常应答的 50 倍,
+ * 同时是 1.6 s 阈值的十分之一不到。 */
+#define EM_SDO_TMO_WRITE_SHORT_MS 150
+
 /* 结构体定义 (对外不透明) */
 
 struct em_axis
@@ -82,6 +115,23 @@ struct em_axis
 
    int32_t  csp_target;    /* CSP 插值目标的当前值 */
 
+   /* ---- 回零会话的跨调用状态 (em_home_prepare/start/step/abort/finish 之间传) ----
+    * 旧 em_home() 把这一整套放在自己的**局部变量**里 —— 那是"一趟回零 = 一次调用"成立时
+    * 才行的写法。拆成四段之后, 这些值必须活得比任何一段长, 只能挂在轴上。
+    * 两轴并行时每一根各有自己的一份, 这也正是要挂在这里、不能挂成文件级静态量的原因。 */
+   int      hm_state;      /* EM_HM_S_* */
+   uint32_t hm_t0;         /* 抬 bit4 的那一刻 (em__now_ms), 超时从它算 */
+   uint32_t hm_tmo_ms;     /* 这一趟的上限 */
+   uint32_t hm_reads;      /* 取到过多少笔完整 6041h —— 判"状态未知"就靠它 */
+   int32_t  hm_pos0;       /* 起手位置 (超时诊断里比"动没动"的基准) */
+   int      hm_pos_ok;     /* hm_pos0 是否可信 (取它时镜像就不可信则 0) */
+   int      hm_lim_shown;  /* 上次打印过的 60FDh 两位组合; **必须显式置 -1**:
+                            * calloc 给的 0 在旧代码里是"上次打印过 0b00", 三态被压成两态,
+                            * 起手第一帧两位都没触发时那句就不打了 —— 与改造前不等价 */
+   int      hm_lim_all;    /* 两位是否都触发过 (快到位了, 打印改频) */
+   uint32_t hm_t_lim_print;/* 上次打印限位组合的时刻 (节流) */
+   int      hm_rc;         /* 上一趟的结局 (em_home_step_rc), 收尾时要用它判 attained */
+
    char     label[32];
 };
 
@@ -137,6 +187,14 @@ struct em_bus
     * 静默够长就会被驱动器看门狗抓住 (AL 0x001B), 而那正是我们要避免的事。
     * 连接期默认值由 em_bus_new 给, 所以每次连接都从 700ms 重新开始。 */
    int sdo_tmo_us;
+
+   /* **SDO 写**的超时 (微秒), 与上面那个读超时分开一格, 因为它俩的默认值就该不同:
+    * 读超时进 OP 之后一直被压短 (60000 us), 而写超时平时保持 0 = 用 EC_TIMEOUTRXM,
+    * 只有回零的起手/收尾两段由 motor_api 自己临时设成 EM_SDO_TMO_WRITE_SHORT_MS。
+    * 0 = 没设过 = 用 EC_TIMEOUTRXM。见那个宏的说明: 两段的边界由 em_home_prepare /
+    * em_home_finish 自己兜住, 所以这里不需要对外暴露 setter —— 设了不复位就是永久压短,
+    * 那属于"一次调用把全局状态改坏"。 */
+   int sdo_wr_tmo_us;
 
    /* 2300h 快照, 下标 = 轴序号。sz 是驱动器自报的宽度 —— 手册 V2.4 p84 写 U16, 而当时那份
     * 现场基线表把它记成 U8 (那份表与记它的工具 2026-09-21 一起从仓库移除了), 两处对不上,

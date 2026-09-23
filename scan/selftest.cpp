@@ -231,8 +231,24 @@ public:
    void setDropFrames(int i, bool d) { t_.ax[i].mirror_ok = !d; }
    void setWkc(int w)          { t_.wkc = w; }
    void setInOp(bool v)        { t_.in_op = v; }
-   /* 总线正在回零。只影响 armRun 那道闸: 复现的是"控制器看得到的那一位" */
+   /* 总线正在回零 —— **只置会话那一位** (ScanController 那道闸读的就是它)。
+    *
+    * 逐轴的"是哪一根 / 什么方式"请用下面那个两参形式: 这里不替调用方挑一根, 因为挑哪一根
+    * 是个有含义的选择, 而**"会话在跑"与"这一根在跑"是两件事** —— 这个形式故意只说出前者。
+    * (真机上两者同源: publish() 从 m_homing / m_homing_mask 一处来。) */
    void setHoming(bool v)      { t_.homing = v; }
+
+   /* 一根在回零 (会话 + 逐轴旗标一次置齐)。两根就在返回后调两次 —— 真机上"哪几根在回零"
+    * 只有一个来源 (m_homing_mask), 所以这里也不给"分两次置出一个中间态"的机会。 */
+   void setHoming(int axis, int method)
+   {
+      if (axis < 0 || axis >= EM_MAX_AXES)
+         return;
+
+      t_.homing                 = true;
+      t_.ax[axis].homing        = true;
+      t_.ax[axis].homing_method = method;
+   }
    void freezeMotion(bool f)   { freeze_ = f; }
    void setPosLag(int ms)      { pos_lag_ms_ = ms; }
    void setRange(int32_t r)    { t_.range = r; }
@@ -2708,6 +2724,443 @@ static void test_homing()
       check(r.startScan(QDir::tempPath() + "/hm2.csv", &err), "回零结束 → 放行",
             err.toStdString());
       r.ctrl.abort(QString());
+   }
+
+   /* ==================================================== 两轴并行回零 (docs/scan_sweep.md §33)
+    *
+    * 这些判据全是 `ecatcmd::` 里的纯函数 —— **这一节是 §33 唯一能被自动验证的部分**。
+    * 会话本身 (serviceHoming / 逐周期步进 / 收尾阶梯) 不在这里, 也不在任何自检里:
+    * scan_selftest 既不编 ecatworker.cpp 也不编 motor_api/, 那部分只有真机能验 (§33.7)。
+    *
+    * S3a 写完时这些函数**还没有调用方** —— 断言先立起来, 接线在 S3b。 */
+
+   /* ---- 步进结局说人话 ------------------------------------------ */
+   caseBegin("两轴回零: 八个结局八句话, 两两不同");
+   {
+      const int codes[8] = { EM_HM_ATTAINED, EM_HM_ABORTED, EM_HM_PEER, EM_HM_FAULT,
+                             EM_HM_HM_ERROR, EM_HM_TIMEOUT, EM_HM_NO_FRAMES, EM_HM_SETUP };
+
+      for (int i = 0; i < 8; i++)
+      {
+         const char *a = ecatcmd::home_step_rc_text(codes[i]);
+         check(a != nullptr && a[0] != '\0', "每一档都得有话",
+               "code=" + std::to_string(codes[i]));
+
+         for (int j = i + 1; j < 8; j++)
+         {
+            const char *b = ecatcmd::home_step_rc_text(codes[j]);
+            check(std::strcmp(a, b) != 0, "两两不同 —— 屏幕上分不出的两档等于没有这一档",
+                  std::to_string(codes[i]) + " vs " + std::to_string(codes[j]));
+         }
+      }
+
+      /* 这两句**刻意不许互换**: 一个是"上位机不知道驱动器怎么了", 一个是"知道, 它就是没
+       * 及时到位"。写反了等于把"去查总线"和"去调参数"指反。 */
+      check(has(ecatcmd::home_step_rc_text(EM_HM_NO_FRAMES), "未知"),
+            "一笔完整 6041h 都没取到 → 必须说「状态未知」");
+      check(!has(ecatcmd::home_step_rc_text(EM_HM_TIMEOUT), "未知"),
+            "超时那一档期间取到过完整帧 → 状态是已知的, 不许说「未知」");
+
+      checkEq(ecatcmd::home_step_rc_legacy(EM_HM_ATTAINED), 0, "到位 → 0");
+      checkEq(ecatcmd::home_step_rc_legacy(EM_HM_ABORTED),  1, "被停止 → 1");
+      checkEq(ecatcmd::home_step_rc_legacy(EM_HM_PEER),     1, "被带停 → 1 (不算失败)");
+      checkEq(ecatcmd::home_step_rc_legacy(EM_HM_FAULT),   -1, "故障 → 负");
+      checkEq(ecatcmd::home_step_rc_legacy(EM_HM_TIMEOUT), -1, "超时 → 负");
+   }
+
+   /* ---- 批级结局 + 元凶 ------------------------------------------ */
+   caseBegin("两轴回零: 一半成功自成一档, 而且要点名到元凶");
+   {
+      const unsigned both = 0x3u;
+      int            rc[2] = { 0, 0 };
+
+      rc[0] = EM_HM_ATTAINED; rc[1] = EM_HM_ATTAINED;
+      checkEq(ecatcmd::home_batch_end(rc, both), ecatcmd::HOME_BATCH_SUCCESS, "都到位 → 成功");
+      checkEq(ecatcmd::home_batch_blame(rc, both), -1, "都到位 → 没有元凶");
+
+      /* **本组最要紧的一条**: 一根到位一根没到位, 不许并进"成功" */
+      rc[0] = EM_HM_ATTAINED; rc[1] = EM_HM_FAULT;
+      checkEq(ecatcmd::home_batch_end(rc, both), ecatcmd::HOME_BATCH_PARTIAL,
+              "一根到位一根故障 → PARTIAL 自成一档 (说成成功就是把一半失败藏起来)");
+      checkEq(ecatcmd::home_batch_blame(rc, both), 1, "被点名的是故障那一根");
+
+      /* PEER 的定义就是"被别人带停的", 它不背锅 */
+      rc[0] = EM_HM_ATTAINED; rc[1] = EM_HM_PEER;
+      checkEq(ecatcmd::home_batch_end(rc, both), ecatcmd::HOME_BATCH_PARTIAL,
+              "到位 + 被带停 → 也是 PARTIAL");
+      checkEq(ecatcmd::home_batch_blame(rc, both), 0,
+              "被带停的那根不背锅 → 元凶是没出事的那根");
+
+      rc[0] = EM_HM_FAULT; rc[1] = EM_HM_PEER;
+      checkEq(ecatcmd::home_batch_blame(rc, both), 0,
+              "故障优先于被带停 → 元凶是故障那根");
+
+      /* 操作员自己按的「停止」不是任何一根的错 */
+      rc[0] = EM_HM_ABORTED; rc[1] = EM_HM_ABORTED;
+      checkEq(ecatcmd::home_batch_end(rc, both), ecatcmd::HOME_BATCH_STOPPED,
+              "都被停止 → 自成一档, 不叫失败");
+      checkEq(ecatcmd::home_batch_blame(rc, both), -1, "被停止不算谁的错");
+
+      rc[0] = EM_HM_ABORTED; rc[1] = EM_HM_FAULT;
+      checkEq(ecatcmd::home_batch_blame(rc, both), 1, "被停止的那根不背锅");
+
+      rc[0] = EM_HM_TIMEOUT; rc[1] = EM_HM_FAULT;
+      checkEq(ecatcmd::home_batch_end(rc, both), ecatcmd::HOME_BATCH_FAILED, "都没到位 → 失败");
+      checkEq(ecatcmd::home_batch_blame(rc, both), 0, "两根都失败 → 报第一根");
+
+      rc[0] = EM_HM_ATTAINED; rc[1] = EM_HM_ATTAINED;
+      checkEq(ecatcmd::home_batch_end(rc, 0u), ecatcmd::HOME_BATCH_NONE, "掩码里没有轴");
+      checkEq(ecatcmd::home_batch_blame(rc, 0u), -1, "掩码里没有轴 → 没有元凶");
+   }
+
+   /* ---- 批级起手闸: 一根不动 ------------------------------------ */
+   caseBegin("两轴回零闸: 一根不合格就整体不动, 而且**两根都点名**");
+   {
+      const unsigned both  = 0x3u;
+      bool           mok[2] = { true, true };
+      bool           flt[2] = { false, false };
+
+      ecatcmd::HomeGate g = ecatcmd::home_batch_refusal(true, true, false, both, mok, flt);
+      check(g.reason == nullptr, "全清 → 放行");
+      checkEq(g.ok_mask, both, "放行的是全部两根");
+      checkEq(g.bad_mask, 0u, "没有不合格的轴");
+
+      /* 总线级那三道**必须与 home_refusal 说的是同一份字** —— 复制一份字符串就是给它们
+       * 开了第二个不设防的副本, 而这几句被上面那组断言钉着 */
+      g = ecatcmd::home_batch_refusal(false, true, false, both, mok, flt);
+      checkEq(g.ok_mask, 0u, "没连上 → 整体不动");
+      check(g.reason != nullptr &&
+               std::strcmp(g.reason, ecatcmd::home_refusal(false, true, true, false, false)) == 0,
+            "没连上那句与 home_refusal 逐字相同");
+
+      g = ecatcmd::home_batch_refusal(true, false, false, both, mok, flt);
+      checkEq(g.ok_mask, 0u, "位置未知 → 整体不动");
+      check(g.reason != nullptr &&
+               std::strcmp(g.reason, ecatcmd::home_refusal(true, false, true, false, false)) == 0,
+            "位置未知那句与 home_refusal 逐字相同");
+
+      g = ecatcmd::home_batch_refusal(true, true, true, both, mok, flt);
+      checkEq(g.ok_mask, 0u, "还有轴在走 → 整体不动");
+      check(g.reason != nullptr &&
+               std::strcmp(g.reason, ecatcmd::home_refusal(true, true, true, false, true)) == 0,
+            "「还有轴在走」那句与 home_refusal 逐字相同");
+
+      /* 一根故障一根健康 */
+      flt[1] = true;
+      g = ecatcmd::home_batch_refusal(true, true, false, both, mok, flt);
+      checkEq(g.ok_mask, 0u, "一根不合格 → 整体不动 (用户选的语义)");
+      checkEq(g.bad_mask, 2u, "点名的是故障那一根 (轴Y), 不是第一根");
+      check(g.reason != nullptr &&
+               std::strcmp(g.reason, ecatcmd::home_refusal(true, true, true, true, false)) == 0,
+            "逐轴那一句与 home_refusal 逐字相同");
+
+      /* **两根都不合格 → 两根都被点名**: 只说第一根, 操作员修完再撞一次才轮到第二根 */
+      flt[0] = true;
+      g = ecatcmd::home_batch_refusal(true, true, false, both, mok, flt);
+      checkEq(g.bad_mask, both, "两根都不合格 → 两根都被点名");
+
+      /* 逐轴那两道也要守住 home_refusal 的**内部顺序**: 一个从没收到过的状态字里的
+       * bit3 不是信息 (同上面「回零闸: 分支, 以及分支的顺序」那一组) */
+      {
+         bool mok2[2] = { false, true };
+         flt[0] = true; flt[1] = false;
+         g = ecatcmd::home_batch_refusal(true, true, false, both, mok2, flt);
+         check(g.reason != nullptr && has(g.reason, "未知"),
+               "丢帧 + 有故障 → 说「状态未知」");
+         check(g.reason != nullptr && !has(g.reason, "bit3"),
+               "丢帧时不许拿一个没收到过的状态字里的 bit3 说事");
+         checkEq(g.bad_mask, 1u, "不合格的是丢帧那一根");
+      }
+
+      /* 掩码外的轴不合格, 不该拦住这一趟 */
+      flt[0] = false; flt[1] = true;
+      g = ecatcmd::home_batch_refusal(true, true, false, 0x1u, mok, flt);
+      checkEq(g.ok_mask, 0x1u, "掩码外那根不合格, 不拦这一趟");
+      check(g.reason == nullptr, "而且不报它");
+
+      g = ecatcmd::home_batch_refusal(true, true, false, 0u, mok, flt);
+      checkEq(g.ok_mask, 0u, "空掩码 → 一根都不放行");
+      check(g.reason != nullptr, "空掩码也要给一句话, 不能静默返回");
+   }
+
+   /* ---- 横幅 ---------------------------------------------------- */
+   caseBegin("两轴回零横幅: 单轴逐字不变, 两轴两根都点名");
+   {
+      ecatcmd::HomeBannerIn b[2];
+
+      b[0].axis = 0; b[0].method = EM_HOME_MODE_ORIGIN_POS;
+      const QString s1 = ecatcmd::home_batch_banner(b, 1);
+      check(s1 == QStringLiteral("轴X 正在回零 (方式 24, 先向正向高速寻找), 按「停止」可立即中止。"),
+            "n == 1 (找原点) 与 scanwindow 里改造前那一句逐字相同", s1.toStdString());
+
+      b[0].method    = EM_HOME_MODE_LIMIT_POS;
+      b[0].dig_known = true; b[0].dig_pos = true; b[0].dig_neg = false;
+      const QString s2 = ecatcmd::home_batch_banner(b, 1);
+      check(s2 == QStringLiteral(
+               "轴X 正在找正限位 (方式 18), 按「停止」可立即中止。 [正限位信号有效]"),
+            "n == 1 (找限位 + 目标已触发) 逐字相同 (含那两个方括号后缀)", s2.toStdString());
+
+      b[0].dig_pos = false;
+      const QString s3 = ecatcmd::home_batch_banner(b, 1);
+      check(s3 == QStringLiteral("轴X 正在找正限位 (方式 18), 按「停止」可立即中止。"),
+            "n == 1 (找限位 + 未触发) 逐字相同", s3.toStdString());
+
+      /* 两轴 */
+      b[0].axis = 0; b[0].method = EM_HOME_MODE_ORIGIN_POS; b[0].dig_known = false;
+      b[1].axis = 1; b[1].method = EM_HOME_MODE_ORIGIN_POS;
+      const QString s4 = ecatcmd::home_batch_banner(b, 2);
+      check(hasq(s4, "轴X") && hasq(s4, "轴Y"),
+            "两轴: **两根轴名都在** (两根同时动而横幅只说一根是最不该出的错)");
+      check(hasq(s4, "24"), "两轴同方式 → 方式号在");
+      check(hasq(s4, "按「停止」可立即中止"), "两轴: 那句出路还在");
+      check(s4.size() <= 40, "两轴横幅不超 40 字 (CLAUDE.md §1.4 横幅上限)",
+            s4.toStdString());
+
+      b[1].method = EM_HOME_MODE_LIMIT_NEG;
+      const QString s5 = ecatcmd::home_batch_banner(b, 2);
+      check(hasq(s5, "24") && hasq(s5, "17"), "两轴方式不同 → 两个方式号都在");
+      check(hasq(s5, "轴X") && hasq(s5, "轴Y"), "两轴方式不同 → 两根轴名也都在");
+      check(hasq(s5, "按「停止」可立即中止"), "那一句出路仍在");
+      check(s5.size() <= 40, "方式不同时也不超 40 字", s5.toStdString());
+
+      check(ecatcmd::home_batch_banner(b, 0).isEmpty(), "零根 → 空串, 不报一句空横幅");
+
+      check(has(ecatcmd::home_stop_hint_text(2), "两根"),
+            "「停止」那句在两根时必须说两根");
+      check(!has(ecatcmd::home_stop_hint_text(2), "6040h"),
+            "而且不许把「撤掉 6040h bit4」那类机制写进屏幕 (那是成因, 见 CLAUDE.md §1.5)");
+   }
+
+   /* ---- 结论句 -------------------------------------------------- */
+   caseBegin("两轴回零结论: n == 1 时逐字不变");
+   {
+      ecatcmd::HomeReport r;
+      r.axis       = 0;
+      r.method     = EM_HOME_MODE_ORIGIN_POS;
+      r.rc_home    = 0;
+      r.end        = ecatcmd::HOME_END_HOLDING;
+      r.rc_disable = 0; r.rc_mode = 0; r.rc_enable = 0;
+      r.mode_disp  = EM_MODE_CSP;
+      r.vel_fast   = 50000; r.vel_slow = 12500; r.acc = 500000;
+      r.tmo_s      = 120;
+
+      /* **这一整句是从改造前的 doHome() 里抄下来的** —— 逐字相同是"重构没改行为"
+       * 唯一能自动验证的证据 (§33.8)。这个字面量就是基准, 改它等于改判据。 */
+      const QString want = QStringLiteral(
+         "轴X 正向找原点 (方式 24): 到位 (rc = 0)。\n"
+         "已切回 CSP 并保持使能, 停在落点带保持力矩 (显示坐标已把这里定为 0)"
+         " [6061h = 8 (CSP 位置同步)]"
+         " [6099h:01 = 50000, :02 = 12500 pul/s, 609Ah = 500000, 上限 120 s]");
+
+      const QString got = ecatcmd::home_batch_note(&r, 1);
+      check(got == want, "n == 1 的整句与改造前逐字相同", got.toStdString());
+
+      /* 没到位那一路要带上收尾那三个返回码 —— 那是"收尾做到哪一步"的唯一显示器 */
+      r.end = ecatcmd::HOME_END_STRANDED;
+      r.rc_disable = 0; r.rc_mode = 0; r.rc_enable = -1;
+      const QString got2 = ecatcmd::home_batch_note(&r, 1);
+      check(hasq(got2, "[收尾: 失能 0 / 切 CSP 0 / 使能 -1]"),
+            "没停在保持力矩 → 收尾那三个返回码必须写出来", got2.toStdString());
+      check(!hasq(got2, "显示坐标已把这里定为 0"),
+            "而「已把这里定为 0」只属于 HOLDING 那一档", got2.toStdString());
+
+      /* 两根: 每根一行, 内容各是各的 */
+      ecatcmd::HomeReport two[2];
+      two[0] = r;
+      two[0].axis = 0; two[0].method = EM_HOME_MODE_ORIGIN_POS; two[0].rc_home = 0;
+      two[0].end = ecatcmd::HOME_END_HOLDING;
+      two[1] = two[0];
+      two[1].axis = 1; two[1].method = EM_HOME_MODE_LIMIT_NEG;
+      two[1].rc_home = -1; two[1].end = ecatcmd::HOME_END_FAULTED;
+
+      const QString bothn = ecatcmd::home_batch_note(two, 2);
+      check(hasq(bothn, "轴X") && hasq(bothn, "轴Y"), "两根各自的结论都在");
+      check(hasq(bothn, "正向找原点") && hasq(bothn, "找负限位"),
+            "两根的动作名各是各的 (找原点要补方向, 找限位自带宽窄)");
+      /* 每根那一句**自己就占两行** (上面那个 `\n` 是改造前就有的: 前半句是结局, 后半句是
+       * 收尾状态), 所以两根 = 2 × 2 行 = 3 个换行。**不是 2** —— 这里要钉的是"两根之间没
+       * 挤在一起", 用 3 而不是"大于 1"是因为多一个换行就是格式改了, 也该有人看见。 */
+      check(bothn.count(QChar('\n')) == 3, "两根各占两行, 中间没有挤在一起",
+            std::to_string(bothn.count(QChar('\n'))));
+   }
+
+   /* ---- 可能仍带电 --------------------------------------------- */
+   caseBegin("两轴回零收尾: 任一根 STRANDED 就要动动力电源告警");
+   {
+      const unsigned both = 0x3u;
+      ecatcmd::HomeEnd e[2] = { ecatcmd::HOME_END_HOLDING, ecatcmd::HOME_END_HOLDING };
+
+      check(!ecatcmd::home_batch_maybe_live(e, both), "两根都停在保持力矩 → 不动告警");
+
+      e[1] = ecatcmd::HOME_END_STRANDED;
+      check(ecatcmd::home_batch_maybe_live(e, both), "任一根 STRANDED → 动告警");
+      check(!ecatcmd::home_batch_maybe_live(e, 0x1u), "掩码外那一根不算");
+
+      e[0] = ecatcmd::HOME_END_FAULTED; e[1] = ecatcmd::HOME_END_HOLDING;
+      check(!ecatcmd::home_batch_maybe_live(e, both),
+            "故障那根停在未使能 → 不是 STRANDED, 不动告警 (它有自己的那条出路)");
+   }
+
+   /* ---- 批结论那一句 -------------------------------------------- */
+   caseBegin("两轴回零批结论: 每一根都念一遍, 并点出元凶");
+   {
+      const unsigned both = 0x3u;
+      int            rc[2] = { 0, 0 };
+
+      /* **单轴那一趟不许有这一句** —— n <= 1 → 空串。这条是"改造前后单轴逐字节一致"的
+       * 一部分: 多一句就算改了行为 (§33.7 第 7 条)。 */
+      rc[0] = EM_HM_ATTAINED;
+      check(ecatcmd::home_batch_summary(rc, 0x1u).isEmpty(), "单轴 → 不发这一句");
+      check(ecatcmd::home_batch_summary(rc, 0u).isEmpty(), "一根都没有 → 不发这一句");
+
+      /* 到位 + 未到位: 两根的名字与各自的结局词都要在, 元凶要点名 */
+      rc[0] = EM_HM_ATTAINED; rc[1] = EM_HM_FAULT;
+      {
+         const QString s = ecatcmd::home_batch_summary(rc, both);
+         check(hasq(s, "轴X") && hasq(s, "轴Y"), "两根轴名都在");
+         check(hasq(s, "到位") && hasq(s, "未到位"), "两根各自的结局都在");
+         check(hasq(s, "请查 轴Y"), "点名的出路指向出问题的那一根");
+         check(!hasq(s, "请查 轴X"), "没出问题的那一根不被点名");
+         /* 横幅那一档的上限是 40 字, 这一句是"现象 + 出路"那一档 (50 字) */
+         check(s.length() <= 50, "长度在上限内", std::to_string(s.length()));
+      }
+
+      /* 元凶是**没出事的那根**时, 出路必须跟着换人 (PEER 不背锅这条要在屏幕上兑现) */
+      rc[0] = EM_HM_ATTAINED; rc[1] = EM_HM_PEER;
+      {
+         const QString s = ecatcmd::home_batch_summary(rc, both);
+         check(hasq(s, "请查 轴X"), "被带停的那根不背锅 → 出路指向另一根");
+         check(!hasq(s, "请查 轴Y"), "被带停的那根不被点名");
+      }
+
+      /* 都到位 / 都被停止: **不点元凶** —— 那两个情形里没有人出错, 点名等于凭空怪罪一根好轴 */
+      rc[0] = EM_HM_ATTAINED; rc[1] = EM_HM_ATTAINED;
+      {
+         const QString s = ecatcmd::home_batch_summary(rc, both);
+         check(!hasq(s, "请查"), "都到位 → 不提「请查」");
+         check(hasq(s, "轴X 到位, 轴Y 到位"), "都到位 → 两根都念一遍");
+      }
+
+      rc[0] = EM_HM_ABORTED; rc[1] = EM_HM_ABORTED;
+      {
+         const QString s = ecatcmd::home_batch_summary(rc, both);
+         check(!hasq(s, "请查"), "都被停止 → 不提「请查」");
+         check(hasq(s, "已停止"), "都被停止 → 说的是「已停止」, 不是「未到位」");
+         check(!hasq(s, "未到位"), "被停止不许说成未到位 (那会让人去查一个不存在的故障)");
+      }
+
+      /* 三个结果词两两不同 —— 屏幕上分不出的两档等于没有这一档 */
+      const std::string w_ok   = ecatcmd::home_step_result_text(EM_HM_ATTAINED);
+      const std::string w_stop = ecatcmd::home_step_result_text(EM_HM_ABORTED);
+      const std::string w_bad  = ecatcmd::home_step_result_text(EM_HM_FAULT);
+
+      check(w_ok != w_stop && w_stop != w_bad && w_ok != w_bad,
+            "三个词两两不同 (屏幕上分不出的两档等于没有这一档)");
+
+      /* 「未到位」那一格必须**收得住**剩下所有的码 —— 少一个就漏出一个没名字的结局 */
+      const int all_bad[] = { EM_HM_PEER, EM_HM_HM_ERROR, EM_HM_TIMEOUT,
+                              EM_HM_NO_FRAMES, EM_HM_SETUP, EM_HM_RUNNING };
+      for (size_t k = 0; k < sizeof(all_bad) / sizeof(all_bad[0]); k++)
+         check(ecatcmd::home_step_result_text(all_bad[k]) == w_bad,
+               "除「到位」「已停止」之外的每一个码都是「未到位」",
+               std::string("rc = ") + std::to_string(all_bad[k]));
+   }
+
+   /* ---- PEER 那根在结论句里说真话 -------------------------------- */
+   caseBegin("两轴回零结论: 被带停的那根不许说成「操作员按了停止」");
+   {
+      /* rc_home 那张三值表把 EM_HM_PEER 与 EM_HM_ABORTED **挤在同一格** (都是 1),
+       * 只说得出「被「停止」中止」—— 而"没人按过停止"与"操作员按了停止"要人做的事完全
+       * 不同 (一个是查驱动器, 一个是重新发起)。step_rc 就是为了分开这一格才存在的:
+       * serviceHoming 里那条"被拉停"的话在**收尾之前**, 而收尾会把它覆盖掉, 所以只在
+       * 控制台上说不够, 结论句自己必须说对。 */
+      ecatcmd::HomeReport r;
+      r.axis = 1;
+      r.method = 24;
+      r.rc_home = ecatcmd::home_step_rc_legacy(EM_HM_PEER);
+      r.end = ecatcmd::HOME_END_HOLDING;
+
+      checkEq(r.rc_home, 1, "PEER 在老那张三值表里确实是 1 (所以光看它分不出来)");
+
+      r.step_rc = EM_HM_ABORTED;
+      check(hasq(ecatcmd::home_axis_note(r), "被「停止」中止"),
+            "真的是被停止 → 照旧说被「停止」中止");
+
+      r.step_rc = EM_HM_PEER;
+      check(hasq(ecatcmd::home_axis_note(r), "被另一根轴带停"),
+            "被对侧带停 → 说被另一根轴带停");
+      check(!hasq(ecatcmd::home_axis_note(r), "被「停止」中止"),
+            "被对侧带停 → **不许**说成操作员按了停止");
+
+      /* 措辞必须与 home_step_rc_text 那一档**同一份** —— 同一件事在屏幕上只许有一种说法 */
+      check(ecatcmd::home_step_result_text(EM_HM_ABORTED) == std::string("已停止"),
+            "批结论那一档的词仍是「已停止」 (它说的是操作员按的)");
+   }
+
+   /* ---- 拒绝理由前面那个点名 ------------------------------------ */
+   caseBegin("两轴回零点名: 单轴逐字不变, 两轴两个名字都在");
+   {
+      /* 单轴这一条**必须逐字等于**改造前 `axis_label(axis)` 那一个串 —— 拒绝理由那句是
+       * "%1 回零未发起, 驱动器未写入。%2", 换了名字就等于换了屏幕上的字 */
+      check(ecatcmd::home_axis_prefix(0x1u) == QStringLiteral("轴X"),
+            "单轴 (X) → 与 fromUtf8(axis_label(0)) 逐字相同");
+      check(ecatcmd::home_axis_prefix(0x2u) == QStringLiteral("轴Y"), "单轴 (Y) → 逐字相同");
+      check(ecatcmd::home_axis_prefix(0x3u) == QStringLiteral("轴X 轴Y"),
+            "两轴 → 两个名字都在, 中间一个空格 (不写「与」: 后面紧跟「回零未发起」)");
+      check(ecatcmd::home_axis_prefix(0u).isEmpty(), "空掩码 → 空串");
+
+      /* 总线级那几道不指向任何一根 (bad_mask = 0), 这时调用方退回用 mask —— 于是
+       * 单轴那条路的名字与改造前一致 (见 startHoming 里那一段) */
+      check(ecatcmd::home_axis_prefix(0u != 0 ? 0u : 0x1u) == QStringLiteral("轴X"),
+            "bad_mask 为 0 时退回 mask → 单轴仍是「轴X」");
+   }
+
+   /* ---- FakeBus 的两轴回零注入 ---------------------------------- */
+   caseBegin("两轴回零注入: 会话旗标与逐轴旗标一次置齐");
+   {
+      Rig r;
+      r.ctrl.setParams(Rig::smallParams());
+
+      r.bus.setHoming(0, 24);
+      BusTelem t = r.bus.telemetry();
+      check(t.homing, "逐轴那条路也会置上会话旗标");
+      check(t.ax[0].homing, "轴X 在回零");
+      checkEq(t.ax[0].homing_method, 24, "轴X 的方式号");
+      check(!t.ax[1].homing, "轴Y 没被连坐");
+
+      /* 两根: 调两次。**会话旗标只有一个来源** —— 真机上它是 m_homing / m_homing_mask,
+       * 所以这里也不给"置出一半"的机会 */
+      r.bus.setHoming(1, 29);
+      t = r.bus.telemetry();
+      check(t.homing && t.ax[0].homing && t.ax[1].homing, "两根都在回零");
+      checkEq(t.ax[1].homing_method, 29, "轴Y 的方式号");
+      checkEq(t.ax[0].homing_method, 24, "轴X 的方式号没被后一次覆盖");
+   }
+
+   /* ---- 「停止」打断了起手: 谁都不许被点名 ------------------------ */
+   caseBegin("两轴回零被停止打断: 全部记「已停止」, 不点任何一根的名");
+   {
+      /* 起手两段之间按下「停止」是**够得着**的: 第二根的 em_home_start 会看见那个请求并
+       * 返回 1, 而这时第一根已经举着 bit4 在找原点了。
+       *
+       * 这正是 `startHoming` 里那条 `if (rc == 1)` 单独成一支的理由 —— 若把"已启动的那几根"
+       * 记成 EM_HM_PEER, 批结论就会**点错人**: `home_batch_blame()` 的兜底前提是"非 PEER 的
+       * 那一根出了事", 而这里非 PEER 的那一根正是被停止请求拦住的那一根, 它没出事。 */
+      const unsigned both = 0x3u;
+      int            rc[2] = { EM_HM_ABORTED, EM_HM_ABORTED };
+
+      checkEq(ecatcmd::home_batch_end(rc, both), ecatcmd::HOME_BATCH_STOPPED,
+              "全部记「已停止」→ 自成一档, 不叫失败");
+      checkEq(ecatcmd::home_batch_blame(rc, both), -1, "没有元凶");
+
+      const QString s = ecatcmd::home_batch_summary(rc, both);
+      check(!hasq(s, "请查"), "不提「请查」—— 操作员按的停止不是任何一根的故障");
+      check(hasq(s, "轴X 已停止") && hasq(s, "轴Y 已停止"), "两根都说「已停止」");
+
+      /* 反面: 真把它记成 PEER 会点错人 —— 这一条钉的正是"不许那么记" */
+      rc[0] = EM_HM_ABORTED; rc[1] = EM_HM_PEER;
+      checkEq(ecatcmd::home_batch_blame(rc, both), 0,
+              "若记成 PEER, 兜底就会去点名**被停止拦住的那一根** —— 所以 startHoming 不许那么记");
    }
 }
 

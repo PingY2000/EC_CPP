@@ -1453,7 +1453,53 @@ QWidget *ScanWindow::buildHomePanel()
    g->setHorizontalSpacing(8);
    g->setVerticalSpacing(5);
 
-   m_edHomeVel = new QSpinBox(box);
+   /* ---- 第 0 行: 外露的那一个按钮 + 展开开关 ----
+    * **这一行是这块框平时唯一看得见的东西** (用户要的): 速度 / 超时 / 那八个按钮全在下面的
+    * m_homeDetail 里, 收起时整块不可见。做法与 refreshMeterPanel() 那两行显隐同一个路子 ——
+    * QLayout 会把不可见的整行收掉, 不用自己算高度。
+    *
+    * ★ **收起不等于"没生效"**: 速度与超时那两个值一直都在被用 (它们是参数不是存档), 只是
+    * 看不见。所以按钮的 tooltip 里**一个数字都不写** —— 写了必然会与那两个框里的值对不上
+    * (这个教训在 m_edHomeTmo 那里已经吃过一次)。报数字的活儿交给按下之后那条横幅: 它由
+    * 工作线程按**真正下发的那几个值**出, 不会过期。 */
+   m_btnHomeBoth = new QPushButton(QStringLiteral("回零校准"), box);
+   m_btnHomeBoth->setObjectName(QStringLiteral("danger"));
+   /* 文案按 CLAUDE.md §1 六条写: 无 `**` / 无操作步骤 / 出路只许「请……」/ 操作类 tooltip
+    * 4 行 90 字以内。第二行那句是机械风险在界面上唯一能做的事 —— 若一根的行程穿过另一根
+    * 的位置, 这一趟就不能用 (§33.7 第 1 条), 而软件判不出这件事, 只能先说出来。
+    * **一个数字都不写**: 速度与超时框收起时看不见, 写在这里的必然与它们在框里的值对不上。 */
+   m_btnHomeBoth->setToolTip(QStringLiteral(
+      "轴X 轴Y 同时按方式 24 正向回零, 以原点开关 (X0) 为原点。\n"
+      "两根轴会同时带电运动; 行程可能相碰时请改用各轴单独的按钮。\n"
+      "启动前先失能; 按「停止」可立即中止。"));
+   connect(m_btnHomeBoth, &QPushButton::clicked, this, &ScanWindow::onHomeBothClicked);
+
+   m_btnHomeFold = new QPushButton(box);
+   /* 不加 objectName: 它不是危险动作。宽度由 layout 给, 文字在下面那一次 setChecked 里写 */
+   m_btnHomeFold->setCheckable(true);
+   m_btnHomeFold->setChecked(false);   /* 缺省收起 —— 平时只外露一个按钮 */
+   connect(m_btnHomeFold, &QPushButton::clicked, this, &ScanWindow::onHomeFoldToggled);
+
+   g->addWidget(m_btnHomeBoth, 0, 0, 1, 4);
+   g->addWidget(m_btnHomeFold, 0, 4);
+
+   /* ---- 第 1 行: 收起来的那一整块 ----
+    * 它自己一个 grid, 行的编号与改造前完全一样 (0 = 速度, 1 = 超时, 2/3 = 两行按钮) ——
+    * 搬进来只是换了个父控件, 里面一个格子都没动。 */
+   m_homeDetail = new QWidget(box);
+   /* `dg` 而不是 `d`: 下面那个内层循环里 `d` 已经是**方向** (0 = 正, 1 = 负) */
+   QGridLayout *dg = new QGridLayout(m_homeDetail);
+   dg->setContentsMargins(0, 4, 0, 0);
+   dg->setHorizontalSpacing(8);
+   dg->setVerticalSpacing(5);
+
+   g->addWidget(m_homeDetail, 1, 0, 1, 5);
+
+   /* 收起时的可见性由这一处决定 (构造之后一次、按下之后一次) —— 别处再 setVisible 会被
+    * 那两次里的一次覆盖掉 */
+   onHomeFoldToggled();
+
+   m_edHomeVel = new QSpinBox(m_homeDetail);
    m_edHomeVel->setRange(HMI_HOME_VEL_MIN, HMI_HOME_VEL_MAX);
    m_edHomeVel->setSingleStep(1000);   /* 与「扫描速度」「手动速度」同一个步长 */
    m_edHomeVel->setSuffix(QStringLiteral(" pul/s"));
@@ -1474,7 +1520,7 @@ QWidget *ScanWindow::buildHomePanel()
     * 做成可改是因为原来的常量 30 s 只对缺省速度成立: 速度下限 100 pul/s 时 30 s 只走 0.06 圈。
     * 八个按钮共用。上下限就是 HMI_HOME_TMO_*_S, 工作线程里还夹同一道 (两处夹取必须一致,
     * 自检里有一对断言钉着这件事)。值进 scan.ini 的 ui/home_tmo_s。 */
-   m_edHomeTmo = new QSpinBox(box);
+   m_edHomeTmo = new QSpinBox(m_homeDetail);
    m_edHomeTmo->setRange(HMI_HOME_TMO_MIN_S, HMI_HOME_TMO_MAX_S);
    m_edHomeTmo->setSingleStep(10);
    m_edHomeTmo->setSuffix(QStringLiteral(" s"));
@@ -1489,11 +1535,11 @@ QWidget *ScanWindow::buildHomePanel()
 
    /* 这两个框占满第 1~4 列: 前两行上再没有别的东西了 ([保存][取消] 原来摆在 3~4 列, 现在
     * 挪到框标题那一行) —— 不收满就会在速度框右边空出一块, 正对着下面那四个按钮的宽度 */
-   g->addWidget(new QLabel(QStringLiteral("速度"), box), 0, 0);
-   g->addWidget(m_edHomeVel, 0, 1, 1, 4);
+   dg->addWidget(new QLabel(QStringLiteral("速度"), m_homeDetail), 0, 0);
+   dg->addWidget(m_edHomeVel, 0, 1, 1, 4);
 
-   g->addWidget(new QLabel(QStringLiteral("超时"), box), 1, 0);
-   g->addWidget(m_edHomeTmo, 1, 1, 1, 4);   /* 与速度同一列, 一眼看出是两个同类的数 */
+   dg->addWidget(new QLabel(QStringLiteral("超时"), m_homeDetail), 1, 0);
+   dg->addWidget(m_edHomeTmo, 1, 1, 1, 4);   /* 与速度同一列, 一眼看出是两个同类的数 */
 
    /* [保存][取消] 摆在框标题那一行的右端 (同另外三块框), 不占这个网格的格子 */
    panelBar(PI_HOME, box);
@@ -1510,9 +1556,9 @@ QWidget *ScanWindow::buildHomePanel()
     * 方向对不对只有试一次才知道 */
    for (int i = 0; i < 2; i++)
    {
-      QLabel *nm = new QLabel(QStringLiteral("轴%1").arg(i == 0 ? 'X' : 'Y'), box);
+      QLabel *nm = new QLabel(QStringLiteral("轴%1").arg(i == 0 ? 'X' : 'Y'), m_homeDetail);
       nm->setStyleSheet(QStringLiteral("color:#9aa3ae;"));
-      g->addWidget(nm, i + 2, 0);   /* i + 2: 上面有「速度」「超时」两行 */
+      dg->addWidget(nm, i + 2, 0);   /* i + 2: 上面有「速度」「超时」两行 */
 
       for (int d = 0; d < 2; d++)
       {
@@ -1523,7 +1569,7 @@ QWidget *ScanWindow::buildHomePanel()
             const int meth = ecatcmd::home_method_for(neg);
 
             m_btnHome[i][d] = new QPushButton(
-               QString::fromUtf8(kHomeBtnText[d]), box);
+               QString::fromUtf8(kHomeBtnText[d]), m_homeDetail);
             m_btnHome[i][d]->setObjectName(QStringLiteral("danger"));
             m_btnHome[i][d]->setToolTip(QStringLiteral("轴%1: 6098h = %2, 以原点开关 (X0) 为原点, 先向%3高速寻找。\n"
                                                        "该轴由驱动器驱动, 启动前先失能; 按「停止」可立即中止。\n"
@@ -1532,7 +1578,7 @@ QWidget *ScanWindow::buildHomePanel()
             connect(m_btnHome[i][d], &QPushButton::clicked, this,
                      [this, i, d] { onHomeClicked(i, d, false); });
 
-            g->addWidget(m_btnHome[i][d], i + 2, 1 + d);
+            dg->addWidget(m_btnHome[i][d], i + 2, 1 + d);
          }
 
          /* ---- 找限位开关 (方式 18 / 17, 手册叫"以限位开关为原点") ----
@@ -1541,7 +1587,7 @@ QWidget *ScanWindow::buildHomePanel()
             const int meth = ecatcmd::home_lim_method_for(neg);
 
             m_btnLim[i][d] = new QPushButton(
-               QString::fromUtf8(kHomeBtnText[2 + d]), box);
+               QString::fromUtf8(kHomeBtnText[2 + d]), m_homeDetail);
             m_btnLim[i][d]->setObjectName(QStringLiteral("danger"));
             m_btnLim[i][d]->setToolTip(QStringLiteral("轴%1: 6098h = %2, 以%3开关为原点。\n"
                                                       "开关未触发时: 先向%4高速寻找, 触发后减速停止并反向低速退出。\n"
@@ -1551,16 +1597,82 @@ QWidget *ScanWindow::buildHomePanel()
             connect(m_btnLim[i][d], &QPushButton::clicked, this,
                      [this, i, d] { onHomeClicked(i, d, true); });
 
-            g->addWidget(m_btnLim[i][d], i + 2, 3 + d);
+            dg->addWidget(m_btnLim[i][d], i + 2, 3 + d);
          }
       }
    }
 
    /* 四列按钮等分本行宽度 (行首那列只放轴名, 不参与拉伸) */
    for (int c = 1; c <= 4; c++)
-      g->setColumnStretch(c, 1);
+      dg->setColumnStretch(c, 1);
+
+   /* 外层: 第 0 列是那个大按钮 (占 4 列宽), 第 4 列是展开开关 —— 开关不参与拉伸,
+    * 否则它会跟着按钮一起变宽, 看着像个动作按钮 */
+   g->setColumnStretch(2, 1);
+   g->setColumnStretch(4, 0);
 
    return box;
+}
+
+/* 「展开 / 收起」。**唯一一处写这块面板可见性与那个开关文字的地方** —— 构造时一次、
+ * 每次按下一次, 共两处调用点, 都在这个函数与它上面那个构造函数里。
+ *
+ * 收起时 `m_homeDetail` 那一行整块不可见 (QLayout 自动收掉), 但**里面的值照样生效**:
+ * 速度与超时是"正在用的参数", 不是存档 —— 那两个框的 tooltip 里因此一个数字都不写。 */
+void ScanWindow::onHomeFoldToggled()
+{
+   const bool open = (m_btnHomeFold != nullptr) && m_btnHomeFold->isChecked();
+
+   if (m_homeDetail != nullptr)
+      m_homeDetail->setVisible(open);
+
+   if (m_btnHomeFold != nullptr)
+      m_btnHomeFold->setText(open ? QStringLiteral("收起") : QStringLiteral("展开"));
+}
+
+/* 「回零校准」—— 一次把 X 与 Y 都按方式 24 (正向找原点) **同时**发起。
+ *
+ * 为什么不复用 onHomeClicked 两次: 那个槽是"点一根", 两次调就是**串行**两趟 (第一根走完才
+ * 轮到第二根), 而在机械上这本是两根各走各的 —— 串行不是硬件的限制, 是上位机以前那个阻塞
+ * 循环造成的 (docs/scan_sweep.md §33)。这一条走 postHomeBoth, 一趟两根。
+ *
+ * **零点世代不在这里推** (同 onHomeClicked 那一句, 理由也同): 那道闸可能把命令拦掉, 命令也
+ * 可能一直躺在队列里, GUI 猜不准"到底动没动", 所以世代由工作线程在真写 m_origin[] 的地方
+ * 维护。这里推一次的话, 被闸拦掉的那一趟会白白换掉世代 —— 而续扫正是靠世代判断
+ * "已采的点还算不算数"。 */
+void ScanWindow::onHomeBothClicked()
+{
+   /* 扫描中一律拦住 (与 onHomeClicked 同一道; 按钮在扫描期间本来就是灰的)。
+    * 这一条**不是照抄**: 两根同时动的代价比一根大, 所以这里也必须有第二道。 */
+   if (m_ctl->running())
+   {
+      hint(QStringLiteral("扫描进行中, 回零不可用。"), true);
+      return;
+   }
+
+   /* 速度与超时是**正在生效的值**, 与收起/展开无关 —— 界面把报数字的活儿交给工作线程
+    * (横幅里按真正下发的值出), 所以这里一个数字都不印在按钮上。 */
+   const uint32_t vel = ecatcmd::home_vel_clamp(m_edHomeVel->value());
+   const int      tmo = ecatcmd::home_tmo_s_clamp(m_edHomeTmo->value());
+   const int      met = ecatcmd::home_method_for(false);   /* 方式 24 = 正向找原点 */
+
+   int      method[EM_MAX_AXES] = {};
+   uint32_t v[EM_MAX_AXES]      = {};
+
+   for (int i = 0; i < 2; i++)
+   {
+      method[i] = met;
+      v[i]      = vel;
+   }
+
+   /* **零点世代不在这里推**(同 onHomeClicked): 那道闸可能把命令拦掉, 命令也可能一直躺在
+    * 队列里, GUI 猜不准 —— 世代由工作线程在真写 m_origin[] 那三处维护。 */
+   m_thr->postHomeBoth(0x3u, method, v, tmo);
+
+   /* 这一句只在**命令没被那道闸接住**时才留得住 (真开始回零的话, 最多 33ms 之后 refresh
+    * 就会用"轴X 轴Y 正在回零 (方式 24)…"那条**状态**横幅把它盖掉 —— 那是设计如此)。 */
+   hint(QStringLiteral("轴X 轴Y 正向回零已下发 (方式 %1, 速度 %2 pul/s)。")
+           .arg(met).arg(vel), false);
 }
 
 QWidget *ScanWindow::buildParamPanel()
@@ -3430,14 +3542,17 @@ void ScanWindow::pushManualSpeed(const BusTelem &t, bool running)
  * 这里只读 a.limit_active。 */
 void ScanWindow::refreshAxisSignals(const BusTelem &t)
 {
-   /* 正在这一根上找限位 (方式 17/18)。**这一位会让下面那条红横幅闭嘴** —— 找限位就是要去
-    * 撞那个开关, 限位信号置起是这一趟的**目的**而不是出了事; 而且那条红横幅与"正在找限位"
-    * 那条状态横幅争同一个 m_banner, 争赢的结果是唯一一句"按「停止」可立即中止"被顶掉。 */
-   const bool finding_limit = t.homing && ecatcmd::home_method_is_limit(t.homing_method);
-
    for (int i = 0; i < 2; i++)
    {
       const AxisTelem &a = t.ax[i];
+
+      /* 正在**这一根**上找限位 (方式 17/18)。**这一位会让下面那条红横幅闭嘴** —— 找限位就是
+       * 要去撞那个开关, 限位信号置起是这一趟的**目的**而不是出了事; 而且那条红横幅与"正在找
+       * 限位"那条状态横幅争同一个 m_banner, 争赢的结果是唯一一句"按「停止」可立即中止"被顶掉。
+       *
+       * 判据落在**这一根**上 (a.homing / a.homing_method), 不是整个会话: 两轴并行时 X 在找
+       * 原点、Y 在找限位是常态, 用会话级的量会让 X 那条红横幅也被压掉。 */
+      const bool finding_limit = a.homing && ecatcmd::home_method_is_limit(a.homing_method);
 
       /* "不知道"的判据跟状态机完全一致 (ScanController 自动中止那一段用的就是
        * !valid || !mirror_ok): 判得比状态机宽的话, 会出现灯说"正常"而程序已经因为
@@ -3539,7 +3654,7 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
           * m_limShown[i] 上面已经置 true 了, 所以这一趟不会反复重算;
           * m_limBanner[i] 刻意**不写** —— 下面那个清理分支是按"这一位掉下去"清的,
           * 掉下去时 m_limShown 归 false, 于是找完限位之后压着限位启扫, 该响的还是响。 */
-         if (finding_limit && i == t.homing_axis)
+         if (finding_limit)
             continue;
 
          /* 「是什么状态」与「接下来查哪儿」两句都从 ecatcmd 里取 —— 那里是唯一一处定义,
@@ -3742,6 +3857,14 @@ void ScanWindow::refresh()
     * 一帧不跑, 且轴此刻按 HM 解释, 607Ah 不是目标位置 (命令只会排队, 点了没反应) */
    const bool can_home = can_move && t.in_op && !t.homing && !t.resetting;
 
+   /* 「回零校准」走的是**一趟两根**, 所以两根都得合格才可按 —— 任一根不合格时工作线程那道闸
+    * 会整体不动, 而让它先按不动比按下之后再报"整体不动"更好 (同那八个按钮的判据)。
+    * 它**不看另外一根是否在回零**: can_home 里已经含 !t.homing (会话级)。 */
+   if (m_btnHomeBoth != nullptr)
+      m_btnHomeBoth->setEnabled(can_home &&
+                                t.ax[0].valid && t.ax[0].mirror_ok && !t.ax[0].fault &&
+                                t.ax[1].valid && t.ax[1].mirror_ok && !t.ax[1].fault);
+
    /* 「使能」: 已使能就灰掉并把字改成「已使能」—— 没有确认框了, 带不带电只能由按钮自己说。
     * 判据看每一根而非只看轴0: 还有轴没使能就仍可按 (故障复位会把某一根单独打回未使能)。 */
    bool any_enabled = false, any_off = false;
@@ -3770,9 +3893,11 @@ void ScanWindow::refresh()
     * (它们是动作不是参数)。 */
    for (int i = 0; i < 2; i++)
    {
+      /* `mine` 必须问**这一根** (t.ax[i].homing), 不能问会话级那个 t.homing: 两轴并行时
+       * 后者对两根都真, 报出来的就是"两根都在回零中…" —— 而按钮上的字要能分辨是哪一根。 */
       const bool    ok   = can_home && t.ax[i].valid && t.ax[i].mirror_ok && !t.ax[i].fault;
-      const bool    mine = t.homing && (t.homing_axis == i);
-      const bool    mine_lim = mine && ecatcmd::home_method_is_limit(t.homing_method);
+      const bool    mine = t.ax[i].homing;
+      const bool    mine_lim = mine && ecatcmd::home_method_is_limit(t.ax[i].homing_method);
 
       for (int d = 0; d < 2; d++)
       {
@@ -3794,42 +3919,40 @@ void ScanWindow::refresh()
    /* 「回零速度」不进上面那张 locked 表, 扫描期间也可改 (它是个值不是动作)。框里那两行
     * 小字 (能找多远 / 6061h) 随它一起删了, 现在这个框里没有按速度重算的文字。 */
 
-   /* 回零横幅: 上升沿起一条, 下降沿只清我们自己写的那条 (原文比对, 同 m_limBanner) */
+   /* 回零横幅: 上升沿起一条, 下降沿只清我们自己写的那条 (原文比对, 同 m_limBanner)。
+    *
+    * **收哪些根由逐轴旗标决定 (t.ax[i].homing), 不按会话级那个 t.homing 猜一根** ——
+    * 两轴并行时"只说一根"是这次改造最不该出的错, 所以这里把正在回零的每一根都收进来,
+    * 文案交给 ecatcmd::home_batch_banner() 一处出 (单轴那条分支逐字等于改造前那句)。 */
+   QString home_s;
+
    if (t.homing)
    {
-      const int     m      = t.homing_method;
-      const bool    is_lim = ecatcmd::home_method_is_limit(m);
-      const QString nm     = (t.homing_axis == 0) ? QStringLiteral("X") : QStringLiteral("Y");
-      const int     ai     = (t.homing_axis >= 0 && t.homing_axis < 2) ? t.homing_axis : 0;
+      ecatcmd::HomeBannerIn in[EM_MAX_AXES];
+      int                    n = 0;
 
-      QString s;
-      if (is_lim)
+      for (int i = 0; i < 2; i++)
       {
-         /* 找限位: **不在这句里声称它现在朝哪走**。"这一趟走 a) 还是 b)"是发起那一刻按
-          * 驱动器自己那两位定下来的, 而这里手上只有界面反相之后的值 —— 「上位机侧取反」
-          * 开着时两者正好相反, 说成"正在反向退开"会恰好说反。分支预告在控制台里 (那句
-          * 是工作线程按驱动器自己的读数打的); 这里只报**信号此刻有效**这件事实, 与限位灯
-          * 同一份量、同一个措辞。 */
-         s = QStringLiteral("轴%1 正在%2 (方式 %3), 按「停止」可立即中止。")
-                .arg(nm, QString::fromUtf8(ecatcmd::home_method_short(m)))
-                .arg(m);
+         if (!t.ax[i].homing)
+            continue;
 
-         if (t.ax[ai].dig_known &&
-             ecatcmd::home_lim_target_active(m, t.ax[ai].dig_pos, t.ax[ai].dig_neg))
-            s += QStringLiteral(" [%1信号有效]")
-                    .arg(QString::fromUtf8(ecatcmd::home_lim_switch_name(m)));
-      }
-      else
-      {
-         s = QStringLiteral("轴%1 正在回零 (方式 %2, 先向%3高速寻找), 按「停止」可立即中止。")
-                .arg(nm).arg(m)
-                .arg(QString::fromUtf8(ecatcmd::home_method_first_dir(m, false)));
+         in[n].axis      = i;
+         in[n].method    = t.ax[i].homing_method;
+         in[n].dig_known = t.ax[i].dig_known;
+         in[n].dig_pos   = t.ax[i].dig_pos;
+         in[n].dig_neg   = t.ax[i].dig_neg;
+         n++;
       }
 
-      if (m_homeBanner != s)
+      home_s = ecatcmd::home_batch_banner(in, n);
+   }
+
+   if (!home_s.isEmpty())
+   {
+      if (m_homeBanner != home_s)
       {
-         m_homeBanner = s;
-         hint(s, false);
+         m_homeBanner = home_s;
+         hint(home_s, false);
          /* hint() 会给非故障提示挂 8 秒自尽。回零是进行中的状态不是事件, 且这句上挂着
           * "按「停止」可立即中止" —— 让它自己消失, 超时那条路上就没了出路 */
          m_bannerTimer->stop();
@@ -3837,6 +3960,8 @@ void ScanWindow::refresh()
    }
    else if (!m_homeBanner.isEmpty())
    {
+      /* 会话在跑、但一根都没报"在回零" (理论上到不了: 起手那处直写与 publish 是同源的) ——
+       * 这时**清掉**而不是留着上一句: 留着的那句会说出一个已经不在动的轴。 */
       if (m_banner->text() == m_homeBanner)
       {
          m_banner->setVisible(false);
@@ -4043,8 +4168,8 @@ void ScanWindow::warnMaybeLive()
 
 void ScanWindow::disconnectAndStop()
 {
-   /* 回零进行中先掐掉它: 这条断开路径是同步等的 (下面 12 秒), 而回零单次能阻塞到**整个回零
-    * 超时**(缺省 120 s, 上限 600 s) —— 不掐的话 12 秒空转到底, 最后 QThread 会在 em_home 还在
+   /* 回零进行中先掐掉它: 这条断开路径是同步等的 (下面 18 秒), 而回零单次能阻塞到**整个回零
+    * 超时**(缺省 120 s, 上限 600 s) —— 不掐的话 18 秒空转到底, 最后 QThread 会在 em_home 还在
     * 泵帧时被拆掉。
     * requestMotionStop() 只往一个标志里存 1, 与「停止」按钮直呼的是同一个。
     * 必须先于下面的 postDisconnect: 命令排队, 队列要等回零退出来才轮到。 */
@@ -4064,7 +4189,15 @@ void ScanWindow::disconnectAndStop()
 
    /* 等它真的收完: 条件是"不在发帧且不在忙", 不是"点过断开" —— teardown 排队执行,
     * 从投递到开跑之间有一小段, 只看 in_op 会在那一段误判成收完了。
-    * 每根轴的失能确认与状态机迁移都有超时, 所以给到 12 秒。
+    * 每根轴的失能确认与状态机迁移都有超时。
+    *
+    * **上限是 18 秒 (900 圈), 2026-09-24 从 12 秒提上来的**, 因为「回零校准」一次收尾
+    * **两根轴**: 收尾阶梯是逐轴做的 (X 走完五步再 Y), 单轴最坏 8 s, 两根就是 16 s ——
+    * 而 16 s > 600 × 20 ms = 12 s。超时的后果不是"多等一会儿", 是**等待循环先退出、
+    * QThread 随后在 em_disable 还在泵帧的时候被拆掉**。单轴那 8 s < 12 s, 所以这个缺口
+    * 是两轴这一步引入的、改造前不存在 (scan_sweep.md §33.5(b))。
+    * 18 s 按"两根各 8 s + 2 s 余量"取, 只影响**正常收完的情况**下多出来的等待 ——
+    * 收完了就 break, 这个上限本身不产生任何延迟。
     *
     * **那一道"先掐掉"有一个窄缝**(2026-09-22 补): 上面判 homing 时 CMD_HOME 可能还在队列里,
     * 于是 homing 还是 false、标志没置上, 而线程随后要阻塞**整个回零超时**才轮到
@@ -4072,7 +4205,7 @@ void ScanWindow::disconnectAndStop()
     * 的模态框。所以在等待循环里补一次: 一旦 homing 真的变真就再掐一下。
     * 这时 requestMotionStop 落在 doHome 直接写 m_telem.homing = true **之后**, 也就是
     * em_clear_stop() 之后, 所以不会被清掉。这样这条路的时长就与超时值无关了。 */
-   for (int i = 0; i < 600; i++)
+   for (int i = 0; i < 900; i++)
    {
       const BusTelem t = m_thr->telemetry();
       if (!t.in_op && !t.busy)

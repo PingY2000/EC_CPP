@@ -96,12 +96,55 @@ void EcatThread::postFaultReset()
    m_cmds.enqueue(c);
 }
 
+/* 单轴那一趟 —— **内部就是两轴那一套**, 只圈一根。老那三个字段照样填 (别的读者还有), 但
+ * `hm_mask` 非空, 所以 drainCommands 走的是两轴那条路, 而那一趟的会话大小恰好是 1。
+ * 这正是"改造前后单轴行为一致"能被自检钉住的原因 (§33.7 第 7 条)。 */
 void EcatThread::postHome(int axis, int method, uint32_t vel_fast, int tmo_s)
 {
    QMutexLocker lk(&m_mtx);
    Cmd c; c.type = CMD_HOME; c.axis = axis; c.method = method;
    c.value = (int32_t)vel_fast;
    c.tmo_s = tmo_s;
+
+   if (axis >= 0 && axis < EM_MAX_AXES)
+   {
+      c.hm_mask          = (1u << axis);
+      c.hm_method[axis]  = method;
+      c.hm_vel[axis]     = vel_fast;
+   }
+
+   m_cmds.enqueue(c);
+}
+
+/* 一趟几根同时。「回零校准」走这一条 (mask = 0b11)。 */
+void EcatThread::postHomeBoth(unsigned mask, const int *method, const uint32_t *vel_fast,
+                              int tmo_s)
+{
+   if (mask == 0)
+      return;
+
+   QMutexLocker lk(&m_mtx);
+   Cmd c; c.type = CMD_HOME; c.tmo_s = tmo_s;
+   c.hm_mask = mask;
+
+   for (int i = 0; i < EM_MAX_AXES; i++)
+      if ((mask & (1u << i)) != 0)
+      {
+         c.hm_method[i] = (method != nullptr) ? method[i] : 0;
+         c.hm_vel[i]    = (vel_fast != nullptr) ? vel_fast[i] : 0;
+      }
+
+   /* 老那三个字段也填上第一根 —— 它们是"这一趟的默认值"。两轴时 drainCommands 不读它们,
+    * 但调试时从队列里看一条 CMD_HOME 应当能一眼看出它瞄的是谁。 */
+   for (int i = 0; i < EM_MAX_AXES; i++)
+      if ((mask & (1u << i)) != 0)
+      {
+         c.axis   = i;
+         c.method = c.hm_method[i];
+         c.value  = (int32_t)c.hm_vel[i];
+         break;
+      }
+
    m_cmds.enqueue(c);
 }
 
@@ -111,7 +154,10 @@ void EcatThread::setKeepOrigin(bool on) { m_keep_origin = on; }
 
 /* 「停止」在回零期间走这一个 —— **全程序唯一一处 GUI 线程直呼 motor_api**。
  * 安全: em_request_stop() 只往一个 `static volatile sig_atomic_t` 里存 1, 不碰总线/网卡。
- * 非如此不可: 回零阻塞在工作线程里, 一条 CMD_STOP 要等它自己退出来才轮到。 */
+ *
+ * 改造前非如此不可: 回零把工作线程整根占住, 一条 CMD_STOP 要等它自己退出来才轮到。
+ * 现在回零只占每圈的一步, 队列那条路也通了 (drainCommands 会话期间专门放行 CMD_STOP) ——
+ * 但这个入口**保留**, 两个理由: 它是"立即"的 (不等那一圈), 而且 scan/ 那个按钮按的是它。 */
 void EcatThread::requestMotionStop()
 {
    em_request_stop();
@@ -227,20 +273,30 @@ void EcatThread::requestQuit() { m_quit.store(true); }
  *   · 回调每帧一次 (2ms), 与平时那一圈的节拍一致 —— publish() 本来就是按这个频率写的。 */
 EcatThread::BlockTick::BlockTick(EcatThread *t) : m_t(t)
 {
+   if (m_t == nullptr)
+      return;
+
    /* "下面这一段时间里主循环发不出帧, 是我们自己造成的" —— 给帧间隔归因用。
     * **在构造时置起、不在析构时清**: 命令跑完那一刻正是那个间隔被测到的那一刻,
     * 析构先清掉就什么都归不到自己头上了, 于是我们自己一次使能造成的 1 秒静默会被
     * 读成"这台 PC 在卡", 把人支去查电源计划与网卡节能 (见 recover_verdict)。 */
-   if (m_t != nullptr)
-      m_t->m_gap_self_want = true;
+   m_t->m_gap_self_want = true;
 
-   if (m_t != nullptr && m_t->m_bus != nullptr)
+   /* **只有最外层那一次真的挂钩子** (理由见头文件里的 m_tick_depth)。
+    * 内层再挂一次没有意义 —— 钩子是"一个用户 + 一个函数", 挂第二遍等于覆盖同一份;
+    * 真正有害的是内层析构那一下摘掉外层的。 */
+   if (m_t->m_tick_depth++ == 0 && m_t->m_bus != nullptr)
       em_set_cycle_hook(m_t->m_bus, &EcatThread::BlockTick::tick, m_t);
 }
 
 EcatThread::BlockTick::~BlockTick()
 {
-   if (m_t != nullptr && m_t->m_bus != nullptr)
+   if (m_t == nullptr)
+      return;
+
+   /* 计数归 0 才摘 —— 与构造严格对称。少了 -- 那句, 摘不掉就等于一直挂着
+    * (那正是做成 RAII 要防的事)。 */
+   if (--m_t->m_tick_depth == 0 && m_t->m_bus != nullptr)
       em_set_cycle_hook(m_t->m_bus, nullptr, nullptr);
 }
 
@@ -258,6 +314,17 @@ void EcatThread::run()
    while (!m_quit.load())
    {
       drainCommands();
+
+      /* ---- 回零会话的每周期一步 ----
+       * **位置三条都不能动** (docs/scan_sweep.md §33):
+       *  - 在 drainCommands() 之后: 本圈刚发起的会话这一圈就要抬 bit4;
+       *  - 在 em_service() 之前: 它写进镜像的东西必须由**本圈**那一帧带出去;
+       *  - 在 interpolate() 之前: 有结局时收尾在**同一圈内**做完, 于是插补器永远看不到
+       *    "收尾做到一半"的轴。
+       * 也不放进下面那个 if (m_bus && m_in_op) 分支里: 总线掉出 OP 时那一支跑不到, 会话
+       * 就会一直挂着 —— 队列再也排不动, 界面上的「停止」也一直停在"立即中止"形态上。
+       * 那个分支条件由 serviceHoming() 自己判 (它会就地收尾并报出来)。 */
+      serviceHoming();
 
       if (m_bus != nullptr && m_in_op)
       {
@@ -365,12 +432,51 @@ void EcatThread::drainCommands()
 {
    for (;;)
    {
-      Cmd c;
+      Cmd  c;
+      bool took_stop = false;
+
       {
          QMutexLocker lk(&m_mtx);
-         if (m_cmds.isEmpty())
-            return;
-         c = m_cmds.dequeue();
+
+         /* ---- 回零会话活着: 队列**一条都不出队**, 只把「停止」挑出来 ----
+          * 这一段是 §33.5(a) 那个洞的补丁, 不是洁癖。下面那句 em_clear_stop() 每条命令都
+          * 清一次 g_stop, 而「停止」在回零期间**唯一的通路就是 g_stop** (GUI 直呼
+          * requestMotionStop(), 不经队列)。改造前安全, 是因为回零把工作线程整根占住 ——
+          * **队列在回零期间根本不会被排空**。改造后队列变活了: 任何一条躺在里面的命令被
+          * 出队, 都会把用户刚按下的「停止」悄悄抹掉。按住没反应、两根继续朝开关走, 而屏幕
+          * 上那句「按「停止」可立即中止」还挂着 —— 这是这次改造最不能出的错。
+          *
+          * 也不能"把别的命令排到回零后面"了事: postRange / postZeroHere / postDisconnect
+          * 原本都排在回零后面, 改造后它们会插进两根轴都带电的中间 —— 其中 postDisconnect
+          * 会在那一刻去收总线。
+          *
+          * CMD_STOP 是唯一例外: 它必须立刻生效, 所以就地取出来, 而且**不走**下面那句
+          * em_clear_stop() —— 它自己就是那个请求, 清掉等于把它自己抹了。 */
+         if (m_homing)
+         {
+            for (int k = 0; k < m_cmds.size(); k++)
+               if (m_cmds.at(k).type == CMD_STOP)
+               {
+                  m_cmds.removeAt(k);
+                  took_stop = true;
+                  break;
+               }
+
+            if (!took_stop)
+               return;
+         }
+         else
+         {
+            if (m_cmds.isEmpty())
+               return;
+            c = m_cmds.dequeue();
+         }
+      }
+
+      if (took_stop)
+      {
+         em_request_stop();
+         return;
       }
 
       /* 每一条命令都从"干净"开始: g_stop 是**进程级**的而且不会自己清, 上一条命令留下的
@@ -426,10 +532,37 @@ void EcatThread::drainCommands()
             break;
 
          case CMD_HOME:
-            /* 本程序里最长的一次阻塞 (回零超时那个值 + 收尾; 缺省 120 s, 上限 600 s):
-             * 使能灯、三个开关灯、位置、状态栏都在这一段里要跟着动。找限位时尤其 ——
-             * 那一趟的目的就是去压那个开关, 灯不跟着亮就没有任何东西能说明它压上了 */
-            { BlockTick tk(this); doHome(c.axis, c.method, (uint32_t)c.value, c.tmo_s); }
+            /* **只有起手这一段还阻塞** (三道闸 + 失能 + 5 笔 SDO + 启动), 最长几秒。
+             * 轮询那一大段现在跑在 run() 主循环的 serviceHoming() 里 —— 那些帧由主循环自己
+             * publish, 所以不必也不该套 BlockTick (套了会在会话期间每 2ms 白拷两遍 BusTelem)。
+             * 起手这一段仍旧要套: 那几笔 SDO 期间一帧都不发, 使能灯与位置不跟着动就说不过去。
+             * 起手就失败时收尾也在这一趟里做完 (startHoming 里那条路), 同样落在钩子内。 */
+            if (c.hm_mask != 0)
+            {
+               /* 两轴那条路 (单轴也从这里过 —— postHome 填的就是 `1 << axis`)。
+                * `hm_method` / `hm_vel` 是数组, 所以这里取的是**命令自己那份拷贝**的地址:
+                * startHoming 起手这一段是同步的 (它返回时轮询还没开始), 整个调用期内 `c`
+                * 都还在这个栈帧上, 指针一直有效。 */
+               BlockTick tk(this);
+               startHoming(c.hm_mask, c.hm_method, c.hm_vel, c.tmo_s);
+            }
+            else
+            {
+               /* `hm_mask == 0` 只可能来自一个**没填新字段的老调用方** (改造期间留下的一条
+                * 兜底, 现在没有这种调用方)。照老三个字段凑一趟单轴的, 而不是静默地什么都不做 ——
+                * "点了回零却没动"是这里最不该出的错。 */
+               const int axis = c.axis;
+               if (axis >= 0 && axis < EM_MAX_AXES)
+               {
+                  int      m[EM_MAX_AXES] = {};
+                  uint32_t v[EM_MAX_AXES] = {};
+                  m[axis] = c.method;
+                  v[axis] = (uint32_t)c.value;
+
+                  BlockTick tk(this);
+                  startHoming(1u << axis, m, v, c.tmo_s);
+               }
+            }
             break;
       }
    }
@@ -701,6 +834,15 @@ void EcatThread::doConnectInner(const QString &ifname)
 
 void EcatThread::doEnable()
 {
+   /* ---- 回零会话活着时, 这一族命令一律不动 ----
+    * 纵深防御的第二层 (第一层是 drainCommands: 会话期间除 CMD_STOP 外一条都不出队)。
+    * **必须有这一层**: 那一层靠的是 m_homing 这个"工作线程自己写的普通 bool", 一旦哪次
+    * 改造把它的时序动了 (比如把会话宣告挪到出队之后), 这些命令就会在一根轴正带电找原点的
+    * 时候动手 —— doRange 会夹目标、doZero 会搬零点, 两个都是"凭空一次没人按过的运动"。
+    * 留这一句比事后查那一次事故便宜得多。下面 doZero / doCenter / doRange 各有一句。 */
+   if (m_homing)
+      return;
+
    if (m_bus == nullptr || !m_in_op)
    {
       note(QStringLiteral("未连接总线"));
@@ -891,18 +1033,27 @@ void EcatThread::doFaultReset()
    note(s);
 }
 
-/* 回零 —— 驱动器自带的 HM 模式 (6060h = 6)。四个方式: 24/29 = 正/反向找**原点开关**,
+/* 回零起手 —— 驱动器自带的 HM 模式 (6060h = 6)。四个方式: 24/29 = 正/反向找**原点开关**,
  * 18/17 = 找**正/负限位开关** (手册 V2.4 p46~p48, 每个各带 a)/b) 两条分支)。
- * 三段顺序不能动: **闸 (一个字节都不写) -> 宣告 -> 动作 + 无条件收尾**, 因为 em_home() 的
- * 五条返回路径留下的状态没有一条可以不管 (后三条举着 bit4 返回, 驱动器那一刻还在找)。
- * 17/18 多一道闸 (两道否决) 与一句分支预告, 位置在两道现有闸之后、宣告之前。 */
-void EcatThread::doHome(int axis, int method, uint32_t vel_fast, int tmo_s)
+ *
+ * 三段顺序不能动: **闸 (一个字节都不写) -> 宣告 -> 起手两段**, 因为失败路径留下的状态没有
+ * 一条可以不管 —— 起手失败时**就地收尾** (本函数最后那一段), 而不是简单 return。
+ * 17/18 多一道闸 (两道否决) 与一句分支预告, 位置在两道现有闸之后、宣告之前。
+ *
+ * **本函数不再等到回零结束**: 它返回时轮询还没开始。整个会话由三处拼成 ——
+ * 这里起手、`serviceHoming()` 每圈走一步、`finishHoming()` 收尾, 三者由 m_homing 串起来。
+ * 这样一根轴的等待不再占住工作线程, 两轴才可能同时动 (docs/scan_sweep.md §33)。 */
+void EcatThread::startHoming(unsigned mask, const int *method, const uint32_t *vel_fast,
+                             int tmo_s)
 {
-   if (axis < 0 || axis >= EM_MAX_AXES)
+   /* 掩码只许圈连上的轴。`postHome` / `postHomeBoth` 填的都是"要哪几根", 而"连上了几根"
+    * 是这里的事实 —— 圈到一根不存在的轴, 下面每一步都要为它多写一个特例。 */
+   mask &= (m_naxis >= EM_MAX_AXES) ? 0xFFFFFFFFu : ((1u << m_naxis) - 1u);
+
+   if (mask == 0)
       return;                    /* 编程错误, 不是操作员的事 */
 
    const bool bus_ready = (m_bus != nullptr) && m_in_op;
-   em_axis_t *ax = bus_ready ? m_ax[axis] : nullptr;
 
    /* 「还有轴在走」用工作线程**自己的真相** (m_want 对 m_tgt), 不用遥测 (有滞后);
     * 回零期间 interpolate() 不跑, 另一根轴的目标会停在半途。 */
@@ -914,30 +1065,52 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast, int tmo_s)
             any_moving = true;
    }
 
-   /* 用**刚读到的** 6041h: 本函数第一件事 em_disable() 真的会撤掉保持力矩 */
-   const bool mirror_ok = (ax != nullptr) && em_mirror_ok(ax) != 0;
-   const bool fault     = (ax != nullptr) && (em_sw(ax) & EM_SW_FAULT) != 0;
-
    /* 只放行四个 (24/29 找原点, 18/17 找限位)。em_home() 自己只查 [1,35], 别的方式的方向
-    * 语义没验过, 放进来是拿滑台去试 —— 而回零是**软件兜不住**的动作。 */
-   if (!ecatcmd::home_method_allowed(method))
+    * 语义没验过, 放进来是拿滑台去试 —— 而回零是**软件兜不住**的动作。
+    * **逐根先查**: 一根的方式号不合法就必须整体不动, 不能让它走到闸那里才发现。 */
+   for (int i = 0; i < EM_MAX_AXES; i++)
+      if ((mask & (1u << i)) != 0 && !ecatcmd::home_method_allowed(method[i]))
+      {
+         note(QStringLiteral("%1 回零方式 %2 不在允许范围内 (仅 24/29 找原点, 18/17 找限位), "
+                             "未写入驱动器。")
+                 .arg(QString::fromUtf8(ecatcmd::axis_label(i)))
+                 .arg(method[i]));
+         return;
+      }
+
+   /* 用**刚读到的** 6041h: 本函数第一件事 em_disable() 真的会撤掉保持力矩。
+    * 逐轴两份 —— 起手闸要**每一根都问一遍**, 而不能只看第一根 (§33.7 第 1 条那条). */
+   bool mirror_ok[EM_MAX_AXES] = {};
+   bool fault[EM_MAX_AXES]     = {};
+
+   for (int i = 0; i < EM_MAX_AXES; i++)
    {
-      note(QStringLiteral("回零方式 %1 不在允许范围内 (仅 24/29 找原点, 18/17 找限位), 未写入驱动器。")
-              .arg(method));
-      return;
+      if ((mask & (1u << i)) == 0)
+         continue;
+
+      const em_axis_t *ax = bus_ready ? m_ax[i] : nullptr;
+      mirror_ok[i] = (ax != nullptr) && em_mirror_ok(ax) != 0;
+      fault[i]     = (ax != nullptr) && (em_sw(ax) & EM_SW_FAULT) != 0;
    }
 
-   const char *why = ecatcmd::home_refusal(bus_ready && ax != nullptr, m_origin_ready,
-                                           mirror_ok, fault, any_moving);
-   if (why != nullptr)
+   /* ---- 起手闸: **一根不合格就整体不动** (用户选的语义) ----
+    * 文案与单轴那条路是同一份 (home_batch_refusal 内部就调 home_refusal), 只是这里要
+    * **把不合格的那几根都点名** —— 只说第一根, 操作员修完再撞一次才轮到第二根。 */
+   const ecatcmd::HomeGate gate =
+      ecatcmd::home_batch_refusal(bus_ready, m_origin_ready, any_moving, mask, mirror_ok, fault);
+
+   if (gate.reason != nullptr)
    {
+      /* 点名用 `bad_mask`, 而总线级那几道**不指向任何一根** (bad_mask = 0) —— 那时退回
+       * 用 `mask`: 操作员按的是"这几根", 屏幕上就得有这几根的名字。单轴时两条路都以
+       * 同一个名字打头, 于是那句话与改造前逐字相同。 */
       note(QStringLiteral("%1 回零未发起, 驱动器未写入。%2")
-              .arg(QString::fromUtf8(ecatcmd::axis_label(axis)),
-                   QString::fromUtf8(why)));
+              .arg(ecatcmd::home_axis_prefix(gate.bad_mask != 0 ? gate.bad_mask : mask),
+                   QString::fromUtf8(gate.reason)));
       return;
    }
 
-   const QString nm = QString::fromUtf8(ecatcmd::axis_label(axis));
+   const unsigned want = gate.ok_mask;
 
    /* ---- 找限位 (17/18) 的第二道闸 + 分支预告 ----
     * 位置在这里是量出来的: 早了没状态 (上面那道闸刚放行), 晚了已经卸力 (下面就是
@@ -946,170 +1119,449 @@ void EcatThread::doHome(int axis, int method, uint32_t vel_fast, int tmo_s)
     * 决定怎么走, 上位机反相只改显示。
     *
     * 预告必须打: 手册 a) 与 b) 两条分支的**首段方向是相反的**, 不说一句, 操作员会以为
-    * 自己点错了按钮, 而那时电机已经在动。 */
-   if (ecatcmd::home_method_is_limit(method))
+    * 自己点错了按钮, 而那时电机已经在动。
+    *
+    * ⚠️ 它必须**逐根都过一遍**再放行: 两根里只要有一根走不了, 这一趟整体不许发起 ——
+    * 否则另一根已经在找原点时这一根才报"不行", 而那时它已经动了。 */
+   for (int i = 0; i < EM_MAX_AXES; i++)
    {
+      if ((want & (1u << i)) == 0 || !ecatcmd::home_method_is_limit(method[i]))
+         continue;
+
+      em_axis_t *ax = m_ax[i];
+
       const bool dig_known = em_dig_in_known(ax) != 0;
       const bool pos_lim   = em_di_poslim(ax) != 0;
       const bool neg_lim   = em_di_neglim(ax) != 0;
-      const bool tgt       = ecatcmd::home_lim_target_active(method, pos_lim, neg_lim);
-      const bool other     = ecatcmd::home_lim_other_active(method, pos_lim, neg_lim);
+      const bool tgt       = ecatcmd::home_lim_target_active(method[i], pos_lim, neg_lim);
+      const bool other     = ecatcmd::home_lim_other_active(method[i], pos_lim, neg_lim);
 
       const char *no = ecatcmd::home_lim_refusal(dig_known, tgt, other);
       if (no != nullptr)
       {
          note(QStringLiteral("%1 %2 未发起, 驱动器未写入。%3")
-                 .arg(nm, QString::fromUtf8(ecatcmd::home_method_short(method)),
+                 .arg(QString::fromUtf8(ecatcmd::axis_label(i)),
+                      QString::fromUtf8(ecatcmd::home_method_short(method[i])),
                       QString::fromUtf8(no)));
          return;
       }
 
-      note(QString::fromUtf8(ecatcmd::home_lim_branch_text(method, tgt)));
+      /* **`.arg()` 是必须的** —— home_lim_branch_text 的文案里带一个 `%1` 占位符, 而改造前
+       * 这里漏了它, 控制台上打出来的是字面的"轴%1 找正限位 (方式 18)…"。 */
+      note(QString::fromUtf8(ecatcmd::home_lim_branch_text(method[i], tgt))
+              .arg(QString::fromUtf8(ecatcmd::axis_label(i))));
    }
-
-   /* ---- 宣告"正在回零"。**必须在第一个阻塞调用之前** ----
-    * 下面那两次加锁直写让界面**从第一个字节之前**就看得见 (界面靠它把「停止」换成立即中止);
-    * 之后这一整段之所以一直在刷新, 靠的是 CMD_HOME 上那个 BlockTick (见头文件)。
-    * 两件事都要: 直写不依赖回调挂没挂, 而回调那一份要等下一帧才出去。 */
-   m_homing = true;
-   m_homing_axis = axis;
-   m_homing_method = method;
-   {
-      QMutexLocker lk(&m_mtx);
-      m_telem.homing = true;
-      m_telem.homing_axis = axis;
-      m_telem.homing_method = method;
-   }
-
-   em_home_cfg_t cfg;
-   em_home_cfg_default(&cfg);
-   cfg.method   = method;
-   cfg.vel_fast = ecatcmd::home_vel_clamp((int32_t)vel_fast);
-   cfg.vel_slow = ecatcmd::home_vel_slow(cfg.vel_fast);
-   /* **acc 必须跟着速度一起算** (见 home_accel_for); offset 保持 0, 界面上没有它的控件 */
-   cfg.acc      = ecatcmd::home_accel_for(cfg.vel_fast);
 
    /* 回零超时的第二道夹取 (第一道是界面那个 spin box 的 setRange), 顺手把秒换算成毫秒。
-    * **全程序唯一一次 `* 1000`** —— 单位在 ini/界面/Cmd 里一律是秒, 换算点只有这一处。 */
+    * **全程序唯一一次 `* 1000`** —— 单位在 ini/界面/Cmd 里一律是秒, 换算点只有这一处。
+    * 超时是**整个会话共用的**一个值 (界面上只有一个框), 所以它算一次、每根都用它。 */
    const int      tmo_s2 = ecatcmd::home_tmo_s_clamp(tmo_s);
    const uint32_t tmo_ms = (uint32_t)tmo_s2 * 1000u;
 
-   /* ★ 先失能。6098h/6099h/609Ah/607Ch **只在未使能时可写** —— 这一刻该轴失去保持力矩,
-    * 竖直轴可能下滑, 这件事躲不掉。 */
-   int rc_disable = 0;
-   if (em_is_enabled(ax))
-      rc_disable = em_disable(ax);
+   /* ---- 把逐轴的值都填好, **最后**才置 mask ----
+    * mask 一置, publish() 就会拿着它去读 m_home_method[] / m_home_done[], 而下面那句
+    * em_disable() 的帧里就会跑一次 publish() (BlockTick 那个回调)。反过来的话, 那一帧会
+    * 报出一个方式号 0。 */
+   for (int i = 0; i < EM_MAX_AXES; i++)
+   {
+      if ((want & (1u << i)) == 0)
+         continue;
 
-   /* 0 = 到位 / 1 = 被停止请求中止 / 负 = 失败。比字面量, 不比 EM_R_OK (那是内部宏) */
-   const int rc_home = em_home(ax, &cfg, tmo_ms);
+      em_home_cfg_t cfg;
+      em_home_cfg_default(&cfg);
+      cfg.method   = method[i];
+      cfg.vel_fast = ecatcmd::home_vel_clamp((int32_t)vel_fast[i]);
+      cfg.vel_slow = ecatcmd::home_vel_slow(cfg.vel_fast);
+      /* **acc 必须跟着速度一起算** (见 home_accel_for); offset 保持 0, 界面上没有它的控件 */
+      cfg.acc      = ecatcmd::home_accel_for(cfg.vel_fast);
 
-   /* 收尾。**无条件, 顺序不能动。** */
+      /* 存下起手时算好的参数: 结论句在 finishHoming() 里写, 那里离这里有好几秒 */
+      m_home_cfg[i]        = cfg;
+      m_home_tmo_s[i]      = tmo_s2;
+      m_home_method[i]     = method[i];
+      m_home_rc[i]         = EM_HM_RUNNING;
+      m_home_done[i]       = false;
+      m_home_disable_rc[i] = 0;
+   }
 
+   /* ---- 宣告"正在回零"。**必须在第一个阻塞调用之前** ----
+    * 那次加锁直写让界面**从第一个字节之前**就看得见 (界面靠它把「停止」换成立即中止);
+    * 之后那几笔 SDO 期间之所以一直在刷新, 靠的是 CMD_HOME 上那个 BlockTick (见头文件)。
+    * 两件事都要: 直写不依赖回调挂没挂, 而回调那一份要等下一帧才出去。 */
+   m_homing      = true;
+   /* **赋值, 不是 |=**: 一次会话就是"这一趟要的那几根", 而 m_homing 为真时队列一条都不出队
+    * (drainCommands), 所以这里不会与上一次会话叠加。 */
+   m_homing_mask = want;
+   {
+      QMutexLocker lk(&m_mtx);
+
+      m_telem.homing = true;
+
+      for (int i = 0; i < EM_MAX_AXES; i++)
+         if ((want & (1u << i)) != 0)
+         {
+            m_telem.ax[i].homing        = true;
+            m_telem.ax[i].homing_method = method[i];
+         }
+   }
+
+   /* ★ 先失能,**逐根**。6098h/6099h/609Ah/607Ch **只在未使能时可写** —— 这一刻该轴失去
+    * 保持力矩, 竖直轴可能下滑, 这件事躲不掉。返回码要留着: 结论里那个「失能 %1」是它与
+    * 收尾那一次的**第一个非零值**, 与改造前那两句的合成规则一样。 */
+   for (int i = 0; i < EM_MAX_AXES; i++)
+   {
+      if ((want & (1u << i)) == 0)
+         continue;
+
+      if (em_is_enabled(m_ax[i]))
+         m_home_disable_rc[i] = em_disable(m_ax[i]);
+   }
+
+   /* ---- 起手两段: 写参数 (纯 SDO, 会静默总线) -> 启动 (有界阻塞, 自泵帧) ----
+    * **两轮的次序是硬约束: 所有 prepare 做完, 才轮到任何 start** (§33.3)。反过来的话,
+    * X 已经在找原点 (bit4 举着、等帧喂它), 主站却在给 Y 写 SDO —— X 那几秒一帧都收不到,
+    * 而那几秒正好够两台驱动器的 SM 看门狗动作。
+    *
+    * **在这里就结束本函数**: 轮询归 serviceHoming(), 收尾归 finishHoming()。 */
+   int fail_at    = -1;
+   int fail_phase = 0;      /* 0 = prepare 那一轮, 1 = start 那一轮 */
+   int rc         = 0;
+
+   for (int i = 0; i < EM_MAX_AXES && rc == 0; i++)
+      if ((want & (1u << i)) != 0 && (rc = em_home_prepare(m_ax[i], &m_home_cfg[i])) != 0)
+      {
+         fail_at    = i;
+         fail_phase = 0;
+      }
+
+   for (int i = 0; i < EM_MAX_AXES && rc == 0; i++)
+      if ((want & (1u << i)) != 0 && (rc = em_home_start(m_ax[i], tmo_ms)) != 0)
+      {
+         fail_at    = i;
+         fail_phase = 1;
+      }
+
+   if (rc == 0)
+      return;               /* 起手成功 —— 从这里开始, 每 2 ms 由 serviceHoming() 走一步 */
+
+   /* ---- 起手就失败: **就地收尾, 一条不留** ----
+    * 这一条与改造前"em_home() 返回非 0 之后仍旧走那整套收尾"逐行对应, 而它绝不是多余的:
+    * em_home_start 可能已经把轴使能了 (em_enable 成功、em__cw_step 超时), 甚至可能已经让
+    * 它动起来了 —— 那种轴必须有人把它交回确定状态。
+    *
+    * 定性**逐根分开**, 不能一律 SETUP:
+    *   · 已经轮到过的那几根 —— prepare 过了; 若失败发生在 start 那一轮, 它们**已经启动**,
+    *     正在找原点, 那是"被对侧拉停"(PEER), 不是"没跑起来"(SETUP);
+    *   · 失败的那一根 —— 0/1/负 三个返回码按老规矩映射;
+    *   · 还没轮到的 —— 一个字节都没写, 但它已经被先失能了, 照样要收尾。 */
+   if (rc == 1)
+   {
+      /* ★ **「停止」是全局的, 所以这一支要单独走**: 它一到, 这一趟里就没有谁"错了"。
+       * 每一根都记成"被停止" —— 包括已经启动起来的那几根: 拉停它们的是操作员, 不是对侧。
+       *
+       * 记成 `EM_HM_PEER` 会**点错人**: `home_batch_blame()` 的兜底前提是"非 PEER 的那一根
+       * 出了事", 而这里非 PEER 的那一根正是被停止请求拦住的那一根 —— 它没出事。于是批结论
+       * 会打出"请查 轴Y", 把操作员按的那个停止说成一根轴的故障。
+       * 全部记 ABORTED 之后 `home_batch_end()` 给的正是 `HOME_BATCH_STOPPED` —— 自成一档,
+       * 不叫失败 (与"两根都被按停"那一档合流, 那本来就是同一件事)。 */
+      for (int i = 0; i < EM_MAX_AXES; i++)
+         if ((want & (1u << i)) != 0)
+         {
+            m_home_rc[i]   = EM_HM_ABORTED;
+            m_home_done[i] = true;
+         }
+   }
+   else
+   {
+      for (int i = 0; i < EM_MAX_AXES; i++)
+      {
+         if ((want & (1u << i)) == 0)
+            continue;
+
+         /* 轮到过的那几根: start 那一轮失败时它们**已经启动**, 正举着 bit4 找原点 ——
+          * 那是"被对侧拉停" (PEER)。prepare 那一轮失败时它们只是写好了参数, 一个字都没动。 */
+         if (i < fail_at)
+            m_home_rc[i] = (fail_phase == 1) ? EM_HM_PEER : EM_HM_SETUP;
+         /* 失败的那一根与还没轮到的那些根都是 SETUP —— 前者"起手段就没跑起来", 后者
+          * 一个字节都没写。两种说法在屏幕上同一句, 而它们要人做的事也是同一件: 看控制台
+          * 弄清是哪一步 (prepare 的 -1 与 start 的 -1 在控制台上是两行不同的日志)。 */
+         else
+            m_home_rc[i] = EM_HM_SETUP;
+
+         m_home_done[i] = true;
+      }
+   }
+
+   finishHoming();
+}
+
+/* 回零会话的每周期一步。**只能从 run() 主循环调** (位置的三条理由写在 run() 里)。
+ *
+ * 三件事, 顺序不能动:
+ *   1. 逐轴走一步 —— 每一步只写输出镜像 (em_home_step 的契约), 并且**当场记下结局**;
+ *   2. 有一根出事 -> 其余的**在同一圈**被拉停 (用户选的"两根一起停");
+ *   3. 全部定局 -> 在**同一圈内**做完收尾 —— 于是插补器与别的命令永远看不到"收尾做到
+ *      一半"的轴。 */
+void EcatThread::serviceHoming()
+{
+   if (!m_homing)
+      return;
+
+   /* ---- 0. 总线没了就先收尾 ----
+    * 掉出 OP 或已经断开时, 会话不能就这么挂着: m_homing 一直真的话, 队列再也排不动
+    * (drainCommands), 界面上的「停止」也一直停在"立即中止"形态上, 而轴上什么都没有了。
+    * 收尾那几级会自己失败并报出来, 这正是要的: 让操作员看见"这一趟没走到头"。 */
+   if (m_bus == nullptr || !m_in_op)
+   {
+      finishHoming();
+      return;
+   }
+
+   /* ---- 1. 逐轴走一步 ---- */
+   bool any_failed = false;
+   int  blame      = -1;   /* 第一根**自己**出错的轴 (被拉停的不算, 所以不能事后反推) */
+
+   for (int i = 0; i < m_naxis; i++)
+   {
+      if ((m_homing_mask & (1u << i)) == 0 || m_home_done[i])
+         continue;
+
+      if (m_ax[i] == nullptr)
+      {
+         m_home_rc[i]   = EM_HM_SETUP;
+         m_home_done[i] = true;
+         any_failed     = true;
+         if (blame < 0)
+            blame = i;
+         continue;
+      }
+
+      const int rc = em_home_step(m_ax[i]);
+
+      if (rc != EM_HM_RUNNING)
+      {
+         m_home_rc[i]   = rc;
+         m_home_done[i] = true;
+
+         /* 到位与"被停止"都不是故障: 它们不该把对侧那一根拉停。
+          * 停下那一条尤其要紧 —— 停止请求是**全局**的, 同一圈里每一根都会看到它,
+          * 各自写回 0x000F 就是了, 再互相 abort 反而会覆盖掉各自的结局。 */
+         if (rc != EM_HM_ATTAINED && rc != EM_HM_ABORTED)
+         {
+            any_failed = true;
+            if (blame < 0)
+               blame = i;
+         }
+      }
+   }
+
+   /* ---- 2. 一根出事 -> 其余的同一圈拉停 ----
+    * **同一圈**: 对侧可能正在朝开关走, 拖到下一圈就多走一个 2ms 的步长, 而这只是最小
+    * 的代价 —— 真正的理由是"两根一起停"是用户在权衡过之后选的语义: 一根出事之后另一根
+    * 接着找一个已经不可信的零点, 没有意义。 */
+   if (any_failed)
+      for (int i = 0; i < m_naxis; i++)
+      {
+         if ((m_homing_mask & (1u << i)) == 0 || m_home_done[i] || m_ax[i] == nullptr)
+            continue;
+
+         em_home_abort(m_ax[i]);
+         m_home_rc[i]   = EM_HM_PEER;
+         m_home_done[i] = true;
+         /* 不许写"请查上一句": note() 是**覆盖写状态栏**, 而出错那根自己的结论句在这一句
+          * *之后*才出去 (结论统一在下面第 3 步逐轴说), 按时间顺序它反而是下一句。
+          *
+          * **这一句留着的理由是它说了别处说不出的一件事 —— 因果关系**: 后面那些结论句只会
+          * 说这一根"被另一根轴带停" (home_axis_note 里那一档), 不说元凶是谁; 批结论
+          * (home_batch_summary) 会点名元凶, 但不把两根连起来。只有这里同时说出"谁把谁拉停的"。 */
+         note(QStringLiteral("%1 回零被拉停: %2 出错。")
+                 .arg(QString::fromUtf8(ecatcmd::axis_label(i)),
+                      QString::fromUtf8(ecatcmd::axis_label(blame))));
+      }
+
+   /* ---- 3. 全部定局 -> 收尾 ---- */
+   for (int i = 0; i < m_naxis; i++)
+      if ((m_homing_mask & (1u << i)) != 0 && !m_home_done[i])
+         return;   /* 还有在跑的 */
+
+   finishHoming();
+}
+
+/* 收尾 + 结论。**无条件、顺序不能动** (与改造前逐行对应):
+ * 逐轴 [收尾阶梯 -> 重新锚定零点 -> 读 6061h -> 判定并一次说完], 最后一句批结论, 关会话。
+ *
+ * 为什么**逐轴**做完一根再做下一根: 每条轴在失能窗口里失去保持力矩, 逐步做会让两根的
+ * 窗口同时变长; 逐轴还保住了"是哪一根出的问题"这个信息 (docs/scan_sweep.md §33.6)。
+ * 代价是总时长变长, 认下来。 */
+void EcatThread::finishHoming()
+{
    /* ---- 0. 再清一次停止标志 ---- 补 drainCommands() 留下的洞: 那个停止请求瞄的是
     * **运动**, 而收尾的全部职责是抵达一个确定状态。 */
    em_clear_stop();
 
-   /* ---- 1. 失能 ---- ★ 不冗余: em_home() 在 bit3 / bit13 / 超时那三条路上是**举着
-    * bit4 返回**的, 驱动器那一刻**还在找**, 让它停下来的正是这里。 */
-   if (em_is_enabled(ax))
+   /* 先把要收尾的那几根**拍一张快照**: 下面每收完一根就把它的 mask 位清掉 (界面据此把
+    * 那一根的"回零中"落下), 而边遍历边改 mask 会漏掉后面那几根。 */
+   const unsigned mask = m_homing_mask;
+
+   /* ---- 结论攒在这里, 最后一句说 ---- ★ **每一根都不许被后一根覆盖掉** ----
+    * note() 是**覆盖写状态栏**, 所以逐轴 note 之后状态栏上只剩最后一根; 而"是哪一根出的问题"
+    * 正是这次改造最要紧的那条信息, 恰好可能被落在前面。两件事一起解决:
+    *   · 逐轴的整句照旧逐根 note (控制台与通知里一句不少, 与改造前的单轴逐字相同);
+    *   · 收尾之后再补一句**批结论**, 把每一根的结果都念一遍并点出元凶 —— 它最后写, 所以
+    *     状态栏上留下的是它 (同 doFaultReset() 那个"点名所有轴"的写法)。
+    * `n == 1` 时**不发这一句**: 那一趟必须与改造前逐字节一致 (§33.7 第 7 条)。 */
+   ecatcmd::HomeReport rep[EM_MAX_AXES];
+   ecatcmd::HomeEnd   ends[EM_MAX_AXES] = {};
+   int                step_rc[EM_MAX_AXES] = {};   /* em_home_step 的原始结局, 批结论要用 */
+   unsigned           rep_mask         = 0;
+   int                nrep             = 0;
+
+   for (int axis = 0; axis < EM_MAX_AXES; axis++)
    {
-      const int rc = em_disable(ax);
-      if (rc_disable == 0)
-         rc_disable = rc;
+      if ((mask & (1u << axis)) == 0)
+         continue;
+
+      em_axis_t *ax = m_ax[axis];
+
+      /* 轴已经不在了 (掉出 OP / 断开): 收尾阶梯没法走, 但结论**必须报** ——
+       * 这一趟没走到头这件事不能因为"总线先没了"就消失。 */
+      if (ax == nullptr)
+      {
+         note(QStringLiteral("%1 回零未完成: 总线已不在。")
+                 .arg(QString::fromUtf8(ecatcmd::axis_label(axis))));
+         m_home_done[axis] = true;
+         m_homing_mask &= ~(1u << axis);
+         continue;
+      }
+
+      /* 0 = 到位 / 1 = 被「停止」中止 / 负 = 失败。**映射只有一处**
+       * (ecatcmd::home_step_rc_legacy, 改造前它就是 em_home() 的返回码本身) */
+      const int rc_home  = ecatcmd::home_step_rc_legacy(m_home_rc[axis]);
+      const int attained = (m_home_rc[axis] == EM_HM_ATTAINED);
+
+      /* ---- 1..4b. 收尾阶梯 + 重锚 + 读模式 ---- 这一段会静默总线, 所以整段挂 BlockTick。
+       *
+       * ★ **挂 tick 不是装饰**: 改造前这几步天然在 doHome() 的那个 tick 底下, 拆开之后
+       * 没人替它们挂。失能 / 切模式 / 重新使能**每一级都是 SDO**, 而 SDO 事务期间过程数据
+       * **一帧都不发** —— 不挂的话界面在这儿停住 1~2 s, 更糟的是那段时间会被 frame-gap
+       * 读成"这台 PC 在卡, 去查电源计划与网卡节能" (2026-09-23 抓到的正是这个形态:
+       * m_gap_self_want 没人置)。它同时是验收第 8 条那个 max_gap_self_ms 的来源。
+       *
+       * ★ 1..3 不冗余: bit3 / bit13 / 超时 / 中止那四条路上驱动器**还在找**, 让它停下来的
+       * 正是这里。阶梯本身住在 motor_api (em_home_finish) —— 两轴并行时"逐轴做完"需要一个
+       * 单元, 而 em_axis_t* 是唯一自然的那一个。
+       *
+       * 起手就失败那条路 (startHoming 里调进来) 本来就在 CMD_HOME 那个钩子底下, 所以那
+       * 一趟是**嵌套**的 —— 嵌套安全靠 BlockTick 的 m_tick_depth (见 ecatworker.h)。 */
+      em_home_end_rc_t end_rc;
+      int              rc_disable = 0, rc_mode = 0, rc_enable = 0;
+
+      {
+         BlockTick tk(this);
+
+         (void)em_home_finish(ax, attained, &end_rc);
+
+         /* 起手那次失能与收尾这一次, 取第一个非零 —— 与改造前那两句的合成规则一样 */
+         rc_disable = (m_home_disable_rc[axis] != 0) ? m_home_disable_rc[axis]
+                                                     : end_rc.rc_disable;
+         rc_mode    = end_rc.rc_mode;
+         rc_enable  = end_rc.rc_enable;
+
+         /* ---- 4. 重新锚定显示原点 ---- ★ **这一行漏掉, 就是一次没人按过按钮的全速运动**:
+          * m_origin 若还是回零之前的值, 下一次 interpolate() 会把**回零之前的物理位置**当成
+          * CSP 目标发出去。**必须在收尾阶梯之后** —— em_arm 钉 607Ah 用"使能那一刻的 6064h"。
+          * (em_pos 在 mirror 不健康时会退化成一条 SDO 读, 所以它在 tick 里面。) */
+         m_origin[axis] = em_pos(ax);
+         m_tgt[axis]    = 0;
+         {
+            QMutexLocker lk(&m_mtx);
+            m_want[axis] = 0;
+         }
+         /* 零点搬了 —— 世代 +1。**无条件**: 这一步在上面那几条失败路上也跑 (超时/bit3/bit13
+          * 都是举着 bit4 返回的), 而无论成败, m_origin[] 确实换了一个值。
+          * 同时把"这份零点归本次运行所有"重新盖一次章: 回零之后任何时候断开重连, 沿用的都是它。 */
+         m_origin_gen++;
+         m_origin_kept  = true;
+         m_origin_naxis = m_naxis;
+
+         /* ---- 4b. 读一次 6061h: 手册 §3.7 把「6061h 读回 6」当作 HM 的前提。
+          * 收尾之后应当是 8 (CSP), 不是 8 就得在结论句里喊出来; 读失败 (-1) 也照实写。 */
+         readModeDisp(axis);
+      }
+      /* tick 到此为止 (它只罩 SDO); 下面判定与结论句不发 SDO。 */
+
+      /* ---- 5. 判定 + 一次说完 ---- */
+
+      /* 判据是**收尾结束这一刻的实测状态**, 不是上面那几个返回码的排列组合 */
+      const bool end_enabled = em_is_enabled(ax) != 0;
+      const bool fault_now   = (em_sw(ax) & EM_SW_FAULT) != 0;
+      const ecatcmd::HomeEnd end =
+         ecatcmd::home_end_state(true, fault_now, end_enabled, rc_mode);
+
+      /* 这一趟的整句由 ecatcmd::home_axis_note() 一处出 —— **一个字的正文都不在这边**:
+       * 那句话自检抄了一遍钉着 (那是"重构没改行为"唯一的自动证据), 正文散在这边就钉不住。 */
+      const em_home_cfg_t &cfg = m_home_cfg[axis];
+      ecatcmd::HomeReport &r   = rep[nrep];
+
+      r.axis       = axis;
+      r.method     = m_home_method[axis];
+      r.rc_home    = rc_home;
+      /* 原始结局也带上: `rc_home` 那张三值表把"被对侧带停"与"操作员按了停止"挤在同一格,
+       * 只有这个字段分得开 (见 HomeReport::step_rc) */
+      r.step_rc    = m_home_rc[axis];
+      r.end        = end;
+      r.rc_disable = rc_disable;
+      r.rc_mode    = rc_mode;
+      r.rc_enable  = rc_enable;
+      r.mode_disp  = m_mode_disp[axis];
+      r.vel_fast   = cfg.vel_fast;
+      r.vel_slow   = cfg.vel_slow;
+      r.acc        = cfg.acc;
+      r.tmo_s      = m_home_tmo_s[axis];
+
+      note(ecatcmd::home_axis_note(r));
+
+      ends[nrep]    = end;
+      step_rc[axis] = m_home_rc[axis];
+      rep_mask |= (1u << axis);
+      nrep++;
+
+      /* 这一根收完了 —— 逐轴落下它的"回零中"。mask 是 publish() 唯一的来源, 清它才是
+       * 真的落下 (直写 m_telem 只会被下一帧覆盖掉)。 */
+      m_homing_mask &= ~(1u << axis);
    }
 
-   /* ---- 2. 切回 CSP: em_set_mode 在已使能时会被拒, 所以必须排在 1 之后。
-    * 不切回来, interpolate() 写的 607Ah 会被驱动器按 HM 解释。 */
-   const int rc_mode = em_set_mode(ax, EM_MODE_CSP);
+   /* 收尾没能确认到"已卸力" -> 走既有的动力电源告警那条路 (ec_shutdown 也是它)。
+    * 判据与"哪几根"共用 ecatcmd::home_batch_maybe_live —— 任一根 STRANDED 就算。 */
+   if (ecatcmd::home_batch_maybe_live(ends, rep_mask))
+      m_maybe_live = true;
 
-   /* ---- 3. 重新使能到 CSP: em_arm 把 607Ah 钉在此刻的 6064h, 使能那一帧原地不动 */
-   int rc_enable = -1;
-   if (rc_mode == 0)
-      rc_enable = em_enable(ax);
+   /* ---- 批结论: 每一根的结果念一遍, 并点出元凶 ----
+    * 只在**两根以上**时发 (n == 1 那一趟必须与改造前逐字节一致)。
+    * 为什么它非有不可: note() 是覆盖写状态栏, 逐轴那几句里只剩最后一句; 而"是哪一根出的问题"
+    * 可能落在前面被冲掉 —— 元凶被冲掉的那一半情形, 恰恰是最需要看见的那一半。 */
+   if (nrep > 1)
+      note(ecatcmd::home_batch_summary(step_rc, rep_mask));
 
-   /* ---- 4. 重新锚定显示原点 ---- ★ **这一行漏掉, 就是一次没人按过按钮的全速运动**:
-    * m_origin 若还是回零之前的值, 下一次 interpolate() 会把**回零之前的物理位置**当成
-    * CSP 目标发出去。**必须在 3 之后** —— em_arm 钉 607Ah 用"使能那一刻的 6064h"。 */
-   m_origin[axis] = em_pos(ax);
-   m_tgt[axis]    = 0;
-   {
-      QMutexLocker lk(&m_mtx);
-      m_want[axis] = 0;
-   }
-   /* 零点搬了 —— 世代 +1。**无条件**: 这一步在上面那几条失败路上也跑 (超时/bit3/bit13
-    * 都是举着 bit4 返回的), 而无论成败, m_origin[] 确实换了一个值。
-    * 同时把"这份零点归本次运行所有"重新盖一次章: 回零之后任何时候断开重连, 沿用的都是它。 */
-   m_origin_gen++;
-   m_origin_kept  = true;
-   m_origin_naxis = m_naxis;
-
-   /* ---- 4b. 读一次 6061h: 手册 §3.7 把「6061h 读回 6」当作 HM 的前提。
-    * 收尾之后应当是 8 (CSP), 不是 8 就得在结论句里喊出来; 读失败 (-1) 也照实写。 */
-   readModeDisp(axis);
-
-   /* ---- 5. 判定 + 复位旗标 + 一次说完 ---- */
-
-   /* 判据是**收尾结束这一刻的实测状态**, 不是上面那几个返回码的排列组合 */
-   const bool end_enabled = em_is_enabled(ax) != 0;
-   const bool fault_now   = (em_sw(ax) & EM_SW_FAULT) != 0;
-   const ecatcmd::HomeEnd end =
-      ecatcmd::home_end_state(true, fault_now, end_enabled, rc_mode);
-
-   m_homing = false;
-   m_homing_axis = -1;
-   m_homing_method = 0;
+   /* ---- 会话结束 ----
+    * **摆在所有轴的结论之后**, 与改造前"先清旗标再 note"的顺序不同: 那一步在单轴时
+    * 只在收尾阶梯自己发的帧里差一拍 (界面晚一帧看到旗标落下), 而两轴时必须等两根都说完,
+    * 否则第一根的结论会在"另一根还在回零"的那一刻出去。 */
+   m_homing      = false;
+   m_homing_mask = 0;
    {
       QMutexLocker lk(&m_mtx);
       m_telem.homing = false;
-      m_telem.homing_axis = -1;
-      m_telem.homing_method = 0;
+      /* 逐轴那一份也要**当场**落下, 不能只靠 mask 清零: 下一帧 publish() 确实会把它推平,
+       * 但这两行之间界面读到的是"本会话在跑 = false, 而这一根在回零 = true" —— 自相矛盾
+       * 的一对。startHoming 起手时那两处直写就是为同一个理由存在的。 */
+      for (int axis = 0; axis < EM_MAX_AXES; axis++)
+         if ((mask & (1u << axis)) != 0)
+         {
+            m_telem.ax[axis].homing        = false;
+            m_telem.ax[axis].homing_method = 0;
+         }
    }
-
-   /* 收尾没能确认到"已卸力" -> 走既有的动力电源告警那条路 (ec_shutdown 也是它) */
-   if (end == ecatcmd::HOME_END_STRANDED)
-      m_maybe_live = true;
-
-   /* 中段那个动作名。找限位的两个方式号**本身就带方向** (正限位/负限位), 再叠一个
-    * "正向/反向"是重复的; 找原点的两个方式号同名, 方向必须补进去才分得清。 */
-   const QString what =
-      ecatcmd::home_method_is_limit(method)
-         ? QString::fromUtf8(ecatcmd::home_method_short(method))
-         : QStringLiteral("%1%2")
-              .arg(QString::fromUtf8(ecatcmd::home_dir_text(
-                      method == ecatcmd::home_method_for(true))),
-                   QString::fromUtf8(ecatcmd::home_method_short(method)));
-
-   /* note() 是**覆盖写**, 所以这里一次说完 */
-   QString s = QStringLiteral("%1 %2 (方式 %3): %4 (rc = %5)。\n%6")
-                  .arg(nm, what,
-                       QString::number(method),
-                       QString::fromUtf8(ecatcmd::home_cause_text(rc_home)),
-                       QString::number(rc_home),
-                       QString::fromUtf8(ecatcmd::home_end_text(end)));
-
-   if (end == ecatcmd::HOME_END_HOLDING)
-      s += QStringLiteral(" (显示坐标已把这里定为 0)");
-
-   if (end != ecatcmd::HOME_END_HOLDING)
-      s += QStringLiteral(" [收尾: 失能 %1 / 切 CSP %2 / 使能 %3]")
-              .arg(rc_disable).arg(rc_mode).arg(rc_enable);
-
-   /* 6061h 单独一格, 并**把期望值写进去**: 它是"驱动器现在按哪种模式解释 607Ah"的唯一显示器 */
-   {
-      const int md = m_mode_disp[axis];
-
-      s += QStringLiteral(" [6061h = %1 (%2)%3]")
-              .arg(md)
-              .arg(QString::fromUtf8(ecatcmd::mode_text(md)),
-                   (md == EM_MODE_CSP)
-                      ? QString()
-                      : QStringLiteral(" <<< 当前不是 CSP(8): 607Ah 会按其他模式解释, 请勿继续下发位置。"));
-   }
-
-   s += QStringLiteral(" [6099h:01 = %1, :02 = %2 pul/s, 609Ah = %3, 上限 %4 s]")
-           .arg(cfg.vel_fast).arg(cfg.vel_slow).arg(cfg.acc).arg(tmo_s2);
-
-   note(s);
 }
 
 /* 读一次该轴的实际运行模式 (6061h, SDO) 存进 m_mode_disp[axis] —— 界面与 doHome 那句
@@ -1403,6 +1855,8 @@ void EcatThread::serviceAutoRecover(qint64 now_ms)
 
 void EcatThread::doZero(int axis)
 {
+   if (m_homing)            /* 同 doEnable 那一句 */
+      return;
    if (axis < 0 || axis >= m_naxis)
       return;
    if (!m_origin_ready)
@@ -1436,6 +1890,8 @@ void EcatThread::doZero(int axis)
 
 void EcatThread::doCenter(int axis)
 {
+   if (m_homing)            /* 同 doEnable 那一句 */
+      return;
    if (axis < 0 || axis >= m_naxis)
       return;
    setTarget(axis, 0);      /* 显示坐标 0 = 界面上那个正中 */
@@ -1446,6 +1902,9 @@ void EcatThread::doCenter(int axis)
  * 放大无条件允许; 缩小只在新范围装得下所有轴当前的 m_tgt 时才允许。 */
 void EcatThread::doRange(int32_t range)
 {
+   if (m_homing)            /* 同 doEnable 那一句 */
+      return;
+
    const int32_t old = m_range.load();
 
    if (range < 1000)
@@ -1586,6 +2045,17 @@ void EcatThread::interpolate(uint32_t dt_ms)
       if (!em_is_enabled(ax))
          continue;
 
+      /* 正在回零的这一根也不下发。**光靠上面那个使能位拦不住** —— 回零中的轴正是已使能的,
+       * 而它此刻按 HM 解释 6060h: 往 607Ah 写一个 CSP 目标, 轻则被忽略, 重则被当成
+       * 回零参数的一部分。改造前这条闸是"天然"的 (回零把整个工作线程占住, 这一圈根本轮
+       * 不到); 现在回零只占每圈的一步, 所以必须**明写**。
+       *
+       * ⚠️ 它拦的是**整个会话**, 不只是"这一根在找"的那几秒: 收尾那一段 (失能 -> 切 CSP ->
+       * 使能) 里 m_origin[] 还没重新锚定, 那一刻放过去就是拿**回零之前的物理位置**当目标
+       * 发出去 —— 一次没人按过的全速运动。 */
+      if ((m_homing_mask & (1u << i)) != 0)
+         continue;
+
       int64_t d = (int64_t)want[i] - (int64_t)m_tgt[i];
 
       if (d != 0)
@@ -1640,8 +2110,8 @@ void EcatThread::publish(int wkc)
    t.resetting    = m_resetting;
    /* 回零同一套, 而且它更长 (回零能跑满整个回零超时; 缺省 120 s, 可改到 600 s) */
    t.homing        = m_homing;
-   t.homing_axis   = m_homing_axis;
-   t.homing_method = m_homing_method;
+   /* 哪几根在回零由下面那个逐轴循环从 m_homing_mask 填 (AxisTelem::homing) ——
+    * m_homing_mask 是**唯一**的来源, "会话在跑"与"这一根在跑"就永远不会互相矛盾。 */
    t.naxis        = m_naxis;
    t.wkc          = wkc;
    t.expected_wkc = (m_bus != nullptr) ? em_expected_wkc(m_bus) : 0;
@@ -1707,6 +2177,13 @@ void EcatThread::publish(int wkc)
       /* 撞限位: **只此一处算**, 控制器 / 参数栏 / 画布都读这个字段 */
       a.limit_active = ecatcmd::limit_hit(a.sw, a.dig_known, a.dig_pos, a.dig_neg,
                                           di_invert);
+
+      /* 这一根自己是不是在回零 (与 t.homing 那个"本会话在跑"分开, 理由见 AxisTelem)。
+       * **只问 mask, 不问结局**: 它说的是"这一根被本次会话持有", 从 prepare 之前到它自己
+       * 收尾完成为止 —— 一根到位之后另一根还在找, 它仍然是被持有的那一根 (它在等对侧),
+       * 界面上要能说出这件事。逐轴旗标的清除在 finishHoming() 里逐轴做。 */
+      a.homing        = ((m_homing_mask & (1u << i)) != 0);
+      a.homing_method = (a.homing ? m_home_method[i] : 0);
 
       /* 报警 (含只有码、bit3 没立起来的那一种)。**冻结目标与红横幅都走这一个判据** ——
        * 只看 a.fault 的话, 一个不置 bit3 的报警在界面上仍然不存在 */
@@ -1851,11 +2328,17 @@ void EcatThread::teardown()
     * 界面那侧"只许往前"的同步就会**漏掉**下一次真正的零点变更 —— 正是危险的那个方向。) */
    m_fault_latched = false;
    m_resetting     = false;   /* 连接断了, "正在复位"这个状态跟着一起没了 */
-   m_homing        = false;   /* 同上。真在回零时走到这里, 调用方应当先 requestMotionStop() */
-   m_homing_axis   = -1;
-   m_homing_method = 0;
+   /* 同上。**会话的逐轴记录也一起清** —— 留着的话下一次 startHoming 之前,
+    * publish() 会拿着上一次的结局去填遥测 (那是上一趟的话)。 */
+   m_homing      = false;
+   m_homing_mask = 0;
    for (int i = 0; i < EM_MAX_AXES; i++)
    {
+      m_home_done[i]       = false;
+      m_home_rc[i]         = EM_HM_RUNNING;
+      m_home_method[i]     = 0;
+      m_home_tmo_s[i]      = 0;
+      m_home_disable_rc[i] = 0;
       m_ax[i]     = nullptr;
       m_tgt[i]    = 0;
       /* 603Fh 跟着一起清: 换了台驱动器还挂着上一台读到的码, 是最难查的那种假象。

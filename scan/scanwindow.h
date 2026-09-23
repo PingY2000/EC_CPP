@@ -150,6 +150,19 @@ private:
     * true -> 18/17 (找**限位开关**, 手册叫"找限位")。不弹确认框, 说明在按钮 tooltip 上;
     * 回零中按「停止」= 立即中止。它同时 +1 零点世代 (两者都重定义零点, 续扫必须换世代)。 */
    void onHomeClicked(int axis, int dir, bool find_limit);
+
+   /* 「回零校准」—— 一次对 X 与 Y 都做**正向回零** (方式 24), 两根**同时**动。
+    *
+    * 它取代不了那八个按钮, 是给"平时那一趟"用的: 用户要的是这块面板平时只外露一个按钮,
+    * 八个按钮收进 m_homeDetail 里 (「展开」看得到, 见 buildHomePanel)。
+    *
+    * 为什么值得一个专门的入口而不是"点两下 X/Y 的正向回零": 逐轴点两下是**串行**的
+    * (第一根走完才轮到第二根), 而这个动作在机械上本来就是两根各走各的 —— 串行不是硬件的
+    * 限制, 是上位机以前那个阻塞循环造成的 (docs/scan_sweep.md §33)。 */
+   void onHomeBothClicked();
+   /* 「展开 / 收起」—— 只翻 m_homeDetail 的可见性, 不碰任何值。
+    * 收起时速度与超时**照样在生效**, 只是看不见; 这是有意的 (见 buildHomePanel 里那段)。 */
+   void onHomeFoldToggled();
    /* 「停止」。回零期间它必须变成立即中止 (队列救不了回零) */
    void onStopClicked();
 
@@ -308,6 +321,15 @@ private:
     * 左边两个按钮; 右边两个找限位开关 (方式 18/17)。文字见 kHomeBtnText */
    QPushButton *m_btnHome[2][2] = {};   /* [轴][方向] 0 = 正向回零, 1 = 反向回零 */
    QPushButton *m_btnLim[2][2] = {};    /* [轴][侧] 0 = 找正限位, 1 = 找负限位 */
+   /* 「回零校准」: 一次把 X 与 Y 都按方式 24 (正向找原点) **同时**发起 */
+   QPushButton *m_btnHomeBoth = nullptr;
+   /* 那八个按钮 + 速度 + 超时所在的那个容器。**收起 = 整个不可见** (QLayout 会自动收掉它
+    * 占的行), 展开 = 回到今天这个样子。收起时里面那几个值**照样在生效** —— 它们是"正在用的
+    * 参数", 不是"存档" (见 buildHomePanel 里那段)。 */
+   QWidget     *m_homeDetail = nullptr;
+   /* 「展开 / 收起」开关。文字随状态变 (收起时写「展开」), 所以它自己的字由
+    * onHomeFoldToggled() 一处写 —— 别处再写会被那一次覆盖 */
+   QPushButton *m_btnHomeFold = nullptr;
    /* 我们发出去的那条"正在回零"横幅的原文, 下降沿靠它认现在挂着的是不是我们自己那条 */
    QString      m_homeBanner;
 

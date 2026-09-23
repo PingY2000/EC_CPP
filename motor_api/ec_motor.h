@@ -583,7 +583,85 @@ int em_pv_stop(em_axis_t *ax);
  * 运行中任一根出故障或撞限位则所有轴一起停。 */
 int em_pv_run_multi(em_axis_t **axes, const int32_t *vel, int n, uint32_t hold_ms);
 
-/* 回零 (HM)。顺序: 未使能时写 6098h/6099h/609Ah/607Ch (写后回读) -> 6060h = 6 -> 使能
+/* ---- 回零的四段。em_home() 是这四段的薄包装, 既有调用方的行为一字不变 ----
+ *
+ * **为什么要切成四段, 而不是留一个函数加个回调**: 6098h/6099h/609Ah/607Ch 只能经 **SDO** 写,
+ * 而一条 SDO 事务期间过程数据**一帧都不发**(同一个线程串行做 SDO 与发帧)。原来一根轴把这
+ * 十来笔 SDO 与"等 bit12"的轮询揉在一个 for(;;) 里, 是因为只有一根。**两根并行时那个结构会
+ * 出事**: X 已经在找原点(bit4 举着、等帧喂它), 主站却在给 Y 写 SDO —— X 那几秒一帧都收不到,
+ * 轻则回零自己中止, 重则从站的 SM 看门狗动作。
+ *
+ * 于是段的划分不是按"代码好不好看", 而是按**会不会静默总线**:
+ *   prepare  静默 (纯 SDO)          -> 多根轴的 prepare 必须**挨着做完**, 中间不许插别的
+ *   start    不静默 (有界阻塞, 发帧) -> 多根轴的 start 必须**都在所有 prepare 之后**
+ *   step     **绝不静默、绝不阻塞**  -> 每周期调一次, 只写输出镜像
+ *   finish   静默但有界             -> 收尾那一圈就地做完
+ *
+ * 调用方 (`hmi/ecatworker.cpp` 的 `EcatThread`) 用 `em_home_step` 做**非阻塞**回零;
+ * 阻塞版 `em_home()` 留给别的调用方, 也留给"单轴回归"做对照。 */
+
+/* 步进的结局。**做成 enum 而不是 0/-1/1**: 多根轴并行时"谁把这一趟拉停的"必须能分开说,
+ * 而 -1 一格至少混着 bit3 / bit13 / 超时三种要人做的事完全不同的情况。
+ *
+ * 取值刻意避开 0 / -1 / 1 —— 那三个是 EM_R_OK / EM_R_FAIL / EM_R_STOP, 与它们同值会让
+ * "把 EM_R_* 当成步进结局比较"这种笔误查不出来。只有 RUNNING == 0 是故意的:
+ * "还在跑"就是这一段成功。 */
+typedef enum
+{
+   EM_HM_RUNNING   =   0,   /* 仍在回零 (bit4 举着), 下个周期继续调 em_home_step */
+   EM_HM_ATTAINED  =  10,   /* 6041h bit12 置起: 到位 (镜像已写回 0x000F) */
+   EM_HM_ABORTED   =  11,   /* em_stop_requested(): 用户按了「停止」(镜像已写回 0x000F) */
+   EM_HM_PEER      =  12,   /* 被 em_home_abort() 拉停: 对侧那一根出事了 */
+   EM_HM_FAULT     = -10,   /* 6041h bit3 = Fault */
+   EM_HM_HM_ERROR  = -11,   /* 6041h bit13 = Homing error */
+   EM_HM_TIMEOUT   = -12,   /* 等 bit12 超时 (期间取到过完整帧 —— 状态是已知的) */
+   EM_HM_NO_FRAMES = -13,   /* 超时且**一笔完整 6041h 都没取到**: 状态未知 */
+   EM_HM_SETUP     = -14    /* 根本没跑起来: 起手段的 SDO 写/回读失败, 或轴已经不在
+                             * (em_home_prepare / em_home_start 的失败)。
+                             * 与上面那三个**不是**一回事: 那些是"回零跑了但没走到底",
+                             * 这个是"一个字节都没进去 / 只进去一半"。 */
+} em_home_step_rc;
+
+/* 收尾四步各自的返回码 (EM_R_*)。逐项分开是因为收尾的结局判定要问"模式切回去了没有"。 */
+typedef struct
+{
+   int rc_release;   /* 落 bit4 并确认 (只有到位那一趟做) */
+   int rc_disable;
+   int rc_mode;      /* 切回 CSP */
+   int rc_enable;
+} em_home_end_rc_t;
+
+/* 准备: 四条拒绝 + 5 笔 SDO 写 + 读 2214h。**会静默总线**(纯 SDO), 所以多根轴要挨着做完。
+ * 成功返回 EM_HM_RUNNING(== EM_R_OK), 失败 EM_R_FAIL。**不自泵帧之外的动作** —— 它会逐笔
+ * 泵 2 帧(理由见实现), 那几帧不下任何命令。 */
+int em_home_prepare(em_axis_t *ax, const em_home_cfg_t *cfg);
+
+/* 启动: 切 HM -> 使能 -> 抬 bit4, 并记下这一趟的计时基准。**有界阻塞**(自泵帧)。
+ * 成功返回 EM_HM_RUNNING, 否则 EM_R_FAIL / EM_R_STOP。 */
+int em_home_start(em_axis_t *ax, uint32_t tmo_ms);
+
+/* **非阻塞**: 只写输出镜像 (em__set_cw), 不 em__cycle, 不 SDO, 不 sleep。
+ * 契约与 em_csp_set_target() 完全一样: 写完要有人去打那一帧 (em_service)。
+ *
+ * **停止请求在这里消费**: 每圈开头判一次 em_stop_requested(), 有就撤 bit4 并按
+ * EM_HM_ABORTED 定局 —— 调用方不必自己再判一次, 两版调用方也因此都有中止路径。
+ *
+ * 没 prepare/start 过就调是安静的 no-op (返回 EM_HM_RUNNING)。**有结局之后再调同样是
+ * no-op** —— 结局只报一次, 所以"谁到点了"这件事必须由调用方当场记下来 (EcatThread 用逐轴
+ * 的结局数组), 不能靠反复调本函数去问。 */
+int em_home_step(em_axis_t *ax);
+
+/* 把这一根**主动**拉停 (对侧出事了)。只写镜像 + 记状态。
+ * **不碰停止标志** —— 设了会让紧随其后的收尾阶梯全部提前退出, 轴就停在"带使能的 HM"上。 */
+void em_home_abort(em_axis_t *ax);
+
+/* 收尾: [到位时落 bit4 并确认] -> 失能 -> 切回 CSP -> 重新使能。
+ * **有界阻塞**, 期间照常发帧。**不碰上位机的 m_origin[]** —— 那是调用方的事。
+ * 收尾阶梯整体成功返回 EM_R_OK, 否则 EM_R_FAIL; 四项分别的返回码写进 out。 */
+int em_home_finish(em_axis_t *ax, int attained, em_home_end_rc_t *out);
+
+/* 回零 (HM)。**阻塞版** = prepare + start + (每周期 step + 泵帧) + finish, 语义与拆开之前
+ * 逐行等价。顺序: 未使能时写 6098h/6099h/609Ah/607Ch (写后回读) -> 6060h = 6 -> 使能
  * -> 6040h 抬 bit4 (0x000F -> 0x001F) 启动 -> 等 6041h bit12 (Homing attained);
  * bit13 (Homing error) 一置就失败。不断言"回零后 6064h == 0" —— 2214h 决定那时显示什么。
  * 返回 0 / -1 / 1(停止请求) */
