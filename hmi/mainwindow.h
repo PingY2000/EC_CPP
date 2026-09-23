@@ -34,6 +34,8 @@ private:
    void disconnectAndStop();     /* 断开 + 收尾; 可重入 */
 
    void onConnectClicked();
+   /* 「重连总线」。断开(先卸力) + 重连(重新进 OP, 各轴未使能)。未连接时等同「连接」 */
+   void onReconnectClicked();
    void onEnableClicked();
    void onDisableClicked();
    void onStopClicked();
@@ -50,6 +52,8 @@ private:
    QComboBox   *m_nic       = nullptr;
    QPushButton *m_btnNic    = nullptr;
    QPushButton *m_btnConn   = nullptr;
+   /* 「重连总线」—— 断开(先卸力) + 重连(重新进 OP)。AutoRecover 救不回来时的出口 */
+   QPushButton *m_btnReconn = nullptr;
    QPushButton *m_btnEnable = nullptr;
    QPushButton *m_btnStop   = nullptr;
    QPushButton *m_btnDis    = nullptr;

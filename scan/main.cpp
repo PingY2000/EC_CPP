@@ -18,7 +18,7 @@ int main(int argc, char **argv)
 
    QApplication app(argc, argv);
    app.setApplicationName(QStringLiteral("scan"));
-   app.setApplicationDisplayName(QStringLiteral("滑台蛇形扫描采集"));
+   app.setApplicationDisplayName(QStringLiteral("扫描采集"));
 
    /* 不显式设字体族的话, 中文可能落到无汉字的字体上 -> 方框 */
    QFont f(QStringLiteral("Microsoft YaHei UI"), 9);

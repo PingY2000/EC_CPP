@@ -144,6 +144,17 @@ struct BusTelem
    bool     comm_bad     = false;
    int      max_gap_ms   = 0;
    int      gaps_over_ms = 0;
+   /* 上面那个最大值里, **由本程序自己的命令造成的**那一份 (复位/使能/回零期间 SOEM 的
+    * SDO 事务一帧都不发)。不分开说, 我们自己一次使能就会被读成"这台 PC 在卡"。 */
+   int      max_gap_self_ms = 0;
+   /* 自动重请求 OP 的窗口量: **本轮**坏帧期间的最长停顿 (好帧归零), 与 max_gap_ms 那个
+    * 只增不减的会话最大值不是一回事 —— 见 EcatThread::m_gap_bad_ms。 */
+   int      gap_bad_ms   = 0;
+   /* 连续多少帧**按时**发出去了 (间隔 <= HMI_GAP_WARN_MS)。这是"上位机稳不稳"的唯一的数,
+    * 与 WKC 无关 —— 见 ecatcmd::recover_verdict 与 HMI_RECOVER_ARM_FRAMES。 */
+   int      gap_ok_run   = 0;
+   /* 本会话自动恢复动过几次手 (0 = 没动过)。界面据此说"已经自己救过一次了" */
+   int      recover_tries = 0;
 
    /* AL 状态与 AL 状态码 (只有 al_checked 为真时才作数)。
     * **只在异常时读**(ecatcmd::comm_bad_from 立起来那一下), 不在健康路径上每秒读一次 ——
@@ -177,6 +188,69 @@ namespace ecatcmd
 inline bool axis_needs_reset(bool valid, bool mirror_ok, bool fault)
 {
    return valid && mirror_ok && fault;
+}
+
+/* 「点复位」这一刻该说什么。
+ *
+ * 为什么不能只看 axis_needs_reset: 那个判据为了不误卸力, 在 mirror_ok = false 时返回
+ * false —— 拒绝写入是对的, 但它把两种完全不同的局面压成了同一个 `false`:
+ *   · 6041h 是新鲜的, 只是 bit3 都是 0  -> 真的没轴需要复位;
+ *   · 6041h 是**陈旧值** (帧不足)      -> **根本判不了有没有故障**。
+ * 现场日志里第二种被说成了第一种:「无轴报故障 (6041h bit3 均为 0), 未写入驱动器」——
+ * 而同一块屏幕上, 程序刚刚宣布过那个 6041h 是陈旧的。两句话互相打脸, 且错的那一句
+ * 把人往"没事"的方向带。
+ *
+ * 三支的**次序**也是内容: RESET_UNKNOWN 必须盖过 RESET_NOFAULT 报出来。
+ * 只有"新鲜且 bit3 立着"才落到 RESET_DO —— 判据本身一个字节都不放宽。 */
+enum ResetGate
+{
+   RESET_DO,       /* 至少有轴该复位, 可以写 */
+   RESET_NOFAULT,  /* 数据新鲜, 没有轴报故障 -> 确实不该写 */
+   RESET_UNKNOWN   /* 数据陈旧, 判不了 -> 不该写, 而且要先说清"为什么判不了" */
+};
+
+inline ResetGate reset_gate(bool valid, bool mirror_ok, bool fault)
+{
+   if (axis_needs_reset(valid, mirror_ok, fault))
+      return RESET_DO;
+   /* 到这里就没轴该复位了, 剩下的只是"为什么": 数据不可信是唯一需要单独解释的理由 */
+   return (valid && !mirror_ok) ? RESET_UNKNOWN : RESET_NOFAULT;
+}
+
+/* RESET_UNKNOWN 那一支说的一整句 (axes = 那几根轴的名字, 已用 "/" 连好)。
+ * **不许说"bit3 均为 0"**: 那个读数是陈旧的, 说它等于把"判不了"说成"没有"。
+ * 处置也必须是通讯向的 (「通讯」灯/红横幅/重连总线), 不许混进 A 家族那条
+ * "查驱动器参数"的建议 —— 这里的问题不在驱动器。 */
+inline QString reset_unknown_text(const QString &axes)
+{
+   return QStringLiteral(
+      "%1 的过程数据帧不完整 (工作计数器持续偏短), 6041h 是**陈旧值** —— "
+      "判不了有没有故障, **一个字节都没写**。"
+      "先解决通讯 (看「通讯」灯与那条红横幅; 或用「重连总线」), 之后再点复位。").arg(axes);
+}
+
+/* RESET_NOFAULT 那一支: 真的没轴需要复位 (数据新鲜, bit3 都是 0)。
+ * 后半句是"为什么不能拿它当万用清零" —— 复位的第一件事是 6040h = 0x0000 (卸力),
+ * 对一根健康的轴做等于松开它的保持力矩 (竖直滑台会掉下来)。 */
+inline QString reset_nofault_text()
+{
+   return QStringLiteral("无轴报故障 (6041h bit3 均为 0), 未写入驱动器。"
+                         "故障复位会先卸力, 对未报故障的轴执行会松开其保持力矩。");
+}
+
+/* 使能的前置闸: 有轴的过程数据不完整 -> 这一次失败的原因**是通讯**。
+ * 没有这一道, 它会落到那句「请查看控制台输出, 并确认 6041h 故障位与限位状态」——
+ * 把人支去看驱动器故障位与限位开关, 而现场那一次的真因是过程数据从来没回来
+ * (6041h 本身就是陈值, 它连"有没有故障"都答不了)。
+ * 那句话**留着**给真的与驱动器状态有关的失败 (模式切换 / 故障位 / Remote / CW 阶梯)。
+ * 措辞走 (B) 家族: 查的是线缆/网卡/上位机负载, 不许出现"驱动器参数"。 */
+inline QString enable_stale_text(const QString &axes)
+{
+   return QStringLiteral(
+      "%1 的过程数据帧不完整 (工作计数器持续偏短), 6041h 与 6064h 都是**陈旧值** —— "
+      "状态未知, 拒绝使能。**这次失败与驱动器的故障位、限位无关**: "
+      "先解决通讯 (看「通讯」灯与那条红横幅; 或用「重连总线」), 通讯恢复后再使能。")
+         .arg(axes);
 }
 
 /* 驱动器**自报**有报警 —— 灯与横幅用这一个, 不是只看 bit3。
@@ -945,19 +1019,191 @@ inline QString al_code_text(int state, int alcode)
  * ("查通讯线、干扰源与站号配置"): 那句话的前提是驱动器自报通讯报警, 是另一件事。
  * max_gap_ms/gaps_over_ms: 本程序自己最长多久没发出过一帧 (见 EcatThread 的帧间隔统计)。
  *   0 = 还没量到 / 量的是"没有超阈值"; > 0 时把最大值说出来 —— 它是"这台 PC 有没有份"
- *   唯一可对账的数: 几 ms = 与上位机无关, 几百 ms = 就是这台 PC。 */
+ *   唯一可对账的数: 几 ms = 与上位机无关, 几百 ms = 就是这台 PC。
+ * self_gap_ms: 上面那个最大值里, **由本程序自己的命令造成的**那一份 (复位/使能/回零
+ *   期间 SOEM 的 SDO 事务一帧都不发, 见 HMI_OP_SDO_TMO_US 那段)。**必须分开说** ——
+ *   否则我们自己一次使能造成的静默会被读成"这台 PC 在卡", 把人支去查电源计划与网卡
+ *   节能, 而那两样与它毫无关系。*/
 inline QString comm_banner_text(int wkc, int expected, int bad_run,
-                                int max_gap_ms, int gaps_over_ms)
+                                int max_gap_ms, int gaps_over_ms, int self_gap_ms)
 {
    QString s = QStringLiteral(
       "过程数据帧连续 %1 帧不足 (工作计数器 %2/%3), 位置与状态为陈旧值, 目标已冻结。")
       .arg(bad_run).arg(wkc).arg(expected);
 
    if (max_gap_ms > 0)
+   {
       s += QStringLiteral("\n本程序最长 %1 ms 未发出帧 (超过 %2 ms 的 %3 次)。")
               .arg(max_gap_ms).arg(HMI_GAP_WARN_MS).arg(gaps_over_ms);
 
+      /* 一句反证的话, 只在真的成立时才说: 全程最长的那一次就是我们自己造成的,
+       * 那就**不能**把它算成"这台 PC 在卡"。 */
+      if (self_gap_ms > 0 && self_gap_ms >= max_gap_ms)
+         s += QStringLiteral("\n其中最长的那次是本程序**自己的命令** (复位/使能/回零) "
+                             "造成的, 不是外部卡顿。");
+   }
+
    return s;
+}
+
+/* ---- 自动重请求 OP: 什么时候动手 ------------------------------------------------
+ * 现场那一次的病根(上位机停顿 1.6s)按掉之后, 这一层是**兜底**: 停顿真发生了, 至少别
+ * 留下"只能断开重连"这一个回程。 */
+
+/* 本机"一直在按时发帧"跑够这么多帧才允许自动动手 (≈ 2s @ HMI_LOOP_MS=2ms)。
+ *
+ * **量的是上位机, 不是总线**: 数的是"这一帧发得及不及时"(相邻两帧的间隔 <= 50ms),
+ * **不是**"WKC 够不够"。现场那一次从站一旦掉出 OP, WKC 就恒为 2/6 ——
+ * 拿 WKC 当"停机停稳了"的判据, 那个数就永远涨不上去, 自动恢复永远不会动手。
+ * 而这里要知道的恰恰是"本机还在不在卡": 卡住了才不能动手 (边卡边请求 OP 只会再被
+ * SM 看门狗踢出来), 而本机不卡了就说明那一段停顿已经过去。
+ *
+ * 取 1000 而不是 HMI_BAD_WKC_LIMIT(10): 那个 10 是"该不该报给操作员"的判据, 短到
+ * 1/3 秒; 自动**写驱动器 AL 寄存器**这件事要保守得多。 */
+#define HMI_RECOVER_ARM_FRAMES    1000
+
+/* 两次自动恢复之间的冷却。一轮恢复本身 1~3s, 冷却 30s 保证不会变成"每 2 秒拉一次 OP"
+ * —— 那样从站在 OP 与 SAFE-OP 之间来回跳, 比停在 SAFE-OP 更糟。 */
+#define HMI_RECOVER_COOLDOWN_MS   30000
+
+/* 本会话自动动手的上限。到顶之后只报「该断开重连了」, 不再试 ——
+ * 反复请求 OP 而每次都掉回来, 说明不是 AL 层能修的, 再试只是让日志变长。 */
+#define HMI_RECOVER_MAX_TRIES     2
+
+/* 自动恢复该不该动手。**顺序是内容**: 先报"这台 PC 自己在卡"这条最要紧的结论, 再报
+ * "试满了"。两条同时成立时必须先说前者 —— 它指出的是根因, 而"试满"只是结果。
+ *
+ * 三个阈值参数各自非法时一律 RECOVER_NO (`<= 0`): 被改成 0 是个非法阈值, 不是"永不
+ * 触发"; 其中 arm_frames = 0 尤其危险 —— 那等于"一帧都没按时发也动手"。
+ * 与 comm_bad_from 同一套写法。 */
+enum RecoverVerdict
+{
+   RECOVER_NO,       /* 不值得动手 (刚缓过来 / 还没缓够 / 刚动过手) */
+   RECOVER_TRY,      /* 动手: 本机已经稳了一阵子, 从站还没跟回来 —— 这是本功能要修的那一次 */
+   RECOVER_MASTER,   /* 别动手, 先查**这台 PC**: 眼下这一帧就迟到了, 本机还在卡 */
+   RECOVER_GIVEUP    /* 本会话试满了 -> 只剩「重连总线」这一条路 */
+};
+
+/* cur_gap_ms: **刚刚**这一帧迟了多久 (不是会话最大值 —— 最大值一次停顿之后就再也下不来,
+ *   拿它判就等于"从此永远认为本机在卡", 自动恢复再也动不了手)。
+ * ok_run: 连续多少帧**按时**发出去了 (上位机的健康状况, 见 HMI_RECOVER_ARM_FRAMES)。
+ * tries/max_tries: 本会话动过几次手 / 上限。 */
+inline RecoverVerdict recover_verdict(int cur_gap_ms, int gap_limit_ms,
+                                      int ok_run, int arm_frames,
+                                      int tries, int max_tries)
+{
+   if (gap_limit_ms <= 0 || arm_frames <= 0 || max_tries <= 0)
+      return RECOVER_NO;
+   /* 本机**现在**就在卡 -> 先说这个, 别去动从站: 这一帧都迟到, 请求 OP 之后下一帧
+    * 多半照样迟到, 从站只会被 SM 看门狗再踢一次。放在 tries 之前 —— 根因比结果要紧。 */
+   if (cur_gap_ms > gap_limit_ms)
+      return RECOVER_MASTER;
+   if (tries >= max_tries)
+      return RECOVER_GIVEUP;
+   /* 本机按时发帧要**持续**够久才算那一段停顿真过去了。 */
+   if (ok_run < arm_frames)
+      return RECOVER_NO;
+   return RECOVER_TRY;
+}
+
+/* 冷却是否已过 (cd = 现在 - 上次动手)。last_ms < 0 = 本会话还没动过手 -> 放行。
+ * `cd <= 0` **不放行**: 那不是"冷却已过", 那是时钟回绕 / 初值 ——
+ * 把它当成"过了"就是"每次调用都动手", 与冷却这件事正好相反。 */
+inline bool recover_cooldown_ok(int cd_ms, int cooldown_ms)
+{
+   if (cooldown_ms <= 0)
+      return false;
+   if (cd_ms <= 0)
+      return false;
+   return cd_ms >= cooldown_ms;
+}
+
+/* 总线**确实坏着** —— 动手的第二个前置条件。与 recover_verdict 是**两个问题**:
+ *   recover_verdict 问"本机够不够稳、还有没有机会" (上位机侧),
+ *   这一条问"总线是不是真的需要救" (总线侧)。两个都成立才动手。
+ *
+ * **少了这一条会怎样 (2026-09-23 实跑)**: 一条**健康**的总线在连上约 2 秒
+ * (HMI_RECOVER_ARM_FRAMES) 之后就被点着 —— 白阻塞界面 1~3 s、白烧一次尝试次数 (上限只有 2),
+ * 而且那一趟的 BlockTick 会把 m_gap_self_want 置起来污染帧间隔的归因。现场日志里第一次
+ * 就是这样烧掉的: 它自己紧接着报「所有从站的 AL 都在 OP —— 没有一台需要恢复」,
+ * 而**触发前那句**却说"从站仍不在 OP" —— 同一段日志里两句互相打脸, 而那句从没被检查过。
+ *
+ * 判据用 bad_wkc_run (连续多少帧 WKC 不足), **不是** mirror_ok: 从站一旦掉出 OP, WKC 就
+ * 恒为 2/6, 那个数会一直涨上去 —— 正是要的"持续坏着"。arm_frames <= 0 一律不放行
+ * (与 recover_verdict 同一条: 非法阈值不是"永不触发", 而 arm_frames=0 等于"一帧没坏也动手")。 */
+inline bool recover_bus_broken(int bad_wkc_run, int arm_frames)
+{
+   return arm_frames > 0 && bad_wkc_run >= arm_frames;
+}
+
+/* 一趟自动恢复的结局 (由 EcatThread 填, 措辞由下面的 recover_done_text 出)。
+ * 这里的字段**照抄 em_recover_t**, 不另立一套判断 —— 库说不该救、救不了, 这里就照着说。 */
+struct RecoverReport
+{
+   int  need      = 0;      /* AL 不在 OP 的从站数 (0 = 病不在 AL 层) */
+   int  ok        = 0;      /* 回到 OP 的 */
+   int  fail      = 0;      /* 试过没回来的 */
+   int  gone      = 0;      /* 没答话 (掉线/掉电) */
+   int  nofit     = 0;      /* 停在 INIT/BOOT (配置丢了) */
+   int  mixed     = 0;      /* 被"有轴仍在 OP 且带力矩"那道闸拦下, 一个字节没写 */
+   /* em_recover_op **在读到任何从站状态之前就拒绝了** (总线没开 / 没建映射 / 没进过 OP),
+    * 原因已经在控制台。**与"没救全"必须分得开**: 那一种 rc 也是 -1, 但它有 need/fail 可报,
+    * 而且处置完全不同 (一个只能重连, 一个要人上去接手)。判据是"库什么数都没填"。 */
+   bool refused   = false;
+   bool stop      = false;  /* 中途收到停止请求 */
+   int  max_gap_ms = 0;     /* 触发那一次的最长停顿, 原样说出来 */
+};
+
+/* 结局那句话。**分支顺序也是内容**: 先说不该动手的那几种 (它们的原因比结果要紧),
+ * 再说结果。任何一支都不许出现"已恢复正常"这种盖过从站状态的结论 ——
+ * 恢复只管过程数据, 各轴一律停在**未使能**, 那是要人接着做的第一步。 */
+inline QString recover_done_text(const RecoverReport &r)
+{
+   if (r.stop)
+      return QStringLiteral(
+         "自动重请求 OP 已中止 (收到停止请求)。已动过的轴不会自动撤回 —— "
+         "它们的 6040h 已被压成 Disable voltage, 要恢复出力请人工使能。");
+
+   if (r.gone > 0 || r.nofit > 0)
+      return QStringLiteral(
+         "自动重请求 OP **没有执行, 一个字节都没写**: %1 台从站没有任何应答 (掉线/掉电), "
+         "%2 台停在 INIT/BOOT (配置已丢)。这两种都不是 AL 层能修的 —— "
+         "查线缆与驱动器供电, 然后点「重连总线」。")
+            .arg(r.gone).arg(r.nofit);
+
+   if (r.mixed)
+      return QStringLiteral(
+         "自动重请求 OP **没有执行, 一个字节都没写**: 有轴仍在 OP 且 6041h bit2 = 1 "
+         "(可能正带保持力矩), 同时有轴已掉出 OP。这种混合局面故意不自动处理 —— "
+         "请人工确认机械安全 (竖直轴先托住), 再点「重连总线」(断开会先卸力)。");
+
+   /* 库**在读到任何从站状态之前**就拒绝了 —— 这一支什么都不知道, 所以**一句关于从站的话
+    * 都不许说** (尤其不许说"所有从站的 AL 都在 OP"—— 它根本没读过 AL)。
+    * 判据见 RecoverReport::refused: 库什么数都没填。 */
+   if (r.refused)
+      return QStringLiteral(
+         "自动重请求 OP **没有执行** (前置条件不满足, 原因已写在控制台)。"
+         "总线此刻的从站状态**未知** —— 请点「重连总线」(断开: 先卸力; 重连: 重新进 OP, "
+         "各轴停在未使能)。");
+
+   if (r.need == 0)
+      return QStringLiteral(
+         "自动重请求 OP 没有动手: 所有从站的 AL 状态都在 OP —— 这一次的停顿不在 AL 层, "
+         "而在**这台 PC** 或线缆上。最长 %1 ms 未发帧这件事要单独查 (电源计划 / 网卡节能)。")
+            .arg(r.max_gap_ms);
+
+   /* 救回来了 —— 也必须把"各轴未使能"说出来。 */
+   if (r.fail == 0 && r.ok > 0)
+      return QStringLiteral(
+         "自动重请求 OP **成功**: %1 台从站已回到 OP, 过程数据交换恢复 (位置与状态重新更新)。"
+         "各轴停在**未使能** (6040h 已压成 Disable voltage), **不会自己带电** —— "
+         "要继续干活请人工使能; 驱动器有故障请先「故障复位」。").arg(r.ok);
+
+   return QStringLiteral(
+      "自动重请求 OP **没有救全**: 本来不在 OP 的 %1 台里回来了 %2 台, **还有 %3 台没回来**。"
+      "总线现在一半在 OP、一半不在: 工作计数器会持续偏短, 位置与状态都不可信, "
+      "**不要在这个状态下继续走轴**。没回来的那几台只有点「重连总线」能恢复。")
+         .arg(r.need).arg(r.ok).arg(r.fail);
 }
 
 }   /* namespace ecatcmd */
@@ -1110,6 +1356,10 @@ private:
     * 故障沿是 publish() 发现的, 而 publish() 不许做 SDO —— 于是它只挂个牌子, 由这里在
     * **下一圈的圈顶**做掉 (2ms 之后)。见 publish() 里 m_fault_read_want 那一段。 */
    void serviceFaultCodeReads();
+
+   /* 兜底: 停顿过去了、从站没跟回来, 就自己把过程数据救回来 (em_recover_op)。
+    * **只能从 run() 的主循环调** (publish(wkc) 的下一行) —— 见 run() 里那一段注释。 */
+   void serviceAutoRecover(qint64 now_ms);
    void doZero(int axis);
    void doCenter(int axis);
    void doRange(int32_t range);
@@ -1174,9 +1424,39 @@ private:
    int        m_max_gap_ms  = 0;
    int        m_gaps_over   = 0;
 
+   /* 上面那个最长间隔里, **由本程序自己的命令造成的**那一份 (复位/使能/回零期间 SOEM 的
+    * SDO 事务期间一帧都不发)。见 comm_banner_text 的 self_gap_ms 与 recover_verdict ——
+    * 不分开的话, 我们自己一次使能就会被读成"这台 PC 在卡"。 */
+   int        m_max_gap_self_ms = 0;
+   /* "下一个测到的帧间隔该算成**本程序自己的命令**造成的" —— BlockTick 构造时置起,
+    * 由下一次测量消费掉 (那种命令干完就测, 中间不会插别的测量)。
+    * **不在 BlockTick 析构时清**: 命令跑完那一刻正是间隔被测到的那一刻, 析构先清掉就什么都
+    * 归不到自己头上了 —— 这正是要防的那个错。只用来给归因, 不参与任何安全判据。 */
+   bool       m_gap_self_want = false;
+
+   /* ---- 自动重请求 OP (见 ecatcmd::recover_verdict) ----
+    * m_gap_bad_ms: 触发判据用的窗口量 —— **与本轮坏帧同生共死**, 好帧归零。
+    *   不能拿 m_max_gap_ms 顶替: 那是个只增不减的会话最大值, 于是第一次停顿之后就再也
+    *   回不到"停顿已经过去"这个状态, 自动恢复会**永远不动手** —— 症状与"没写这个功能"一样。
+    * m_recover_last_ms: 上次动手的 clk; < 0 = 本会话还没动过手 (冷却放行)。
+    * m_recover_tries: 本会话动手次数 (到 HMI_RECOVER_MAX_TRIES 就只报「重连总线」)。
+    * m_recover_said: 上一次报过的结局话 (用来避免同一句话每 2ms 刷一次)。 */
+   int        m_gap_bad_ms      = 0;
+   /* 刚刚那一帧迟了多久 / 连续多少帧按时发出去了 (上位机的健康状况)。
+    * **不是** m_max_gap_ms: 那是个会话最大值, 一次停顿之后就再也下不来。 */
+   int        m_last_gap_ms     = 0;
+   int        m_gap_ok_run      = 0;
+   int        m_recover_last_ms = -1;
+   int        m_recover_tries   = 0;
+   QString    m_recover_said;    /* 上次由自动恢复报出去的那一句 (防同一句反复弹) */
+   int        m_recover_warn_ms = -1;  /* 上次报"别动手"那句的时刻 (与动手冷却分开) */
+
    /* 连续不足帧数。**工作线程自己数**: scan/ 的 ScanController 有一份自己的中止判据,
     * 这一份是要进电文给两个程序共用的 (见 BusTelem::bad_wkc_run) */
    int        m_bad_wkc_run = 0;
+   /* **连续**多少帧是好的 (好帧 ++, 坏帧归零)。自动恢复的"停机停稳了"判据就是它
+    * (见 HMI_RECOVER_ARM_FRAMES) —— 与 m_bad_wkc_run 是一对, 一个数坏一个数好。 */
+   int        m_good_wkc_run = 0;
    bool       m_comm_bad    = false;
 
    /* 最近一次读到的 AL 状态 (只在 comm_bad 的**上升沿**读一次, 见 publish())。

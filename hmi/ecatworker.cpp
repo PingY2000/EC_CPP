@@ -227,6 +227,13 @@ void EcatThread::requestQuit() { m_quit.store(true); }
  *   · 回调每帧一次 (2ms), 与平时那一圈的节拍一致 —— publish() 本来就是按这个频率写的。 */
 EcatThread::BlockTick::BlockTick(EcatThread *t) : m_t(t)
 {
+   /* "下面这一段时间里主循环发不出帧, 是我们自己造成的" —— 给帧间隔归因用。
+    * **在构造时置起、不在析构时清**: 命令跑完那一刻正是那个间隔被测到的那一刻,
+    * 析构先清掉就什么都归不到自己头上了, 于是我们自己一次使能造成的 1 秒静默会被
+    * 读成"这台 PC 在卡", 把人支去查电源计划与网卡节能 (见 recover_verdict)。 */
+   if (m_t != nullptr)
+      m_t->m_gap_self_want = true;
+
    if (m_t != nullptr && m_t->m_bus != nullptr)
       em_set_cycle_hook(m_t->m_bus, &EcatThread::BlockTick::tick, m_t);
 }
@@ -288,10 +295,40 @@ void EcatThread::run()
          {
             const qint64 gap = svc_t0 - m_svc_prev_ms;
 
+            /* 这一段是不是**我们自己**造成的 (刚跑完一条会静默总线的命令, 见 BlockTick)。
+             * m_gap_self_want 在这里消费掉 —— 置它的那次命令与本测量之间不会插别的测量。 */
+            const bool self_caused = m_gap_self_want;
+            m_gap_self_want = false;
+
+            m_last_gap_ms = (int)gap;
+
             if (gap > m_max_gap_ms)
                m_max_gap_ms = (int)gap;
             if (gap > HMI_GAP_WARN_MS)
                m_gaps_over++;
+
+            /* 上位机的健康状况: 这一帧发得及不及时。**只有我们自己造成的静默不算**
+             * —— 那几百毫秒是我们自己在跑复位/使能/回零, 不是本机卡。算进去的话, 每次
+             * 使能都要重新等 2 秒才谈得上自动恢复。 */
+            if (gap > HMI_GAP_WARN_MS && !self_caused)
+               m_gap_ok_run = 0;
+            else if (m_gap_ok_run < 1000000)
+               m_gap_ok_run++;
+
+            if (self_caused)
+            {
+               /* 自成一档: 复位/使能/回零期间 SOEM 的 SDO 事务**一帧都不发**, 那几百毫秒
+                * 是我们自己干的, 不是网卡也不是电源管理。 */
+               if (gap > m_max_gap_self_ms)
+                  m_max_gap_self_ms = (int)gap;
+            }
+            else if (gap > m_gap_bad_ms)
+            {
+               /* **自动恢复的触发量只看这一支**: 净的外部停顿。
+                * 顺手把上面那条命令造成的也算进去的话, 我们自己一次使能就能把自动恢复
+                * 点着 (而那一刻从站好得很), 冷却一到又点一次。 */
+               m_gap_bad_ms = (int)gap;
+            }
          }
          m_svc_prev_ms = svc_t1;
 
@@ -299,11 +336,20 @@ void EcatThread::run()
             tryInitOrigin();
 
          publish(wkc);
+
+         /* ---- 自动重请求 OP ----
+          * **调用点只能在这里, 不许搬进 publish()**: publish() 就是 BlockTick::tick 的
+          * 回调体, 在它里面触发会经 em_recover_op -> em__cycle -> tick -> publish 当场递归,
+          * 而 BlockTick 的注释已经写明这条。摆在这一圈的最后, 遥测与帧间隔都已经结完账。 */
+         serviceAutoRecover(svc_t1);
       }
       else
       {
          last = clk.elapsed();
          m_svc_prev_ms = -1;   /* 没在发帧, 别把"连接前的空档"算成一个帧间隔 */
+         m_gap_self_want = false;
+         m_gap_ok_run    = 0;  /* 没在发帧就谈不上"按时发帧" */
+         m_last_gap_ms   = 0;
 
          /* 没进 OP 也要刷遥测: 界面的按钮形态从遥测推出来, 而连接期不发帧 */
          publish(0);
@@ -485,7 +531,17 @@ void EcatThread::doConnectInner(const QString &ifname)
    m_svc_prev_ms = -1;
    m_max_gap_ms  = 0;
    m_gaps_over   = 0;
+   m_gap_self_want   = false;
+   m_max_gap_self_ms = 0;
+   m_gap_bad_ms      = 0;
+   m_last_gap_ms     = 0;
+   m_gap_ok_run      = 0;
+   m_recover_warn_ms = -1;
+   m_recover_last_ms = -1;   /* 新连接 = 自动恢复从零开始 (冷却与次数都重来) */
+   m_recover_tries   = 0;
+   m_recover_said.clear();
    m_bad_wkc_run = 0;
+   m_good_wkc_run = 0;
    m_comm_bad    = false;
    m_al_state    = 0;
    m_al_code     = 0;
@@ -526,7 +582,10 @@ void EcatThread::doConnectInner(const QString &ifname)
             continue;
          }
 
-         consoleNote(QStringLiteral("%1: 2300h = 0x%2 (%3 字节)  X0~X2 = %4/%5/%6%s")
+         /* 最后那个占位符是 %7, **不是 %s**。写成 %s 时 QString::arg 会抛
+          * "Argument missing" 并把整句 NPN 极性提示丢掉, 屏幕上留着字面的 "%s" ——
+          * 而那句提示正是"极性配反了"唯一的线索 (现场日志里就有这一条)。 */
+         consoleNote(QStringLiteral("%1: 2300h = 0x%2 (%3 字节)  X0~X2 = %4/%5/%6%7")
                         .arg(QString::fromUtf8(em_axis_label(ax)))
                         .arg(v, 4, 16, QLatin1Char('0'))
                         .arg(sz)
@@ -653,6 +712,26 @@ void EcatThread::doEnable()
       return;
    }
 
+   /* ---- 前置闸: 帧不完整就**不要**落到下面那句"请确认 6041h 故障位与限位状态" ----
+    * 那一句的前提是"我看得见驱动器状态", 而帧不足时 6041h / 6064h 都是陈值 ——
+    * 现场那一次就是被这一句支去看故障位与限位, 真因却是过程数据从来没回来。
+    * 只报轴名, 不复述任何 6041h 读数 (它不可信)。 */
+   {
+      QStringList stale;
+
+      for (int i = 0; i < m_naxis; i++)
+      {
+         if (em_mirror_ok(m_ax[i]) == 0)
+            stale << QString::fromUtf8(ecatcmd::axis_label(i));
+      }
+
+      if (!stale.isEmpty())
+      {
+         note(ecatcmd::enable_stale_text(stale.join(QStringLiteral("、"))));
+         return;
+      }
+   }
+
    for (int i = 0; i < m_naxis; i++)
    {
       if (em_is_enabled(m_ax[i]))
@@ -709,22 +788,39 @@ void EcatThread::doFaultReset()
    /* ---- 1. 先算"该复位谁"。**这一步之前一个字节都不写** ---- */
    int todo[EM_MAX_AXES];
    int ntodo = 0;
+   /* 帧不完整、判不了的那几根。与 todo 分开存: 两件事的处置完全不同 ——
+    * 一个是"写驱动器", 一个是"先把通讯修好"。 */
+   QStringList unknown;
 
    for (int i = 0; i < m_naxis; i++)
    {
       /* 用**刚读到的**状态字, 不用遥测快照 —— 而这一条判断决定要不要卸力 */
-      if (ecatcmd::axis_needs_reset(true,
-                                    em_mirror_ok(m_ax[i]) != 0,
-                                    (em_sw(m_ax[i]) & EM_SW_FAULT) != 0))
-         todo[ntodo++] = i;
+      const bool mok = em_mirror_ok(m_ax[i]) != 0;
+      const bool flt = (em_sw(m_ax[i]) & EM_SW_FAULT) != 0;
+
+      switch (ecatcmd::reset_gate(true, mok, flt))
+      {
+         case ecatcmd::RESET_DO:
+            todo[ntodo++] = i;
+            break;
+         case ecatcmd::RESET_UNKNOWN:
+            unknown << QString::fromUtf8(ecatcmd::axis_label(i));
+            break;
+         case ecatcmd::RESET_NOFAULT:
+            break;
+      }
    }
 
    if (ntodo == 0)
    {
-      /* 这一句是重点: **真的一个字节都没写**。后半句是"为什么不能拿它当万用清零" ——
-       * 复位的第一件事是 6040h = 0x0000 (卸力), 对健康的轴做等于松开它的保持力矩。 */
-      note(QStringLiteral("无轴报故障 (6041h bit3 均为 0), 未写入驱动器。"
-                          "故障复位会先卸力, 对未报故障的轴执行会松开其保持力矩。"));
+      /* **"判不了"必须先说, 而且不许说成"没有"** —— 现场那一次把陈旧的 6041h 说成了
+       * 「bit3 均为 0」, 与同一块屏幕上刚说过的"陈旧值"直接打脸, 还把人支去查驱动器。
+       * 两支都**真的一个字节都没写** (RESET_UNKNOWN 是 axis_needs_reset 的返回 false
+       * 那一路, 判据一个字节都没放宽)。 */
+      if (!unknown.isEmpty())
+         note(ecatcmd::reset_unknown_text(unknown.join(QStringLiteral("、"))));
+      else
+         note(ecatcmd::reset_nofault_text());
       return;
    }
 
@@ -778,6 +874,16 @@ void EcatThread::doFaultReset()
          s += QStringLiteral("   ");
       s += QStringLiteral("%1 复位失败。请先按故障码查明原因 (6041h 实测值见控制台)。")
               .arg(bad.join(QStringLiteral("; ")));
+   }
+
+   /* 同一趟里有帧不完整的轴**: 上面那句只说动了手的那些, 一句都不许盖住这几根 ——
+    * 它们的 6041h 是陈值, 所以既没被复位也没被检查, 而"漏了谁"正是最该看见的。 */
+   if (!unknown.isEmpty())
+   {
+      if (!s.isEmpty())
+         s += QStringLiteral("   ");
+      s += QStringLiteral("%1 本次**没有检查也没有复位** (过程数据帧不完整, 6041h 是陈旧值)。")
+              .arg(unknown.join(QStringLiteral("、")));
    }
 
    /* m_fault_latched **不在这里碰**: 它只有一个写者 (publish()), 清除条件就是 "bit3 掉了"。
@@ -1119,6 +1225,184 @@ void EcatThread::doStop()
    note(QStringLiteral("已停止: 目标冻结在当前位置, 保持力矩未撤。"));
 }
 
+/* 自动重请求 OP —— 兜底, 不是主修 (主修是 Windows 那几条省电项, 见 README)。
+ *
+ * 现场那一次的病根是上位机停顿 1.6s, 而**从站跟不回来**才让程序彻底没救: 两台驱动器被
+ * SM 看门狗踢出 OP, WKC 恒为 2/6, mirror_ok 降 0 且再也升不回来 (它只在完整帧上置位),
+ * 于是复位/使能全被拒, 唯一的回程是"断开->重连"。
+ *
+ * 这一段要修的就是那个回程。**只管把 AL 拉回 OP, 让各轴停在未使能** —— 不重新给力矩、
+ * 不清驱动器故障、不碰仍在 OP 的轴。三条规矩逐条写在 em_recover_op 的注释里。
+ *
+ * 调用点**只能**在 run() 那一圈的最后 (publish 之后) —— 见 run() 里那段说明。 */
+void EcatThread::serviceAutoRecover(qint64 now_ms)
+{
+   if (m_bus == nullptr || !m_in_op || m_naxis <= 0)
+      return;
+
+   /* ---- 闸门: 有任何一条命令在动/在排队就一点都不碰 ----
+    * 那些命令正在写 6040h / 6041h / 607Ah, 而恢复会重写从站的 AL 寄存器并把掉出 OP 的
+    * 轴的 6040h 压成 0x0000 —— 两个写者同时动同一根轴, 后果不可推演。
+    * 回零是阻塞的 (m_homing), 天然跑不到这里; 其余四条 (使能/失能/复位/停止) 靠这三个
+    * 标志位 + 队列非空拦住。**队列非空这一条不能省**: drainCommands 每圈取一条,
+    * 上一圈取走的那条还在跑时队列是空的, 所以标志位与队列两条都要。 */
+   if (m_busy || m_resetting || m_homing)
+      return;
+   {
+      QMutexLocker lk(&m_mtx);
+      if (!m_cmds.isEmpty())
+         return;
+   }
+   /* 从站数与建立映射时不一样 = 总线结构变了, 那时只有"断开->重连"是对的
+    * (em_recover_op 里 `!bus->mapped` 那一支的同一件事, 这里是界面侧的早退) */
+   if (em_slave_count(m_bus) != m_naxis)
+      return;
+
+   const ecatcmd::RecoverVerdict v =
+      ecatcmd::recover_verdict(m_last_gap_ms, HMI_GAP_WARN_MS,
+                               m_gap_ok_run, HMI_RECOVER_ARM_FRAMES,
+                               m_recover_tries, HMI_RECOVER_MAX_TRIES);
+
+   if (v == ecatcmd::RECOVER_NO)
+      return;
+
+   /* ---- 总线**确实**坏着才谈得上"救"与"试满了" (见 recover_bus_broken) ----
+    * 2026-09-23 实跑: 少了这一条, 一条健康的总线在连上约 2 s (ARM_FRAMES) 之后就被点着 ——
+    * 第一趟是在"已使能 2 根轴"之后 2 s 触发的, 而它自己紧接着报「所有从站的 AL 都在 OP」。
+    * 上限 2 次会在几十秒内烧光, 而真出事那一次就轮不到了。
+    *
+    * **RECOVER_MASTER 不受这道闸管**: 它说的是"这台 PC 自己在卡", 那是根因告警 ——
+    * 总线好不好都要说, 操作员正是靠它去改电源计划与网卡节能 (README 那一节)。 */
+   if (v != ecatcmd::RECOVER_MASTER
+       && !ecatcmd::recover_bus_broken(m_bad_wkc_run, HMI_RECOVER_ARM_FRAMES))
+      return;
+
+   /* 不动手的那两种: 说一次就够了。**说之前先看"这一句是不是就是上一句"** ——
+    * 这一条每 2ms 跑一次, 不加这道闸, 同一句话会在状态栏里刷成噪音, 并且把 notify()
+    * 弹窗一直顶着。 */
+   if (v == ecatcmd::RECOVER_MASTER || v == ecatcmd::RECOVER_GIVEUP)
+   {
+      const QString s =
+         (v == ecatcmd::RECOVER_MASTER)
+            ? QStringLiteral("刚才这一帧迟了 %1 ms (超过 %2 ms): 是**这台机器自己**的停顿, "
+                             "不是从站的问题 —— 不去动从站的 AL 寄存器。"
+                             "要查的是电源计划与网卡节能 (见 README「上位机侧要关掉的省电项」)。")
+                 .arg(m_last_gap_ms).arg(HMI_GAP_WARN_MS)
+            : QStringLiteral("本会话已经自动重请求 OP %1 次 (上限 %2), 不再自动动手。"
+                             "从站还没回来就点「重连总线」: 断开(先卸力) -> 重连(重新进 OP, "
+                             "各轴停在未使能)。")
+                 .arg(m_recover_tries).arg(HMI_RECOVER_MAX_TRIES);
+
+      /* 冷却只为**不重复说同一句话**, 与"动手"那个冷却分开算: 两个冷却共用一个成员的话,
+       * 报过一次"M 在卡"就会把紧接着该做的那次恢复也按掉 30 秒。 */
+      if (s != m_recover_said
+          && (m_recover_warn_ms < 0
+              || now_ms - m_recover_warn_ms >= HMI_RECOVER_COOLDOWN_MS))
+      {
+         m_recover_said    = s;
+         m_recover_warn_ms = (int)now_ms;
+         note(s);
+      }
+      return;
+   }
+
+   /* ---- RECOVER_TRY: 动手 ----
+    * 冷却: 本会话第一次动手不受限 (last < 0), 之后要隔够。 */
+   if (m_recover_last_ms >= 0
+       && !ecatcmd::recover_cooldown_ok((int)(now_ms - m_recover_last_ms),
+                                        HMI_RECOVER_COOLDOWN_MS))
+      return;
+
+   m_recover_last_ms = (int)now_ms;
+   m_recover_tries++;
+
+   /* 动手之前先说出来: 底下这一趟阻塞 1~3s, 界面那 1~3s 里只有 BlockTick 在喂,
+    * 操作员看到灯不变而不知道为什么。与 doHome 一样, **宣告要挡在动作前面**。
+    *
+    * 措辞**只说这里真的查过的那两件事** (本机连续按时发帧够久 + 过程数据帧连续不足够久)。
+    * 曾经写的是"从站仍不在 OP"—— 那是**没查过**的 (判据里没有一条读 AL), 而第一趟实跑
+    * 就撞上了: 它自己紧接着报「所有从站的 AL 都在 OP」, 与这句当场打脸。 */
+   note(QStringLiteral("本机已连续 %1 帧按时发出, 而过程数据帧仍连续 %2 帧不足 —— "
+                       "正在**自动重请求 OP** (只救过程数据交换, 不会重新给力矩)…")
+           .arg(m_gap_ok_run).arg(m_bad_wkc_run));
+
+   /* 值初始化: em_recover_op 在**拒绝**那几条早退路径上不填 out (它的 out 是递增填的),
+    * 这里不置 0 就会拿栈上的垃圾去组织给操作员的话 */
+   em_recover_t r = {};
+   int rc;
+   {
+      /* BlockTick: 1~3 秒里界面继续动 (它的 tick 只在 em__cycle 收完一帧时响, 而
+       * em_wait_state 每圈都发帧 —— 与 CMD_HOME 那一条同一个用法) */
+      BlockTick tk(this);
+      rc = em_recover_op(m_bus, &r);
+   }
+
+   /* ---- 恢复这一趟**不算一次帧间隔** ----
+    * 不重置的话, 上面那 1~3s 会被下一圈测成一个几秒的 gap, 于是
+    *   · m_max_gap_ms 变成一个几秒的数 —— 而那是操作员判断"是不是这台 PC 的锅"唯一
+    *     能对账的量 (README 的验收方法就看它), 被自己污染了就再也对不了账;
+    *   · 再叠上"本机在卡"那条判据, 下一次自动恢复会被自己按掉。
+    * 这一行看起来像多余的清理, 删掉就同时坏掉上面两件事。
+    *
+    * ⚠️ `m_gap_self_want = false;` **必须与 `m_svc_prev_ms = -1` 成对** —— 2026-09-23 实跑
+    * 抓到的那个 bug 就是漏了这一行: 上面 BlockTick 的构造函数把它置了起来, 而置起来之后
+    * **唯一的消费点**是 run() 里那段 `if (m_svc_prev_ms >= 0)` 里面的测量 —— 而这里恰好
+    * 把那个测量整段跳过了。于是这个标志**留给了下一次真正的测量**, 把一段纯外部的停顿
+    * 判成"我们自己的命令造成的"。三件事同时坏掉:
+    *   · 横幅说「其中最长的那次是本程序自己的命令造成的, 不是外部卡顿」—— **在说谎**,
+    *     而且正好把人从根因 (电源计划 / 网卡节能) 上支开, 这是最坏的方向;
+    *   · m_gap_bad_ms 记不到那一次真停顿;
+    *   · 真停顿没把 m_gap_ok_run 归零 ⇒ 计数继续涨 ⇒ **2 秒后又触发一次** (日志里那两次
+    *     连着来, 中间只隔一句输出)。
+    * 一句话: 跳过了一次测量, 就必须同时把"这一次该归给谁"也吃掉。 */
+   m_svc_prev_ms    = -1;
+   m_gap_self_want  = false;
+   m_gap_ok_run     = 0;
+   m_last_gap_ms    = 0;
+   m_gap_bad_ms     = 0;
+
+   /* ---- 只对**被动过的那几根**重钉目标 ----
+    * 恢复之后它们的位置读数已经变了 (掉出 OP 期间的位置没人知道), 而 m_tgt/m_want 还停在
+    * 掉线之前的值 —— 不重钉, 下一次使能就会朝那个旧目标窜过去。
+    * 照 CMD_DISABLE 那条尾巴的做法; 仍在 OP 的轴一根都不许碰 (它可能正带着操作员刚下发的
+    * 运动, 而恢复本来就没动它)。 */
+   if (r.ok > 0)
+   {
+      QMutexLocker lk(&m_mtx);
+
+      for (int i = 0; i < m_naxis && i < EM_MAX_AXES; i++)
+      {
+         if ((r.was_out & (1u << i)) == 0)
+            continue;
+         if ((r.still_out & (1u << i)) != 0)
+            continue;   /* 没救回来的那根位置仍不可信, 不动它 */
+         if (!m_origin_ready)
+            continue;   /* 零点还没建立, 没有可下的目标 */
+         m_tgt[i]  = em_pos(m_ax[i]) - m_origin[i];
+         m_want[i] = m_tgt[i];
+      }
+   }
+
+   ecatcmd::RecoverReport rep;
+   rep.need       = r.need;
+   rep.ok         = r.ok;
+   rep.fail       = r.fail;
+   rep.gone       = r.gone;
+   rep.nofit      = r.nofit;
+   rep.mixed      = r.mixed;
+   rep.stop       = (rc == 1);            /* EM_R_STOP; EM_R_OK/EM_R_FAIL 都是 0/-1 */
+
+   /* **"拒绝"与"没救全"的 rc 都是 -1**, 分不开 —— 所以按"库填了几个数"来判:
+    * 一个都没填 = 它连从站状态都没读就退出来了 (总线没开 / 没建映射 / 没进过 OP)。
+    * 这一支一个关于从站的字都不许说 (见 recover_done_text)。 */
+   rep.refused    = (rc != 0 && !rep.stop
+                     && r.need == 0 && r.ok == 0 && r.fail == 0
+                     && r.gone == 0 && r.nofit == 0 && r.mixed == 0);
+   rep.max_gap_ms = m_max_gap_ms;
+
+   note(ecatcmd::recover_done_text(rep));
+}
+
 void EcatThread::doZero(int axis)
 {
    if (axis < 0 || axis >= m_naxis)
@@ -1456,15 +1740,32 @@ void EcatThread::publish(int wkc)
     * 只在**进了 OP** 时才数: 连接期 publish(0) 与 not-in-op 那一支的 wkc 恒为 0,
     * 拿它当"不足帧"会把每次连接都记成一串坏帧。 */
    if (m_in_op && t.expected_wkc > 0 && wkc < t.expected_wkc)
+   {
       m_bad_wkc_run++;
+      m_good_wkc_run = 0;
+   }
    else
+   {
       m_bad_wkc_run = 0;
 
-   t.bad_wkc_run  = m_bad_wkc_run;
-   t.comm_bad     = ecatcmd::comm_bad_from(wkc, t.expected_wkc, m_bad_wkc_run,
-                                           HMI_BAD_WKC_LIMIT);
-   t.max_gap_ms   = m_max_gap_ms;
-   t.gaps_over_ms = m_gaps_over;
+      /* 好帧**归零帧间隔的坏账** —— 见 m_gap_bad_ms 的注释: 自动恢复要的正是
+       * "停顿已经过去、从站没跟回来"这个状态, 而这个状态只能由"已经好了一阵子"说出口。
+       * 不能拿 m_max_gap_ms 顶替: 那是会话最大值, 第一次停顿之后永远回不到这里。 */
+      if (m_in_op)
+      {
+         m_good_wkc_run++;
+         m_gap_bad_ms = 0;
+      }
+   }
+
+   t.bad_wkc_run   = m_bad_wkc_run;
+   t.comm_bad      = ecatcmd::comm_bad_from(wkc, t.expected_wkc, m_bad_wkc_run,
+                                            HMI_BAD_WKC_LIMIT);
+   t.max_gap_ms    = m_max_gap_ms;
+   t.gaps_over_ms  = m_gaps_over;
+   t.max_gap_self_ms = m_max_gap_self_ms;
+   t.gap_bad_ms    = m_gap_bad_ms;
+   t.recover_tries = m_recover_tries;
    t.al_state     = m_al_state;
    t.al_code      = m_al_code;
    t.al_checked   = m_al_checked;
@@ -1501,6 +1802,12 @@ void EcatThread::publish(int wkc)
 
       s += QStringLiteral(" 本程序最长 %1 ms 未发出帧。")
               .arg(m_max_gap_ms);
+
+      /* 那最长的一次如果是**我们自己命令造成的**, 必须说出来 —— 否则这句会被读成
+       * "这台 PC 在卡", 把人支去查电源计划与网卡节能 (见 comm_banner_text)。 */
+      if (m_max_gap_self_ms > 0 && m_max_gap_self_ms >= m_max_gap_ms)
+         s += QStringLiteral("其中最长的那次是本程序自己的命令造成的, 不是外部卡顿。");
+
       note(s);
    }
    m_comm_bad = t.comm_bad;

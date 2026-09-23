@@ -77,6 +77,16 @@ void MainWindow::buildUi()
       "生效映射里主站拥有的那些项会被每周期覆盖 (6040h/6060h/607Ah/...), 收尾时还原。"));
    connect(m_btnConn, &QPushButton::clicked, this, &MainWindow::onConnectClicked);
 
+   /* 「重连总线」摆在「连接/断开」旁边, 不塞进菜单栏也不另开窗口 (仓库既有规矩:
+    * 界面入口必须外露) —— 它与那个按钮是同一件事的两步, 中间还要等收尾真的走完。 */
+   m_btnReconn = new QPushButton(QStringLiteral("重连总线"), central);
+   m_btnReconn->setToolTip(QStringLiteral(
+      "断开 (先给各轴卸力) -> 重新连接 (重新进 OP, 各轴停在**未使能**)。\n"
+      "自动重请求 OP 救不回来时用它: 停顿把从站踢出 OP 之后, 只有重连能重建 PDO 映射与\n"
+      "同步管理器配置。\n"
+      "各轴不会自己带电, 重连后要出力请重新「使能」。"));
+   connect(m_btnReconn, &QPushButton::clicked, this, &MainWindow::onReconnectClicked);
+
    m_btnEnable = new QPushButton(QStringLiteral("使能"), central);
    m_btnEnable->setObjectName(QStringLiteral("danger"));
    m_btnEnable->setToolTip(QStringLiteral("切 CSP 模式并使能 —— **这是唯一让电机带电的按钮**"));
@@ -100,6 +110,7 @@ void MainWindow::buildUi()
    bar->addWidget(m_btnNic);
    bar->addSpacing(12);
    bar->addWidget(m_btnConn);
+   bar->addWidget(m_btnReconn);
    bar->addSpacing(12);
    bar->addWidget(m_btnEnable);
    bar->addWidget(m_btnStop);
@@ -224,6 +235,53 @@ void MainWindow::onConnectClicked()
    hint(QStringLiteral("正在连接... (选轴 / 补映射 / 进 OP 都要做 SDO, 慢是正常的)"), false);
 
    m_thr->postConnect(m_nic->currentData().toString());
+}
+
+/* 「重连总线」= 断开 (走完整收尾: 失能 → 还原映射 → 降 PRE_OP) 再连。
+ * 网卡名从 GUI 的 m_nic 取 —— 连上之后它只是被置灰, 数据还在。
+ *
+ * **这里要问一句**, 与「连接」一样: 断开的第一步就是把各轴失能, 也就是**松开保持力矩**,
+ * 竖直滑台会掉下来。而「重连总线」最可能被按下去的时刻, 恰恰是总线刚出过问题、操作员
+ * 急着恢复的那一刻 —— 那正是最容易忘了这一点的时刻。 */
+void MainWindow::onReconnectClicked()
+{
+   if (!m_connected)
+   {
+      onConnectClicked();
+      return;
+   }
+
+   const QString nic = m_nic->currentData().toString();
+
+   if (nic.isEmpty())
+   {
+      hint(QStringLiteral("网卡名已丢失, 无法自动重连。请断开后重新选择网卡。"), true);
+      return;
+   }
+
+   QMessageBox box(QMessageBox::Warning,
+                   QStringLiteral("重连总线"),
+                   QStringLiteral(
+                      "接下来会:\n"
+                      "  · 断开: **先给各轴卸力** (滑台失去保持力矩, 可能因自重下滑)\n"
+                      "  · 还原 PDO 映射, 降回 PRE_OP, 关网卡\n"
+                      "  · 重新连接: 重建映射并进 OP\n\n"
+                      "重连之后各轴停在**未使能** —— 不会自己带电, 要出力请重新「使能」。\n"
+                      "自动重请求 OP 救不回来时才需要这一下。"),
+                   QMessageBox::Ok | QMessageBox::Cancel, this);
+   box.setDefaultButton(QMessageBox::Cancel);
+   if (box.exec() != QMessageBox::Ok)
+      return;
+
+   hint(QStringLiteral("正在重连总线 (断开: 先给各轴卸力; 然后重新进 OP, 各轴停在未使能)…"),
+        false);
+
+   disconnectAndStop();
+
+   if (!m_thr->isRunning())
+      return;
+
+   m_thr->postConnect(nic);
 }
 
 void MainWindow::onEnableClicked()

@@ -58,6 +58,12 @@ extern "C" {
 #define EM_STEP_TMO_MS    1000    /* 使能状态机单步超时 */
 #define EM_SDO_TMO_MOTION  200    /* 运动期的 SDO 超时 (非运动期用 EC_TIMEOUTRXM) */
 
+/* em_recover_op 的两个预算。**与 EM_EXIT_* 分开**: 那几个是进程退出码, 这两个不是。
+ * 单级 1s 与 em_shutdown 降回 PRE_OP 同量级; 整趟 3s 是"工作线程最长被占多久"的上界,
+ * 调用方那句"正在自动重请求 OP"背后就是这个数。 */
+#define EM_RECOVER_TMO_MS        1000
+#define EM_RECOVER_TOTAL_TMO_MS  3000
+
 /* 连续多少个短帧就把 mirror_ok 降回 0 (收到一帧完整的就归零)。取 20:
  * 按本机实测 ~3ms/圈约 60ms —— 单帧抖动不会误判, 而链路真断了 60ms 内就认账。
  * 与 ScanController 那边"WKC 连续不足 10 帧"同一量级 (30Hz ≈ 1/3 秒)。 */
@@ -293,6 +299,37 @@ int em_expected_wkc(const em_bus_t *bus);
 
 /* 配置 DC 并请求所有轴进 OPERATIONAL。返回 0 / -1 */
 int em_enter_op(em_bus_t *bus, int use_dc, uint32_t cycle_us);
+
+/* ---- 自动重请求 OP: 怎么答复 ---------------------------------------------------- */
+/* 四个计数用于组织给操作员的话; 两张位图用于**只对被动过的那几根轴**收尾
+ * (位 i = 轴 i; EM_MAX_AXES = 8, 装得下 uint32_t)。 */
+typedef struct
+{
+   int      need;      /* AL 不在 OP 的从站数。**0 = 没有一台需要恢复 -> 病不在 AL 层** */
+   int      ok;        /* 重请求之后回到 OP 的从站数 */
+   int      fail;      /* 试过但没回来 */
+   int      gone;      /* AL 读回来是 0 (没答话: 掉线 / 掉电) */
+   int      nofit;     /* 停在 INIT/BOOT (配置已丢) —— 这一种只有"断开->重连" */
+   int      mixed;     /* 被"有轴仍在 OP 且带力矩"那道闸拦下, **一个 AL 写都没发** */
+   uint32_t was_out;   /* 动手之前 轴 i 的 AL 不在 OP (调用方据此重映射目标) */
+   uint32_t still_out; /* 走完这一趟 轴 i 的 AL 仍不在 OP */
+} em_recover_t;
+
+/* 自动重请求 OP —— 把**过程数据交换**救回来。**不是**自动重新给力矩。
+ *
+ * 明确不做的事 (写在这里, 因为它比"做了什么"更容易被后人改坏):
+ *   · 不重新给力矩: 不调 em_enable / em_arm / em_set_mode。掉出 OP 的轴在请求 OP 之前
+ *     其 RxPDO[6040h] 被压成 Disable voltage, OP 一恢复驱动器看到的是 switch-on-disabled;
+ *   · 不清驱动器故障: 一个 SDO 都不做、不写 6040h bit7 —— 故障去 em_fault_reset(), 那条
+ *     路有人工闸 (且 0xFF01 过流那类靠反复复位硬顶会顶坏硬件);
+ *   · 不碰仍在 OP 的从站: 它可能正带保持力矩, 压它的 6040h 会真的卸力 (竖直轴会掉下来)。
+ *     所以"逐台判断"不是啰嗦, 是安全 —— 这里没有"整组一起处理"的代码路径;
+ *   · 不重建 PDO 映射: 从站回到 PRE-OP/INIT 之后的映射对不对不上一律交"断开->重连"。
+ *
+ * 触发时机由调用方决定 (本函数只管"怎么救")。返回 0 = 跑完一趟 (成败看 *out) /
+ * -1 = 拒绝或没有救全 / EM_R_STOP = 中途收到停止请求。**out 是递增填的**: 任何一条提前
+ * 返回带出去的数都不会谎报。out == NULL 一律拒绝 —— "几台需要恢复"本身就是结论的一半。 */
+int em_recover_op(em_bus_t *bus, em_recover_t *out);
 
 /* 收发一帧并更新各轴镜像。返回 wkc; -1 = 致命错误 (调用者应停止)。镜像只在整帧完整时
  * 更新 (wkc >= 期望 WKC): 短帧时镜像是陈值或半个帧。 */

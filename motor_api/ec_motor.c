@@ -934,6 +934,28 @@ uint16_t em_al_state(em_bus_t *bus, int slave)
    return bus->ctx.slavelist[slave].state;
 }
 
+/* AL 状态低四位 -> "阶梯号" (-1 = 不该往上爬)。em_recover_op 用它决定从哪一级开始爬。
+ *
+ * **不能拿数值大小排**: EC_STATE_BOOT = 3 夹在 PRE_OP(2) 与 SAFE_OP(4) 之间, 而
+ * INIT(1) 也不是"PRE_OP 之上" —— `cur < want` 这种写法会把 BOOT 当成可以跳级。
+ * 判 -1 的两类在 em_recover_op 里必须**分开报**: 0 是"这台没答话", INIT 是"配置丢了",
+ * 处置完全不同 (前者查线缆与供电, 后者只有重连能救)。 */
+static int em__al_rung(uint16_t al)
+{
+   switch (al & 0x0Fu)
+   {
+      case EC_STATE_PRE_OP:      return 0;
+      case EC_STATE_SAFE_OP:     return 1;
+      case EC_STATE_OPERATIONAL: return 2;
+      default:                   return -1;   /* INIT / BOOT / 未知 */
+   }
+}
+
+/* 阶梯三级, 下标就是 em__al_rung 的"阶梯号"。em_recover_op 与 em__clear_al_error 共用
+ * (后者要的是"**当前**那一级"的值, 拿它去带 ACK)。 */
+static const uint16_t em__al_rungs[3] = { EC_STATE_PRE_OP, EC_STATE_SAFE_OP,
+                                          EC_STATE_OPERATIONAL };
+
 static void em_request_state(em_bus_t *bus, int slave, uint16_t want)
 {
    /* 从站处于 AL 错误态 (状态字 bit4) 时必须把 ACK 一起写进去才能清掉 ——
@@ -1657,6 +1679,314 @@ int em_enter_op(em_bus_t *bus, int use_dc, uint32_t cycle_us)
    return EM_R_OK;
 }
 
+/* 把一根从站的 AL 错误位 (状态字 bit4) 清掉。**只清错, 不往上爬** —— 爬阶梯是调用方的下一步。
+ * 返回 EM_R_OK = 错误位已清 / EM_R_FAIL = 超时仍在或收到停止请求 (都已打印)。
+ *
+ * ⚠️ **为什么必须单独走这一步** (2026-09-23 第一次实跑抓到的): bit4 是**闩锁**,
+ * 从站被 SM 看门狗踢出去之后不写 ACK 就一直立着; 而 em_wait_state() 里那条
+ * "含错误位 -> 立刻判失败" 会在**第一帧**就返回 —— 我们刚写下去的 ACK 连一帧都没来得及生效。
+ * 现场那一次两台轴都是同一圈退出来的:
+ *     [FAIL] 请求 OP 被拒绝: AL 状态 0x14 (含错误位), AL 状态码 0x001B ...
+ * 即阶梯**从来没被走上去过**, 而日志看起来像"爬了但没爬动"。
+ *
+ * 写法照 EtherCAT 的常规: ACK 与**当前那一级**一起写 (不是与目标级一起写), 从站确认之后
+ * 才松开错误位; 每圈照常 em__cycle 发过程数据 —— 清错期间断帧只会让看门狗再踢一脚。
+ * rung_cur 是 em__al_rung 的"阶梯号" (0/1), 调用方已保证它不是 2 (仍在 OP 的不碰)。 */
+static int em__clear_al_error(em_bus_t *bus, em_axis_t *ax, int rung_cur, uint32_t *t_all)
+{
+   uint32_t t0 = em__now_ms();
+   uint16_t st;
+
+   if (rung_cur < 0 || rung_cur > 2)
+      return EM_R_FAIL;   /* 调用方已经筛过, 这里是防将来改坏 */
+
+   bus->ctx.slavelist[ax->slave].state =
+      (uint16_t)(em__al_rungs[rung_cur] | EC_STATE_ACK);
+   (void)ecx_writestate(&bus->ctx, (uint16_t)ax->slave);
+   printf("  %s: 写 AL 控制 0x%02X|ACK (先清错误位, 不往上爬)\n",
+          ax->label, (unsigned)em__al_rungs[rung_cur]);
+
+   for (;;)
+   {
+      if (em_stop_requested())
+         return EM_R_FAIL;
+
+      (void)em__cycle(bus);
+
+      /* 重新读一次原始状态字 (含错误位) —— ecx_statecheck 按 0x000F 掩过, 看不见 bit4 */
+      st = em_al_state(bus, ax->slave);
+      if ((st & EC_STATE_ERROR) == 0)
+      {
+         printf("  %s: 错误位已清, 现在 AL 0x%02X —— 接着往上爬\n", ax->label, (unsigned)st);
+         return EM_R_OK;
+      }
+
+      if ((int32_t)(em__now_ms() - t0) >= (int32_t)EM_RECOVER_TMO_MS)
+      {
+         em__err("%s: AL 状态 0x%02X 的错误位 %ums 内没清掉 (AL 状态码 0x%04X %s) —— "
+                 "从站不肯松开这次告警, 这不是 AL 层能修的: 查线缆与驱动器供电, "
+                 "然后【断开->重连】",
+                 ax->label, (unsigned)st, (unsigned)EM_RECOVER_TMO_MS,
+                 (unsigned)bus->ctx.slavelist[ax->slave].ALstatuscode,
+                 ec_ALstatuscode2string(bus->ctx.slavelist[ax->slave].ALstatuscode));
+         return EM_R_FAIL;
+      }
+
+      /* 整趟预算由调用方掌管 (t_all 从进 OP 之前起算), 这里只读不写。
+       * 不查这一条的后果: 一台从站把整趟预算吃光, 后面几台连试都试不上。 */
+      if (t_all != NULL
+          && (int32_t)(em__now_ms() - *t_all) >= (int32_t)EM_RECOVER_TOTAL_TMO_MS)
+      {
+         em__err("%s: 整趟恢复的时间预算 (%ums) 用尽, 不再试", ax->label,
+                 (unsigned)EM_RECOVER_TOTAL_TMO_MS);
+         return EM_R_FAIL;
+      }
+
+      em__sleep_ms(EM_POLL_MS);
+   }
+}
+
+int em_recover_op(em_bus_t *bus, em_recover_t *out)
+{
+   /* 阶梯三级 (em__al_rungs)。按 em__al_rung 的"阶梯号"往上爬, 不按数值大小 (理由见 em__al_rung) */
+   int      rung_from[EM_MAX_AXES];
+   uint32_t t_all;
+   int      i, k, rc = EM_R_OK;
+
+   if (out == NULL)
+   {
+      em__err("em_recover_op: 必须传 out —— »几台需要恢复« 本身就是结论的一半");
+      return EM_R_FAIL;
+   }
+
+   memset(out, 0, sizeof(*out));
+
+   if (bus == NULL || !bus->opened || !bus->mapped || !bus->in_op)
+   {
+      em__err("em_recover_op: 总线没开 / 没建过程数据映射 / 没进过 OP -> 拒绝。"
+              "这一种只有【断开->重连】");
+      return EM_R_FAIL;
+   }
+
+   printf("\n---- 自动重请求 OP (只救过程数据交换, 不会重新给力矩) ----\n");
+
+   /* ---- 1. 先逐台读 AL 原始状态字 (含错误位 0x10), 把"该碰谁"定下来 ----
+    * 用逐台 FPRD 的 em_al_state, **不用 ecx_readstate()**: 后者是广播读, 在"所有从站状态
+    * 一致且无错误位"时会提前返回、不填单个从站的 state —— 而这里恰恰要判"哪几台不一致"。
+    * 先读后写是这一层的全部安全性所在。 */
+   for (i = 0; i < bus->naxis; i++)
+   {
+      em_axis_t *ax = bus->axis[i];
+      uint16_t   st = em_al_state(bus, ax->slave);
+      int        rg = em__al_rung(st);
+
+      rung_from[i] = rg;
+
+      if (st == 0)
+      {
+         /* 0 不是合法 AL 状态 —— 是"这台没答话"(掉线 / 掉电)。**不重请求**: 对一台不在总线上
+          * 的从站写 AL 控制只是白等一个超时, 而它根本不是 AL 层能救的; 且 WKC 永远回不满,
+          * 把别的轴救回来也没有意义。 */
+         out->gone++;
+         printf("  %s: AL 状态读回来是 0 —— 这台没答话 (掉线 / 掉电), 不重请求\n", ax->label);
+         continue;
+      }
+      if (rg < 0)
+      {
+         /* INIT/BOOT: 那台的 SM / FMMU / 映射全丢了 —— 就算把它顶到 OP, 帧的布局也与建映射
+          * 时算的对不上, WKC 永远回不满; 而重配映射要重跑 ecx_config_map_group = 重连。 */
+         out->nofit++;
+         printf("  %s: AL 0x%02X 不在可往上爬的阶梯上 (INIT/BOOT/未知) —— 不重请求\n",
+                ax->label, (unsigned)st);
+         continue;
+      }
+      if (rg == 2)
+      {
+         /* **一个字节都不碰**, 连它的 6040h 都不碰 (见公共头那三条)。
+          * 无条件打印: 现场要能一眼看出"它没被动过" */
+         printf("  %s: 仍在 OP, 一个字节都不碰\n", ax->label);
+         continue;
+      }
+
+      out->need++;
+      out->was_out |= (1u << i);
+      printf("  %s: AL 0x%02X 不在 OP (要从第 %d 级往上爬)\n",
+             ax->label, (unsigned)st, rg + 1);
+   }
+
+   /* ---- 2. 硬闸: 这几种局面**故意一个字节都不写** ---- */
+   if (out->gone > 0 || out->nofit > 0)
+   {
+      em__err("重请求 OP 被拒绝, **一个字节都没写**: 有 %d 台从站没有任何应答 (掉线/掉电), "
+              "有 %d 台停在 INIT/BOOT (配置已丢)。这两种都不是 AL 层能修的 —— "
+              "查线缆与驱动器供电, 然后【断开->重连】",
+              out->gone, out->nofit);
+      return EM_R_FAIL;
+   }
+
+   /* "有轴仍在 OP 且带力矩" + "有轴掉出 OP" = 混合局面, 交给人。
+    * 机械上的理由: 两根轴本来一起支撑/一起走, 只把掉出去的那根救回来并置成未使能, 等于让
+    * 另一根单独抱着负载 (龙门/竖直轴会被扭)。这不是通信救得回来的局面。
+    * 判"带力矩"用的是**最后一份完整帧**的 6041h bit2 —— 链路一断它就是陈值, 而陈值说"使能过"
+    * 正是要拦的那一半, 所以这里刻意**不要求 mirror_ok** (往严的一侧错)。 */
+   if (out->need > 0)
+   {
+      for (i = 0; i < bus->naxis; i++)
+      {
+         em_axis_t *ax = bus->axis[i];
+
+         if ((out->was_out & (1u << i)) != 0) continue;
+         if (rung_from[i] != 2)               continue;   /* 不是"仍在 OP"的那一批 */
+         if ((ax->sw & EM_SW_OP_ENABLED) != 0)
+         {
+            out->mixed = 1;
+            em__err("重请求 OP 被拒绝, **一个字节都没写**: %s 仍在 OP 且 6041h bit2 = 1 "
+                    "(可能正带保持力矩), 同时有 %d 台已掉出 OP。这种混合局面**故意不自动处理** —— "
+                    "请人工确认机械安全 (竖直轴先托住), 再【断开->重连】(断开会先卸力)",
+                    ax->label, out->need);
+            return EM_R_FAIL;
+         }
+      }
+   }
+
+   if (out->need == 0)
+   {
+      /* 一台都不在 OP 之外: AL 层没问题, 病在上位机侧 (或线缆/干扰)。**不发任何 AL 写** */
+      printf("  重请求 OP: 所有从站的 AL 都在 OP —— 没有一台需要恢复\n");
+      return EM_R_OK;
+   }
+
+   /* ---- 3. 请求 OP 之前, **只对掉出 OP 的轴**把 RxPDO 控制字压成 0x0000 ----
+    * 两条理由, 缺一条都会让人改坏它:
+    *   ① 为什么压: 镜像里多半还留着上次的 0x000F (使能) 或 0x001F (回零)。而下面第 5 步
+    *      必须继续发过程数据帧 (不然驱动器看门狗再踢一脚), 于是 OP 一恢复, 驱动器在**第一帧**
+    *      就执行那个控制字 —— 那是"自动重新带电 / 自动重新起转", 正是本功能明确不做的事。
+    *   ② 为什么只压这一台: 仍在 OP 的轴可能正带保持力矩, 把它的 6040h 压 0 会真的卸力
+    *      (竖直轴会掉下来)。**这不是可以"统一处理"的地方**。
+    * 另: 对一台已经掉出 OP 的轴写 0x0000 是无害的 (SAFE-OP 本来就不给输出)。 */
+   for (i = 0; i < bus->naxis; i++)
+   {
+      em_axis_t *ax = bus->axis[i];
+
+      if ((out->was_out & (1u << i)) == 0) continue;
+
+      if (ax->off_cw >= 0)
+      {
+         em__set_cw(ax, EM_CW_DISABLE_V);
+         printf("  %s: 压 RxPDO[6040h]=0x0000 (OP 一恢复它就是 switch-on-disabled)\n",
+                ax->label);
+      }
+      else
+         em__warn("%s: 6040h 不在 RxPDO 映射里, 压不了控制字 —— "
+                  "它回到 OP 时看到的仍是上一次留下的控制字", ax->label);
+   }
+
+   /* ---- 4. 先把上面那几笔 0x0000 真的发出去, 再请求 OP ----
+    * 镜像写只改本地缓冲, 下一帧才出去。不等它出去就请求 OP, 驱动器恢复 OP 的那一刻收到的仍是
+    * 我们上次留下的值 —— 与 em_fault_reset "先把 bit7 压 0 打十帧再抬" 同一个理由。 */
+   for (k = 0; k < 10; k++) { (void)em__cycle(bus); em__sleep_ms(EM_POLL_MS); }
+
+   /* ---- 5a. 先逐台把 AL 错误位 (bit4) 清掉, 再谈往上爬 ----
+    * 摆在这一步而不是并进 em_wait_state: 那一支是**进 OP / 使能**共用的路径, 它"含错误位就
+    * 立刻失败"对那条路是对的 (驱动器真报故障时不该干等), 只有恢复这一条需要"给 ACK 一点时间"。
+    * 详见 em__clear_al_error 的头注释 (含 2026-09-23 那次两台都同一圈退出来的实测)。 */
+   t_all = em__now_ms();
+
+   for (i = 0; i < bus->naxis; i++)
+   {
+      em_axis_t *ax = bus->axis[i];
+      uint16_t   st;
+
+      if ((out->was_out & (1u << i)) == 0) continue;
+
+      st = em_al_state(bus, ax->slave);
+      if ((st & EC_STATE_ERROR) == 0)
+         continue;   /* 没立着错误位, 直接爬 */
+
+      if (em__clear_al_error(bus, ax, rung_from[i], &t_all) != EM_R_OK)
+      {
+         /* 清不掉 = 这一台这次救不回来。**不 break**: 后面几台与它无关, 各试各的 ——
+          * 与第 5 步"一台失败不跳过后面几台"同一条。 */
+         out->fail++;
+         out->still_out |= (1u << i);
+         continue;
+      }
+   }
+
+   if (em_stop_requested())
+   {
+      em__warn("收到停止请求, 重请求 OP 中止 (已动过的轴不回收: AL 层没有 »撤回« 这回事)");
+      return EM_R_STOP;
+   }
+
+   /* ---- 5b. 逐台爬阶梯 ----
+    * 每一级都用 em_wait_state(): 它就是 em_enter_op 进 OP 用的那一个, 每圈 em__cycle + 让步,
+    * 于是"迁移期间过程数据不能断"这条**自动成立**。自己写一个裸 sleep 的等待循环, 就是从站被
+    * SM 看门狗再踢一脚的那条路 —— 而"再被踢出去"看起来会像"重请求 OP 没用"。
+    * 它失败时会打印 AL 状态码, 那正是诊断。
+    * 一台失败**不跳过后面几台** (与 em_disable_all 同一条: 目标是尽可能多救)。 */
+   for (i = 0; i < bus->naxis; i++)
+   {
+      em_axis_t *ax = bus->axis[i];
+
+      if ((out->was_out & (1u << i)) == 0) continue;
+      if ((out->still_out & (1u << i)) != 0) continue;   /* 5a 就没清掉错误位, 别再爬 */
+
+      for (k = rung_from[i] + 1; k <= 2; k++)
+      {
+         if ((int32_t)(em__now_ms() - t_all) >= (int32_t)EM_RECOVER_TOTAL_TMO_MS)
+         {
+            em__err("%s: 整趟恢复的时间预算 (%ums) 用尽, 不再试", ax->label,
+                    (unsigned)EM_RECOVER_TOTAL_TMO_MS);
+            break;
+         }
+         if (em_wait_state(bus, ax->slave, em__al_rungs[k], EM_RECOVER_TMO_MS) != EM_R_OK)
+            break;
+      }
+
+      /* em_wait_state 对"收到停止请求"与"超时"都回 EM_R_FAIL (分不开), 所以停止这件事由我们
+       * 自己查一次 —— 它一置位就该止损, 不要接着去动下一台。 */
+      if (em_stop_requested())
+      {
+         em__warn("收到停止请求, 重请求 OP 中止 (已动过的轴不回收: AL 层没有 »撤回« 这回事)");
+         rc = EM_R_STOP;
+         break;
+      }
+
+      if ((bus->ctx.slavelist[ax->slave].state & 0x0Fu) == EC_STATE_OPERATIONAL)
+      {
+         out->ok++;
+         printf("  %s: [PASS] 已回到 OP\n", ax->label);
+      }
+      else
+      {
+         out->fail++;
+         out->still_out |= (1u << i);
+      }
+   }
+
+   /* ---- 6. 再打几帧, 让**回到 OP 的那些轴**的镜像重新变成"完整帧" ----
+    * 不做这一步, 调用方接下来读到的 6041h 是迁移之前的陈值, 于是"它有没有故障 / 还带不带电"
+    * 这两个问题都会被答错 —— 而且都是往"没事"那个方向答错。 */
+   for (k = 0; k < 10; k++) { (void)em__cycle(bus); em__sleep_ms(EM_POLL_MS); }
+
+   /* ---- 7. 把话说清楚, 不留"一半 OP 一半 SAFE-OP"的糊涂状态而不报 ----
+    * **故意不动 bus->in_op**: 把它置 0 会让调用方那一圈不再发帧, 于是**还没掉出去的轴也会被
+    * 饿出去**, 一级一级全塌; 而"报不报"这件事与那个标志位无关, 下面这几句就是报。 */
+   if (out->fail > 0)
+   {
+      em__err("重请求 OP 结束: 本来不在 OP 的 %d 台, 回到 OP 的 %d 台, **没回来的 %d 台**。"
+              "总线现在一半在 OP、一半不在: 工作计数器会持续偏短, 位置与状态都不可信。"
+              "没回来的那几台**只有【断开->重连】能恢复** (重连会重建 PDO 映射与 SM)",
+              out->need, out->ok, out->fail);
+      if (rc == EM_R_OK) rc = EM_R_FAIL;
+   }
+   else
+      printf("  重请求 OP 结束: 本来不在 OP 的 %d 台已全部回到 OP\n", out->need);
+
+   return rc;
+}
+
 void em_shutdown(em_bus_t *bus, int restore_mapping, int *motor_maybe_live)
 {
    int i;
@@ -1711,7 +2041,7 @@ void em_shutdown(em_bus_t *bus, int restore_mapping, int *motor_maybe_live)
    {
       em_axis_t *ax = bus->axis[i];
       const uint32_t f0 = ax->frames;
-      int k;
+      int k, got_sw = 0;
       uint16_t sw = 0;
 
       if (!bus->in_op || !ax->ever_enabled)
@@ -1723,17 +2053,28 @@ void em_shutdown(em_bus_t *bus, int restore_mapping, int *motor_maybe_live)
          if (!ax->mirror_ok)
             continue;   /* 这帧不完整, sw 是陈值, 不作数; 但继续打, 直到超时 */
          sw = ax->sw;
+         got_sw = 1;
          if ((sw & EM_SW_OP_ENABLED) == 0)
             break;
          em__sleep_ms(5);
       }
       if (ax->frames == f0 || !ax->mirror_ok)
       {
-         em__err("%s: 失能无法确认 —— 收尾这段一帧完整的过程数据都没收到 "
-                 "(连续短帧 %u > %d, 最后读到的 6041h=0x%04X)。"
-                 "**不要当成已失能**: 按 README 那条立即断动力电源",
-                 ax->label, (unsigned)ax->short_frames, EM_SHORT_FRAMES_LIMIT,
-                 (unsigned)sw);
+         /* 两句话**必须分开说**: 一笔都没取到时 sw 是**(零初始化的)0x0000**, 把它当
+          * "最后读到的 6041h" 是在冒充一个读数 —— 0x0000 在 CiA402 里明确表示
+          * "Switch on disabled 且无故障", 与"我没读到"正好相反, 而且正好是"看着没事"
+          * 那个方向。`em__cw_step` 里对同样的事已经专门写过注释。 */
+         if (got_sw)
+            em__err("%s: 失能无法确认 —— 收尾这段一帧完整的过程数据都没收到 "
+                    "(连续短帧 %u >= %d, 最后读到过 6041h=0x%04X, 是更早那份完整帧的值)。"
+                    "**不要当成已失能**: 按 README 那条立即断动力电源",
+                    ax->label, (unsigned)ax->short_frames, EM_SHORT_FRAMES_LIMIT,
+                    (unsigned)sw);
+         else
+            em__err("%s: 失能无法确认 —— 收尾这段一帧完整的过程数据都没收到 "
+                    "(6041h **未知**: 这一段一笔都没取到, 别读成 0x0000=\"无故障\")。"
+                    "**不要当成已失能**: 按 README 那条立即断动力电源",
+                    ax->label);
          unconfirmed = 1;
       }
       else if ((sw & EM_SW_OP_ENABLED) != 0)

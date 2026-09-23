@@ -881,7 +881,7 @@ static QString nicShort(const QString &n)
 
 ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
 {
-   setWindowTitle(QStringLiteral("滑台蛇形扫描采集 —— YKD2205PE / SOEM"));
+   setWindowTitle(QStringLiteral("扫描采集 —— YKD2205PE / SOEM"));
 
    m_thr = new EcatThread(this);
    /* **本程序这里开一个分叉**(2026-09-22): 断开重连时沿用上次那份零点, 显示坐标跨重连连续。
@@ -1222,6 +1222,16 @@ QWidget *ScanWindow::buildTopBar()
                                         "零点沿用本次运行中已确定的值, 断开重连不重设。"));
    connect(m_btnConn, &QPushButton::clicked, this, &ScanWindow::onConnectClicked);
 
+   /* 「重连总线」摆在「连接/断开」旁边, 不塞进菜单栏也不另开窗口 (仓库既有规矩:
+    * 界面入口必须外露) —— 它与那个按钮是同一件事的两步, 中间还要等收尾真的走完。 */
+   m_btnReconn = new QPushButton(QStringLiteral("重连总线"), w);
+   m_btnReconn->setToolTip(QStringLiteral(
+      "断开 (先给各轴卸力) -> 重新连接 (重新进 OP, 各轴停在**未使能**)。\n"
+      "自动重请求 OP 救不回来时用它: 停顿把从站踢出 OP 之后, 只有重连能重建 PDO 映射与\n"
+      "同步管理器配置。\n"
+      "各轴不会自己带电, 重连后要出力请重新「使能」。"));
+   connect(m_btnReconn, &QPushButton::clicked, this, &ScanWindow::onReconnectClicked);
+
    m_btnEnable = new QPushButton(QStringLiteral("使能"), w);
    m_btnEnable->setObjectName(QStringLiteral("danger"));
    m_btnEnable->setToolTip(QStringLiteral("切换到 CSP 模式并使能电机。"));
@@ -1252,6 +1262,7 @@ QWidget *ScanWindow::buildTopBar()
    bar->addWidget(m_btnNic);
    bar->addSpacing(12);
    bar->addWidget(m_btnConn);
+   bar->addWidget(m_btnReconn);
    bar->addSpacing(12);
    bar->addWidget(m_btnEnable);
    bar->addWidget(m_btnStop);
@@ -1630,7 +1641,7 @@ QWidget *ScanWindow::buildParamPanel()
    m_cbDir->addItem(QStringLiteral("X 负向 (-X)"));
 
    m_cbMode = new QComboBox(box);
-   m_cbMode->addItem(QStringLiteral("蛇形 (逐行往返)"));
+   m_cbMode->addItem(QStringLiteral("逐行往返"));
    m_cbMode->addItem(QStringLiteral("每行同向") );
 
    m_edCsv = new QLineEdit(box);
@@ -2623,6 +2634,41 @@ void ScanWindow::onConnectClicked()
    m_thr->postConnect(m_nic->currentData().toString());
 }
 
+/* 「重连总线」= 断开 (走完整收尾: 失能 → 还原映射 → 降 PRE_OP, 所以**先卸力**) 再连。
+ * 网卡名从 GUI 的 m_nic 取 —— 连接成功后它只是被置灰, 数据还在 (EcatThread 自己不存
+ * 网卡名, 这一轮不给它加成员: 界面已经有这个数据了)。
+ *
+ * 没连上时它退化成「连接」: 按钮一直可点 (它最有用的时候正是总线出问题那一刻),
+ * 而"没连上还想重连"没有别的合理语义。 */
+void ScanWindow::onReconnectClicked()
+{
+   if (!m_connected)
+   {
+      onConnectClicked();
+      return;
+   }
+
+   const QString nic = m_nic->currentData().toString();
+
+   if (nic.isEmpty())
+   {
+      hint(QStringLiteral("网卡名已丢失, 无法自动重连。请断开后重新选择网卡。"), true);
+      return;
+   }
+
+   hint(QStringLiteral("正在重连总线 (断开: 先给各轴卸力; 然后重新进 OP, 各轴停在未使能)…"),
+        false);
+
+   /* 同步等收尾真的走完 —— 与「断开」同一个通路, 也同一份等待逻辑 (12s + 回零掐断) */
+   disconnectAndStop();
+
+   if (!m_thr->isRunning())
+      return;
+
+   m_thr->postConnect(nic);
+   saveSettings();
+}
+
 void ScanWindow::onEnableClicked()
 {
    /* 「使能」= CLI 的 --allow-motion。不弹确认框: 带不带电靠按钮自己的形态说 ——
@@ -3556,7 +3602,8 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
       /* 措辞全在 ecatcmd::comm_banner_text 里 (**(B) 家族**: 讲的是"我这边的帧不够",
        * 与驱动器自报的 0xFF06 那套 fault_code_action 分开) */
       m_commBanner = ecatcmd::comm_banner_text(t.wkc, t.expected_wkc, t.bad_wkc_run,
-                                               t.max_gap_ms, t.gaps_over_ms);
+                                               t.max_gap_ms, t.gaps_over_ms,
+                                               t.max_gap_self_ms);
       hint(m_commBanner, true);
    }
    else if (!t.comm_bad)
@@ -3643,13 +3690,25 @@ void ScanWindow::refresh()
                            : QStringLiteral("AL 状态未读取");
 
          if (t.max_gap_ms > 0)
+         {
             s += QStringLiteral(" · 最长 %1 ms 未发帧").arg(t.max_gap_ms);
+
+            /* 那最长的一次如果是**我们自己命令造成的**, 必须写在它旁边 —— 这一个数
+             * 是操作员判断"是不是这台 PC 的锅"唯一能对账的量, 归因错了就是把人数到
+             * 电源计划与网卡节能上去查一个不存在的问题 (见 comm_banner_text)。 */
+            if (t.max_gap_self_ms > 0 && t.max_gap_self_ms >= t.max_gap_ms)
+               s += QStringLiteral(" (本程序自己的命令)");
+         }
       }
       if (t.comm_bad)
       {
          s += QStringLiteral(" · 连续 %1 帧 WKC 不足").arg(t.bad_wkc_run);
          bad = true;
       }
+      /* 自动重请求 OP 动过手就常驻说出来 —— 它改过各轴的状态 (压成未使能),
+       * 事后对账时要能从屏幕上看出"这中间有一次自动动作"。 */
+      if (t.recover_tries > 0)
+         s += QStringLiteral(" · 已自动重请求 OP %1 次").arg(t.recover_tries);
 
       m_lWkc->setText(s);
       m_lWkc->setStyleSheet(bad ? QStringLiteral("color:#ffb020; font-weight:bold")

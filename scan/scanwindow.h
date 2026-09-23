@@ -97,6 +97,8 @@ private:
    /* ---- 操作 ---- */
    /* 「连接」。不弹确认框, 说明写在按钮 tooltip 上 */
    void onConnectClicked();
+   /* 「重连总线」。断开(先卸力) + 重连(重新进 OP, 各轴未使能)。未连接时等同「连接」 */
+   void onReconnectClicked();
    /* 「使能」。不弹确认框: 带不带电由按钮文字与灰/亮表示 (已使能时是灰的「已使能」) */
    void onEnableClicked();
    /* 清驱动器的故障位 */
@@ -268,6 +270,9 @@ private:
    QComboBox   *m_nic       = nullptr;
    QPushButton *m_btnNic    = nullptr;
    QPushButton *m_btnConn   = nullptr;
+   /* 「重连总线」—— 断开(先卸力) + 重连(重新进 OP)。AutoRecover 救不回来时的出口,
+    * 从前这条路只能靠人自己悟 ("断开连接后重新连接, 可以复位") */
+   QPushButton *m_btnReconn = nullptr;
    QPushButton *m_btnEnable = nullptr;
    QPushButton *m_btnStop   = nullptr;
    QPushButton *m_btnDis    = nullptr;

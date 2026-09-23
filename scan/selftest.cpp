@@ -1638,6 +1638,10 @@ static void test_faultreset()
 {
    using namespace ecatcmd;
 
+   auto hasq = [](const QString &s, const char *w) {
+      return s.contains(QString::fromUtf8(w));
+   };
+
    /* 「该不该复位这根轴」= 全部安全性所在。em_fault_reset() 先写 6040h = 0x0000 (卸力) 打十帧,
     * 再抬 bit7 (上升沿触发, 不先压 0 构不成沿), 而它到末尾才报告"本来就没有故障" —— 对一根健康
     * 的保持轴做这件事会真的松开保持力矩, 竖直滑台会掉下来。这道闸必须在调用之前。 */
@@ -1700,6 +1704,60 @@ static void test_faultreset()
 
       /* out = nullptr: 只要个数 */
       checkEq(pick_faulted_axes(t, nullptr, 0), 2, "count only");
+   }
+
+   /* ---- reset_gate 与 axis_needs_reset 必须**永远一致** ----
+    * 现场那一次的错话就是从这里来的: 判据 (axis_needs_reset) 返回 false, 而解释那句话
+    * 把它一律说成"没有轴报故障" (数据其实是陈旧的)。现在解释改用 reset_gate, 两者各走
+    * 各的就会重演同一个错 —— 所以把"等价"钉死在这八种输入上。
+    * 判据一个字节都不许放宽: RESET_DO 必须**恰好**等于 axis_needs_reset 为真的那一格。 */
+   caseBegin("faultreset: reset_gate 三支与旧判据逐个输入等价 (解释那条路不许另立判据)");
+   for (int b = 0; b < 8; b++)
+   {
+      const bool valid     = (b & 1) != 0;
+      const bool mirror_ok = (b & 2) != 0;
+      const bool fault     = (b & 4) != 0;
+
+      const bool     do_   = axis_needs_reset(valid, mirror_ok, fault);
+      const ResetGate g    = reset_gate(valid, mirror_ok, fault);
+
+      checkEq(g == RESET_DO, do_, "RESET_DO 恰好就是 axis_needs_reset 为真的那一格");
+
+      /* 「判不了」只能出现在"这根轴存在、而且它的 6041h 是陈旧值"这一格 ——
+       * 不许把"没有这根轴"或"数据新鲜"也说成判不了 (那会把话说糊, 且与旧判据脱钩)。 */
+      checkEq(g == RESET_UNKNOWN, valid && !mirror_ok && !do_,
+              "RESET_UNKNOWN 只在「轴存在 + 帧陈旧 + 不该写」这一格");
+   }
+
+   /* 现场那两句的**关键字**. 判据对而话说错, 与判据错一样会把人支到错的地方。 */
+   caseBegin("faultreset: 两句文案各说各的事 (陈旧值那一路不许说成「bit3 均为 0」)");
+   {
+      const QString unk = reset_unknown_text(QStringLiteral("轴X"));
+      const QString nof = reset_nofault_text();
+
+      check(hasq(unk, "轴X"),   "陈旧那一路要点名是哪根轴");
+      check(hasq(unk, "陈旧"),  "并且把「6041h 是陈旧的」说出来 —— 这是它唯一的理由");
+      check(hasq(unk, "一个字节都没写"), "并保证没写过驱动器");
+      /* **这一条是本轮修复的核心**: 陈旧值不等于"没有故障", 两句话不许互相打脸 */
+      check(!hasq(unk, "bit3"), "陈旧那一路不许说 bit3 (那个读数不可信, 说它就是冒充读数)");
+      check(!hasq(unk, "无轴报故障"), "更不许说成「无轴报故障」");
+
+      check(hasq(nof, "bit3"), "新鲜且无故障那一路才说 bit3");
+      check(hasq(nof, "未写入驱动器"), "并保证没写过驱动器");
+      check(hasq(nof, "卸力"), "并把「复位会先卸力」这个理由说出来");
+      check(!hasq(nof, "陈旧"), "它不该说陈旧 (数据是新鲜的)");
+
+      /* 两族措辞不许混: 陈旧那一路的处置是通讯 (B 家族), 不许指向驱动器参数 */
+      check(!hasq(unk, "驱动器参数"), "(B) 不许借 (A) 的处置办法");
+
+      /* 使能那条前置闸同理: 真因是通讯, 就必须**明说它与故障位/限位无关** —— 否则操作员
+       * 还是会被上一版那句话支去查 6041h 与限位开关。 */
+      const QString en = enable_stale_text(QStringLiteral("轴X、轴Y"));
+      check(hasq(en, "轴X") && hasq(en, "轴Y"), "使能那条要点名出问题的轴");
+      check(hasq(en, "陈旧"), "使能那条要说 6041h/6064h 是陈旧的");
+      check(hasq(en, "无关"), "并**明说**与驱动器的故障位、限位无关");
+      check(hasq(en, "拒绝使能"), "并说明拒绝了");
+      check(!hasq(en, "限位状"), "不许再把人往「确认限位状态」上支");
    }
 }
 
@@ -3658,7 +3716,7 @@ static void test_bushealth()
       }
 
       const QString a = ecatcmd::fault_banner_text(t);      /* (A) */
-      const QString b = ecatcmd::comm_banner_text(0, 7, 12, 300, 4);   /* (B) */
+      const QString b = ecatcmd::comm_banner_text(0, 7, 12, 300, 4, 0);   /* (B) */
 
       check(!a.isEmpty() && !b.isEmpty(), "两条都出得来");
       check(a != b, "两条横幅不是同一句话");
@@ -3673,11 +3731,11 @@ static void test_bushealth()
       check(!hasq(b, "站号"), "(B) 不许抄 (A) 那句「查站号配置」");
 
       /* (B) 的措辞要随帧数变 —— 写成常量就没有诊断价值了 */
-      const QString b2 = ecatcmd::comm_banner_text(1, 7, 12, 300, 4);
+      const QString b2 = ecatcmd::comm_banner_text(1, 7, 12, 300, 4, 0);
       check(b != b2, "帧数变了, 句子跟着变");
 
       /* 没量到帧间隔时 (max_gap_ms = 0) 那一截不出现: 不许编一个 0 ms 出来 */
-      const QString b3 = ecatcmd::comm_banner_text(0, 7, 12, 0, 0);
+      const QString b3 = ecatcmd::comm_banner_text(0, 7, 12, 0, 0, 0);
       check(!hasq(b3, "0 ms"), "没量到就不提这个数");
    }
 
@@ -3716,6 +3774,190 @@ static void test_bushealth()
    }
 }
 
+/* ------------------------------------------------- 自动重请求 OP (2026-09-23) */
+
+/* 与 test_bushealth 同一个处境: 真正**动手**的那一段 (em_recover_op) 在 motor_api 的 .c 里
+ * 且要链 SOEM, scan_selftest 编不了 —— 这里能钉住的只有"给定这几个数, 该不该动手、该说什么"。
+ * 哪一半只有硬件能验, 见 docs/scan_sweep.md §31。 */
+static void test_autorecover()
+{
+   using namespace ecatcmd;
+
+   auto hasq = [](const QString &s, const char *w) {
+      return s.contains(QString::fromUtf8(w));
+   };
+
+   const int LIM = HMI_GAP_WARN_MS;
+   const int ARM = HMI_RECOVER_ARM_FRAMES;
+   const int MAXT = HMI_RECOVER_MAX_TRIES;
+
+   /* 三个宏被改成 0 就等于**功能静默消失**: 症状与"从来没写过这个功能"一模一样
+    * (永不触发), 而日志里什么都不会说。先钉住它们是正数。 */
+   caseBegin("自动恢复: 三个宏不许被改成 0 (改成 0 = 功能静默消失, 与没写一模一样)");
+   check(HMI_RECOVER_ARM_FRAMES  > 0, "arm_frames > 0");
+   check(HMI_RECOVER_COOLDOWN_MS > 0, "cooldown > 0");
+   check(HMI_RECOVER_MAX_TRIES   > 0, "max_tries > 0");
+   check(HMI_RECOVER_COOLDOWN_MS > 1000, "冷却要比一轮恢复 (1~3s) 长得多, 否则会连着拉 OP");
+   check(HMI_RECOVER_ARM_FRAMES  > HMI_BAD_WKC_LIMIT,
+         "arming 必须比「该不该报警」那个 10 帧保守得多 (它要写从站的 AL 寄存器)");
+
+   /* 判据的**次序**是内容: 先报"本机现在就在卡"这条最要紧的结论, 再报"试满了"。 */
+   caseBegin("自动恢复: 该不该动手 (顺序 = 内容: MASTER 必须压过 GIVEUP)");
+   {
+      checkEq(recover_verdict(LIM, LIM, ARM, ARM, 0, MAXT), RECOVER_TRY,
+              "刚好到阈值 (50) → 不算「本机在卡」, 且本机已经稳够 → 动手");
+      checkEq(recover_verdict(LIM + 1, LIM, ARM, ARM, 0, MAXT), RECOVER_MASTER,
+              "超过阈值一毫秒 (51) → 本机在卡, 不许动从站");
+
+      /* **两条同时成立**: 本机在卡 **且** 本会话已试满 —— 必须先说前者 (根因), 而不是
+       * "试满了" (那只是个结果)。写反了操作员会去点重连, 而真正该查的是这台 PC。 */
+      checkEq(recover_verdict(LIM + 500, LIM, ARM, ARM, MAXT, MAXT), RECOVER_MASTER,
+              "本机在卡 + 已试满 → 先说「本机在卡」");
+      checkEq(recover_verdict(LIM, LIM, ARM, ARM, MAXT, MAXT), RECOVER_GIVEUP,
+              "本机不卡但已试满 → 只剩「重连总线」");
+
+      /* 本机按时发帧还没跑够 ARM 帧 → 那一段停顿**还不能算过去了**: 从站可能正被
+       * SM 看门狗踢出来, 这时候请求 OP 是白费一次机会 (而且它会消耗掉冷却与次数) */
+      checkEq(recover_verdict(2, LIM, 0, ARM, 0, MAXT), RECOVER_NO, "刚缓过来一帧 → 不动手");
+      checkEq(recover_verdict(2, LIM, ARM - 1, ARM, 0, MAXT), RECOVER_NO,
+              "差一帧到 arming → 不动手 (边界**不含**右边)");
+      checkEq(recover_verdict(2, LIM, ARM, ARM, 0, MAXT), RECOVER_TRY,
+              "正好到 arming → 动手 (边界**含**右边)");
+
+      /* 阈值参数非法 (`<= 0`) 一律 RECOVER_NO —— 被改成 0 是个非法阈值, 不是"永不触发"
+       * 以外的任何意思, 尤其不许变成"一帧都没按时发也动手"。与 comm_bad_from 同一套写法。 */
+      checkEq(recover_verdict(0, 0,    ARM, ARM,  0, MAXT), RECOVER_NO, "阈值 0 → 不动手");
+      checkEq(recover_verdict(0, -5,   ARM, ARM,  0, MAXT), RECOVER_NO, "负阈值 → 不动手");
+      checkEq(recover_verdict(0, LIM,  ARM, 0,    0, MAXT), RECOVER_NO, "arming 为 0 → 不动手");
+      checkEq(recover_verdict(0, LIM,  ARM, -1,   0, MAXT), RECOVER_NO, "负 arming → 不动手");
+      checkEq(recover_verdict(0, LIM,  ARM, ARM,  0, 0),    RECOVER_NO, "上限为 0 → 不动手");
+      checkEq(recover_verdict(0, LIM,  ARM, ARM,  0, -3),   RECOVER_NO, "负上限 → 不动手");
+
+      /* 参数顺序写反 (把 arm 帧数当阈值传) 是这一族函数最容易犯的错, 这里钉一个不对称的
+       * 输入: 阈值 1000 而 ok_run 只有 50 → 必须是 NO 而不是 TRY/MASTER。 */
+      checkEq(recover_verdict(50, ARM, 50, ARM, 0, MAXT), RECOVER_NO,
+              "阈值被误写成 1000 时不许动手 (防参数传串)");
+   }
+
+   /* 冷却: 两个反直觉的边界都在这里 —— **第一次动手不受限**, 而"cd <= 0"不是"过了"。 */
+   caseBegin("自动恢复: 冷却 (第一次不受限; cd<=0 不是「冷却已过」而是时钟回绕)");
+   {
+      check(recover_cooldown_ok(HMI_RECOVER_COOLDOWN_MS, HMI_RECOVER_COOLDOWN_MS),
+            "正好到冷却 → 放行 (边界含)");
+      check(!recover_cooldown_ok(HMI_RECOVER_COOLDOWN_MS - 1, HMI_RECOVER_COOLDOWN_MS),
+            "差 1ms → 不放行");
+      check(!recover_cooldown_ok(0, HMI_RECOVER_COOLDOWN_MS),  "cd = 0 → 不放行");
+      check(!recover_cooldown_ok(-1000, HMI_RECOVER_COOLDOWN_MS), "cd < 0 → 不放行");
+      check(!recover_cooldown_ok(999999, 0),  "冷却为 0 是非法阈值, 不许放行");
+      check(!recover_cooldown_ok(999999, -1), "负冷却同理");
+   }
+
+   /* 2026-09-23 实跑: 少了这道闸, 一条**健康**的总线在连上约 2 秒后就被点着 ——
+    * 第一趟自己紧接着报「所有从站的 AL 都在 OP」, 而**触发前那句**却说"从站仍不在 OP"。
+    * 所以这里钉两件事: 坏帧不够久不许动手; 以及非法阈值不许变成"一帧没坏也动手"。 */
+   caseBegin("自动恢复: 「总线确实坏着」这道闸 (少了它, 健康的总线也会被点着)");
+   {
+      check(recover_bus_broken(HMI_RECOVER_ARM_FRAMES, HMI_RECOVER_ARM_FRAMES),
+            "正好够久 → 坏着 (边界含)");
+      check(!recover_bus_broken(HMI_RECOVER_ARM_FRAMES - 1, HMI_RECOVER_ARM_FRAMES),
+            "差一帧 → 还不算坏着");
+      check(recover_bus_broken(1000000, HMI_RECOVER_ARM_FRAMES), "一直坏 → 坏着");
+      /* 一条健康的总线: 好帧归零那个计数, 所以这里是 0 —— 正是要拦下的那一种 */
+      check(!recover_bus_broken(0, HMI_RECOVER_ARM_FRAMES),
+            "**总线好着 → 不许动手** (这是本闸的全部意义)");
+      check(!recover_bus_broken(999999, 0),  "arm_frames=0 是非法阈值, 不是「永不触发」");
+      check(!recover_bus_broken(999999, -1), "负阈值同理");
+   }
+
+   caseBegin("自动恢复: 结局那句话 (六条分支各说各的事)");
+   {
+      RecoverReport r;
+      r.max_gap_ms = 1657;
+
+      /* ① 不该执行的那两种: 一个字节都没写, 而且要给出去处 */
+      r = RecoverReport(); r.gone = 1;
+      {
+         const QString s = recover_done_text(r);
+         check(hasq(s, "一个字节都没写"), "有从站没答话 → 明确说没写过驱动器");
+         check(hasq(s, "线缆"),           "并把「查线缆与供电」这条唯一的结论给出来");
+         check(hasq(s, "重连总线"),       "并指出出处 (重连总线)");
+      }
+
+      r = RecoverReport(); r.nofit = 1;
+      {
+         const QString s = recover_done_text(r);
+         check(hasq(s, "一个字节都没写"), "停在 INIT/BOOT → 同样没写过");
+         check(hasq(s, "INIT"),           "并把「停在 INIT/BOOT」这个事实说出来");
+      }
+
+      /* ② 混合局面: **故意**不自动处理, 交给人 —— 这句话必须让人看出"是我不想动" */
+      r = RecoverReport(); r.mixed = true;
+      {
+         const QString s = recover_done_text(r);
+         check(hasq(s, "一个字节都没写"), "混合局面 → 没写过驱动器");
+         check(hasq(s, "力矩"),           "并说清为什么 (有轴可能带着保持力矩)");
+         check(hasq(s, "人工"),           "并要求人工确认机械安全");
+      }
+
+      /* ③ need == 0: AL 层没问题 —— 那就**不许**说"已恢复", 要把人支去查本机 */
+      r = RecoverReport(); r.need = 0; r.max_gap_ms = 1657;
+      {
+         const QString s = recover_done_text(r);
+         check(hasq(s, "都在 OP"), "AL 都在 OP → 照实说");
+         check(hasq(s, "PC"),      "并指出病在上位机侧 (要单独查 —— 一个 AL 字节都没碰)");
+         check(hasq(s, "1657"),    "并把最长停顿那个数说出来 —— 它是唯一能对账的量");
+         check(!hasq(s, "成功"),   "不许说「成功」 (它什么都没做)");
+      }
+
+      /* ④ 救回来了: **必须**同时说"各轴未使能" —— 恢复只管过程数据, 一句话盖过从站状态
+       * 就是让人以为电机已经带电/可以动了。 */
+      r = RecoverReport(); r.need = 2; r.ok = 2; r.max_gap_ms = 1657;
+      {
+         const QString s = recover_done_text(r);
+         check(hasq(s, "成功"),   "救回来了 → 说成功");
+         check(hasq(s, "未使能"), "**并且**说各轴停在未使能");
+         check(hasq(s, "使能"),   "并指出下一步是人工使能");
+         check(hasq(s, "不会自己带电"), "并把「不会自己带电」说清楚");
+      }
+
+      /* ⑤ 没救全: 这是最危险的一档 (一半 OP 一半不在, WKC 持续偏短) —— 必须**劝停** */
+      r = RecoverReport(); r.need = 2; r.ok = 1; r.fail = 1; r.max_gap_ms = 1657;
+      {
+         const QString s = recover_done_text(r);
+         check(hasq(s, "还有 1 台没回来") || hasq(s, "没回来"), "要点名还有几台没回来");
+         check(hasq(s, "不要在这个状态下继续走轴"), "并且劝停 —— 这是最危险的一档");
+         check(hasq(s, "重连总线"), "并指出唯一的出处");
+         check(!hasq(s, "成功"), "不许说成功");
+      }
+
+      /* ⑥ 中途停止: 已动过的轴不会自动撤回 —— 必须说出来, 否则操作员以为一切照旧 */
+      r = RecoverReport(); r.stop = true; r.ok = 1; r.need = 2;
+      {
+         const QString s = recover_done_text(r);
+         check(hasq(s, "中止"), "中止 → 说中止");
+         check(hasq(s, "不会自动撤回"), "并说清已动过的轴不会自动撤回");
+         check(hasq(s, "使能"), "并给出恢复出力的办法");
+      }
+
+      /* ⑦ 库在**读到任何从站状态之前**就拒绝了: 这一支什么都不知道, 所以
+       * **一句关于从站的话都不许说** —— 尤其不许说"所有从站的 AL 都在 OP"。
+       * 那正是本轮要修的那一类错误 (拿一个没读过的值当结论)。 */
+      r = RecoverReport(); r.refused = true;
+      {
+         const QString s = recover_done_text(r);
+         check(hasq(s, "没有执行"), "拒绝了 → 照实说没执行");
+         check(hasq(s, "未知"),     "并说清从站状态未知");
+         check(!hasq(s, "都在 OP"), "**不许**说「AL 都在 OP」—— 它根本没读过 AL");
+         check(!hasq(s, "成功"),    "更不许说成功");
+         check(hasq(s, "重连总线"), "并把唯一的出处给出来");
+      }
+
+      /* 各分支互不串味: 混合那一句不许跑到"救回来了"那一支里去 */
+      r = RecoverReport(); r.need = 2; r.ok = 2;
+      check(!hasq(recover_done_text(r), "混合"), "救回来了就不许再提混合局面");
+   }
+}
+
 int main(int argc, char **argv)
 {
    QCoreApplication app(argc, argv);
@@ -3738,6 +3980,7 @@ int main(int argc, char **argv)
    test_homing();
    test_origin();
    test_bushealth();
+   test_autorecover();
    test_meter_sources();
    test_meter_meta();
    test_meterlog();

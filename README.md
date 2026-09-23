@@ -319,6 +319,70 @@ PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
     用那个条件的话它会在事情变糟的那一刻从红变成灰 —— 恰好相反。
     配它的还有: 状态栏那句「最长 `N` ms 没发帧」(这台 PC 是不是元凶的那把尺)、
     连续不足帧数、以及异常时读一次的 AL 状态码; 以及一条**不自动消失**的红横幅。
+- **上位机侧要关掉的省电项 (2026-09-23; 这是「最长 N ms 没发帧」的根因处置)。**
+  现场实机量到: 空闲挂着没人动, 本程序**最长 1657 ms 一帧都没发出去**(超 50 ms 共 12 次),
+  两台驱动器的 SM 看门狗因此动作(AL `0x14` / 状态码 `0x001B` = 主站喂帧超时), 从站停止
+  过程数据交换, 工作计数器恒为 2/6 —— 于是复位/使能全被拒, **唯一的回程是「断开 → 重连」**。
+  已量到本机两条证据: 网卡是 Realtek PCIe GbE, 省电特性全开 (`*EEE` / `EnableGreenEthernet` /
+  `GigaLite` / `PowerSavingMode` / `*InterruptModeration`); 电源计划是**平衡**,
+  `SUB_PCIEXPRESS`/`ASPM` = `0x2`(最大电源节省量), 交直流都是。
+  **一层一层改, 改完用状态栏那个「最长 N ms 未发帧」验收 —— 它不变就说明这一层没生效,
+  别接着往下改。**
+  ```powershell
+  $n = (Get-NetAdapter | Where-Object { $_.InterfaceGuid -eq '{7C64E0FA-D69A-4C92-A821-E5D341E63575}' }).Name
+  Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword '*EEE'                -RegistryValue 0
+  Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword 'EnableGreenEthernet' -RegistryValue 0
+  Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword 'GigaLite'            -RegistryValue 0
+  Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword 'PowerSavingMode'     -RegistryValue 0
+  Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword '*InterruptModeration' -RegistryValue 0
+  Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword '*PriorityVlanTag'    -RegistryValue 0
+  Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword '*FlowControl'        -RegistryValue 0
+  Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword '*SpeedDuplex'        -RegistryValue 4
+  Disable-NetAdapterPowerManagement -Name $n     # 「允许计算机关闭此设备以节约电源」
+  powercfg -setacvalueindex SCHEME_CURRENT SUB_PCIEXPRESS ASPM 0
+  powercfg -setdcvalueindex SCHEME_CURRENT SUB_PCIEXPRESS ASPM 0
+  powercfg -setactive SCHEME_CURRENT
+  ```
+  `*SpeedDuplex` 的 `4` = 这台驱动里「100 Mbps 全双工」的那个值 (0=自动侦测 / 4=100M FD /
+  6=1G FD), 钉死它只为不让它周期性重协商 —— 现场本来就跑 100 Mbps。
+  **回滚** = 把每条的值改回改之前读到的 (`Get-NetAdapterAdvancedProperty` 一读就有,
+  `*SpeedDuplex` 回 `0`)。`Disable-NetAdapterPowerManagement` 在本机可能报
+  `Windows System Error 31` —— 那就去「设备管理器 → 网络适配器 → 属性 → 电源管理」用 GUI
+  取消勾选; **顺手看一眼那个报错还在不在, 查询本该成功却失败, 本身就像驱动状态不对**。
+  没上 `PROCTHROTTLEMIN=100`(CPU 最低状态拉满): 这是笔记本, 先看上面这些够不够,
+  一次动三层的话下回再出问题就分不清是哪一层。
+  **未解的一个疑问**: `2217h`(本机实读 = 20)在文档里标注为「同步帧阈值」, 程序只读不写。
+  若它真是驱动器侧的看门狗阈值, 放大它就能容忍上位机的长停顿 —— 但那是**削弱保护**不是修
+  根因, 且要先对着手册 V2.4 p84 确认它到底是不是这个意思。本轮**不碰驱动器参数**。
+- **自动重请求 OP (兜底) 与「重连总线」按钮。**
+  停顿真发生了、从站没跟回来时, 程序会**自己**把过程数据救回来(「重连总线」旁边那条出口
+  不再需要人自己悟)。它**只管把 AL 拉回 OP 并让各轴停在未使能**, 明确不做: **不重新给
+  力矩、不自动使能、不清驱动器故障位、不碰仍在 OP 的轴、不重建 PDO 映射**。
+  触发前要过一串闸, **两个条件各管一头**: 本机**按时**发帧连续够久
+  (`HMI_RECOVER_ARM_FRAMES` = 1000 帧 ≈ 2 s) **且**过程数据帧连续不足够久
+  (`ecatcmd::recover_bus_broken`); 再加冷却 30 s、本会话最多 2 次, 而且有任何命令在
+  跑/在排队时一点都不碰。
+  - 第二个条件(总线**确实**坏着)是 2026-09-23 第一次实跑补上的: 少了它, 一条**健康**的
+    总线在连上约 2 秒后就会被点着 —— 白阻塞界面 1~3 秒、白烧一次尝试次数(上限只有 2),
+    而它自己紧接着还会报「所有从站的 AL 都在 OP」。**动手前那句话现在只说真的查过的事**:
+    「本机已连续 N 帧按时发出, 而过程数据帧仍连续 M 帧不足」。
+  - 爬 `AL` 阶梯之前**先单独清一次错误位**: 写「当前那一级 `|` ACK」, 每圈照常发过程数据,
+    等 bit4 自己消失再往上爬。状态字 bit4 是**闩锁**, 而"含错误位就立刻判失败"那条会在
+    **第一帧**就返回 —— 把 ACK 与目标级一起写、或者清错期间断帧, 症状都是"重请求了但没上去"。
+  - 三种局面**一个 AL 字节都不写**, 只喊人: 有从站**没答话**(AL 读回 0 = 掉线/掉电)、
+    有从站停在 **INIT/BOOT**(配置已丢)、以及「有轴仍在 OP 且 `6041h` bit2 = 1(可能正带
+    保持力矩) + 有轴掉出 OP」的**混合局面**(只把掉出去的那根救回来会让另一根单独抱着负载;
+    竖直轴会被扭)。前两种和"没救全"都只有**「重连总线」**能恢复。
+  - 「重连总线」= 断开(**先给各轴卸力**, 滑台失去保持力矩) → 重连(重新进 OP, 各轴停在
+    **未使能**)。它没连上时等同「连接」; `hmi` 会先弹确认框(`scan` 与它自己的「断开」一致,
+    不弹)。这两个程序都摆在顶栏「连接/断开」旁边, **不藏进菜单栏或独立窗口**。
+  - 帧间隔统计现在**分两份**: 净的外部停顿, 与**本程序自己的命令造成的**那一份(复位/使能/
+    回零期间 SOEM 的 SDO 事务一帧都不发)。**自动恢复的触发只看前者** —— 不分开的话, 我们
+    自己一次使能造成的静默会被读成"这台 PC 在卡", 把人支去查电源计划与网卡节能。
+    状态栏/横幅在最长的那个间隔是自家造成时会点明。**这一份归因曾经是错的**
+    (2026-09-23 实跑): 自动恢复收尾处跳过一次帧间隔测量, 却没把"这一次该归给谁"一起吃掉,
+    于是标志漏给了下一次测量 —— 一段纯外部的停顿被写成"本程序自己的命令造成的", 正好把人
+    从根因上支开。修在 `serviceAutoRecover` 收尾: 跳过一次测量就必须同时吃掉那个标志。
   - **合成一块不改变判据**: 两组信号回答的是**两个不同的问题** —— 「会不会中止扫描」看
     `6041h` bit11 (状态栏那对灯 / 画布红环 / 横幅); 「**开关本身压着没有**」看 `60FDh`
     三个位。两者**可能不一致, 不一致时以 bit11 为准**。表头上前两个名字与后三个名字分得开,
