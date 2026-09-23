@@ -872,7 +872,7 @@ void EcatThread::doFaultReset()
    {
       if (!s.isEmpty())
          s += QStringLiteral("   ");
-      s += QStringLiteral("%1 复位失败。请先按故障码查明原因 (6041h 实测值见控制台)。")
+      s += QStringLiteral("%1 复位失败。请按故障码查明原因 (6041h 实测值见控制台)。")
               .arg(bad.join(QStringLiteral("; ")));
    }
 
@@ -882,7 +882,7 @@ void EcatThread::doFaultReset()
    {
       if (!s.isEmpty())
          s += QStringLiteral("   ");
-      s += QStringLiteral("%1 本次**没有检查也没有复位** (过程数据帧不完整, 6041h 是陈旧值)。")
+      s += QStringLiteral("%1 本次没有检查也没有复位 (过程数据帧不完整, 6041h 是陈旧值)。")
               .arg(unknown.join(QStringLiteral("、")));
    }
 
@@ -1284,13 +1284,11 @@ void EcatThread::serviceAutoRecover(qint64 now_ms)
    {
       const QString s =
          (v == ecatcmd::RECOVER_MASTER)
-            ? QStringLiteral("刚才这一帧迟了 %1 ms (超过 %2 ms): 是**这台机器自己**的停顿, "
-                             "不是从站的问题 —— 不去动从站的 AL 寄存器。"
-                             "要查的是电源计划与网卡节能 (见 README「上位机侧要关掉的省电项」)。")
+            ? QStringLiteral("刚才这一帧迟了 %1 ms (超过 %2 ms): 停顿在这台机器自己, "
+                             "不在从站, 未动从站的 AL。请检查电源计划与网卡节能。")
                  .arg(m_last_gap_ms).arg(HMI_GAP_WARN_MS)
-            : QStringLiteral("本会话已经自动重请求 OP %1 次 (上限 %2), 不再自动动手。"
-                             "从站还没回来就点「重连总线」: 断开(先卸力) -> 重连(重新进 OP, "
-                             "各轴停在未使能)。")
+            : QStringLiteral("本会话已自动重请求 OP %1 次 (上限 %2), 不再自动动手。"
+                             "从站没回来请重连总线。")
                  .arg(m_recover_tries).arg(HMI_RECOVER_MAX_TRIES);
 
       /* 冷却只为**不重复说同一句话**, 与"动手"那个冷却分开算: 两个冷却共用一个成员的话,
@@ -1323,7 +1321,7 @@ void EcatThread::serviceAutoRecover(qint64 now_ms)
     * 曾经写的是"从站仍不在 OP"—— 那是**没查过**的 (判据里没有一条读 AL), 而第一趟实跑
     * 就撞上了: 它自己紧接着报「所有从站的 AL 都在 OP」, 与这句当场打脸。 */
    note(QStringLiteral("本机已连续 %1 帧按时发出, 而过程数据帧仍连续 %2 帧不足 —— "
-                       "正在**自动重请求 OP** (只救过程数据交换, 不会重新给力矩)…")
+                       "正在自动重请求 OP (只救过程数据交换, 不给力矩)…")
            .arg(m_gap_ok_run).arg(m_bad_wkc_run));
 
    /* 值初始化: em_recover_op 在**拒绝**那几条早退路径上不填 out (它的 out 是递增填的),

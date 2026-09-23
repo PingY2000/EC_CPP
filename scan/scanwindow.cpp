@@ -1226,10 +1226,8 @@ QWidget *ScanWindow::buildTopBar()
     * 界面入口必须外露) —— 它与那个按钮是同一件事的两步, 中间还要等收尾真的走完。 */
    m_btnReconn = new QPushButton(QStringLiteral("重连总线"), w);
    m_btnReconn->setToolTip(QStringLiteral(
-      "断开 (先给各轴卸力) -> 重新连接 (重新进 OP, 各轴停在**未使能**)。\n"
-      "自动重请求 OP 救不回来时用它: 停顿把从站踢出 OP 之后, 只有重连能重建 PDO 映射与\n"
-      "同步管理器配置。\n"
-      "各轴不会自己带电, 重连后要出力请重新「使能」。"));
+      "断开后重新连接: 断开先给各轴卸力, 重连重新进 OP, 各轴停在未使能。\n"
+      "各轴不会自己带电, 要出力请重新「使能」。"));
    connect(m_btnReconn, &QPushButton::clicked, this, &ScanWindow::onReconnectClicked);
 
    m_btnEnable = new QPushButton(QStringLiteral("使能"), w);
@@ -4037,8 +4035,8 @@ void ScanWindow::showFault(const QString &why)
 void ScanWindow::warnMaybeLive()
 {
    QMessageBox::critical(this, QStringLiteral("电机可能仍带电"),
-      QStringLiteral(
-         "收尾时未能确认所有轴已失能 (控制台退出码 10)。\n\n"));
+      QStringLiteral("收尾时未能确认所有轴已失能 (控制台退出码 10)。\n\n"
+                     "请立即断开驱动器的动力电源, 不要只依赖软件。"));
 }
 
 /* ---------------------------------------------------------------- 收尾 */

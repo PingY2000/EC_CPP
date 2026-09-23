@@ -134,7 +134,7 @@ cmake --build out/build/hmi-qt-ucrt64 --target scan
 
 ```bash
 PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
-# ... 833 passed, 0 failed, 1 skipped
+# ... 924 passed, 0 failed, 1 skipped
 ```
 
 它只链 `Qt6Core`, 所以上面那条 `windeployqt6` (照 `bin/hmi.exe` 跑) 搬来的 DLL 就够它用了。

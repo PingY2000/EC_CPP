@@ -228,7 +228,7 @@ void MainWindow::onConnectClicked()
    if (box.exec() != QMessageBox::Ok)
       return;
 
-   hint(QStringLiteral("正在连接… (选轴 / 补映射 / 进 OP 都是 SDO 事务, 耗时以秒计)"), false);
+   hint(QStringLiteral("正在连接... (选轴 / 补映射 / 进 OP 都要做 SDO, 慢是正常的)"), false);
 
    m_thr->postConnect(m_nic->currentData().toString());
 }
@@ -251,7 +251,7 @@ void MainWindow::onReconnectClicked()
 
    if (nic.isEmpty())
    {
-      hint(QStringLiteral("网卡名已丢失, 无法自动重连。请重新选择网卡。"), true);
+      hint(QStringLiteral("网卡名已丢失, 无法自动重连。请断开后重新选择网卡。"), true);
       return;
    }
 
@@ -259,16 +259,17 @@ void MainWindow::onReconnectClicked()
                    QStringLiteral("重连总线"),
                    QStringLiteral(
                       "接下来会:\n"
-                      "  · 断开: 先给各轴卸力 (滑台失去保持力矩, 可能因自重下滑)\n"
+                      "  · 断开: **先给各轴卸力** (滑台失去保持力矩, 可能因自重下滑)\n"
                       "  · 还原 PDO 映射, 降回 PRE_OP, 关网卡\n"
                       "  · 重新连接: 重建映射并进 OP\n\n"
-                      "重连之后各轴停在未使能, 不会自己带电 —— 要出力请重新「使能」。"),
+                      "重连之后各轴停在**未使能** —— 不会自己带电, 要出力请重新「使能」。\n"
+                      "自动重请求 OP 救不回来时才需要这一下。"),
                    QMessageBox::Ok | QMessageBox::Cancel, this);
    box.setDefaultButton(QMessageBox::Cancel);
    if (box.exec() != QMessageBox::Ok)
       return;
 
-   hint(QStringLiteral("正在重连总线…"),
+   hint(QStringLiteral("正在重连总线 (断开: 先给各轴卸力; 然后重新进 OP, 各轴停在未使能)…"),
         false);
 
    disconnectAndStop();
@@ -439,8 +440,11 @@ void MainWindow::refresh()
 void MainWindow::warnMaybeLive()
 {
    QMessageBox::critical(this, QStringLiteral("电机可能仍带电"),
-      QStringLiteral("收尾时未能确认所有轴已失能 (控制台退出码 10)。\n\n"
-                     "请立即断开驱动器的动力电源, 不要只依赖软件。"));
+      QStringLiteral(
+         "收尾时**未能确认所有轴都失能** —— 与控制台退出码 10 同一语义。\n\n"
+         "立即断开驱动器的动力电源, 不要只依赖软件。\n\n"
+         "常见原因是收尾过程中总线已经掉了: 那时驱动器还带着力矩, 而我们已经没有\n"
+         "通道去撤它。"));
 }
 
 void MainWindow::disconnectAndStop()

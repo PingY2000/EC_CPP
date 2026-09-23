@@ -50,7 +50,7 @@ scan/
   powermeter.h/.cpp       PowerMeter 抽象 + 三个模拟实现
   scanlog.h/.cpp          CSV 追加写 + 读回
   scanprefs.h/.cpp        参数的记忆 (exe 旁边的 scan.ini)。**只链 Qt6::Core**, 见 §16
-  selftest.cpp            **不需要硬件也不需要界面**的自检 (833 条断言, 见 §13)
+  selftest.cpp            **不需要硬件也不需要界面**的自检 (924 条断言, 见 §13)
 ```
 
 `scanplan` **不 include 任何 Qt**(`std::vector` + POD + `std::string`)。
