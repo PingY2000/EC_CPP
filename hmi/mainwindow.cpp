@@ -369,11 +369,23 @@ void MainWindow::refresh()
 
    if (t.in_op)
    {
-      m_lWkc->setText(QStringLiteral("WKC %1 / 期望 %2")
-                         .arg(t.wkc).arg(t.expected_wkc));
+      QString s = QStringLiteral("WKC %1 / 期望 %2").arg(t.wkc).arg(t.expected_wkc);
       /* WKC 偏短 = 有从站没参与过程数据交换 */
-      m_lWkc->setStyleSheet(t.wkc >= t.expected_wkc ? "color:#7b8391"
-                                                    : "color:#ffb020; font-weight:bold");
+      bool bad = (t.wkc < t.expected_wkc);
+
+      /* 平均帧周期 (**与 scan 侧同一个 ecatcmd::cadence_text, 说法不许有两套**):
+       * 它的盲区与补法见 BusTelem::period_avg_ms —— 一圈均匀地慢下来时 WKC 是满的,
+       * 屏幕上什么都不会变。只在超过上限时才出字, 所以常态下这一格还是原来那个样子。 */
+      const QString cad = ecatcmd::cadence_text(t.period_avg_ms);
+      if (!cad.isEmpty())
+      {
+         s += QStringLiteral(" · ") + cad;
+         bad = true;
+      }
+
+      m_lWkc->setText(s);
+      m_lWkc->setStyleSheet(bad ? "color:#ffb020; font-weight:bold"
+                                : "color:#7b8391");
    }
    else
    {

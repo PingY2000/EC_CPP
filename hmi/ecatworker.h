@@ -159,6 +159,12 @@ struct BusTelem
    /* 上面那个最大值里, **由本程序自己的命令造成的**那一份 (复位/使能/回零期间 SOEM 的
     * SDO 事务一帧都不发)。不分开说, 我们自己一次使能就会被读成"这台 PC 在卡"。 */
    int      max_gap_self_ms = 0;
+   /* 最近 HMI_PERIOD_WIN_FRAMES 帧的**平均帧周期** (ms; 0 = 还没满一窗, 还没量到)。
+    * **与 max_gap_ms 是两个数, 不许互相顶替**: 那个量的是"两帧之间最长空了多少" (而且
+    * 只看 > 50 ms 的离群点, 也不含 em_service 内部的耗时), 这个量的是"整条节拍多快"。
+    * 实测那一趟 30 分钟里, 前者报的是 79 ms 那一次离群点, 而整趟的帧周期是 15.8 ms ——
+    * 谁也替不了谁。判据在 ecatcmd::cadence_slow() 一处。 */
+   int      period_avg_ms = 0;
    /* 自动重请求 OP 的窗口量: **本轮**坏帧期间的最长停顿 (好帧归零), 与 max_gap_ms 那个
     * 只增不减的会话最大值不是一回事 —— 见 EcatThread::m_gap_bad_ms。 */
    int      gap_bad_ms   = 0;
@@ -1397,6 +1403,18 @@ inline QString fault_banner_text(const BusTelem &t)
  * 取 50 正好把"抖动"与"真卡住"分开。 */
 #define HMI_GAP_WARN_MS     50
 
+/* 平均帧周期的统计窗口 (帧) 与告警线。**这是与 HMI_GAP_WARN_MS 成对的另一把尺, 量的是
+ * 另一个方向**: 那一把只记"最长一次停了多久", 而且是离群点判据 (> 50 ms), 也不含
+ * em_service 内部的耗时 —— 一圈**均匀地**慢下来它报不出这件事。2026-09-24 查"连上放着
+ * 不动, 过一会儿断连"时就是这么被瞒过去的: 那一趟 30 分钟里帧实打实地每 15.9 ms 才发
+ * 一次 (应为 2.5 ms), 而屏幕上没有任何一个数与"节拍"有关。
+ *
+ * 窗口 64 帧: 2 ms 圈期下约 0.16 s, 够快; 而它要抓的那种病一旦发生就一直那样, 不差这点。
+ * 告警线 3 倍圈期 (= 6 ms): 离实测的正常 2.5 ms 有 2.4 倍余量, 离实测的病态 15.6 ms 有
+ * 2.6 倍 —— 两边都不挨着。**跟着 HMI_LOOP_MS 走**, 将来改圈期不必回来改这里。 */
+#define HMI_PERIOD_WIN_FRAMES   64
+#define HMI_PERIOD_WARN_MS      (HMI_LOOP_MS * 3)
+
 /* **进了 OP 之后**所有 SDO 读的超时 (微秒) —— 进 OP 那一刻由 doConnectInner 用
  * em_set_sdo_timeout 装上, 之后 6061h / 1C32h / 2217h / 603Fh 那几条诊断读全走它。
  *
@@ -1421,6 +1439,29 @@ inline bool comm_bad_from(int wkc, int expected, int bad_run, int limit)
    if (wkc >= expected)
       return false;
    return bad_run >= limit;
+}
+
+/* 整条节拍是不是慢了。**刻意不给它一个"没量到"以外的第二含义**: 0 (连上不到一窗) 与
+ * 正常一样返回 false —— 没量到就别说, 不许编一个 0 ms 出来。
+ *
+ * 它**不并进 comm_bad_from** 是有意的: comm_bad 那条线会去点自动重请求 OP, 也就是往
+ * 从站的 AL 寄存器里写字节; 而"本机节拍慢"还没到该动寄存器的程度 —— 它该做的是让人看见
+ * (状态栏 + 到异常那一刻说进电文里), 不是自己动手救。 */
+inline bool cadence_slow(int period_avg_ms)
+{
+   return period_avg_ms > HMI_PERIOD_WARN_MS;
+}
+
+/* 节拍那条短句。空串 = 没什么可说的 (没量到 / 正常), **调用方自己决定往哪儿接** ——
+ * 状态栏接成 " · 帧周期平均 …", 电文接成 " 本程序帧周期平均 …。"
+ * 措辞走 (B) 家族: 说的都是"我这边的帧", 不借驱动器自报故障 (0xFF06) 那一套。 */
+inline QString cadence_text(int period_avg_ms)
+{
+   if (!cadence_slow(period_avg_ms))
+      return QString();
+
+   return QStringLiteral("帧周期平均 %1 ms (上限 %2 ms)")
+             .arg(period_avg_ms).arg(HMI_PERIOD_WARN_MS);
 }
 
 /* 603Fh 那两条路的**唯一**一处挑选规则。两个来源:
@@ -1519,9 +1560,12 @@ inline QString al_code_text(int state, int alcode)
  * self_gap_ms: 上面那个最大值里, **由本程序自己的命令造成的**那一份 (复位/使能/回零
  *   期间 SOEM 的 SDO 事务一帧都不发, 见 HMI_OP_SDO_TMO_US 那段)。**必须分开说** ——
  *   否则我们自己一次使能造成的静默会被读成"这台 PC 在卡", 把人支去查电源计划与网卡
- *   节能, 而那两样与它毫无关系。*/
+ *   节能, 而那两样与它毫无关系。
+ * period_avg_ms: 平均帧周期, 只在那条告警线之上才出现 (见 cadence_text)。它补的正是
+ *   上面那个数的盲区: 节拍**均匀地**慢下来时 max_gap_ms 一动不动。*/
 inline QString comm_banner_text(int wkc, int expected, int bad_run,
-                                int max_gap_ms, int gaps_over_ms, int self_gap_ms)
+                                int max_gap_ms, int gaps_over_ms, int self_gap_ms,
+                                int period_avg_ms)
 {
    QString s = QStringLiteral(
       "过程数据帧连续 %1 帧不足 (工作计数器 %2/%3), 位置与状态为陈旧值, 目标已冻结。")
@@ -1538,6 +1582,12 @@ inline QString comm_banner_text(int wkc, int expected, int bad_run,
          s += QStringLiteral("\n其中最长的那次是本程序自己的命令 (复位/使能/回零) "
                              "造成的, 不是外部卡顿。");
    }
+
+   /* 节拍那条**独立于上面那个数**: 一圈**均匀地**慢下来时 max_gap_ms 报不出"每一帧都
+    * 迟到" (它只认 > 50 ms 的离群点), 而那同样足以让驱动器掉出 OP。所以它单独一句,
+    * 而且只要慢就得说 —— 这一句在那一趟里是缺的。 */
+   if (cadence_slow(period_avg_ms))
+      s += QStringLiteral("\n本程序") + cadence_text(period_avg_ms) + QStringLiteral("。");
 
    return s;
 }
@@ -1985,6 +2035,16 @@ private:
    qint64     m_svc_prev_ms = -1;
    int        m_max_gap_ms  = 0;
    int        m_gaps_over   = 0;
+
+   /* ---- 平均帧周期 (见 BusTelem::period_avg_ms) ----
+    * 帧周期 = 这一帧**开始**的时刻 − 上一帧开始的时刻 —— 所以除上面那个"空档"之外还要
+    * 记住上一帧的起点 (m_svc_prev_t0)。驱动器只认"多久收到一帧", 那正是这个数。
+    * 窗口满 HMI_PERIOD_WIN_FRAMES 帧算一次平均, 存在 m_period_avg 里给遥测看;
+    * **不用指数滑动平均**: 整数除法会把小于窗口的值一路截成 0 (2/64 = 0, 之后永远是 0)。 */
+   qint64     m_svc_prev_t0 = -1;
+   qint64     m_period_sum  = 0;
+   int        m_period_n    = 0;
+   int        m_period_avg  = 0;
 
    /* 上面那个最长间隔里, **由本程序自己的命令造成的**那一份 (复位/使能/回零期间 SOEM 的
     * SDO 事务期间一帧都不发)。见 comm_banner_text 的 self_gap_ms 与 recover_verdict ——

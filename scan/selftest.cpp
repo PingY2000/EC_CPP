@@ -4169,7 +4169,7 @@ static void test_bushealth()
       }
 
       const QString a = ecatcmd::fault_banner_text(t);      /* (A) */
-      const QString b = ecatcmd::comm_banner_text(0, 7, 12, 300, 4, 0);   /* (B) */
+      const QString b = ecatcmd::comm_banner_text(0, 7, 12, 300, 4, 0, 0);   /* (B) */
 
       check(!a.isEmpty() && !b.isEmpty(), "两条都出得来");
       check(a != b, "两条横幅不是同一句话");
@@ -4184,11 +4184,11 @@ static void test_bushealth()
       check(!hasq(b, "站号"), "(B) 不许抄 (A) 那句「查站号配置」");
 
       /* (B) 的措辞要随帧数变 —— 写成常量就没有诊断价值了 */
-      const QString b2 = ecatcmd::comm_banner_text(1, 7, 12, 300, 4, 0);
+      const QString b2 = ecatcmd::comm_banner_text(1, 7, 12, 300, 4, 0, 0);
       check(b != b2, "帧数变了, 句子跟着变");
 
       /* 没量到帧间隔时 (max_gap_ms = 0) 那一截不出现: 不许编一个 0 ms 出来 */
-      const QString b3 = ecatcmd::comm_banner_text(0, 7, 12, 0, 0, 0);
+      const QString b3 = ecatcmd::comm_banner_text(0, 7, 12, 0, 0, 0, 0);
       check(!hasq(b3, "0 ms"), "没量到就不提这个数");
    }
 
@@ -4224,6 +4224,47 @@ static void test_bushealth()
 
       check(!other.isEmpty(), "0xFF02 有处置那句话");
       check(s2.count(one) == 1 && s2.count(other) == 1, "不同码 → 两句各一次");
+   }
+
+   caseBegin("通讯: 节拍那把尺 —— 平均帧周期 (2026-09-24 那条断连反馈)");
+   {
+      /* 这一组钉的是"整条节拍多快"与"最长一次停了多久"是**两个数**。那一趟里帧是**均匀地**
+       * 每 15.9 ms 才发一次 (应为 2.5 ms), 而 max_gap_ms 报不出这件事、屏幕上一个字都没有。
+       * 所以 cadence_slow 判的是另一个量, 并且**不许并进 comm_bad_from**: 那条线会去写从站
+       * 的 AL 寄存器, 而"本机节拍慢"还不到该动寄存器的程度 —— 它只该让人看见。 */
+      check(!ecatcmd::cadence_slow(0), "没量到 (0) → 不报警");
+      check(!ecatcmd::cadence_slow(3), "实测的正常 (2.5 ms) → 不报警");
+      check(!ecatcmd::cadence_slow(HMI_PERIOD_WARN_MS), "正好压在上限 → 还算正常 (边界含)");
+      check(ecatcmd::cadence_slow(HMI_PERIOD_WARN_MS + 1), "过上限 1 ms → 报警");
+      check(ecatcmd::cadence_slow(16), "实测的病态 (15.9 ms) → 报警");
+
+      /* 上限跟着圈期走, 不是写死一个数; 而且必须夹在实测的那两个数中间 —— 离哪边太近
+       * 都会变成"常在报警"或"永远不报警" */
+      check(!ecatcmd::cadence_slow(HMI_LOOP_MS * 3), "上限就是 3 倍圈期");
+      check(HMI_PERIOD_WARN_MS > 3 && HMI_PERIOD_WARN_MS < 16,
+            "上限落在实测的「正常 2.5」与「病态 15.9」之间");
+
+      /* 措辞: 没量到与正常都**一个字都不出**。与 max_gap_ms 那条同一个规矩 ——
+       * 常态不许在屏幕上多出噪声, 也不许编一个 0 ms 出来 */
+      check(ecatcmd::cadence_text(0).isEmpty(), "没量到 → 一个字都不出");
+      check(ecatcmd::cadence_text(3).isEmpty(), "正常 → 不说");
+
+      const QString slow  = ecatcmd::cadence_text(16);
+      const QString limit = QString::number(HMI_PERIOD_WARN_MS);
+      check(!slow.isEmpty(), "慢了才出字");
+      check(hasq(slow, "16"), "把量到的数说出来");
+      check(hasq(slow, limit.toUtf8().constData()), "把上限也说出来 —— 不然这个数没法对账");
+      check(hasq(slow, "ms"), "单位带出来");
+      check(!hasq(slow, "**"), "字符串里不许出现 **");
+      check(!hasq(slow, "Sleep") && !hasq(slow, "节流"),
+            "成因不许写进屏幕上的字 (那是 docs/scan_messages.md 的事)");
+
+      /* 电文那一句: 节拍慢要**另起一句**, 不许挤进"本程序最长多久没发帧"那一句里 ——
+       * 那个数报不出"每一帧都迟到", 借它的数说话就是说了一句假的 */
+      const QString b_slow = ecatcmd::comm_banner_text(0, 6, 12, 8, 0, 0, 16);
+      check(hasq(b_slow, "帧周期") && hasq(b_slow, "16"), "节拍慢要单独说出来");
+      const QString b_ok = ecatcmd::comm_banner_text(0, 6, 12, 8, 0, 0, 3);
+      check(!hasq(b_ok, "帧周期"), "节拍正常就不提这一句");
    }
 }
 

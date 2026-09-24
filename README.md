@@ -319,6 +319,9 @@ PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
     用那个条件的话它会在事情变糟的那一刻从红变成灰 —— 恰好相反。
     配它的还有: 状态栏那句「最长 `N` ms 没发帧」(这台 PC 是不是元凶的那把尺)、
     连续不足帧数、以及异常时读一次的 AL 状态码; 以及一条**不自动消失**的红横幅。
+    2026-09-24 又加了**平均帧周期**那半句(「· 帧周期平均 `N` ms (上限 `M` ms)」):
+    它是**另一把尺** —— 上面那个数只记 > 50 ms 的离群点, 看不出节拍**均匀地**慢下来,
+    而实测那正是本机出过的毛病(见下面那条省电项与 `docs/scan_sweep.md` §34)。
 - **上位机侧要关掉的省电项 (2026-09-23; 这是「最长 N ms 没发帧」的根因处置)。**
   现场实机量到: 空闲挂着没人动, 本程序**最长 1657 ms 一帧都没发出去**(超 50 ms 共 12 次),
   两台驱动器的 SM 看门狗因此动作(AL `0x14` / 状态码 `0x001B` = 主站喂帧超时), 从站停止
@@ -326,8 +329,12 @@ PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
   已量到本机两条证据: 网卡是 Realtek PCIe GbE, 省电特性全开 (`*EEE` / `EnableGreenEthernet` /
   `GigaLite` / `PowerSavingMode` / `*InterruptModeration`); 电源计划是**平衡**,
   `SUB_PCIEXPRESS`/`ASPM` = `0x2`(最大电源节省量), 交直流都是。
-  **一层一层改, 改完用状态栏那个「最长 N ms 未发帧」验收 —— 它不变就说明这一层没生效,
-  别接着往下改。**
+  **一层一层改, 改完用状态栏那两句验收 ——「最长 N ms 未发帧」与「帧周期平均 N ms」
+  (2026-09-24 加的)。两个数都不动就说明这一层没生效, 别接着往下改。**
+  **只盯前一个是会漏的**: 本机还有一条它看不见的毛病 —— 节拍整体慢成一个系统 tick
+  (`Sleep(2)` 实际睡 15.9 ms, 应为 2.5 ms), 帧是**均匀地**每 15.9 ms 才发一次。那个数
+  只记 > 50 ms 的离群点, 所以全程不变。处置(`em_sleep_ms` 换高精度定时器 + 工作线程
+  起手拒绝省电节流)与实测数据见 `docs/scan_sweep.md` §34。
   ```powershell
   $n = (Get-NetAdapter | Where-Object { $_.InterfaceGuid -eq '{7C64E0FA-D69A-4C92-A821-E5D341E63575}' }).Name
   Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword '*EEE'                -RegistryValue 0

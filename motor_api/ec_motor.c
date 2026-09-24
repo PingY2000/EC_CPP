@@ -68,9 +68,66 @@ uint32_t em__now_ms(void)
 #endif
 }
 
+/* ---- 节拍: 高精度可等待定时器 (2026-09-24) -----------------------------------------
+ * **Sleep() 不能用来打这个节拍。** Sleep() 的粒度由本进程有没有"1 ms 定时器精度请求"
+ * 决定 (Windows 10 2004 起该请求是 per-process 的), 没请求就是一个系统 tick。
+ * 本机 (Win11 26200) 实测: 机器静下来之后 Sleep(2) 实际睡 **15.9 ms** —— 一圈慢 8 倍,
+ * 而"接上放着不动, 过一会儿断连"那条现场反馈里, **这是唯一量出来的、也足以造成断连**
+ * 的一件事 (现场那条 AL 0x14 / 0x001B 本身没复现出来, 见 docs/scan_sweep.md §34.6)。
+ * SOEM 的 osal 确实调过一次
+ * timeBeginPeriod(1), 但**实测不管用**: 调一次、每 20 s 重调一次, 15 分钟里 Sleep(2) 的
+ * 中位数两次都是 15.92 ms —— 那次精度请求被 Windows 的省电节流吃掉了 (EcatThread 起手
+ * 那记 SetProcessInformation 是管这件事的另一半)。所以这里不跟它赌。
+ *
+ * CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Win10 1803+) 实测 **2.55 ms**, 而且**不受省电
+ * 节流影响** —— 强制把 EcoQoS 打开也只到 2.44 ms。这是它比"重调 timeBeginPeriod"强的
+ * 地方。同为实测: 光 Sleep(2) 是 15.84 ms, 光拒绝节流是 2.91 ms。
+ * 建不出来 (老系统 / 不是 Win10 1803 以上) 就落回 Sleep(), 行为与从前一模一样。
+ *
+ * 定时器**全进程一个**: 每个调用点各建一个, 句柄数会按秒往上堆 (14 个调用点里有几个在
+ * 每帧都跑的循环里), 所以复用同一个, 第一次进来靠 InitOnce 挡住。
+ * ⚠️ 共用一个句柄意味着**同一时刻只能有一个线程在用**: 两个线程同时进来会互相偷走对方的
+ * 信号 (一个提前醒、一个等到兜底超时)。本工程成立 —— motor_api 只有总线工作线程调
+ * (hmi/ecatworker.h 顶部那条"全程序只有这个线程碰 motor_api"), CLI 工具都是单线程的。
+ * 将来真要多线程调, 这里要改成每线程一个定时器。 */
+static INIT_ONCE em__hr_once  = INIT_ONCE_STATIC_INIT;
+static HANDLE    em__hr_timer = NULL;
+
+static BOOL CALLBACK em__hr_make(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+   (void)once; (void)param; (void)ctx;
+   em__hr_timer = CreateWaitableTimerExW(NULL, NULL,
+                                         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                         TIMER_ALL_ACCESS);
+   return TRUE;   /* 建不出来也是"做过了": 每个 tick 重试一次 Create 没有意义 */
+}
+
 void em__sleep_ms(int ms)
 {
 #ifdef _WIN32
+   if (ms > 0)
+   {
+      InitOnceExecuteOnce(&em__hr_once, em__hr_make, NULL, NULL);
+
+      if (em__hr_timer != NULL)
+      {
+         /* 到期时间取**相对**的 (负数), 单位 100ns: ms × 10000; lPeriod = 0 = 只响一次。
+          * 每次重装而不是设一个固定周期: 调用点的 ms 不固定 (2 与 5 都有), 一个固定周期的
+          * 定时器说不出"这次要睡 5 ms"。 */
+         LARGE_INTEGER due;
+
+         due.QuadPart = -(LONGLONG)ms * 10000;
+
+         if (SetWaitableTimer(em__hr_timer, &due, 0, NULL, NULL, FALSE))
+         {
+            /* 兜底超时: 定时器真出了岔子也不至于把工作线程永久挂在这里 (那是比慢 8 倍
+             * 更糟的故障)。正常路径上它一次都不到期 —— 先到期的总是那个定时器。 */
+            WaitForSingleObject(em__hr_timer, (DWORD)ms + 1000);
+            return;
+         }
+      }
+   }
+
    Sleep((DWORD)ms);
 #else
    usleep((useconds_t)ms * 1000);
@@ -78,6 +135,35 @@ void em__sleep_ms(int ms)
 }
 
 void em_sleep_ms(int ms) { em__sleep_ms(ms); }
+
+/* ---- 节拍的另一半: 别让 Windows 给我们挂省电节流 (Power Throttling / EcoQoS) --------
+ * 窗口不在前台、没人操作时 Windows 会给"它认为的后台进程"挂上 EcoQoS: 调度降频 +
+ * **把本进程的定时器精度请求丢掉**。后一条正是 Sleep(2) 睡成一个系统 tick 的原因之一
+ * (另一半见 em__sleep_ms 那段)。
+ *
+ * ControlMask 点这两位 + StateMask = 0 = "不降频, 而且**认**我的定时器精度请求"。
+ * 只点 IGNORE_TIMER_RESOLUTION 不够 —— 那一位只说"别丢掉我的精度请求", 降频本身还在。
+ *
+ * 实测 (本机 Win11 26200, 同一趟里 A/B 各 45 s): 原样 15.84 ms → 这一句之后 2.91 ms。
+ * 它是**进程级**的, 幂等, 谁调都不出错; 老系统没有这个 API 时返回 -1, 调用者忽略即可。
+ * 非 Windows 上什么都不做, 返回 0。 */
+int em_reject_power_throttling(void)
+{
+#ifdef _WIN32
+   PROCESS_POWER_THROTTLING_STATE s;
+
+   memset(&s, 0, sizeof(s));
+   s.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+   s.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+                   PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+   s.StateMask   = 0;
+
+   return SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &s,
+                                sizeof(s)) ? 0 : -1;
+#else
+   return 0;
+#endif
+}
 
 void em__err(const char *fmt, ...)
 {

@@ -280,8 +280,16 @@ int em_list_adapters(em_adapter_t *out, int max);
  * 但那之前的汉字输出会是乱码 (源码 UTF-8, Windows 控制台默认 GBK)。 */
 void em_console_init(void);
 
-/* 毫秒睡眠 —— 调用方写自己的过程数据循环时要用它做节拍 (空转会吃满一个核) */
+/* 毫秒睡眠 —— 调用方写自己的过程数据循环时要用它做节拍 (空转会吃满一个核)。
+ * Windows 上走的是高精度可等待定时器, **不是** Sleep(): Sleep(2) 一旦被 Windows 的
+ * 省电节流摘掉定时器精度请求, 睡的就成了一个系统 tick (本机实测 15.9 ms, 慢 8 倍)。 */
 void em_sleep_ms(int ms);
+
+/* 拒绝 Windows 的省电节流 (Power Throttling / EcoQoS)。**与上面那个节拍是一件事的两半**:
+ * em_sleep_ms 保证"我们等得准", 这一句保证"我们跑得动" (被挂上节流的进程不只被判得慢,
+ * 它自己的定时器精度请求也会被丢掉)。进程级、幂等; 想在过程数据循环里跑得稳就在起手调一次。
+ * 返回 0 = 已生效 / 非 Windows 上的空操作; -1 = 这个系统上办不到 (忽略即可)。 */
+int em_reject_power_throttling(void);
 
 int em_slave_count(const em_bus_t *bus);
 int em_slave_info(const em_bus_t *bus, int slave, em_slave_info_t *out);

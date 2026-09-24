@@ -307,6 +307,14 @@ void EcatThread::BlockTick::tick(void *user, int wkc)
 
 void EcatThread::run()
 {
+   /* ---- 起手: 先把 Windows 的省电节流关掉, 再谈别的 ----
+    * 被挂上 EcoQoS 的进程不只被判得慢, **连自己那个定时器精度请求都会被丢掉** ——
+    * 本机实测 Sleep(2) 就是这么睡成 15.9 ms 的 (一圈慢 8 倍, 而驱动器每 2 ms 就该收到
+    * 一帧)。em_sleep_ms 那边换成高精度定时器是这件事的另一半, 两半都要有:
+    * 那一半管"我们等得准", 这一半管"我们跑得动"。
+    * 进程级、幂等、老系统上办不到也只是返回 -1, 所以不看返回值 —— 它不是判据。 */
+   em_reject_power_throttling();
+
    QElapsedTimer clk;
    clk.start();
    qint64 last = clk.elapsed();
@@ -397,7 +405,26 @@ void EcatThread::run()
                m_gap_bad_ms = (int)gap;
             }
          }
+
+         /* 帧周期 = 这一帧**开始**的时刻 − 上一帧开始的时刻。与上面那个 gap 是两个数:
+          * gap 量的是两帧之间的空档, 把 em_service 自己花的时间排除在外; 而驱动器认的是
+          * **多久收到一帧**, 那正是这个。攒满一窗算一次平均 —— 单帧抖动不该进这个数,
+          * 要看的恰恰是"整条节拍有多快" (见 BusTelem::period_avg_ms)。 */
+         if (m_svc_prev_t0 >= 0)
+         {
+            m_period_sum += svc_t0 - m_svc_prev_t0;
+            m_period_n++;
+
+            if (m_period_n >= HMI_PERIOD_WIN_FRAMES)
+            {
+               m_period_avg = (int)(m_period_sum / m_period_n);
+               m_period_sum = 0;
+               m_period_n   = 0;
+            }
+         }
+
          m_svc_prev_ms = svc_t1;
+         m_svc_prev_t0 = svc_t0;
 
          if (!m_origin_ready)
             tryInitOrigin();
@@ -414,6 +441,13 @@ void EcatThread::run()
       {
          last = clk.elapsed();
          m_svc_prev_ms = -1;   /* 没在发帧, 别把"连接前的空档"算成一个帧间隔 */
+         m_svc_prev_t0 = -1;
+         /* 没在发帧就谈不上节拍。平均值也要清: 留着上一个会话的数, 重连之后屏幕上会先
+          * 摆出一个陈旧的数字, 而那个数字恰恰是"本机跟不跟得上"的唯一读数 —— 陈旧的那
+          * 一个与"没量到"说的是两件事, 宁可什么都不说。 */
+         m_period_sum = 0;
+         m_period_n   = 0;
+         m_period_avg = 0;
          m_gap_self_want = false;
          m_gap_ok_run    = 0;  /* 没在发帧就谈不上"按时发帧" */
          m_last_gap_ms   = 0;
@@ -662,6 +696,10 @@ void EcatThread::doConnectInner(const QString &ifname)
 
    /* 这一趟的帧间隔统计从这里重新开始 (上一个连接的数不该混进来) */
    m_svc_prev_ms = -1;
+   m_svc_prev_t0 = -1;
+   m_period_sum  = 0;
+   m_period_n    = 0;
+   m_period_avg  = 0;
    m_max_gap_ms  = 0;
    m_gaps_over   = 0;
    m_gap_self_want   = false;
@@ -1806,6 +1844,7 @@ void EcatThread::serviceAutoRecover(qint64 now_ms)
     *     连着来, 中间只隔一句输出)。
     * 一句话: 跳过了一次测量, 就必须同时把"这一次该归给谁"也吃掉。 */
    m_svc_prev_ms    = -1;
+   m_svc_prev_t0    = -1;   /* 帧周期那一路同理: 这一趟恢复不是"两帧之间的一段" */
    m_gap_self_want  = false;
    m_gap_ok_run     = 0;
    m_last_gap_ms    = 0;
@@ -2239,6 +2278,7 @@ void EcatThread::publish(int wkc)
    t.max_gap_ms    = m_max_gap_ms;
    t.gaps_over_ms  = m_gaps_over;
    t.max_gap_self_ms = m_max_gap_self_ms;
+   t.period_avg_ms = m_period_avg;
    t.gap_bad_ms    = m_gap_bad_ms;
    t.recover_tries = m_recover_tries;
    t.al_state     = m_al_state;
@@ -2282,6 +2322,14 @@ void EcatThread::publish(int wkc)
        * "这台 PC 在卡", 把人支去查电源计划与网卡节能 (见 comm_banner_text)。 */
       if (m_max_gap_self_ms > 0 && m_max_gap_self_ms >= m_max_gap_ms)
          s += QStringLiteral("其中最长的那次是本程序自己的命令造成的, 不是外部卡顿。");
+
+      /* 节拍慢也在这里说出来 —— **"最长多久没发帧"那个数看不见它**: 那个数只记 > 50 ms 的
+       * 离群点, 也不含 em_service 内部的耗时, 所以一圈均匀地慢下来它报不出"每一帧都迟到"
+       * 这件事 (那一趟 30 分钟它报的是 79 ms 那一次离群点, 而整趟帧周期是 15.8 ms)。
+       * 到了"帧不足"这一刻, 两个数要一起摆在屏幕上, 让人分得开是线缆还是本机。 */
+      if (ecatcmd::cadence_slow(m_period_avg))
+         s += QStringLiteral(" 本程序") + ecatcmd::cadence_text(m_period_avg)
+              + QStringLiteral("。");
 
       note(s);
    }

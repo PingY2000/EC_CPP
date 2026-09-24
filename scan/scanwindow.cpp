@@ -3716,7 +3716,7 @@ void ScanWindow::refreshAxisSignals(const BusTelem &t)
        * 与驱动器自报的 0xFF06 那套 fault_code_action 分开) */
       m_commBanner = ecatcmd::comm_banner_text(t.wkc, t.expected_wkc, t.bad_wkc_run,
                                                t.max_gap_ms, t.gaps_over_ms,
-                                               t.max_gap_self_ms);
+                                               t.max_gap_self_ms, t.period_avg_ms);
       hint(m_commBanner, true);
    }
    else if (!t.comm_bad)
@@ -3822,6 +3822,18 @@ void ScanWindow::refresh()
        * 事后对账时要能从屏幕上看出"这中间有一次自动动作"。 */
       if (t.recover_tries > 0)
          s += QStringLiteral(" · 已自动重请求 OP %1 次").arg(t.recover_tries);
+
+      /* 节拍那条**刻意不放进上面那个"出过事才常驻"的闸里** —— 它要抓的恰恰是"什么都没
+       * 发生, 只是慢"那一拍: 一圈慢成 15.9 ms 时 comm_bad 一次都不会立起来, 而等到它立
+       * 起来就已经断连了 (2026-09-24 那条现场反馈就这么被瞒过去的)。
+       * 它自己带着"只在超过上限时才出字"这道闸 (cadence_text 返回空串), 所以常态下这块
+       * 屏幕上不会多出任何东西。 */
+      const QString cad = ecatcmd::cadence_text(t.period_avg_ms);
+      if (!cad.isEmpty())
+      {
+         s += QStringLiteral(" · ") + cad;
+         bad = true;
+      }
 
       m_lWkc->setText(s);
       m_lWkc->setStyleSheet(bad ? QStringLiteral("color:#ffb020; font-weight:bold")

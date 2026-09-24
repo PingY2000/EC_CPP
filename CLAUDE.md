@@ -70,7 +70,7 @@ cmake --build out/build/hmi-qt-ucrt64            # 两个界面 + 自检, 期望
 ```bash
 export PATH="/c/msys64/ucrt64/bin:/c/Qt/6.10.1/mingw_64/bin:$PATH"
 ./bin/scan_selftest.exe                          # 不需要设备也不需要界面
-# ... 924 passed, 0 failed, 1 skipped
+# 2026-09-24 实测 1095 passed, 0 failed, 0 skipped (那一行是**当时**的数, 加断言就会变)
 ```
 
 **任何改动之后都要跑一次自检。** 它是这个仓库唯一能自动验证判据的东西 (只链 `Qt6::Core`)。
