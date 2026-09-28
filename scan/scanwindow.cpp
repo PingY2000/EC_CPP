@@ -1602,6 +1602,29 @@ QWidget *ScanWindow::buildHomePanel()
       }
    }
 
+   /* ---- 第 4 行: 「测量原点宽度」+ 第 5 行: 读数 ----
+    * 摆在八个按钮**之下**: 它量的是那八个按钮跑完之后滑台停在哪儿, 语义上跟在它们后面。
+    *
+    * 按钮占满五列 —— 它是"两根一起"的动作, 不该长得像某一根的东西。
+    * tooltip 按操作类写 (4 行 / 90 字以内): 不写步骤、不写任何数字 (速度与超时那两个框收起时
+    * 看不见, 写在这里的必然与框里的值对不上), 出路那一句与另外几个按钮同一份措辞。 */
+   m_btnSpan = new QPushButton(QStringLiteral("测量原点宽度"), m_homeDetail);
+   m_btnSpan->setObjectName(QStringLiteral("danger"));
+   m_btnSpan->setToolTip(QStringLiteral(
+      "先以方式 24 回零, 再顺着正向量出原点信号两个边沿之间的脉冲数。\n"
+      "量完停在信号远端边沿, 显示坐标不再是 0。\n"
+      "两根轴会同时带电运动, 启动前先失能; 按「停止」可立即中止。"));
+   connect(m_btnSpan, &QPushButton::clicked, this, &ScanWindow::onSpanClicked);
+
+   dg->addWidget(m_btnSpan, 4, 0, 1, 5);
+
+   m_lSpan = new QLabel(m_homeDetail);
+   m_lSpan->setWordWrap(true);
+   /* 灰一点, 与上面那两行「速度」「超时」的轴名同一个写法 —— 它是读数不是输入 */
+   m_lSpan->setStyleSheet(QStringLiteral("color:#9aa3ae;"));
+   dg->addWidget(new QLabel(QStringLiteral("原点宽度"), m_homeDetail), 5, 0);
+   dg->addWidget(m_lSpan, 5, 1, 1, 4);
+
    /* 四列按钮等分本行宽度 (行首那列只放轴名, 不参与拉伸) */
    for (int c = 1; c <= 4; c++)
       dg->setColumnStretch(c, 1);
@@ -1673,6 +1696,37 @@ void ScanWindow::onHomeBothClicked()
     * 就会用"轴X 轴Y 正在回零 (方式 24)…"那条**状态**横幅把它盖掉 —— 那是设计如此)。 */
    hint(QStringLiteral("轴X 轴Y 正向回零已下发 (方式 %1, 速度 %2 pul/s)。")
            .arg(met).arg(vel), false);
+}
+
+/* 「测量原点宽度」—— 量原点信号两个边沿之间跨了多少脉冲。
+ *
+ * 一趟两段, 同一个会话 (docs/scan_sweep.md §35): 段 1 就是「回零校准」那一趟 (方式 24, 两根
+ * 同时), 段 2 从那个落点顺着正向慢速走过去, 每 2 ms 采一次 60FDh bit2 看它翻两次。所以这里
+ * 下发的是 **postSpanWidth**, 不是 postHomeBoth —— 两者的差别只有一个牌子。
+ *
+ * 速度用「回零校准」那个框 (段 2 取它的 1/4: 走得越慢, 两次采样之间跨过的脉冲越少);
+ * 超时也用它, 但只对段 2 计时。
+ *
+ * 拦扫描这一道与 onHomeBothClicked 同源且必须留着: 两根同时带电运动, 扫描循环也在发目标,
+ * 谁也不该和谁抢 607Ah。 */
+void ScanWindow::onSpanClicked()
+{
+   if (m_ctl->running())
+   {
+      hint(QStringLiteral("扫描进行中, 测量原点宽度不可用。"), true);
+      return;
+   }
+
+   const uint32_t vel = ecatcmd::home_vel_clamp(m_edHomeVel->value());
+   const int      tmo = ecatcmd::home_tmo_s_clamp(m_edHomeTmo->value());
+
+   /* **零点世代不在这里推** (同 onHomeBothClicked): 那道闸可能把命令拦掉, 命令也可能一直躺在
+    * 队列里 —— 世代由工作线程在真写 m_origin[] 的地方维护。 */
+   m_thr->postSpanWidth(0x3u, vel, tmo);
+
+   /* 这一句只在**命令没被那道闸接住**时才留得住 (真跑起来的话, 最多 33 ms 之后 refresh 就会用
+    * 那条"正在测量原点宽度…"的状态横幅把它盖掉 —— 那是设计如此)。 */
+   hint(QStringLiteral("轴X 轴Y 测量原点宽度已下发 (速度 %1 pul/s)。").arg(vel), false);
 }
 
 QWidget *ScanWindow::buildParamPanel()
@@ -3877,6 +3931,33 @@ void ScanWindow::refresh()
                                 t.ax[0].valid && t.ax[0].mirror_ok && !t.ax[0].fault &&
                                 t.ax[1].valid && t.ax[1].mirror_ok && !t.ax[1].fault);
 
+   /* 「测量原点宽度」= 「回零校准」那一整套判据, **再叠加 60FDh 读得到**。
+    * 60FDh 不在生效 TxPDO 里时 bit2 永远是 0, 那一趟会一路走到行程上限, 报出一句"没等到
+    * 原点信号" —— 而真正的原因是"根本没在采"。让按钮先按不动, 与工作线程那道闸同源
+    * (ecatcmd::span_dig_refusal): 屏幕上先灰掉, 比跑完一趟再解释好。 */
+   if (m_btnSpan != nullptr)
+      m_btnSpan->setEnabled(can_home &&
+                            t.ax[0].valid && t.ax[0].mirror_ok && !t.ax[0].fault &&
+                            t.ax[1].valid && t.ax[1].mirror_ok && !t.ax[1].fault &&
+                            t.ax[0].dig_known && t.ax[1].dig_known);
+
+   /* 那一行读数。四态 (未测量 / 测量中 / 脉冲数 / 未测得) 的正文只由
+    * ecatcmd::span_readout() 一处出 —— 这里只负责把遥测搬过去。 */
+   if (m_lSpan != nullptr)
+   {
+      ecatcmd::SpanReadIn rin[2];
+
+      for (int i = 0; i < 2; i++)
+      {
+         rin[i].axis     = i;
+         rin[i].spanning = t.ax[i].spanning;
+         rin[i].width    = t.ax[i].span_width;
+         rin[i].why      = (ecatcmd::SpanWhy)t.ax[i].span_why;
+      }
+
+      m_lSpan->setText(ecatcmd::span_readout(rin, 2));
+   }
+
    /* 「使能」: 已使能就灰掉并把字改成「已使能」—— 没有确认框了, 带不带电只能由按钮自己说。
     * 判据看每一根而非只看轴0: 还有轴没使能就仍可按 (故障复位会把某一根单独打回未使能)。 */
    bool any_enabled = false, any_off = false;
@@ -3910,6 +3991,10 @@ void ScanWindow::refresh()
       const bool    ok   = can_home && t.ax[i].valid && t.ax[i].mirror_ok && !t.ax[i].fault;
       const bool    mine = t.ax[i].homing;
       const bool    mine_lim = mine && ecatcmd::home_method_is_limit(t.ax[i].homing_method);
+      /* 「这一根正被**段 2** 持有」—— 那一趟干的事已经不是回零了, 两排按钮都得改口, 否则
+       * 屏幕在说一件正在发生的别的事 (段 1 里它是 false: 那一段与普通回零逐字一样, 说
+       * "回零中…" 才是实话)。 */
+      const bool    mine_span = t.ax[i].spanning;
 
       for (int d = 0; d < 2; d++)
       {
@@ -3920,11 +4005,13 @@ void ScanWindow::refresh()
           * 而且**两排各自认自己那一趟**: 找限位时左边两列不改字 (那一趟不是找原点),
           * 找原点时右边两列不改字 —— 说反了人会以为"找完还要再找一次"。
           * 文字里不再带轴名 (行首那个标签已经说了), 按下后变短也不会把列宽撑开。 */
-         m_btnHome[i][d]->setText((mine && !mine_lim)
-                                     ? QStringLiteral("回零中…")
-                                     : QString::fromUtf8(kHomeBtnText[d]));
-         m_btnLim[i][d]->setText(mine_lim ? QStringLiteral("找限位中…")
-                                          : QString::fromUtf8(kHomeBtnText[2 + d]));
+         m_btnHome[i][d]->setText(mine_span ? QStringLiteral("测量中…")
+                                            : ((mine && !mine_lim)
+                                                  ? QStringLiteral("回零中…")
+                                                  : QString::fromUtf8(kHomeBtnText[d])));
+         m_btnLim[i][d]->setText(mine_span ? QStringLiteral("测量中…")
+                                           : (mine_lim ? QStringLiteral("找限位中…")
+                                                       : QString::fromUtf8(kHomeBtnText[2 + d])));
       }
    }
 
@@ -3938,7 +4025,22 @@ void ScanWindow::refresh()
     * 文案交给 ecatcmd::home_batch_banner() 一处出 (单轴那条分支逐字等于改造前那句)。 */
    QString home_s;
 
-   if (t.homing)
+   if (t.spanning)
+   {
+      /* 这次会话是「测量原点宽度」—— **横幅换一条**, 不能沿用回零那句: 两句说的是两件事
+       * (量边沿距离 vs 找开关), 共用一句必然要说错一件。
+       * 收哪些根仍由逐轴旗标决定 (与下面那条同一条规矩)。段 1 期间 t.spanning 也是真的,
+       * 那是对的 —— 那一段本来就是这次测量的第一步, 横幅从那时起就该说测量。 */
+      int ax[EM_MAX_AXES];
+      int n = 0;
+
+      for (int i = 0; i < 2; i++)
+         if (t.ax[i].homing)
+            ax[n++] = i;
+
+      home_s = ecatcmd::span_banner(ax, n);
+   }
+   else if (t.homing)
    {
       ecatcmd::HomeBannerIn in[EM_MAX_AXES];
       int                    n = 0;

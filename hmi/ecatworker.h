@@ -58,6 +58,11 @@
 #define HMI_FAULT_CODE_UNREAD (-2)   /* 还没读过 (故障沿刚起来, 那一刻还没轮到 SDO) */
 #define HMI_FAULT_CODE_FAIL   (-1)   /* 读了, 但读不到 (SDO 没应答 / 驱动器不自答) */
 
+/* AxisTelem::span_width 的哨兵。**不用 0 兼"没量到"**: 0 是一个可能的真读数 (两个边沿落在
+ * 同一圈里), 拿它兼哨兵就会把"量到了 0"说成"没量到"。
+ * 定义在这里而不是在下面那一族旁边: AxisTelem 的成员初值要用它, 而那个结构体在上面。 */
+#define HMI_SPAN_NONE  (-1)
+
 /* 一根轴的一帧快照。全部是显示坐标。 */
 struct AxisTelem
 {
@@ -94,6 +99,21 @@ struct AxisTelem
     * homing_method 只为显示给人看 (6098h 的方式号), 不在回零时无意义。 */
    bool     homing        = false;
    int      homing_method = 0;
+
+   /* ---- 这一根正被「测量原点宽度」的段 2 持有 ----
+    * **与 homing 分开是有原因的**: 段 2 里 homing 仍为真 (会话没结束), 但这一根干的事已经不是
+    * 回零了 —— 八个回零按钮据此改口说「测量中…」(见 scanwindow 的 refresh()), 否则屏幕在说
+    * 一件正在发生的别的事。
+    * 段 1 (方式 24 那一趟) 里它**是 false**: 那一段与普通「回零校准」逐字一样, 说「回零中…」
+    * 才是实话。 */
+   bool     spanning      = false;
+   /* 本会话量到的原点信号宽度 (脉冲), 或 HMI_SPAN_NONE = 还没量到 / 没量。
+    * 量到了就一直留着 (那是这台机器的实测值), 直到下一次测量把它换掉。 */
+   int32_t  span_width    = HMI_SPAN_NONE;
+   /* 上一次测量这一根**没量到**的原因 (ecatcmd::SpanWhy 的值; 0 = 没有这一回事)。
+    * int 而不是那个枚举: 那个枚举定义在本文件靠后的 ecatcmd 段里, 这里还看不见。
+    * 与 span_width 分工: 这个只在"没量到"时有意义, 而 0 正好是 SPAN_WHY_NONE。 */
+   int      span_why      = 0;
 
    /* 驱动器自报的实际运行模式 6061h (em_get_mode), 或 HMI_MODE_DISP_UNREAD / -1 (读失败)。
     * 手册 §3.7 把「6061h 读回 6」当作 HM 的前提。它不是每周期刷新的: 6061h 不在 TxPDO 里,
@@ -134,6 +154,12 @@ struct BusTelem
     * 这期间它一直是 true。逐轴的那一份在 AxisTelem::homing 里。
     * 注意它撑得比以前长: 以前一次回零 = 一次阻塞调用, 现在覆盖"prepare 之前 -> 收尾之后"。 */
    bool     homing    = false;
+   /* 本会话是「测量原点宽度」而不是普通回零。**覆盖段 1 与段 2 全程** —— 按下按钮那一刻
+    * 它就已经是真的, 因为段 1 是这次测量的第一步, 横幅从那时起就该说测量。
+    *
+    * 与 AxisTelem::spanning 分工: 这一份答"这次会话是干什么的", 那一份答"这一根走到段 2 了吗"。
+    * 界面拿这一份挑横幅文案、拿那一份挑按钮文字。 */
+   bool     spanning  = false;
    /* 逐轴的"这一根正在回零"在 AxisTelem::homing / homing_method 里 —— **唯一的那一份**。
     * 这里曾经有 homing_axis / homing_method 两个单数量给老读者过渡 (取"第一根"), 到 S3b
     * 一并删掉: 两轴并行时它们只能说出其中一根, 而"只说一根"正是这次改造最不该出的错。
@@ -1225,6 +1251,379 @@ inline QString home_batch_note(const HomeReport *r, int n)
    return s;
 }
 
+/* ---- 6. 测量原点宽度 (接着回零走一段, 盯着 60FDh bit2 翻两次) ---------------------
+ *
+ * 回零校准 (方式 24) 停在原点开关信号的**释放边沿**上, 并把它定为显示坐标 0。由此可以顺手
+ * 量出这个信号有多宽 (多少个脉冲) —— 宽度以内的位置差异, 回零是分辨不出来的。
+ *
+ * 量法**不是**"跑方式 24 再跑方式 29 相减": 从方式 24 的落点出发, 方式 29 朝负向先走、
+ * 撞到负限位再折回正向重新进近, 极可能仍停在**同一个**边沿上, 差 ≈ 0 —— 那个数是假的。
+ * 真做法是顺着这个已知落点往前慢慢走, 每圈采一次 bit2, 记它翻两次的那两个位置:
+ *
+ *   BACKOFF  起手 bit2 已经是 1 (驱动器把落点留在信号内) -> 朝负向退到它变 0 (近侧边沿)
+ *   SEEK     朝正向走, 等 bit2 由 0 变 1 -> 记下近侧边沿的位置 p1
+ *   CROSS    已在信号内, 继续朝正向走等它变 0 -> 记下另一个边沿的位置 p2, 宽度 = p2 - p1
+ *
+ * **这一族只吃纯数据**, 与上面那一族同一个理由: `scan_selftest` 不编 ecatworker.cpp, 判据
+ * 写在会话里就永远验不到。会话本身 (每圈步进与采样) 只能真机验。
+ *
+ * 采样只在每 2 ms 一圈的主循环里做, 所以宽度有 **±1 步**的量化 (默认慢速约 ±25 pul) ——
+ * 这是原理, 写进 docs/scan_sweep.md, **不写进界面**。
+ *
+ * 措辞上有一条硬规矩: **这一族刻意不说「触发 / 未触发」**。这里用的是驱动器 60FDh 的
+ * **原始位** (em_di_home), 而屏幕上那盏灯是「上位机侧取反」之后的值 —— 与 X0~X3 的接线
+ * 有关, 同一台机器上两者正好相反。说"未触发"会与灯打脸, 所以一律只说"原点信号"。 */
+
+/* 逐轴子态。IDLE / DONE 是"不在这一趟里", 中间三个才是真在走的。 */
+enum SpanStep
+{
+   SPAN_IDLE = 0,
+   SPAN_BACKOFF,
+   SPAN_SEEK,
+   SPAN_CROSS,
+   SPAN_DONE
+};
+
+/* 这一根为什么没量到。**每一档要人做的事都不一样** (查接线 / 改参数 / 重新使能), 所以一档
+ * 一句话, 两两不同 —— 屏幕上分不出的两档等于没有这一档。 */
+enum SpanWhy
+{
+   SPAN_WHY_NONE = 0,   /* 没失败 (正在量 / 量到了) */
+   SPAN_WHY_NO_EDGE,    /* 走完全程都没等到原点信号 */
+   SPAN_WHY_NO_EXIT,    /* 进了信号就再没出来 (比行程上限还宽) */
+   SPAN_WHY_STOPPED,    /* 操作员按了「停止」 */
+   SPAN_WHY_TIMEOUT,    /* 超时 */
+   SPAN_WHY_FAULT,      /* 6041h bit3 */
+   SPAN_WHY_DISABLED,   /* 掉使能 */
+   SPAN_WHY_NO_DIG,     /* 60FDh 中途读不到了 */
+   SPAN_WHY_STUCK,      /* 不跟随: 卡住 / 撞限位 / 2204h 超程停车 */
+   SPAN_WHY_NO_BUS,     /* 掉出 OP / 断开 */
+   SPAN_WHY_PEER,       /* 被另一根轴带停 */
+   SPAN_WHY_NO_TARGET   /* 607Ah 目标下发不出去 */
+};
+
+/* 子态迁移。**只吃"这一圈采到的 bit2"** —— 位置与失败判据不在这里 (那些要用别的量)。
+ * DONE / IDLE 不再迁移, 所以重复调用推不回中间态 (会话每圈都会调一次)。 */
+inline SpanStep span_next(SpanStep cur, bool dig_home)
+{
+   switch (cur)
+   {
+      case SPAN_BACKOFF: return dig_home ? SPAN_BACKOFF : SPAN_SEEK;
+      /* 进了信号 -> 近侧边沿到手, 转去等它退出 */
+      case SPAN_SEEK:    return dig_home ? SPAN_CROSS : SPAN_SEEK;
+      /* 出了信号 -> 另一个边沿到手 */
+      case SPAN_CROSS:   return dig_home ? SPAN_CROSS : SPAN_DONE;
+      case SPAN_IDLE:
+      case SPAN_DONE:    return cur;
+   }
+   return cur;
+}
+
+/* 这一步朝哪走。只有退避那一段是负向 —— 其余一律正向, 所以这里没有第二个输入。 */
+inline int span_dir(SpanStep s)
+{
+   return (s == SPAN_BACKOFF) ? -1 : 1;
+}
+
+/* 这一圈推多少脉冲。与 interpolate() 同一个理由: 快到了也得走一步, 否则到不了;
+ * dt 按实测并 100 ms 封顶 —— 一次卡顿不该变成一次跳步, 跳过去就等于漏采一个边沿。 */
+inline int32_t span_step_pul(uint32_t vel, int dt_ms)
+{
+   int d = (dt_ms > 0) ? dt_ms : HMI_LOOP_MS;
+   if (d > 100)
+      d = 100;
+
+   const int64_t step = ((int64_t)vel * (int64_t)d) / 1000;
+   return (step < 1) ? 1 : (int32_t)step;
+}
+
+/* 段 2 一次最多走多远 (脉冲)。**必须与当前量程取小**: 会话一结束插补器就恢复, 它会把 m_tgt
+ * 夹进 ±量程 (见 ecatworker.cpp 的 interpolate()), 落点在量程外就是一次没人按过的回调运动。
+ * 常量取 HMI_RANGE 的意义: 它同时是"原点信号宽度"的物理上限 —— 比整条量程还宽的开关不存在。
+ * 量程未知 (<= 0) 时用常量: 那时夹取也不成立, 但行程总得有个头。 */
+#define HMI_SPAN_MAX_PUL  500000
+
+inline int32_t span_travel_cap(int32_t range)
+{
+   if (range < 0)
+      range = -range;
+   if (range > 0 && range < (int32_t)HMI_SPAN_MAX_PUL)
+      return range;
+   return (int32_t)HMI_SPAN_MAX_PUL;
+}
+
+/* 段 2 允许目标跑到**实际位置**前面多少脉冲。 */
+#define HMI_SPAN_LEAD_PUL 2000
+/* 连续多少圈"目标被这道理性夹住"才算不跟随 (2 ms 一圈 -> 100 ms)。 */
+#define HMI_SPAN_STUCK_CYCLES 50
+/* 退避那一段 (SPAN_BACKOFF) 单独的上限, 比行程上限紧得多。
+ *
+ * **为什么退避要单独一道**: 退避是段 2 里唯一一次朝**负向**走, 而负向那一侧是什么没人知道
+ * —— 段 1 刚把这一根带到原点开关上, 它离负限位有多远不是一个已知量。行程上限 (50 万脉冲)
+ * 对"找边沿"够用, 对"退出一段本该只有几十脉冲宽的开关"就太松了: 真的卡在信号里出不来时,
+ * 那 50 万会一路走到负限位跟前才停。2 万脉冲 = 默认量程的 2%, 比任何原点开关都宽得多,
+ * 又远小于限位前的余量。走满它还没退出 -> NO_EXIT (与行程上限同一档, 都是"信号没放开")。 */
+#define HMI_SPAN_BACKOFF_PUL 20000
+
+/* 段 2 每圈把目标往前推一步的结果。
+ *
+ * **为什么不是简单的 `tgt += step`**: 那样驱动器只要慢半拍, 目标就会一路跑在前面积累成几千
+ * 脉冲的欠账, 等它跟上来就是一次冲刺 —— 而冲刺正是一次漏采边沿的机会 (我们要的是"每 2 ms
+ * 挪一小步, 盯着 bit2 翻")。所以每圈都把目标夹在 `实际位置 + lead` 以内: 驱动器跟得上,
+ * 夹取不生效, 一步不多不少; 驱动器停住了 (撞限位 / 2204h 超程停车 / 卡死), 夹取生效,
+ * 目标不再往前跑 —— `limited` 就是这个状态, 由会话数圈定局 (见 SPAN_WHY_STUCK)。
+ *
+ * `lead <= 0` 时不做夹取 (调用方保证 lead > 0; 这个分支只为"参数写错时别把轴钉死")。 */
+struct SpanAdvance
+{
+   int32_t tgt     = 0;      /* 这一圈该下发的显示坐标目标 */
+   bool    limited = false;  /* 目标被"实际位置 + lead"夹住了 = 这一根没跟上 */
+};
+
+inline SpanAdvance span_advance(int32_t tgt, int32_t pos, int32_t step, int32_t lead, int dir)
+{
+   SpanAdvance r;
+   if (step < 1)
+      step = 1;
+
+   const int64_t back = (dir < 0) ? -1 : 1;
+   const int64_t want = (int64_t)tgt + (int64_t)step * back;
+
+   if (lead > 0)
+   {
+      /* 正向的头上是 pos + lead, 负向的头上是 pos − lead。两头都拿**实际位置**当基准 ——
+       * 不拿上一圈的目标, 否则这道理性自己会跟着漂。 */
+      const int64_t cap = (int64_t)pos + (int64_t)lead * back;
+      const int64_t cl  = (dir < 0) ? ((cap > want) ? cap : want)
+                                    : ((cap < want) ? cap : want);
+      /* 夹完不许**倒着走**: 驱动器已经跑到目标前方时, cap 会落在目标的反侧 —— 那一下若照夹,
+       * 目标会朝反方向跳一步, 正是要防的那种"没人按过的运动"。 */
+      const int64_t nx = (dir < 0) ? ((cl < tgt) ? cl : tgt)
+                                   : ((cl > tgt) ? cl : tgt);
+      r.tgt     = (int32_t)nx;
+      /* **一步都没挪**才算没跟上。只被夹掉一部分是正常跟随 (起步那一圈就是: 目标只落得下
+       * 一小步) —— 拿"被夹过"当判据会在起手第一圈就误报。 */
+      r.limited = (nx == tgt);
+      return r;
+   }
+
+   r.tgt = (int32_t)((want > INT32_MAX) ? INT32_MAX : ((want < INT32_MIN) ? INT32_MIN : want));
+   return r;
+}
+
+/* 没量到的原因: **现象**。与 fault_code_meaning 同一个写法 —— 出路单独一个函数出,
+ * 因为读数那一行只放得下现象, 而结论句要两句都带上。 */
+inline const char *span_why_text(SpanWhy w)
+{
+   switch (w)
+   {
+      case SPAN_WHY_NONE:      return "";
+      case SPAN_WHY_NO_EDGE:   return "一路走完都没等到原点信号";
+      case SPAN_WHY_NO_EXIT:   return "进了原点信号就再没出来, 已到行程上限";
+      case SPAN_WHY_STOPPED:   return "被「停止」中止";
+      case SPAN_WHY_TIMEOUT:   return "超时时间到还没量完";
+      case SPAN_WHY_FAULT:     return "6041h bit3 = Fault";
+      case SPAN_WHY_DISABLED:  return "这一根掉了使能";
+      case SPAN_WHY_NO_DIG:    return "60FDh 中途读不到了";
+      /* 只说现象, **不带"可能是撞限位 / 超程停车"那句猜测** —— 那是成因分析, 按
+       * CLAUDE.md §1.5 搬进 docs/scan_messages.md; 屏幕上由出路那句指向"限位与行程"。 */
+      case SPAN_WHY_STUCK:     return "轴没跟着走";
+      case SPAN_WHY_NO_BUS:    return "总线已断开";
+      case SPAN_WHY_PEER:      return "被另一根轴带停";
+      case SPAN_WHY_NO_TARGET: return "目标位置下发不出去";
+   }
+   return "";
+}
+
+/* 没量到的原因: **出路**, 只许一条「请……」(CLAUDE.md §1.5), 不写操作步骤。
+ * nullptr = 没有出路可给 —— 操作员自己按的「停止」不给人指路, 那是他刚做过的动作。
+ * 措辞与既有那几句**逐字对齐**: 同一个成因在屏幕上只许有一种说法
+ * (60FDh 那句与 home_lim_refusal 同一份, bit3 那句与 home_refusal 同一份)。 */
+inline const char *span_why_action(SpanWhy w)
+{
+   switch (w)
+   {
+      case SPAN_WHY_NO_EDGE:   return "请检查原点开关的接线与位置后再试。";
+      case SPAN_WHY_NO_EXIT:   return "请检查该开关是否一直有效后再试。";
+      case SPAN_WHY_TIMEOUT:   return "请把回零速度调大或把超时调长后再试。";
+      case SPAN_WHY_FAULT:     return "请先「故障复位」。";
+      case SPAN_WHY_DISABLED:  return "请重新「使能」后再试。";
+      case SPAN_WHY_NO_DIG:    return "请勾选「让 60FDh 进 TxPDO」并重新连接。";
+      case SPAN_WHY_STUCK:     return "请检查限位与行程后再试。";
+      case SPAN_WHY_NO_BUS:    return "请重新连接后再试。";
+      case SPAN_WHY_NO_TARGET: return "请检查过程数据映射后再试。";
+      case SPAN_WHY_NONE:
+      case SPAN_WHY_STOPPED:
+      case SPAN_WHY_PEER:      return nullptr;
+   }
+   return nullptr;
+}
+
+/* 失败包络的**唯一一处判据**: 每圈把实测状态喂进来, 由这里挑出"先报哪一个"。
+ * **顺序是内容** (与 home_refusal 同一套写法):
+ *   · 先报操作员自己按的 (他知道自己按了, 但屏幕上要有回音);
+ *   · 再报总线没了 —— 那之后所有读数都不作数;
+ *   · 再报驱动器自己的两位 (bit3 / bit2), 那是**事实**;
+ *   · 最后才是"没跟上"这种**推断**出来的结论 —— 推断永远排在事实后面。
+ * "到行程上限"报哪一句由 in_signal 决定: 还没进信号 = 没等到边沿, 已进信号 = 再没出来;
+ * 这是同一件事的两种现象, 要人做的处置不同。
+ * 全都不成立返回 SPAN_WHY_NONE = 继续走。 */
+struct SpanEnv
+{
+   bool stop_req    = false;   /* em_stop_requested() —— 「停止」与断开收尾都走它 */
+   bool bus_gone    = false;   /* m_bus == nullptr (掉线收尾) */
+   bool bus_ready   = false;   /* m_in_op */
+   bool fault       = false;   /* 6041h bit3 */
+   bool enabled     = false;   /* 6041h bit2 */
+   bool dig_known   = false;   /* 60FDh 这一圈采得到 */
+   bool csp_wrote   = true;    /* em_csp_set_target() 那一步写进镜像了 */
+   bool stuck       = false;   /* 连续若干圈没跟上目标 */
+   bool over_time   = false;
+   bool over_travel = false;
+   bool in_signal   = false;   /* 已经进过信号 (子态 CROSS 及之后) */
+};
+
+inline SpanWhy span_fail_why(const SpanEnv &e)
+{
+   if (e.stop_req)                  return SPAN_WHY_STOPPED;
+   if (e.bus_gone || !e.bus_ready)  return SPAN_WHY_NO_BUS;
+   if (e.fault)                     return SPAN_WHY_FAULT;
+   if (!e.enabled)                  return SPAN_WHY_DISABLED;
+   if (!e.dig_known)                return SPAN_WHY_NO_DIG;
+   if (!e.csp_wrote)                return SPAN_WHY_NO_TARGET;
+   if (e.stuck)                     return SPAN_WHY_STUCK;
+   if (e.over_travel)
+      return e.in_signal ? SPAN_WHY_NO_EXIT : SPAN_WHY_NO_EDGE;
+   if (e.over_time)                 return SPAN_WHY_TIMEOUT;
+   return SPAN_WHY_NONE;
+}
+
+/* 测量会话的第四道闸: **60FDh 必须读得到** —— bit2 是这次测量唯一的依据, 而它多半不在生效
+ * TxPDO 里。现有那道 60FDh 否决只管找限位 (17/18), 这一趟走的是 24, 走不到它, 所以这是
+ * **新的一道**。必须在任何写动作之前 —— 起手第一件事是 em_disable(), 它真的会撤掉保持力矩。
+ *
+ * 返回 nullptr = 可以发起; 否则 reason 是那句话, bad_mask 点名不合格的那几根 (文案与
+ * home_lim_refusal 那份逐字对齐: 同一个成因只许有一种说法)。 */
+inline const char *span_dig_refusal(unsigned mask, const bool *dig_known, unsigned &bad_mask)
+{
+   bad_mask = 0;
+
+   for (int i = 0; i < EM_MAX_AXES; i++)
+   {
+      if ((mask & (1u << i)) == 0)
+         continue;
+      if (!dig_known[i])
+         bad_mask |= (1u << i);
+   }
+
+   if (bad_mask != 0)
+      return "60FDh 读不到 → 采不到原点信号, 拒绝测量。"
+             "请勾选「让 60FDh 进 TxPDO」并重新连接";
+   return nullptr;
+}
+
+/* 一根轴这一趟的结局。 */
+struct SpanReport
+{
+   int       axis    = 0;
+   bool      ok      = false;
+   int32_t   width   = HMI_SPAN_NONE;   /* 脉冲数; HMI_SPAN_NONE = 没量到 */
+   SpanWhy   why     = SPAN_WHY_NONE;
+   int32_t   end_pos = 0;               /* 停下时的显示坐标 */
+};
+
+/* 一根轴的整句。带了那个数就是这一趟的全部意义, 所以成功的句子**必须**把它写出来,
+ * 并说清"停在哪儿" (段 2 不重锚零点, 停下时的显示坐标不再是 0)。 */
+inline QString span_axis_note(const SpanReport &r)
+{
+   const QString nm = QString::fromUtf8(axis_label(r.axis));
+
+   if (r.ok)
+      return QStringLiteral("%1 原点宽度 %2 pul (停在远端边沿, 显示坐标 %3)。")
+         .arg(nm).arg(r.width).arg(r.end_pos);
+
+   const char *act = span_why_action(r.why);
+
+   return QStringLiteral("%1 原点宽度未测得: %2。%3")
+      .arg(nm, QString::fromUtf8(span_why_text(r.why)),
+           (act != nullptr) ? QString::fromUtf8(act) : QString());
+}
+
+/* 批级一句: 两根各自量到多少 (没量到的说"未测得")。**只在两根时发** —— note() 是覆盖写
+ * 状态栏, 逐轴那两句里只剩最后一句, 而"是哪一根没量到"正是最要紧的那条信息。
+ * 不出原因的全文 (那在两轴各自那一行里已经念过), 否则这一句会顶到 50 字以上。 */
+inline QString span_summary(const SpanReport *r, int n)
+{
+   QString s = QStringLiteral("测量结束: ");
+
+   for (int k = 0; k < n; k++)
+   {
+      if (k > 0)
+         s += QStringLiteral(", ");
+      const QString nm = QString::fromUtf8(axis_label(r[k].axis));
+
+      s += r[k].ok ? QStringLiteral("%1 %2 pul").arg(nm).arg(r[k].width)
+                   : QStringLiteral("%1 未测得").arg(nm);
+   }
+
+   return s + QStringLiteral("。");
+}
+
+/* 折叠块里那一行读数。**四态各一句, 两两不同**: 「未测量」(还没跑过) 与「未测得」
+ * (跑过但没量到) 必须分得开 —— 前者要人按一下按钮, 后者要人去查开关。 */
+struct SpanReadIn
+{
+   int     axis     = 0;
+   /* 这一根正被**段 2** 持有 (AxisTelem::spanning 搬过来的)。段 1 里它是 false —— 那一段干
+    * 的事与普通回零逐字一样, 所以段 1 期间这一行显示的是**上一次**那个数 (或「未测量」),
+    * 按钮那边同时说着「回零中…」; 段 2 起才轮到「测量中」。 */
+   bool    spanning = false;
+   int32_t width    = HMI_SPAN_NONE;
+   SpanWhy why      = SPAN_WHY_NONE;
+};
+
+inline QString span_readout(const SpanReadIn *in, int n)
+{
+   QString s;
+   for (int k = 0; k < n; k++)
+   {
+      if (k > 0)
+         s += QStringLiteral(", ");
+      const QString nm = QString::fromUtf8(axis_label(in[k].axis));
+
+      /* 量到的排在最前: 一根量完了、另一根还在量时, 这一行要能同时说出这两件事 */
+      if (in[k].width >= 0)
+         s += QStringLiteral("%1 %2 pul").arg(nm).arg(in[k].width);
+      else if (in[k].spanning)
+         s += QStringLiteral("%1 测量中").arg(nm);
+      else if (in[k].why != SPAN_WHY_NONE)
+         s += QStringLiteral("%1 未测得 (%2)")
+                 .arg(nm, QString::fromUtf8(span_why_text(in[k].why)));
+      else
+         s += QStringLiteral("%1 未测量").arg(nm);
+   }
+   return s;
+}
+
+/* 测量进行中那条横幅。**与回零那条分开写**: 两句话说的是两件事 (量边沿距离 vs 找开关),
+ * 共用一句必然要说错一件。n >= 2 时**两根轴名都要在** (同 home_batch_banner 那条规矩);
+ * 1 句 / 40 字 (CLAUDE.md §1.4), 出路那一句与回零那条同一份措辞。 */
+inline QString span_banner(const int *axis, int n)
+{
+   if (axis == nullptr || n <= 0)
+      return QString();
+
+   QString names;
+   for (int k = 0; k < n; k++)
+   {
+      if (k > 0)
+         names += QStringLiteral(" ");
+      names += QString::fromUtf8(axis_label(axis[k]));
+   }
+
+   return QStringLiteral("%1 正在测量原点宽度, 按「停止」可立即中止。").arg(names);
+}
+
 /* ---- 故障码 603Fh 的说人话 ----
  * 判据做成 inline 放这里, 与 mode_text 同一个理由: **scan_selftest 不编 ecatworker.cpp**,
  * 写在 .cpp 里就永远验不到。 */
@@ -1804,6 +2203,21 @@ public:
     * 另一根的位置, 这一趟就不能用, 软件兜不住。 */
    void postHomeBoth(unsigned mask, const int *method, const uint32_t *vel_fast, int tmo_s);
 
+   /* 量 mask 上那几根的**原点信号宽度** (脉冲) —— 「测量原点宽度」按钮走这一条。
+    *
+    * 一趟 = 两段, **同一个会话**: 段 1 是完整的方式 24 回零 (与「回零校准」逐字一样的路径),
+    * 段 2 从这个落点顺着正向慢速走, 盯 60FDh bit2 翻两次 (进 / 出), 宽度 = 两次之间的脉冲数。
+    * 段 2 全程留在 CSP 且保持使能: 不写 SDO、不切模式、不失能、不重锚零点。
+    *
+    * vel_fast 是**段 1** 的 6099h:01 (与 postHome 同一个数); 段 2 取它的 1/4 —— 段 2 走得越慢,
+    * "两次采样之间"的量化误差越小 (量化 ≈ ±1 步, 见 ecatcmd::span_step_pul)。
+    * tmo_s 只对**段 2** 计时 (段 1 用自己的那一套)。
+    *
+    * ⚠️ 与 postHome 一样**会先失能** (段 1 要写 6098h/6099h): 竖直轴失去保持力矩。
+    * ⚠️ 60FDh 读不到就整体拒绝 —— 采不到那条信号, 这一趟什么也量不出来, 不白跑 (见
+    * ecatcmd::span_dig_refusal)。这一道在失能**之前**, 所以拒绝时轴没被动过。 */
+   void postSpanWidth(unsigned mask, uint32_t vel_fast, int tmo_s);
+
    /* 断开重连时沿不沿用上一份零点。**默认 false, 也就是本类自己的老行为**: 连接那一刻的
     * 位置就是零点。`scan/` 在构造之后调一次 true。
     *
@@ -1886,6 +2300,11 @@ private:
       int      hm_method[EM_MAX_AXES] = {};
       uint32_t hm_vel[EM_MAX_AXES]    = {};
 
+      /* ---- 这一趟回零是「测量原点宽度」的段 1 ----
+       * 段 1 本身与普通回零**一个字符都不差** (方式 24, 同样的预检与收尾) —— 唯一的差别是
+       * 收尾之后**不关会话**, 接着走段 2。所以这里只挂一个牌子, 由 finishHoming() 末尾读它。 */
+      bool     span = false;
+
       QString text;
    };
 
@@ -1941,6 +2360,21 @@ private:
     * 判定并一次说完], 然后关掉会话。轴已经不在了也照走 (阶梯会自己报失败)。 */
    void finishHoming();
    void doStop();
+
+   /* ---- 测量原点宽度的段 2 (见 postSpanWidth) ----
+    * 三个都只从工作线程调。会话的**开关**是 m_spanning, 由 beginSpan() 置起、finishSpan()
+    * 清掉 —— 期间 m_homing / m_homing_mask 一直是真 (会话没结束), 所以 drainCommands 的队列
+    * 冻结与插补器跳过都照旧生效, 这两条正是段 2 能安全走的前提。 */
+   /* mask = 段 1 走到位的那些根 (finishHoming() 手里那份快照 —— 它已经把 m_homing_mask
+    * 清零了, 所以必须传进来)。接手时**重臂** mask 与逐轴遥测, 见实现里那一段注释。 */
+   void beginSpan(unsigned mask);
+   void serviceSpan(qint64 now_ms);/* 每圈一步: 采 bit2 -> 推目标 -> 判失败 */
+   void finishSpan();              /* 收尾 + 结论 (成功/失败/被停止走同一句) */
+   /* 把这一根冻在当前位置 (目标 = 实际), 与 doStop / CMD_DISABLE 同一套写法。
+    * **顺序不能动**: 先算 m_tgt、再持锁写 m_want、最后才轮到调用方清 mask / homing ——
+    * 反过来的话, 中间那一拍插补器会拿旧 m_want 去追一个已经不动的轴。 */
+   void freezeSpanAxis(int i);
+
    /* 把该轴的实际运行模式 6061h 读一次存进 m_mode_disp[axis] (SDO 读)。
     * **只许在本来就阻塞、或本来就便宜的时刻调** —— publish() / interpolate() 不许调。 */
    void readModeDisp(int axis);
@@ -2027,6 +2461,44 @@ private:
    /* 起手那次失能 (写 6098h 之前必须做的) 的返回码 —— 结论里那个「失能 %1」是它和收尾
     * 那一次的**第一个非零值**, 与改造前那两句的合成规则一致。 */
    int        m_home_disable_rc[EM_MAX_AXES] = {};
+
+   /* ---- 测量原点宽度的会话 (见 postSpanWidth / docs/scan_sweep.md §35) ----
+    *
+    * 挂在回零会话上, **不是另一套会话**: 段 1 走完回零的全部阶梯, 段 2 由这几个成员接着。
+    * 于是"队列冻结 / 插补器跳过 / 按钮按住"三条一条都不用重写 —— 它们问的都是 m_homing。
+    *
+    * 下面**只有工作线程碰**, 一个例外都没有 (段 2 不阻塞, 所以也没有 publish() 读它们)。 */
+   /* 这趟回零到了收尾之后**不关会话**, 接着进段 2。由 CMD_HOME 分支置起, finishSpan 清掉。 */
+   bool       m_span_pending = false;
+   /* 段 2 正在跑。serviceHoming() 拿它早退 (它看见"所有 m_home_done 都置起"会把会话再收一次尾)。
+    * 段 1 期间它**是 false** —— 那时该由 serviceHoming() 走它自己那一套。 */
+   bool       m_spanning     = false;
+   /* 段 2 有哪几根 (bit i)。段 1 用 m_homing_mask, 那一个在 finishHoming() 里被清零, 所以
+    * 段 2 自己留一份 —— 两根不同时成功时, 这个 mask 与段 1 的就不是同一个集合了。 */
+   unsigned   m_span_mask    = 0;
+   ecatcmd::SpanStep m_span_step[EM_MAX_AXES] = {};
+   /* 近侧边沿的位置 (脉冲, 显示坐标差值的语义 = 相对 m_span_start[i]) */
+   int32_t    m_span_p1   [EM_MAX_AXES] = {};
+   /* 段 2 的起点 (显示坐标) —— 行程上下限与宽度都以它为基准。
+    * 段 2 期间 m_origin[] 一个字节都不动 (不重锚), 所以显示坐标的差 = 原始位置的差; 全程用
+    * 显示坐标是为了与 m_tgt[] 同一个坐标系 —— 少一次换算就少一处能把符号写反的地方。 */
+   int32_t    m_span_start[EM_MAX_AXES] = {};
+   int32_t    m_span_width[EM_MAX_AXES] = {};
+   bool       m_span_ok   [EM_MAX_AXES] = {};
+   ecatcmd::SpanWhy m_span_why[EM_MAX_AXES] = {};
+   /* 连续多少圈"目标被夹住" —— 到 HMI_SPAN_STUCK_CYCLES 就按不跟随定局 */
+   int        m_span_stuck[EM_MAX_AXES] = {};
+
+   uint32_t   m_span_vel    = 0;      /* 段 2 的慢速 (段 1 那个的 1/4, 在 beginSpan 里算) */
+   int        m_span_tmo_ms = 0;      /* 段 2 的超时 (复用超时框, 只对段 2 计时) */
+   /* 两个时刻都是 clk 的毫秒数, **< 0 = 还没开始** —— 不能用 0 当"没开始" (那次 clk 可能
+    * 正好是 0, 拿 0 兼哨兵会让第一圈看上去像"已经跑了 0 秒", 与真跑过 0 秒分不开)。 */
+   qint64     m_span_t0     = -1;
+   qint64     m_span_prev_ms = -1;    /* 上一圈的 clk, 用来算实测 dt */
+
+   /* 上面三个数组 (width / ok / why) **会话结束之后不清**: 那是这一个型号的现场实测值, 操作员
+    * 量完就该一直看得见, 直到下一次测量把它换掉。publish() 每圈从这里重算遥测, 所以不留副本。
+    * 清它们的地方只有一处: 新一次测量起手 (postSpanWidth)。 */
 
    /* ---- 帧间隔统计 (见 BusTelem::max_gap_ms) ----
     * 每次 em_service() 前后各取一次 clk, 相邻两次的间隔就是"多久没发帧"。

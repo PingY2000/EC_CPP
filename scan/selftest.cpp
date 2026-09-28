@@ -3164,6 +3164,458 @@ static void test_homing()
    }
 }
 
+/* ------------------------------------------------- 测量原点宽度 (2026-09-28) */
+
+/* 这一族全是纯判据 (`ecatcmd::span_*`), 住在 ecatworker.h 里。**会话那一半只有真机能验**
+ * —— 每圈步进、60FDh 采样、转段时 mask 的重臂、teardown 的清理全在 ecatworker.cpp 里, 而
+ * scan_selftest 既不编那个文件也不编 motor_api。这里钉的是: 子态怎么迁移、每圈走多远、
+ * 失败先报哪一条、以及每一句话的字 (含"不许说触发/未触发"那条与"不许两个星号"那条)。 */
+static void test_span()
+{
+   auto hasq = [](const QString &s, const char *w) {
+      return s.contains(QString::fromUtf8(w));
+   };
+   /* 本仓库复发次数最多的那条: 注释里的 `**` 是强调, 字符串里的 `**` 是 bug —— 屏幕上
+    * 显示的就是字面的两个星号。新加的每一句都要过一遍。 */
+   auto no_stars = [](const QString &s) {
+      return s.indexOf(QStringLiteral("**")) < 0 && s.indexOf(QStringLiteral("->")) < 0;
+   };
+
+   /* ---- 子态迁移 ------------------------------------------------ */
+   caseBegin("原点宽度: 子态迁移 (退避 -> 找边沿 -> 穿过去 -> 量到)");
+   {
+      /* 这个真值表就是"怎么量"的全部内容, 每一档的两个输入都钉住 */
+      checkEq(ecatcmd::span_next(ecatcmd::SPAN_BACKOFF, true),  ecatcmd::SPAN_BACKOFF,
+              "退避中信号还在 -> 继续退");
+      checkEq(ecatcmd::span_next(ecatcmd::SPAN_BACKOFF, false), ecatcmd::SPAN_SEEK,
+              "退出信号 -> 近侧边沿到手, 转去找");
+      checkEq(ecatcmd::span_next(ecatcmd::SPAN_SEEK, false),    ecatcmd::SPAN_SEEK,
+              "还没进信号 -> 继续找");
+      checkEq(ecatcmd::span_next(ecatcmd::SPAN_SEEK, true),     ecatcmd::SPAN_CROSS,
+              "进信号 -> 记下近侧边沿, 转去等它退出");
+      checkEq(ecatcmd::span_next(ecatcmd::SPAN_CROSS, true),    ecatcmd::SPAN_CROSS,
+              "还在信号里 -> 继续走");
+      checkEq(ecatcmd::span_next(ecatcmd::SPAN_CROSS, false),   ecatcmd::SPAN_DONE,
+              "退出信号 -> 另一个边沿到手, 量到了");
+
+      /* DONE / IDLE 不再迁移: 会话**每圈**都会调一次, 重复调用把它推回中间态就等于又要走一遍 */
+      for (int d = 0; d < 2; d++)
+      {
+         checkEq(ecatcmd::span_next(ecatcmd::SPAN_DONE, d != 0), ecatcmd::SPAN_DONE,
+                 "量到之后不再迁移");
+         checkEq(ecatcmd::span_next(ecatcmd::SPAN_IDLE, d != 0), ecatcmd::SPAN_IDLE,
+                 "不在这一趟里就一直是 IDLE");
+      }
+
+      /* 只有退避那一段是负向 —— 写反了就是朝信号外面走, 永远量不到 */
+      checkEq(ecatcmd::span_dir(ecatcmd::SPAN_BACKOFF), -1, "退避 = 负向");
+      checkEq(ecatcmd::span_dir(ecatcmd::SPAN_SEEK),     1, "找边沿 = 正向");
+      checkEq(ecatcmd::span_dir(ecatcmd::SPAN_CROSS),    1, "穿过去 = 正向 (走到一半掉头就量不到了)");
+   }
+
+   /* ---- 每圈走多远 ---------------------------------------------- */
+   caseBegin("原点宽度: 每圈的步长 (至少 1 脉冲, dt 按 100 ms 封顶)");
+   {
+      for (uint32_t v = 0; v <= 210; v += 10)
+         check(ecatcmd::span_step_pul(v, 2) >= 1,
+               "多慢的速度都得至少走 1 脉冲 (一步不走 = 原地等到超时)",
+               std::string("vel = ") + std::to_string(v));
+      check(ecatcmd::span_step_pul(0, 2) >= 1, "速度是 0 也一样");
+
+      checkEq(ecatcmd::span_step_pul(12500, 2),    25,   "12500 pul/s × 2 ms = 25 脉冲");
+      checkEq(ecatcmd::span_step_pul(12500, 100),  1250, "dt 到 100 ms 就是 1250 脉冲");
+      /* 一次卡顿不该变成一次跳步 —— 跳过去就等于漏采一个边沿 */
+      checkEq(ecatcmd::span_step_pul(12500, 5000), 1250, "dt 超过 100 ms 一律按 100 ms 算");
+      checkEq(ecatcmd::span_step_pul(12500, 0),    25,   "dt <= 0 用 HMI_LOOP_MS 兜底");
+      checkEq(ecatcmd::span_step_pul(12500, -3),   25,   "dt 是负数也一样兜底");
+   }
+
+   /* ---- 行程上限 ------------------------------------------------ */
+   caseBegin("原点宽度: 行程上限与量程取小 (会话一结束插补器就恢复并夹取)");
+   {
+      /* 上限若比量程大, 落点会在会话结束那一拍被 interpolate() 夹回量程内 ——
+       * 那就是一次没人按过按钮的回调运动。所以这里是"取小", 不是"取常量"。 */
+      checkEq(ecatcmd::span_travel_cap(800000),  HMI_SPAN_MAX_PUL,
+              "量程比常量宽 -> 用常量");
+      checkEq(ecatcmd::span_travel_cap(300000),  300000,
+              "量程比常量窄 -> 用量程 (否则落点会被夹回去)");
+      checkEq(ecatcmd::span_travel_cap(-300000), 300000, "量程是负的也照取绝对值");
+      checkEq(ecatcmd::span_travel_cap(0),       HMI_SPAN_MAX_PUL,
+              "量程未知 -> 用常量 (行程总得有个头)");
+      check(ecatcmd::span_travel_cap(4000000) > 0, "永远是个正数");
+      checkEq(ecatcmd::span_travel_cap(1000),    1000, "量程很小时上限就是那个小量程");
+
+      /* 退避那一段自己那道更紧的上限。**它比行程上限紧** —— 退避是整个段 2 里唯一朝负向走
+       * 的一段, 而负向那一侧有什么没人知道 (段 1 刚把这一根带到原点开关上)。 */
+      check(HMI_SPAN_BACKOFF_PUL < HMI_SPAN_MAX_PUL,
+            "退避上限必须比行程上限紧 (否则它等于不存在)");
+      check(HMI_SPAN_BACKOFF_PUL > 0, "但它得是个正数");
+      /* 默认量程 10 万脉冲下它该落在量程里 —— 拿 50 万去退避就是把负限位当终点 */
+      check(HMI_SPAN_BACKOFF_PUL < HMI_RANGE, "退避上限要比默认量程小得多");
+   }
+
+   /* ---- 每圈推多远 ---------------------------------------------- */
+   caseBegin("原点宽度: 目标夹在「实际位置 + lead」以内 (驱动器停住时目标不再往前跑)");
+   {
+      const int32_t LEAD = 2000;
+
+      /* 1. 跟得上的正常情况: 一步就是一步, 夹取不生效 —— 多一步不许有, 少一步也不许
+       *    (少走一步 = 永远追不上, 多走一步 = 攒欠账) */
+      {
+         const ecatcmd::SpanAdvance a = ecatcmd::span_advance(100, 100, 25, LEAD, 1);
+         checkEq(a.tgt,     125, "正向: 跟得上就是 100 + 25");
+         check(!a.limited,       "这一圈不算没跟上");
+      }
+      {
+         const ecatcmd::SpanAdvance a = ecatcmd::span_advance(-100, -100, 25, LEAD, -1);
+         checkEq(a.tgt,     -125, "负向: 跟得上就是 100 - 25");
+         check(!a.limited,        "这一圈不算没跟上");
+      }
+
+      /* 2. 驱动器停住 (位置不动): 目标最多跑到 pos + lead 就不再往前 —— 这才是要防的那件事:
+       *    目标要是照着一路加下去, 攒下几千脉冲的欠账, 等驱动器动起来就是一次冲刺, 而
+       *    冲刺正是一次漏采边沿的机会。 */
+      {
+         ecatcmd::SpanAdvance a = ecatcmd::span_advance(LEAD - 10, 0, 25, LEAD, 1);
+         checkEq(a.tgt,     LEAD, "再推一步就顶到 pos + lead 上");
+         check(!a.limited,       "顶到上限那一圈仍不算没跟上 (目标是动的)");
+
+         a = ecatcmd::span_advance(LEAD, 0, 25, LEAD, 1);
+         checkEq(a.tgt,     LEAD, "已经到上限 -> 目标钉住不动");
+         check(a.limited,        "**目标一点都不动** = 这一根没跟上");
+      }
+      {
+         ecatcmd::SpanAdvance a = ecatcmd::span_advance(-LEAD, 0, 25, LEAD, -1);
+         checkEq(a.tgt,     -LEAD, "负向同理: 顶在 pos - lead 上");
+         check(a.limited,         "负向顶住 = 没跟上");
+      }
+
+      /* 3. 一整张表扫一遍: 新目标**永远落在 [旧目标, 旧目标 + 一步] 里** (正向), 一件例外都
+       *    不许有 —— 这就是"夹取只可能让这一步走得更短, 不可能让它更长、更不可能掉头"。
+       *    扫的是位置从"远远落后"到"远远领先"、目标从正到负。 */
+      for (int32_t pos = -5000; pos <= 5000; pos += 500)
+         for (int32_t t = -5000; t <= 5000; t += 500)
+         {
+            const ecatcmd::SpanAdvance a = ecatcmd::span_advance(t, pos, 25, LEAD, 1);
+
+            check(a.tgt >= t && a.tgt <= t + 25,
+                  "正向: 新目标落在 [旧目标, 旧目标 + 一步] 里",
+                  std::string("pos = ") + std::to_string(pos) + ", tgt = " + std::to_string(t)
+                     + " -> " + std::to_string(a.tgt));
+
+            const ecatcmd::SpanAdvance b = ecatcmd::span_advance(t, pos, 25, LEAD, -1);
+
+            check(b.tgt <= t && b.tgt >= t - 25,
+                  "负向: 新目标落在 [旧目标 - 一步, 旧目标] 里",
+                  std::string("pos = ") + std::to_string(pos) + ", tgt = " + std::to_string(t)
+                     + " -> " + std::to_string(b.tgt));
+         }
+
+      /* 4. 实际位置落在**目标后方**很远时 (上一趟攒下的欠账), 边界会落在目标的反侧 ——
+       *    那一下要是照夹, 目标会朝反方向跳一步, 正是要防的那种"没人按过的运动"。
+       *    这一条也是**不跟随**的一种: 追了 5 万脉冲还没追上。 */
+      {
+         const ecatcmd::SpanAdvance a = ecatcmd::span_advance(100000, 0, 25, LEAD, 1);
+         checkEq(a.tgt,    100000, "边界在目标反侧 -> 目标原地不动, 绝不倒退");
+         check(a.limited,         "而且这就是没跟上");
+      }
+      {
+         const ecatcmd::SpanAdvance a = ecatcmd::span_advance(-100000, 0, 25, LEAD, -1);
+         checkEq(a.tgt,    -100000, "负向同理: 不许朝正向跳一步");
+         check(a.limited,          "也是没跟上");
+      }
+
+      /* 5. 步长写错 (0 / 负数) 也永远至少推 1 脉冲 —— 一步不走就是原地等到超时 */
+      checkEq(ecatcmd::span_advance(0, 0, 0, LEAD, 1).tgt,  1, "步长 0 兜底成 1");
+      checkEq(ecatcmd::span_advance(0, 0, -5, LEAD, 1).tgt, 1, "步长是负数也一样兜底");
+
+      /* 6. lead <= 0 = 不做夹取 (调用方保证 lead > 0; 这条只为"参数写错时别把轴钉死在原地") */
+      checkEq(ecatcmd::span_advance(100, 0, 25, 0, 1).tgt,  125, "lead = 0 -> 不加夹取");
+      checkEq(ecatcmd::span_advance(100, 0, 25, -5, 1).tgt, 125, "lead 是负数 -> 也不加夹取");
+
+      /* 7. 一整趟走下来: 目标与实际位置的距离**永远不超过 lead** —— 这是上面每一条合起来的
+       *    结论, 也是段 2 不会攒欠账的全部保证。位置按"每圈跟一步"推, 中途插一次卡住。 */
+      {
+         int32_t tgt = 0, pos = 0;
+         int     worst = 0, stuck_run = 0, seen_stuck = 0;
+
+         for (int k = 0; k < 400; k++)
+         {
+            const ecatcmd::SpanAdvance a = ecatcmd::span_advance(tgt, pos, 25, LEAD, 1);
+
+            tgt = a.tgt;
+            if (a.limited)
+            {
+               stuck_run++;
+               if (stuck_run > seen_stuck)
+                  seen_stuck = stuck_run;
+            }
+            else
+            {
+               stuck_run = 0;
+            }
+
+            if (a.limited)
+               continue;
+
+            /* 前 100 圈跟得上, 之后停住不走 (模拟撞上什么) */
+            if (k < 100)
+               pos = tgt;
+
+            const int gap = (tgt > pos) ? (tgt - pos) : (pos - tgt);
+            if (gap > worst)
+               worst = gap;
+         }
+
+         check(worst <= LEAD, "全程目标与实际位置的距离不超过 lead",
+               std::string("最大 ") + std::to_string(worst));
+
+         /* 卡住之后必须**报得出来**: 连续受限的圈数要到得了那条线, 否则"不跟随"这条判据
+          * 永远不触发, 轴会一直杵在那里等到超时。 */
+         check(seen_stuck >= HMI_SPAN_STUCK_CYCLES,
+               "卡住之后连续受限的圈数到得了 HMI_SPAN_STUCK_CYCLES",
+               std::string("最长 ") + std::to_string(seen_stuck) + " 圈");
+      }
+   }
+
+   /* ---- 失败原因: 一档一句 -------------------------------------- */
+   caseBegin("原点宽度: 每一档失败都有自己的现象, 而且不许说「触发」");
+   {
+      const ecatcmd::SpanWhy all[] = {
+         ecatcmd::SPAN_WHY_NO_EDGE, ecatcmd::SPAN_WHY_NO_EXIT, ecatcmd::SPAN_WHY_STOPPED,
+         ecatcmd::SPAN_WHY_TIMEOUT, ecatcmd::SPAN_WHY_FAULT,   ecatcmd::SPAN_WHY_DISABLED,
+         ecatcmd::SPAN_WHY_NO_DIG,  ecatcmd::SPAN_WHY_STUCK,   ecatcmd::SPAN_WHY_NO_BUS,
+         ecatcmd::SPAN_WHY_PEER,    ecatcmd::SPAN_WHY_NO_TARGET
+      };
+      const int n = (int)(sizeof(all) / sizeof(all[0]));
+
+      for (int k = 0; k < n; k++)
+      {
+         const std::string t = ecatcmd::span_why_text(all[k]);
+         check(!t.empty(), "每一档都要有一句现象", std::to_string(all[k]));
+
+         /* 这一族刻意**不说「触发 / 未触发」**: 看的是驱动器 60FDh 的原始位, 而屏幕上那盏灯
+          * 是「上位机侧取反」之后的值 —— 同一台机器上两者正好相反, 说触发会与灯打脸。 */
+         check(t.find("触发") == std::string::npos,
+               "现象里不许出现「触发」(界面那盏灯可能就是反的)", t);
+         check(t.find("压着") == std::string::npos, "也不许说「压着」(术语表: 触发 / 未触发)", t);
+         check(t.find("松开") == std::string::npos, "也不许说「松开」", t);
+         /* 成因分析搬进 docs/scan_messages.md, 屏幕上只说现象 */
+         check(t.find("可能") == std::string::npos, "不许在屏幕上猜成因", t);
+
+         /* 出路: nullptr, 或**恰好一条**「请……」 */
+         const char *a = ecatcmd::span_why_action(all[k]);
+         if (a != nullptr)
+         {
+            const std::string s(a);
+            const QString    q = QString::fromUtf8(a);
+
+            check(s.compare(0, 3, "请") == 0, "出路只许以「请」开头", s);
+            check(q.endsWith(QStringLiteral("。")), "……并且以句号收尾", s);
+            check(s.find("触发") == std::string::npos, "出路里也不许出现「触发」", s);
+            check(s.find("；") == std::string::npos && s.find("然后") == std::string::npos
+                     && s.find("第一步") == std::string::npos,
+                  "出路不许写成两步 (CLAUDE.md §1.5: 不是操作步骤)", s);
+            check(no_stars(q), "出路里也不许有两个星号", s);
+         }
+      }
+
+      /* 两两不同 —— 屏幕上分不出的两档等于没有这一档 */
+      for (int k = 0; k < n; k++)
+         for (int j = k + 1; j < n; j++)
+            check(std::string(ecatcmd::span_why_text(all[k]))
+                     != std::string(ecatcmd::span_why_text(all[j])),
+                  "两档现象不许是同一句话",
+                  std::string(ecatcmd::span_why_text(all[k])) + " / "
+                     + ecatcmd::span_why_text(all[j]));
+
+      /* 操作员自己按的「停止」不给人指路 (那是他刚做过的动作); PEER 的出路在对侧那一根身上 */
+      check(ecatcmd::span_why_action(ecatcmd::SPAN_WHY_STOPPED) == nullptr,
+            "被「停止」中止之后没有出路可指");
+      check(ecatcmd::span_why_action(ecatcmd::SPAN_WHY_PEER) == nullptr,
+            "被带停的那一根不指路 (要查的是另一根)");
+      check(std::string(ecatcmd::span_why_text(ecatcmd::SPAN_WHY_NONE)).empty(),
+            "没失败就没有现象可说");
+      check(ecatcmd::span_why_action(ecatcmd::SPAN_WHY_NONE) == nullptr,
+            "没失败就没有出路可指");
+
+      /* 同一个成因只许有**一种**说法 —— 这两句与既有那两句逐字对齐, 否则同一件事在屏幕上
+       * 会有两种讲法, 而操作员会以为它们是两件事 */
+      check(std::string(ecatcmd::span_why_text(ecatcmd::SPAN_WHY_FAULT))
+               == std::string("6041h bit3 = Fault"),
+            "bit3 那一句与 home_refusal 里那份逐字相同");
+      check(std::string(ecatcmd::span_why_action(ecatcmd::SPAN_WHY_FAULT)).find("「故障复位」")
+               != std::string::npos,
+            "bit3 的出路也指着同一个按钮");
+      const std::string dg_act =
+         std::string(ecatcmd::span_why_action(ecatcmd::SPAN_WHY_NO_DIG));
+      const char *lim_refuse = ecatcmd::home_lim_refusal(false, false, false);
+      check(lim_refuse != nullptr
+               && dg_act.find("让 60FDh 进 TxPDO") != std::string::npos
+               && std::string(lim_refuse).find("让 60FDh 进 TxPDO") != std::string::npos,
+            "两族指的都是界面上同一个勾的名字 (指错勾等于没指路)");
+   }
+
+   /* ---- 失败包络: 先报哪一条 ------------------------------------ */
+   caseBegin("原点宽度: 失败包络的顺序 (事实压过推断, 操作员的动作压过一切)");
+   {
+      ecatcmd::SpanEnv ok;
+      ok.bus_ready = ok.enabled = true;
+      ok.dig_known = true;
+      ok.csp_wrote = true;
+      checkEq(ecatcmd::span_fail_why(ok), ecatcmd::SPAN_WHY_NONE, "全都正常 -> 继续走");
+
+      ecatcmd::SpanEnv e = ok;
+      e.stop_req = true;
+      checkEq(ecatcmd::span_fail_why(e), ecatcmd::SPAN_WHY_STOPPED, "「停止」压过一切");
+
+      e = ok; e.bus_gone = true;
+      checkEq(ecatcmd::span_fail_why(e), ecatcmd::SPAN_WHY_NO_BUS,
+              "总线没了先报这个 (那之后所有读数都不作数)");
+      e = ok; e.bus_ready = false;
+      checkEq(ecatcmd::span_fail_why(e), ecatcmd::SPAN_WHY_NO_BUS, "掉出 OP 同上");
+
+      e = ok; e.fault = true;
+      checkEq(ecatcmd::span_fail_why(e), ecatcmd::SPAN_WHY_FAULT, "bit3 -> 报故障");
+      e = ok; e.enabled = false;
+      checkEq(ecatcmd::span_fail_why(e), ecatcmd::SPAN_WHY_DISABLED, "掉使能");
+      e = ok; e.dig_known = false;
+      checkEq(ecatcmd::span_fail_why(e), ecatcmd::SPAN_WHY_NO_DIG, "60FDh 读不到了");
+      e = ok; e.csp_wrote = false;
+      checkEq(ecatcmd::span_fail_why(e), ecatcmd::SPAN_WHY_NO_TARGET, "目标位置写不进去");
+
+      /* 「没跟上」是**推断**出来的, 排在事实后面 */
+      e = ok; e.fault = true; e.stuck = true;
+      checkEq(ecatcmd::span_fail_why(e), ecatcmd::SPAN_WHY_FAULT,
+              "bit3 与「没跟上」同时成立 -> 报事实");
+      e = ok; e.stuck = true;
+      checkEq(ecatcmd::span_fail_why(e), ecatcmd::SPAN_WHY_STUCK, "只有推断 -> 报没跟上");
+
+      /* 「到行程上限」报哪一句由"进没进过信号"定: 同一件事的两种现象, 处置不同 */
+      e = ok; e.over_travel = true; e.in_signal = false;
+      checkEq(ecatcmd::span_fail_why(e), ecatcmd::SPAN_WHY_NO_EDGE,
+              "没进过信号就到上限 -> 没等到边沿");
+      e = ok; e.over_travel = true; e.in_signal = true;
+      checkEq(ecatcmd::span_fail_why(e), ecatcmd::SPAN_WHY_NO_EXIT, "进去过就再没出来");
+
+      /* 上限比超时更具体 —— 两个同时成立时报上限那一条 */
+      e = ok; e.over_travel = true; e.over_time = true; e.in_signal = false;
+      checkEq(ecatcmd::span_fail_why(e), ecatcmd::SPAN_WHY_NO_EDGE, "上限压过超时");
+      e = ok; e.over_time = true;
+      checkEq(ecatcmd::span_fail_why(e), ecatcmd::SPAN_WHY_TIMEOUT, "只超时 -> 报超时");
+   }
+
+   /* ---- 60FDh 那道新闸 ------------------------------------------ */
+   caseBegin("原点宽度闸: 60FDh 读不到的那几根点名拒绝");
+   {
+      const bool known_ok[EM_MAX_AXES]   = { true,  true  };
+      const bool known_x[EM_MAX_AXES]    = { false, true  };
+      const bool known_y[EM_MAX_AXES]    = { true,  false };
+      const bool known_none[EM_MAX_AXES] = { false, false };
+      unsigned   bad = 0xFFFFu;
+
+      check(ecatcmd::span_dig_refusal(0x3u, known_ok, bad) == nullptr, "两根都读得到 -> 放行");
+      checkEq(bad, 0, "放行时 bad_mask 清成 0");
+
+      check(ecatcmd::span_dig_refusal(0x3u, known_x, bad) != nullptr, "X 读不到 -> 拒绝");
+      checkEq(bad, 0x1u, "点名只点 X 这一根");
+
+      check(ecatcmd::span_dig_refusal(0x3u, known_none, bad) != nullptr, "两根都读不到 -> 拒绝");
+      checkEq(bad, 0x3u, "两根都点名");
+
+      check(ecatcmd::span_dig_refusal(0x1u, known_y, bad) == nullptr,
+            "只要 X 而 Y 读不到 -> 放行 (掩码外那一根不算)");
+      checkEq(bad, 0, "那时 bad_mask 是 0");
+
+      /* 那句话要带上出路, 而且用的是界面上那个勾的名字 (与找限位那道同一份说法) */
+      const char *why = ecatcmd::span_dig_refusal(0x3u, known_none, bad);
+      const std::string ws = (why != nullptr) ? std::string(why) : std::string();
+      check(ws.find("60FDh") != std::string::npos, "点名 60FDh");
+      check(ws.find("拒绝") != std::string::npos, "说清是拒绝发起 (界面据此着红)");
+      check(ws.find("让 60FDh 进 TxPDO") != std::string::npos,
+            "出路指的是界面上那个勾");
+      check(ws.find("->") == std::string::npos, "禁用的箭头写法");
+   }
+
+   /* ---- 结论句 / 读数 / 横幅 ------------------------------------ */
+   caseBegin("原点宽度: 结论句、读数、横幅 (四态各一句, 单位与标点都要对)");
+   {
+      ecatcmd::SpanReport r;
+      r.axis = 1; r.ok = true; r.width = 12345; r.end_pos = 12370;
+
+      const QString okn = ecatcmd::span_axis_note(r);
+      check(hasq(okn, "轴Y"), "点名这一根");
+      check(hasq(okn, "12345 pul"), "把量到的脉冲数写出来 (单位是英文符号, 与数值之间一个空格)");
+      check(hasq(okn, "停在远端边沿"),
+            "说清停在哪儿 (段 2 不重锚零点, 停下时的显示坐标不再是 0)");
+      check(no_stars(okn), "字符串里不许出现两个星号 (本仓库复发最多的那条)");
+
+      r.ok = false; r.width = HMI_SPAN_NONE; r.why = ecatcmd::SPAN_WHY_NO_EDGE;
+      const QString badn = ecatcmd::span_axis_note(r);
+      check(hasq(badn, "轴Y"), "失败也要点名");
+      check(hasq(badn, "未测得"), "跑过但没量到 = 未测得");
+      check(hasq(badn, "一路走完都没等到原点信号"), "现象照实说");
+      check(hasq(badn, "请检查原点开关的接线与位置"), "并且带上那一条出路");
+      check(no_stars(badn), "失败句里也不许有两个星号");
+
+      /* 两根各念一遍, 长度守着"现象 + 出路"那一档 (50 字) */
+      ecatcmd::SpanReport two[2];
+      two[0].axis = 0; two[0].ok = true; two[0].width = 12345;
+      two[1].axis = 1; two[1].why = ecatcmd::SPAN_WHY_NO_EDGE;
+      const QString sum = ecatcmd::span_summary(two, 2);
+      check(hasq(sum, "轴X 12345 pul") && hasq(sum, "轴Y 未测得"), "两根各自念一遍");
+      check(sum.length() <= 50, "长度在上限内", std::to_string(sum.length()));
+      check(no_stars(sum), "批结论里也不许有两个星号");
+
+      /* ---- 读数: 四态两两不同 ---- */
+      auto read1 = [](int state) {
+         ecatcmd::SpanReadIn x;
+         x.axis = 0;
+         if (state == 1) x.spanning = true;                    /* 测量中 */
+         if (state == 2) x.why = ecatcmd::SPAN_WHY_TIMEOUT;     /* 未测得 */
+         if (state == 3) x.width = 7;                          /* 有数 */
+         return ecatcmd::span_readout(&x, 1);
+      };
+      const QString t0 = read1(0), t1 = read1(1), t2 = read1(2), t3 = read1(3);
+      check(hasq(t0, "未测量"), "没跑过 = 未测量 (要人按一下按钮)");
+      check(hasq(t1, "测量中"), "正在跑 = 测量中");
+      check(hasq(t2, "未测得"), "跑过没量到 = 未测得 (要人去查开关)");
+      check(hasq(t3, "7 pul"), "量到了就报数");
+      check(t0 != t1 && t1 != t2 && t2 != t3 && t0 != t2 && t0 != t3 && t1 != t3,
+            "四态两两不同 (屏幕上分不出的两档等于没有这一档)");
+      check(no_stars(t0) && no_stars(t1) && no_stars(t2) && no_stars(t3),
+            "读数里也不许有两个星号");
+
+      /* 一根量完了、另一根还在量: 这一行要能同时说出这两件事 */
+      ecatcmd::SpanReadIn ri[2];
+      ri[0].axis = 0; ri[0].spanning = true; ri[0].width = 500;
+      ri[1].axis = 1; ri[1].spanning = true;
+      const QString both = ecatcmd::span_readout(ri, 2);
+      check(hasq(both, "轴X 500 pul") && hasq(both, "轴Y 测量中"),
+            "一根有数、一根还在量, 两件事都在");
+      check(hasq(both, "轴X") && hasq(both, "轴Y"), "两根轴名都在");
+
+      /* ---- 横幅 ---- */
+      const int axes2[2] = { 0, 1 };
+      const QString b2 = ecatcmd::span_banner(axes2, 2);
+      check(hasq(b2, "轴X") && hasq(b2, "轴Y"),
+            "两根轴名都要在 (只说一根是这次改造最不该出的错)");
+      check(hasq(b2, "正在测量原点宽度"), "说的是测量这件事, 不是回零");
+      check(hasq(b2, "按「停止」可立即中止"), "那句出路还在");
+      check(b2.length() <= 40, "1 句 / 40 字 (CLAUDE.md §1.4 横幅上限)",
+            std::to_string(b2.length()));
+      check(no_stars(b2), "横幅里也不许有两个星号");
+
+      const int axes1[1] = { 1 };
+      const QString b1 = ecatcmd::span_banner(axes1, 1);
+      check(hasq(b1, "轴Y"), "单轴也说轴名");
+      check(b1.length() <= 40, "单轴也在上限内", std::to_string(b1.length()));
+
+      check(ecatcmd::span_banner(nullptr, 2).isEmpty(), "没有轴 -> 空串, 不报一句空横幅");
+      check(ecatcmd::span_banner(axes2, 0).isEmpty(), "零根 -> 空串");
+   }
+}
+
 /* ------------------------------------------------- 零点跨重连保留 (2026-09-22) */
 
 /* 这两条判据是这次改动里**唯一**测得到的部分。保留/重取那个决定、世代计数、doEnable 的重钉,
@@ -4472,6 +4924,7 @@ int main(int argc, char **argv)
    test_faultreset();
    test_limitsw();
    test_homing();
+   test_span();
    test_origin();
    test_bushealth();
    test_autorecover();
