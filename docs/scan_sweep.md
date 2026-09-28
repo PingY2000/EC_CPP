@@ -5685,6 +5685,18 @@ if (anc.degraded) m_home_off[axis].eff = 0;      /* 结论句照实说「未生�
 | S2 | `finishHoming()` 第 4 步换成 `home_anchor()` 那一对 + 结论句填 `r.off` + `teardown()` 清 `m_home_off[]` | **已写** |
 | S3 | `scanprefs.{h,cpp}` 两个字段 + 两个键; `scanwindow.{h,cpp}` 两个 spin box、面板下移两行、`GateItem`、存/读/存回、三个调用点、两处 tooltip 半句 | **已写** —— 界面部分**没有人看过**(见下) |
 | S4 | 本节 + `scan_messages.md` §14 + 各节注记 + `README` 两处 | **已写** |
+| S5 | **现场报回来的一个 bug**: 八个按钮**叠在**两个偏移框上 | **已修** —— 见下 |
+
+**S3 之后现场发现的那个 bug(2026-09-28)**: 屏幕上"回零偏移X / Y 被按钮遮挡"。
+成因是**改漏了一处**: `buildHomePanel()` 里面板下移两行时, 两个偏移框那一处写成了
+`i + 2`, 而八个按钮那两处**仍是 `i + 2`**(应为 `i + 4`)—— 于是按钮与偏移框落在
+**同一个格子**里, QGridLayout 把它们给到同一个矩形, 后加的按钮盖在上面。
+上面 38.6 那张表**本来就是对的**(它写的就是"其余行整体下移两行"), 错的是代码。
+修法是那两行改成 `i + 4`。**自检抓不到这一类**: `scanwindow.cpp` 不在
+`SCAN_COMMON_SRC` 里, 断言够不着 `QGridLayout`。修完用一次静态核对补的:
+把 `buildHomePanel()` 里 12 条 `addWidget` 的行/列/跨行列**照着源码解析出来**、
+按 `i` / `d` 两个循环展开成 40 个格子, 确认**没有两件东西落在同一个格子上**,
+而且用到的行正好是 0…7(与 38.6 那张表逐行对上)。那一核对是一次性的脚本, 没有入库。
 
 **自检能验的**(`scan_selftest` 只链 `Qt6::Core`): `home_off_clamp` 的上下限与
 `HMI_HOME_OFF_DEF == 75000`; `home_off_from_pref` 的五档(含 ★ `0 → 0`);

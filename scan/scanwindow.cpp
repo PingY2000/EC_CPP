@@ -1743,7 +1743,7 @@ QWidget *ScanWindow::buildHomePanel()
             connect(m_btnHome[i][d], &QPushButton::clicked, this,
                      [this, i, d] { onHomeClicked(i, d, false); });
 
-            dg->addWidget(m_btnHome[i][d], i + 2, 1 + d);
+            dg->addWidget(m_btnHome[i][d], i + 4, 1 + d);
          }
 
          /* ---- 找限位开关 (方式 18 / 17, 手册叫"以限位开关为原点") ----
@@ -1762,7 +1762,7 @@ QWidget *ScanWindow::buildHomePanel()
             connect(m_btnLim[i][d], &QPushButton::clicked, this,
                      [this, i, d] { onHomeClicked(i, d, true); });
 
-            dg->addWidget(m_btnLim[i][d], i + 2, 3 + d);
+            dg->addWidget(m_btnLim[i][d], i + 4, 3 + d);
          }
       }
    }
