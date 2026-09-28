@@ -99,7 +99,7 @@ void EcatThread::postFaultReset()
 /* 单轴那一趟 —— **内部就是两轴那一套**, 只圈一根。老那三个字段照样填 (别的读者还有), 但
  * `hm_mask` 非空, 所以 drainCommands 走的是两轴那条路, 而那一趟的会话大小恰好是 1。
  * 这正是"改造前后单轴行为一致"能被自检钉住的原因 (§33.7 第 7 条)。 */
-void EcatThread::postHome(int axis, int method, uint32_t vel_fast, int tmo_s)
+void EcatThread::postHome(int axis, int method, uint32_t vel_fast, int tmo_s, int32_t off)
 {
    QMutexLocker lk(&m_mtx);
    Cmd c; c.type = CMD_HOME; c.axis = axis; c.method = method;
@@ -111,6 +111,7 @@ void EcatThread::postHome(int axis, int method, uint32_t vel_fast, int tmo_s)
       c.hm_mask          = (1u << axis);
       c.hm_method[axis]  = method;
       c.hm_vel[axis]     = vel_fast;
+      c.hm_off[axis]     = off;
    }
 
    m_cmds.enqueue(c);
@@ -118,7 +119,7 @@ void EcatThread::postHome(int axis, int method, uint32_t vel_fast, int tmo_s)
 
 /* 一趟几根同时。「回零校准」走这一条 (mask = 0b11)。 */
 void EcatThread::postHomeBoth(unsigned mask, const int *method, const uint32_t *vel_fast,
-                              int tmo_s)
+                              int tmo_s, const int32_t *off)
 {
    if (mask == 0)
       return;
@@ -132,6 +133,7 @@ void EcatThread::postHomeBoth(unsigned mask, const int *method, const uint32_t *
       {
          c.hm_method[i] = (method != nullptr) ? method[i] : 0;
          c.hm_vel[i]    = (vel_fast != nullptr) ? vel_fast[i] : 0;
+         c.hm_off[i]    = (off != nullptr) ? off[i] : 0;
       }
 
    /* 老那三个字段也填上第一根 —— 它们是"这一趟的默认值"。两轴时 drainCommands 不读它们,
@@ -157,7 +159,7 @@ void EcatThread::postHomeBoth(unsigned mask, const int *method, const uint32_t *
  *
  * 方式 24 在这里是**定死**的, 不给调用方选: 段 2 的起点必须是"原点开关上的那个边沿",
  * 而 29/18/17 的落点在别处 (负向那一侧 / 限位开关上), 从那里出发量不到原点开关的宽度。 */
-void EcatThread::postSpanWidth(unsigned mask, uint32_t vel_fast, int tmo_s)
+void EcatThread::postSpanWidth(unsigned mask, uint32_t vel_fast, int tmo_s, const int32_t *off)
 {
    if (mask == 0)
       return;
@@ -172,6 +174,8 @@ void EcatThread::postSpanWidth(unsigned mask, uint32_t vel_fast, int tmo_s)
       {
          c.hm_method[i] = EM_HOME_MODE_ORIGIN_POS;  /* 24 —— 「回零校准」用的就是它 */
          c.hm_vel[i]    = vel_fast;
+         /* 段 1 就是方式 24 回零, 所以「回零偏移」照常生效; 段 2 的运算全是相对的, 不受它影响 */
+         c.hm_off[i]    = (off != nullptr) ? off[i] : 0;
       }
 
    /* 老那三个字段照 postHomeBoth 的规矩填第一根 (调试时从队列里看一条 CMD_HOME 该能一眼
@@ -631,23 +635,25 @@ void EcatThread::drainCommands()
                m_span_pending = c.span;
 
                BlockTick tk(this);
-               startHoming(c.hm_mask, c.hm_method, c.hm_vel, c.tmo_s);
+               startHoming(c.hm_mask, c.hm_method, c.hm_vel, c.tmo_s, c.hm_off);
             }
             else
             {
                /* `hm_mask == 0` 只可能来自一个**没填新字段的老调用方** (改造期间留下的一条
                 * 兜底, 现在没有这种调用方)。照老三个字段凑一趟单轴的, 而不是静默地什么都不做 ——
-                * "点了回零却没动"是这里最不该出的错。 */
+                * "点了回零却没动"是这里最不该出的错。
+                * o[] 保持全 0 = 这一趟不搬零点 —— 老调用方说的那件事里本来就没有偏移。 */
                const int axis = c.axis;
                if (axis >= 0 && axis < EM_MAX_AXES)
                {
                   int      m[EM_MAX_AXES] = {};
                   uint32_t v[EM_MAX_AXES] = {};
+                  int32_t  o[EM_MAX_AXES] = {};
                   m[axis] = c.method;
                   v[axis] = (uint32_t)c.value;
 
                   BlockTick tk(this);
-                  startHoming(1u << axis, m, v, c.tmo_s);
+                  startHoming(1u << axis, m, v, c.tmo_s, o);
                }
             }
             break;
@@ -1135,7 +1141,7 @@ void EcatThread::doFaultReset()
  * 这里起手、`serviceHoming()` 每圈走一步、`finishHoming()` 收尾, 三者由 m_homing 串起来。
  * 这样一根轴的等待不再占住工作线程, 两轴才可能同时动 (docs/scan_sweep.md §33)。 */
 void EcatThread::startHoming(unsigned mask, const int *method, const uint32_t *vel_fast,
-                             int tmo_s)
+                             int tmo_s, const int32_t *off_ui)
 {
    /* 掩码只许圈连上的轴。`postHome` / `postHomeBoth` 填的都是"要哪几根", 而"连上了几根"
     * 是这里的事实 —— 圈到一根不存在的轴, 下面每一步都要为它多写一个特例。 */
@@ -1293,8 +1299,19 @@ void EcatThread::startHoming(unsigned mask, const int *method, const uint32_t *v
       cfg.method   = method[i];
       cfg.vel_fast = ecatcmd::home_vel_clamp((int32_t)vel_fast[i]);
       cfg.vel_slow = ecatcmd::home_vel_slow(cfg.vel_fast);
-      /* **acc 必须跟着速度一起算** (见 home_accel_for); offset 保持 0, 界面上没有它的控件 */
+      /* **acc 必须跟着速度一起算** (见 home_accel_for)。
+       * cfg.offset 是驱动器那个 607Ch「原点偏移」, **保持 0, 一个字节都不写**: 界面上那个
+       * 「回零偏移」是**上位机的软件零点** (收尾时搬 m_origin), 与 607Ch 是两回事 —— 写它
+       * 会让驱动器把自己报的 6064h 一起挪, 与软件零点叠加 (docs/scan_sweep.md §20.5)。 */
       cfg.acc      = ecatcmd::home_accel_for(cfg.vel_fast);
+
+      /* 「回零偏移」的账在这里算好 (找限位与装不下都在 home_off_decide 里判掉), 收尾时
+       * 直接用它 —— **读 m_range 而不是遥测那个 range**: 后者滞后一帧, 而这一趟要不要搬零点
+       * 必须按**此刻**的真量程判。会话期间量程不会变 (doRange() 头一句 `if (m_homing) return;`),
+       * 所以起手算的与收尾那一刻的是同一个值。 */
+      m_home_off[i] = ecatcmd::home_off_decide((off_ui != nullptr) ? off_ui[i] : 0,
+                                               ecatcmd::home_method_is_limit(method[i]),
+                                               m_range.load());
 
       /* 存下起手时算好的参数: 结论句在 finishHoming() 里写, 那里离这里有好几秒 */
       m_home_cfg[i]        = cfg;
@@ -2009,16 +2026,30 @@ void EcatThread::finishHoming()
          rc_mode    = end_rc.rc_mode;
          rc_enable  = end_rc.rc_enable;
 
-         /* ---- 4. 重新锚定显示原点 ---- ★ **这一行漏掉, 就是一次没人按过按钮的全速运动**:
-          * m_origin 若还是回零之前的值, 下一次 interpolate() 会把**回零之前的物理位置**当成
-          * CSP 目标发出去。**必须在收尾阶梯之后** —— em_arm 钉 607Ah 用"使能那一刻的 6064h"。
-          * (em_pos 在 mirror 不健康时会退化成一条 SDO 读, 所以它在 tick 里面。) */
-         m_origin[axis] = em_pos(ax);
-         m_tgt[axis]    = 0;
+         /* ---- 4. 重新锚定显示原点 (含「回零偏移」) ---- ★ **这一行漏掉, 就是一次没人按过
+          * 按钮的全速运动**: m_origin 若还是回零之前的值, 下一次 interpolate() 会把**回零之前
+          * 的物理位置**当成 CSP 目标发出去。**必须在收尾阶梯之后** —— em_arm 钉 607Ah 用
+          * "使能那一刻的 6064h"。 (em_pos 在 mirror 不健康时会退化成一条 SDO 读, 所以它在 tick
+          * 里面。)
+          *
+          * ★ **第二个坑就在这一对数上**: 偏移非 0 时 m_tgt 写的是 **-off 而不是 0**。
+          * home_anchor() 保证 `origin + tgt == 落点`, 也就是物理目标一个脉冲都不动 ——
+          * 只搬 origin 而把 m_tgt 留成 0, 就是命令驱动器从 origin+0 走到落点: 一次**没人按过
+          * 按钮的 off 个脉冲全速移动** (缺省 75000 pul = 1.5 mm)。理由与不变式见 ecatworker.h。
+          * off == 0 时它逐字退回改造前那两行 {origin = 落点, tgt = 0}。 */
+         const ecatcmd::HomeAnchor anc = ecatcmd::home_anchor(em_pos(ax), m_home_off[axis].eff);
+
+         m_origin[axis] = anc.origin;
+         m_tgt[axis]    = anc.tgt;
          {
             QMutexLocker lk(&m_mtx);
-            m_want[axis] = 0;
+            m_want[axis] = anc.tgt;
          }
+
+         /* 溢出退档 (落点贴近 int32 边界): eff 清成 0, 让结论句照实说「未生效」而不是
+          * 新开一档 —— 屏幕上的说法越少越好, 而这件事本来就近乎不可能发生。 */
+         if (anc.degraded)
+            m_home_off[axis].eff = 0;
          /* 零点搬了 —— 世代 +1。**无条件**: 这一步在上面那几条失败路上也跑 (超时/bit3/bit13
           * 都是举着 bit4 返回的), 而无论成败, m_origin[] 确实换了一个值。
           * 同时把"这份零点归本次运行所有"重新盖一次章: 回零之后任何时候断开重连, 沿用的都是它。 */
@@ -2060,6 +2091,9 @@ void EcatThread::finishHoming()
       r.vel_slow   = cfg.vel_slow;
       r.acc        = cfg.acc;
       r.tmo_s      = m_home_tmo_s[axis];
+      /* 「回零偏移」的账 (起手时算的; 溢出退档时 eff 已在第 4 步里清成 0) —— 结论句尾巴
+       * 那个方括号由 home_off_clause() 按它分档 */
+      r.off        = m_home_off[axis];
 
       note(ecatcmd::home_axis_note(r));
 
@@ -2947,6 +2981,9 @@ void EcatThread::teardown()
       m_home_rc[i]         = EM_HM_RUNNING;
       m_home_method[i]     = 0;
       m_home_tmo_s[i]      = 0;
+      /* 「回零偏移」的账也一起清: 留着的话下一次 startHoming 会先拿它填结论句 (虽然那一条
+       * 马上就被覆盖), 而"上一台驱动器的偏移"这种东西留在屏幕上是与宽度同一种假象。 */
+      m_home_off[i]        = ecatcmd::HomeOff();
       m_home_disable_rc[i] = 0;
       /* 段 2 的逐轴记录。**宽度 (m_span_width) 也一并清**: 换了台驱动器之后, 屏幕上还挂着
        * 上一台的实测宽度, 是最难查的那种假象 (与 603Fh 那条同一个理由)。 */

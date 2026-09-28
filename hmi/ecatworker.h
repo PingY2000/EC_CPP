@@ -49,6 +49,17 @@
 #define HMI_HOME_TMO_MAX_S    600
 #define HMI_HOME_TMO_DEF_S    120
 
+/* 「回零偏移」: 找原点 (方式 24/29) 停稳之后, 把显示坐标 0 放在落点**正方向**多少个脉冲处。
+ * 现场要的零点不在原点开关的落点上 (它离落点 1.5 mm), 所以缺省不是 0。
+ *
+ * **0 是一个合法值** (0 = 零点就放在落点上 = 改造前的行为), 于是"没记过"这个语义只能落在
+ * 负数那一侧 —— 见 ecatcmd::home_off_from_pref()。界面 setRange 与工作线程的夹取读同一组宏,
+ * 与 HMI_HOME_VEL_* 同一条规矩: 界面显示的数就是线上发的数, 不许漂移。
+ * 上限取 HMI_RANGE: 再大也过不了 home_off_fits() (量程比它宽时那个数才是真的上限)。 */
+#define HMI_HOME_OFF_MIN        0
+#define HMI_HOME_OFF_MAX  HMI_RANGE   /* = 500000 pul, 约 10 圈 */
+#define HMI_HOME_OFF_DEF    75000     /* pul, 按缺省脉冲当量 1 mm = 50000 pul 即 1.5 mm */
+
 /* AxisTelem::mode_disp 里"工作线程还没为这根轴读过 6061h"的哨兵值。
  * 不能拿 -1 兼这个语义 (em_get_mode 读失败也返回 -1), 也不能借 0 (合法模式号: 未定义)。 */
 #define HMI_MODE_DISP_UNREAD  (-2)
@@ -644,6 +655,130 @@ inline int home_tmo_s_from_pref(int v)
    return home_tmo_s_clamp(v);
 }
 
+/* ---- 「回零偏移」(找原点落点的偏移) -----------------------------------------------
+ *
+ * 现场要的零点**不是**原点开关的落点: 它离落点 1.5 mm (= 75000 pul)。这个偏移让找原点
+ * (方式 24/29) 收尾时把显示坐标 0 放在落点**正方向** off 个脉冲处, 于是落点读出 -off。
+ *
+ * 这一族全是纯函数并且住在头文件里: 自检 (scan_selftest) 只链 Qt6::Core, **不编
+ * ecatworker.cpp**, 判据写进 .cpp 就永远验不到 —— 而这里每一条判据都决定一次真实的运动。
+ * ------------------------------------------------------------------------------- */
+
+/* 界面上那个 spin box 的第二道夹取; 第一道是 setRange。与 home_vel_clamp 同一条规矩。 */
+inline int32_t home_off_clamp(int32_t v)
+{
+   if (v < HMI_HOME_OFF_MIN) return HMI_HOME_OFF_MIN;
+   if (v > HMI_HOME_OFF_MAX) return HMI_HOME_OFF_MAX;
+   return v;
+}
+
+/* 从 scan.ini 读回来的回零偏移。★ **哨兵只能落在负数那一侧**: 0 是一个合法值 (0 = 零点就
+ * 放在落点上 = 改造前的行为), 拿 <= 0 当"没记过"的后果是 —— 操作员把两个框都改成 0 存进
+ * ini, 下次开程序读回来变成 75000, 一次静默的零点搬家。
+ * **不许照抄 home_vel_from_pref / home_tmo_s_from_pref 的 `<= 0`** —— 那两个的 0 确实是
+ * 非法值 (速度 0 / 超时 0 都出事), 这一个不是。 */
+inline int32_t home_off_from_pref(int v)
+{
+   if (v < 0)
+      return HMI_HOME_OFF_DEF;
+   return home_off_clamp(v);
+}
+
+/* 这个偏移装得进当前量程吗。量程未知 (<= 0) 一律不搬 —— 不知道就别赌。
+ * **判据与 origin_keep_ok() 是同一条界** (闭区间, 那边是 |pos - origin| <= range 而
+ * pos - origin 正好是 -off): 现在装得下的, 重连时才沿用得上; 若这里松一档, 重连那一刻
+ * 零点会被静默重取, 偏移无声消失。 */
+inline bool home_off_fits(int32_t off, int32_t range)
+{
+   if (range <= 0 || off < 0)
+      return false;
+   return (int64_t)off <= (int64_t)range;
+}
+
+/* 一趟采下来的账: 界面给的数 (req)、这一趟真正生效的数 (eff)、当时的量程、这一趟是不是找限位。
+ * 三件事都留在里面是**因为结论句要说清"为什么没生效"** —— 只留一个 eff 就只能说"没搬"。 */
+struct HomeOff
+{
+   int32_t req      = 0;       /* 界面框里的数 (夹过) */
+   int32_t eff      = 0;       /* 这一趟真正生效的偏移; 0 = 落点即显示坐标 0 */
+   int32_t range    = 0;       /* 起手那一刻的 m_range */
+   bool    is_limit = false;   /* 这一趟是找限位 (17/18) —— 它不叠加偏移 */
+};
+
+/* ★ **判据只此一处**: 谁在什么情况下配得上一个非零的 eff。
+ * 找限位不叠加 (既有决定, §20.5: 那一侧几乎没有行程, 它的落点就是释放点 —— 那一趟的显示
+ * 坐标 0 落在开关的释放点上这件事仍是真话), 装不下就不搬 (需求: 照常回零, 这一趟不搬零点)。
+ * 找限位那一支连 req 都不清空: 结论句要说得清"你填了 75000, 但这一趟是找限位"。 */
+inline HomeOff home_off_decide(int32_t off_ui, bool is_limit, int32_t range)
+{
+   HomeOff o;
+   o.req      = home_off_clamp(off_ui);
+   o.range    = range;
+   o.is_limit = is_limit;
+   o.eff      = (is_limit || !home_off_fits(o.req, range)) ? 0 : o.req;
+   return o;
+}
+
+/* 收尾那一步要写进 m_origin / m_tgt 的一对数。**这一段是整条路上最危险的一处算术。**
+ *
+ * ★ **不变式: `origin + tgt == 落点 L`** —— 物理目标一个脉冲都不许动。
+ *   - origin = L + off  : 落点处的显示坐标 = 6064h - origin = L - (L + off) = **-off**
+ *                         (现场要的就是屏幕读 -75000, 即零点在落点的正方向)
+ *   - tgt    = -off     : 只改 origin 而把 m_tgt/m_want 留成 0, 等于命令驱动器从
+ *                         origin+0 走到落点 —— 一次**没人按过按钮的 75000 脉冲全速移动**
+ *                         (缺省脉冲当量下 1.5 mm)。§18.5 那一行警告的同一个 bug 类。
+ *
+ * off == 0 时这一对**逐字退回改造前那两行** {origin = L, tgt = 0} —— 现有那条逐字节钉死的
+ * 结论句字面量因此在偏移为 0 时仍然成立。
+ *
+ * 溢出 (落点贴近 int32 边界) 退回 off = 0 那一对并置 degraded: 有符号溢出是 UB, 而且
+ * "离边界 2147483647 个脉冲还能回零"这件事本就没有意义 —— 与 origin_keep_ok 同一条理由。 */
+struct HomeAnchor
+{
+   int32_t origin   = 0;
+   int32_t tgt      = 0;
+   bool    degraded = false;   /* true = 溢出, 退回 off = 0; 结论句照实说「未生效」 */
+};
+
+inline HomeAnchor home_anchor(int32_t landing, int32_t off)
+{
+   const int64_t o = (int64_t)landing + (int64_t)off;
+
+   if (o > (int64_t)INT32_MAX || o < (int64_t)INT32_MIN)
+   {
+      HomeAnchor a;
+      a.origin   = landing;
+      a.tgt      = 0;
+      a.degraded = true;
+      return a;
+   }
+
+   HomeAnchor a;
+   a.origin = (int32_t)o;
+   a.tgt    = -off;   /* off >= 0, 所以取负不会溢出 */
+   return a;
+}
+
+/* 结论句尾巴那一个方括号 —— **四档, 判断顺序就是 is_limit → eff → req → 兜底**。
+ * ★ 找限位那一档必须排在 req 前面: 找限位 + 界面填了 75000 时 req 非 0 而 eff 为 0,
+ *   顺序反了就会把"这一趟是找限位, 本来就不搬"说成"偏移没生效"。
+ * ★ 兜底那一句与找限位那句**逐字相同** —— 于是偏移为 0 时整句与改造前逐字一致
+ *   (scan/selftest.cpp 把那一句整句抄下来钉着, 那是"缺省行为没变"唯一的自动证据)。 */
+inline QString home_off_clause(const HomeOff &o)
+{
+   if (o.is_limit)
+      return QStringLiteral(" (显示坐标已把这里定为 0)");
+
+   if (o.eff != 0)
+      return QStringLiteral(" (显示坐标 0 在落点正方向 %1 pul 处)").arg(o.eff);
+
+   if (o.req != 0)
+      return QStringLiteral(" (回零偏移 %1 pul 未生效: 当前量程 ±%2 pul)")
+                .arg(o.req).arg(o.range);
+
+   return QStringLiteral(" (显示坐标已把这里定为 0)");
+}
+
 /* 沿用上一轮的零点安不安全 —— 只有滑台仍在**当前量程**内才许沿用。
  * 量程未知 (<= 0) 一律不沿用: 不知道就别赌。
  *
@@ -1187,6 +1322,7 @@ struct HomeReport
    uint32_t  vel_slow   = 0;
    uint32_t  acc        = 0;
    int       tmo_s      = 0;
+   HomeOff   off;                            /* 这一趟的回零偏移 (含"为什么没生效") */
 };
 
 /* 一根轴的整句。**这一段的字是改造前 `doHome()` 就有的, 逐字搬过来 —— 一个字都不许改**
@@ -1216,8 +1352,11 @@ inline QString home_axis_note(const HomeReport &r)
                        QString::number(r.rc_home),
                        QString::fromUtf8(home_end_text(r.end)));
 
+   /* 落点在哪 = 显示坐标 0 的三种情形 (偏移生效 / 偏移装不下 / 找限位与偏移 0)。
+    * 位置与改造前一样 (只属于 HOLDING 档), 只是内容由 home_off_clause() 分档 —— 偏移为 0 时
+    * 它回的那一句与改造前逐字相同。 */
    if (r.end == HOME_END_HOLDING)
-      s += QStringLiteral(" (显示坐标已把这里定为 0)");
+      s += home_off_clause(r.off);
 
    if (r.end != HOME_END_HOLDING)
       s += QStringLiteral(" [收尾: 失能 %1 / 切 CSP %2 / 使能 %3]")
@@ -1533,7 +1672,8 @@ struct SpanReport
 };
 
 /* 一根轴的整句。带了那个数就是这一趟的全部意义, 所以成功的句子**必须**把它写出来,
- * 并说清"停在哪儿" (段 2 不重锚零点, 停下时的显示坐标不再是 0)。 */
+ * 并说清"停在哪儿" (段 2 不重锚零点, 终端显示坐标 = **宽度 - 回零偏移**, 不回到落点 ——
+ * 偏移正好等于宽度时它正好是 0, 所以措辞是"不回到落点"而不是"不再是 0", 见 §38)。 */
 inline QString span_axis_note(const SpanReport &r)
 {
    const QString nm = QString::fromUtf8(axis_label(r.axis));
@@ -2180,14 +2320,19 @@ public:
     * home_lim_method_for 算): 24/29 = 找原点 (原点开关 X0), 18/17 = 找限位 (以正/负限位
     * 开关为原点)。vel_fast: 6099h:01, 内部还夹一道。本程序里最长的阻塞命令。
     * tmo_s: 等 6041h bit12 的上限 (秒), 内部还夹一道。
+    * off:   「回零偏移」(脉冲, 界面上那个框的原值, 内部还夹一道) —— 找原点收尾时把显示坐标 0
+    *        放在落点正方向多少个脉冲处。**找限位 (17/18) 那一趟不叠加它**, 由
+    *        ecatcmd::home_off_decide() 一处判定; 界面照实传下来, 不在界面里判
+    *        (否则"填了 75000 却按了找限位"这件事在结论句里就丢了)。
     * ⚠️ 它会**先失能**: 6098h/6099h/609Ah/607Ch 只能在未使能时写, 竖直轴失去保持力矩。
     *
-    * tmo_s **不给缺省实参** —— 本程序只有一个调用点, 逼每个将来的调用方都把话说出来。
+    * tmo_s 与 off 都**不给缺省实参** —— 逼每个调用方都把这两个数说出来。
     *
     * 这一条**内部就是两轴那一套** (`hm_mask = 1 << axis`), 单轴与两轴从此只有一条路可走 ——
     * 于是"改造前后单轴行为一致"变成一条**可测的性质** (会话大小 = 1), 而不是靠两条代码路各写
     * 一遍然后祈祷它们不漂移。 */
-   void postHome(int axis, int method, uint32_t vel_fast, int tmo_s);
+   void postHome(int axis, int method, uint32_t vel_fast, int tmo_s, int32_t off);
+
 
    /* 一趟把 mask 上那几根**同时**发起回零 —— 「回零校准」按钮走这一条。
     *
@@ -2195,13 +2340,14 @@ public:
     * 同时轮询两根 (docs/scan_sweep.md §33)。串行从来不是硬件的限制, 是上位机那个阻塞循环
     * 造成的。
     *
-    * method[] / vel_fast[] 都是**逐根一个**, 下标即轴号; mask 上没圈到的那几格不读。
+    * method[] / vel_fast[] / off[] 都是**逐根一个**, 下标即轴号; mask 上没圈到的那几格不读。
     * 起手预检任一根过不了闸就**整体不动** (报出是哪一根、为什么), 一根出错则**两根一起停**
     * 并一起收尾 —— 两条都是用户在权衡之后选的语义。
     *
     * ⚠️ 两轴同时带电运动在机械上是**要人先确认**的事 (§33.7 第 1 条): 若一根的行程穿过
     * 另一根的位置, 这一趟就不能用, 软件兜不住。 */
-   void postHomeBoth(unsigned mask, const int *method, const uint32_t *vel_fast, int tmo_s);
+   void postHomeBoth(unsigned mask, const int *method, const uint32_t *vel_fast, int tmo_s,
+                     const int32_t *off);
 
    /* 量 mask 上那几根的**原点信号宽度** (脉冲) —— 「测量原点宽度」按钮走这一条。
     *
@@ -2211,12 +2357,15 @@ public:
     *
     * vel_fast 是**段 1** 的 6099h:01 (与 postHome 同一个数); 段 2 取它的 1/4 —— 段 2 走得越慢,
     * "两次采样之间"的量化误差越小 (量化 ≈ ±1 步, 见 ecatcmd::span_step_pul)。
+    * off[] (逐根一个, 与 postHomeBoth 同款) 走**段 1** —— 段 1 就是方式 24 回零。段 2 全程是
+    * 相对运算 (traveled / span_advance / freezeSpanAxis 都只减 m_origin), 搬零点对它没有影响:
+    * 唯一变的是印出来的那个显示坐标 (终点 = 宽度 - 偏移)。
     * tmo_s 只对**段 2** 计时 (段 1 用自己的那一套)。
     *
     * ⚠️ 与 postHome 一样**会先失能** (段 1 要写 6098h/6099h): 竖直轴失去保持力矩。
     * ⚠️ 60FDh 读不到就整体拒绝 —— 采不到那条信号, 这一趟什么也量不出来, 不白跑 (见
     * ecatcmd::span_dig_refusal)。这一道在失能**之前**, 所以拒绝时轴没被动过。 */
-   void postSpanWidth(unsigned mask, uint32_t vel_fast, int tmo_s);
+   void postSpanWidth(unsigned mask, uint32_t vel_fast, int tmo_s, const int32_t *off);
 
    /* 断开重连时沿不沿用上一份零点。**默认 false, 也就是本类自己的老行为**: 连接那一刻的
     * 位置就是零点。`scan/` 在构造之后调一次 true。
@@ -2299,6 +2448,9 @@ private:
       unsigned hm_mask = 0;
       int      hm_method[EM_MAX_AXES] = {};
       uint32_t hm_vel[EM_MAX_AXES]    = {};
+      /* ★ `= {}` **不能省**: hm_mask == 0 那条老式命令的兜底路上没人填它 (postHome 一族
+       * 永远填 hm_mask), 一个没初始化的栈值就是一次没人按过的零点搬家。 */
+      int32_t  hm_off[EM_MAX_AXES]    = {};
 
       /* ---- 这一趟回零是「测量原点宽度」的段 1 ----
        * 段 1 本身与普通回零**一个字符都不差** (方式 24, 同样的预检与收尾) —— 唯一的差别是
@@ -2352,7 +2504,8 @@ private:
     * **到这里就返回**: 轮询交给 serviceHoming(), 收尾交给 finishHoming()。
     * 三道闸里任何一条不放行就一个字节都不写; prepare/start 失败则就地走收尾 (与改造前
     * "无条件收尾"一致 —— 半途失败留下的状态没有一条可以不管)。 */
-   void startHoming(unsigned mask, const int *method, const uint32_t *vel_fast, int tmo_s);
+   void startHoming(unsigned mask, const int *method, const uint32_t *vel_fast, int tmo_s,
+                    const int32_t *off_ui);
    /* 会话的每周期一步 (run() 主循环里调)。定局就记账, 一根出事就同一圈拉停其余的,
     * 全部定局就在**这一圈内**做完收尾。 */
    void serviceHoming();
@@ -2458,6 +2611,11 @@ private:
    int        m_home_method[EM_MAX_AXES]  = {};
    em_home_cfg_t m_home_cfg[EM_MAX_AXES];
    int        m_home_tmo_s[EM_MAX_AXES]   = {};
+   /* 「回零偏移」的账 —— **在起手时算好**, 不在收尾时算: 起手失败那三条路 (闸拦下 / 预检
+    * 不过 / 起手写 SDO 出错) 自己会调 finishHoming(), 结论句那时也要说出这个数; 而它要与
+    * 其余会话状态同生共死 (收尾之后 teardown 才清)。会话期间量程不会变 (doRange() 头一句
+    * `if (m_homing) return;`), 所以起手算的就等于收尾那一刻的。 */
+   ecatcmd::HomeOff m_home_off[EM_MAX_AXES];
    /* 起手那次失能 (写 6098h 之前必须做的) 的返回码 —— 结论里那个「失能 %1」是它和收尾
     * 那一次的**第一个非零值**, 与改造前那两句的合成规则一致。 */
    int        m_home_disable_rc[EM_MAX_AXES] = {};

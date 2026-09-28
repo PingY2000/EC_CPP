@@ -733,6 +733,9 @@ void ScanWindow::panelSavePrefs(int pi)
    case PI_HOME:
       pf.home_vel   = m_edHomeVel->value();
       pf.home_tmo_s = m_edHomeTmo->value();
+      /* 两个偏移照原值存 (0 也照存 —— "没记过"是 -1, 见 scanprefs.h) */
+      pf.home_off_x = m_edHomeOff[0]->value();
+      pf.home_off_y = m_edHomeOff[1]->value();
       break;
    case PI_ADV:
       pf.want_dig_in     = m_cbWantDigIn->isChecked();
@@ -1586,10 +1589,16 @@ QWidget *ScanWindow::buildHomePanel()
    /* 文案按 CLAUDE.md §1 六条写: 无 `**` / 无操作步骤 / 出路只许「请……」/ 操作类 tooltip
     * 4 行 90 字以内。第二行那句是机械风险在界面上唯一能做的事 —— 若一根的行程穿过另一根
     * 的位置, 这一趟就不能用 (§33.7 第 1 条), 而软件判不出这件事, 只能先说出来。
-    * **一个数字都不写**: 速度与超时框收起时看不见, 写在这里的必然与它们在框里的值对不上。 */
+    * **一个数字都不写**: 速度 / 超时 / 回零偏移那几个框收起时看不见, 写在这里的必然与它们在
+    * 框里的值对不上。
+    *
+    * 2026-09-28 加「回零偏移」时改的是第 1、2 行: 原来那句「以原点开关 (X0) 为原点」在偏移
+    * 非 0 时是假话 —— X0 只是**基准**, 显示坐标 0 由「回零偏移」定 (见 §38)。顺手把行宽收进
+    * 30 字 (原来第 1 行 36 字, 本就超了每行上限), 四件事一件不少。 */
    m_btnHomeBoth->setToolTip(QStringLiteral(
-      "轴X 轴Y 同时按方式 24 正向回零, 以原点开关 (X0) 为原点。\n"
-      "两根轴会同时带电运动; 行程可能相碰时请改用各轴单独的按钮。\n"
+      "轴X 轴Y 按方式 24 正向回零。\n"
+      "基准是原点开关 (X0); 显示坐标 0 由「回零偏移」定。\n"
+      "两根同时带电运动; 相碰时请改用单轴按钮。\n"
       "启动前先失能; 按「停止」可立即中止。"));
    connect(m_btnHomeBoth, &QPushButton::clicked, this, &ScanWindow::onHomeBothClicked);
 
@@ -1603,8 +1612,10 @@ QWidget *ScanWindow::buildHomePanel()
    g->addWidget(m_btnHomeFold, 0, 4);
 
    /* ---- 第 1 行: 收起来的那一整块 ----
-    * 它自己一个 grid, 行的编号与改造前完全一样 (0 = 速度, 1 = 超时, 2/3 = 两行按钮) ——
-    * 搬进来只是换了个父控件, 里面一个格子都没动。 */
+    * 它自己一个 grid。行的编号在 2026-09-28 插了两个「回零偏移」框之后**整体下移了两行**:
+    * 0/1 = 速度 / 超时, 2/3 = 回零偏移X / 回零偏移Y, 4/5 = 两行按钮, 6/7 = 测量原点宽度 + 读数。
+    * 偏移与速度 / 超时一样是**八个按钮共用的参数**, 所以排在按钮上面 —— 下面那三个 addWidget
+    * 里的行号是 `i + 4` / `6` / `7`, 改一个都要一起改。 */
    m_homeDetail = new QWidget(box);
    /* `dg` 而不是 `d`: 下面那个内层循环里 `d` 已经是**方向** (0 = 正, 1 = 负) */
    QGridLayout *dg = new QGridLayout(m_homeDetail);
@@ -1660,13 +1671,44 @@ QWidget *ScanWindow::buildHomePanel()
    dg->addWidget(new QLabel(QStringLiteral("超时"), m_homeDetail), 1, 0);
    dg->addWidget(m_edHomeTmo, 1, 1, 1, 4);   /* 与速度同一列, 一眼看出是两个同类的数 */
 
+   /* ---- 回零偏移 (2026-09-28 加) ----
+    * 找原点 (方式 24/29) 停稳之后, 显示坐标 0 放在落点**正方向**多少个脉冲处 —— 现场要的
+    * 零点不在原点开关的落点上, 按缺省脉冲当量 75000 pul = 1.5 mm。逐轴一个, 填进
+    * m_edHomeOff[0] / [1]。
+    *
+    * 名字里的「回零」不能省成「原点偏移」: 那是驱动器 607Ch 的名字, 而这一项**不写 607Ch**
+    * (它是上位机的软件零点, 见 §20.5 / §38)。与结论句里那个「回零偏移」同一种说法。
+    *
+    * 缺省显式设, 理由同上面两个框 (新建的 QSpinBox 是 0, setRange 会把它夹到下限 0 ——
+    * 而 0 在这里是"落点即零点", 一个**合法但不想要**的值: 不设的话升级之后没人会发现
+    * 缺省该是 75000)。界面 setRange 与工作线程的夹取读同一组宏。 */
+   for (int i = 0; i < 2; i++)
+   {
+      m_edHomeOff[i] = new QSpinBox(m_homeDetail);
+      m_edHomeOff[i]->setRange(HMI_HOME_OFF_MIN, HMI_HOME_OFF_MAX);
+      m_edHomeOff[i]->setSingleStep(1000);   /* 0.02 mm, 与「手动速度」同一个量级的步长 */
+      m_edHomeOff[i]->setSuffix(QStringLiteral(" pul"));
+      m_edHomeOff[i]->setValue(HMI_HOME_OFF_DEF);
+      /* 文案: 2 行 60 字以内, 一个数字都不写 (框收起时看不见), 出路那一句按规矩只说现象 */
+      m_edHomeOff[i]->setToolTip(QStringLiteral(
+         "回零后显示坐标 0 定在落点正方向该数处。\n"
+         "0 = 落点即 0; 找限位不用; 超过量程本次不搬零点。"));
+
+      dg->addWidget(new QLabel(QStringLiteral("回零偏移%1")
+                                  .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y")),
+                               m_homeDetail), i + 2, 0);
+      dg->addWidget(m_edHomeOff[i], i + 2, 1, 1, 4);
+   }
+
    /* [保存][取消] 摆在框标题那一行的右端 (同另外三块框), 不占这个网格的格子 */
    panelBar(PI_HOME, box);
    addPanel(PI_HOME, box,
-            /* 速度与超时是参数; 八个按钮是动作, 不进表 (它们要的是"连上了、不在回零中",
-             * 那条判据在 refresh() 里) */
-            QList<GateItem>{ GateItem{ m_edHomeVel, false, false },
-                             GateItem{ m_edHomeTmo, false, false } });
+            /* 速度 / 超时 / 两个回零偏移是参数; 八个按钮是动作, 不进表 (它们要的是"连上了、
+             * 不在回零中", 那条判据在 refresh() 里) */
+            QList<GateItem>{ GateItem{ m_edHomeVel,    false, false },
+                             GateItem{ m_edHomeTmo,    false, false },
+                             GateItem{ m_edHomeOff[0], false, false },
+                             GateItem{ m_edHomeOff[1], false, false } });
 
    /* 一行一根轴: 行首一个轴名 (同上面「轴信号」那块表的行标签), 右边四个按钮。
     * 轴名放在行首而不是按钮文字里 —— 四个按钮挤在一行, 每个再带个 "X " 就排不下了,
@@ -1677,7 +1719,7 @@ QWidget *ScanWindow::buildHomePanel()
    {
       QLabel *nm = new QLabel(QStringLiteral("轴%1").arg(i == 0 ? 'X' : 'Y'), m_homeDetail);
       nm->setStyleSheet(QStringLiteral("color:#9aa3ae;"));
-      dg->addWidget(nm, i + 2, 0);   /* i + 2: 上面有「速度」「超时」两行 */
+      dg->addWidget(nm, i + 4, 0);   /* i + 4: 上面有「速度」「超时」「回零偏移X/Y」四行 */
 
       for (int d = 0; d < 2; d++)
       {
@@ -1690,9 +1732,13 @@ QWidget *ScanWindow::buildHomePanel()
             m_btnHome[i][d] = new QPushButton(
                QString::fromUtf8(kHomeBtnText[d]), m_homeDetail);
             m_btnHome[i][d]->setObjectName(QStringLiteral("danger"));
-            m_btnHome[i][d]->setToolTip(QStringLiteral("轴%1: 6098h = %2, 以原点开关 (X0) 为原点, 先向%3高速寻找。\n"
+            /* 2026-09-28: 第 2 行原话是「以原点开关 (X0) 为原点」, 偏移非 0 时是假话 ——
+             * X0 只是基准, 显示坐标 0 由「回零偏移」定 (§38)。原来那句「先向%3高速寻找」删了:
+             * 按钮文字本身写着「正向 / 反向回零」, 而这一句留着会把行宽顶到 41 字 (上限 30)。 */
+            m_btnHome[i][d]->setToolTip(QStringLiteral("轴%1: 6098h = %2。\n"
+                                                       "基准是原点开关 (X0); 显示坐标 0 由「回零偏移」定。\n"
                                                        "该轴由驱动器驱动, 启动前先失能; 按「停止」可立即中止。\n"
-                                                       "运动方向未经本程序验证。").arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y")).arg(meth).arg(QString::fromUtf8(ecatcmd::home_dir_text(neg))));
+                                                       "运动方向未经本程序验证。").arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y")).arg(meth));
 
             connect(m_btnHome[i][d], &QPushButton::clicked, this,
                      [this, i, d] { onHomeClicked(i, d, false); });
@@ -1721,7 +1767,7 @@ QWidget *ScanWindow::buildHomePanel()
       }
    }
 
-   /* ---- 第 4 行: 「测量原点宽度」+ 第 5 行: 读数 ----
+   /* ---- 第 6 行: 「测量原点宽度」+ 第 7 行: 读数 ----
     * 摆在八个按钮**之下**: 它量的是那八个按钮跑完之后滑台停在哪儿, 语义上跟在它们后面。
     *
     * 按钮占满五列 —— 它是"两根一起"的动作, 不该长得像某一根的东西。
@@ -1729,20 +1775,23 @@ QWidget *ScanWindow::buildHomePanel()
     * 看不见, 写在这里的必然与框里的值对不上), 出路那一句与另外几个按钮同一份措辞。 */
    m_btnSpan = new QPushButton(QStringLiteral("测量原点宽度"), m_homeDetail);
    m_btnSpan->setObjectName(QStringLiteral("danger"));
+   /* 第 2 行 2026-09-28 改过: 原话「显示坐标不再是 0」在**偏移正好等于信号宽度**时是假话
+    * (段 2 的终点显示坐标 = 宽度 − 偏移, 那时它正好是 0)。改成「不回到落点」—— 那句在任何
+    * 偏移下都成立, 而且在偏移为 0 时说的仍是同一件事。 */
    m_btnSpan->setToolTip(QStringLiteral(
       "先以方式 24 回零, 再顺着正向量出原点信号两个边沿之间的脉冲数。\n"
-      "量完停在信号远端边沿, 显示坐标不再是 0。\n"
+      "量完停在信号远端边沿, 显示坐标不回到落点。\n"
       "两根轴会同时带电运动, 启动前先失能; 按「停止」可立即中止。"));
    connect(m_btnSpan, &QPushButton::clicked, this, &ScanWindow::onSpanClicked);
 
-   dg->addWidget(m_btnSpan, 4, 0, 1, 5);
+   dg->addWidget(m_btnSpan, 6, 0, 1, 5);
 
    m_lSpan = new QLabel(m_homeDetail);
    m_lSpan->setWordWrap(true);
    /* 灰一点, 与上面那两行「速度」「超时」的轴名同一个写法 —— 它是读数不是输入 */
    m_lSpan->setStyleSheet(QStringLiteral("color:#9aa3ae;"));
-   dg->addWidget(new QLabel(QStringLiteral("原点宽度"), m_homeDetail), 5, 0);
-   dg->addWidget(m_lSpan, 5, 1, 1, 4);
+   dg->addWidget(new QLabel(QStringLiteral("原点宽度"), m_homeDetail), 7, 0);
+   dg->addWidget(m_lSpan, 7, 1, 1, 4);
 
    /* 四列按钮等分本行宽度 (行首那列只放轴名, 不参与拉伸) */
    for (int c = 1; c <= 4; c++)
@@ -1792,24 +1841,28 @@ void ScanWindow::onHomeBothClicked()
       return;
    }
 
-   /* 速度与超时是**正在生效的值**, 与收起/展开无关 —— 界面把报数字的活儿交给工作线程
-    * (横幅里按真正下发的值出), 所以这里一个数字都不印在按钮上。 */
+   /* 速度 / 超时 / 回零偏移都是**正在生效的值**, 与收起/展开无关 —— 界面把报数字的活儿交给
+    * 工作线程 (横幅里按真正下发的值出), 所以这里一个数字都不印在按钮上。
+    * 偏移**照实传下去**: 这一趟走的是方式 24, 它一定生效; 而"生效了还是装不下"由工作线程
+    * 按当时的量程判 (home_off_decide), 结论句照实说。 */
    const uint32_t vel = ecatcmd::home_vel_clamp(m_edHomeVel->value());
    const int      tmo = ecatcmd::home_tmo_s_clamp(m_edHomeTmo->value());
    const int      met = ecatcmd::home_method_for(false);   /* 方式 24 = 正向找原点 */
 
    int      method[EM_MAX_AXES] = {};
    uint32_t v[EM_MAX_AXES]      = {};
+   int32_t  off[EM_MAX_AXES]    = {};
 
    for (int i = 0; i < 2; i++)
    {
       method[i] = met;
       v[i]      = vel;
+      off[i]    = m_edHomeOff[i]->value();
    }
 
    /* **零点世代不在这里推**(同 onHomeClicked): 那道闸可能把命令拦掉, 命令也可能一直躺在
     * 队列里, GUI 猜不准 —— 世代由工作线程在真写 m_origin[] 那三处维护。 */
-   m_thr->postHomeBoth(0x3u, method, v, tmo);
+   m_thr->postHomeBoth(0x3u, method, v, tmo, off);
 
    /* 这一句只在**命令没被那道闸接住**时才留得住 (真开始回零的话, 最多 33ms 之后 refresh
     * 就会用"轴X 轴Y 正在回零 (方式 24)…"那条**状态**横幅把它盖掉 —— 那是设计如此)。 */
@@ -1839,9 +1892,15 @@ void ScanWindow::onSpanClicked()
    const uint32_t vel = ecatcmd::home_vel_clamp(m_edHomeVel->value());
    const int      tmo = ecatcmd::home_tmo_s_clamp(m_edHomeTmo->value());
 
+   /* 回零偏移照实传下去 —— 段 1 就是方式 24 回零, 它生效。段 2 是相对运算, 搬零点不影响它,
+    * 只是印出来的终点显示坐标 = 宽度 − 偏移 (那个数由工作线程出)。 */
+   int32_t off[EM_MAX_AXES] = {};
+   for (int i = 0; i < 2; i++)
+      off[i] = m_edHomeOff[i]->value();
+
    /* **零点世代不在这里推** (同 onHomeBothClicked): 那道闸可能把命令拦掉, 命令也可能一直躺在
     * 队列里 —— 世代由工作线程在真写 m_origin[] 的地方维护。 */
-   m_thr->postSpanWidth(0x3u, vel, tmo);
+   m_thr->postSpanWidth(0x3u, vel, tmo, off);
 
    /* 这一句只在**命令没被那道闸接住**时才留得住 (真跑起来的话, 最多 33 ms 之后 refresh 就会用
     * 那条"正在测量原点宽度…"的状态横幅把它盖掉 —— 那是设计如此)。 */
@@ -2627,9 +2686,9 @@ void ScanWindow::applyDefaults()
    m_cbDiInvert ->setChecked(pd.npn_sw_invert);
    m_cbShadeAuto->setChecked(pd.shade_auto);   /* 色标自动跟随 ("恢复默认"也回到这一档) */
 
-   /* 回零速度与回零超时刻意不在这里: 「恢复默认」会把 applyDefaults 再跑一遍, 会把为试回零
-    * 特意压小的速度、或者特意调长的超时抬回去。这两个的缺省设在 buildHomePanel 里,
-    * 之后由 loadSettings 覆盖。 */
+   /* 回零速度 / 回零超时 / 两个回零偏移都刻意不在这里: 「恢复默认」会把 applyDefaults 再跑
+    * 一遍, 会把为试回零特意压小的速度、特意调长的超时、或者现场量出来的偏移抬回去。
+    * 这几个的缺省设在 buildHomePanel 里, 之后由 loadSettings 覆盖。 */
 }
 
 /* 记忆: 读回上次的参数 (见 scanprefs.h)。只覆盖 ini 里真有的项, 缺的留在 applyDefaults
@@ -2673,6 +2732,12 @@ void ScanWindow::loadSettings()
     * **现存的那个 scan.ini 不需要迁移**: 缺这一项就是 -1, 落到 120 s, 正是要的缺省 */
    m_edHomeTmo->setValue(ecatcmd::home_tmo_s_from_pref(pf.home_tmo_s));
 
+   /* 回零偏移: -1 = 没记过 → HMI_HOME_OFF_DEF; 越界的夹回 [MIN, MAX]。
+    * ★ **0 读回来还是 0** —— home_off_from_pref 的哨兵落在负数那一侧, 与上面那两个框
+    * (它们的哨兵是 `<= 0`) 不一样: 0 在这里是一个合法选择 (落点即零点)。 */
+   m_edHomeOff[0]->setValue(ecatcmd::home_off_from_pref(pf.home_off_x));
+   m_edHomeOff[1]->setValue(ecatcmd::home_off_from_pref(pf.home_off_y));
+
    /* 网卡此刻还选不了 (适配器清单是异步到的), 先存着, 到了再选 */
    m_savedNic = pf.nic;
 }
@@ -2696,6 +2761,8 @@ void ScanWindow::saveSettings()
    pf.manual_speed = m_edManSpeed->value();
    pf.home_vel     = m_edHomeVel->value();
    pf.home_tmo_s   = m_edHomeTmo->value();
+   pf.home_off_x   = m_edHomeOff[0]->value();
+   pf.home_off_y   = m_edHomeOff[1]->value();
    pf.want_dig_in     = m_cbWantDigIn->isChecked();
    pf.npn_write_drive = m_cbNpnWrite->isChecked();
    pf.npn_sw_invert   = m_cbDiInvert->isChecked();
@@ -3028,7 +3095,10 @@ void ScanWindow::onHomeClicked(int axis, int dir, bool find_limit)
     * 拼在一起。现在世代由工作线程在**真写 m_origin[] 的那三处**维护, 界面在 refresh() 里从
     * 遥测同步 (只许往前, 见 ecatcmd::origin_epoch_sync)。 */
 
-   m_thr->postHome(axis, meth, vel, tmo);
+   /* 「回零偏移」**两条路传的是同一个数**, 不在这里按 find_limit 分叉: 用不用它由工作线程按
+    * 6098h 判 (home_off_decide) —— 在界面上判的话, "填了 75000 却按了找限位"这件事在结论句
+    * 里就没了, 而操作员正需要看见"这一趟没用它"。 */
+   m_thr->postHome(axis, meth, vel, tmo, m_edHomeOff[axis]->value());
 
    /* 这一句只在**命令没被那道闸接住**时才留得住 (真开始回零的话, 最多 33ms 之后
     * refresh 就会用"轴X 正在回零…"那条**状态**横幅把它盖掉 —— 那是设计如此)。 */

@@ -1700,6 +1700,40 @@ static void test_advprefs()
       checkEq(ecatcmd::home_tmo_s_from_pref(1), HMI_HOME_TMO_MIN_S, "太小 → 夹到下限");
       checkEq(ecatcmd::home_tmo_s_from_pref(999999999), HMI_HOME_TMO_MAX_S, "太大 → 夹到上限");
    }
+
+   /* ---- 回零偏移 (2026-09-28) ------------------------------------ */
+   caseBegin("advprefs: 回零偏移 —— 0 是一个**合法值**, 不是「没记过」");
+   {
+      const Prefs p;
+      checkEq(p.home_off_x, -1, "回零偏移X: 还没记过");
+      checkEq(p.home_off_y, -1, "回零偏移Y: 还没记过");
+
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+      Prefs q;
+      q.home_off_x = 0;          /* ★ 这一条是这一组的全部意义: 0 必须存得住也读得回 0 —— */
+      q.home_off_y = 75000;      /* 读成缺省就是一次静默的零点搬家 (见 home_off_from_pref) */
+      prefsSave(ini, q);
+      const Prefs b = prefsLoad(ini);
+      checkEq(b.home_off_x, 0,     "存下的 0 读回来还是 0");
+      checkEq(b.home_off_y, 75000, "另一个轴原样往返");
+
+      /* 文件不存在 / 旧 ini 没有这两个键 —— 都是 -1 (交给 home_off_from_pref 落到 75000) */
+      const Prefs fresh = prefsLoad(dir.filePath(QStringLiteral("scan2.ini")));
+      checkEq(fresh.home_off_x, -1, "文件不存在 → -1");
+      checkEq(fresh.home_off_y, -1, "文件不存在 → -1 (另一根)");
+   }
+
+   caseBegin("advprefs: 被手改坏的偏移 —— 哨兵只在负数那一侧");
+   {
+      checkEq(ecatcmd::home_off_from_pref(-1), HMI_HOME_OFF_DEF, "-1 = 没记过 → 缺省");
+      checkEq(ecatcmd::home_off_from_pref(-5), HMI_HOME_OFF_DEF, "任何负数 = 没记过");
+      /* ★ 这一条与上面那两条是**对着**的: 照 home_vel_from_pref 的 `<= 0` 抄的话,
+       * 这一条会变成 EXPECT 75000 —— 那正是要防的那个 bug */
+      checkEq(ecatcmd::home_off_from_pref(0),  0,             "0 原样用 (落点即零点)");
+      checkEq(ecatcmd::home_off_from_pref(75000), 75000,      "正常值原样用");
+      checkEq(ecatcmd::home_off_from_pref(999999999), HMI_HOME_OFF_MAX, "太大 → 夹到上限");
+   }
 }
 
 /* ------------------------------------------------- 故障复位 (6040h bit7 上升沿) */
@@ -2471,6 +2505,140 @@ static void test_homing()
             "MAX_S * 1000 装得进 int32");
    }
 
+   /* ---- 回零偏移 (2026-09-28) ------------------------------------
+    * 现场要的零点不在原点开关的落点上 (离落点 1.5 mm), 这个偏移让找原点收尾时把显示坐标 0
+    * 放到落点正方向 off 个脉冲处。下面四组按"从外到里"排: 夹取 → 装不装得下 → 谁配得上它 →
+    * 最后是那一步真正写进 m_origin/m_tgt 的算术。 */
+   caseBegin("回零偏移: 夹取与输入框的上下限是同一个宏");
+   {
+      checkEq(ecatcmd::home_off_clamp(-1), HMI_HOME_OFF_MIN, "-1 → 下限");
+      checkEq(ecatcmd::home_off_clamp(HMI_HOME_OFF_MIN - 1), HMI_HOME_OFF_MIN, "MIN - 1 → 下限");
+      checkEq(ecatcmd::home_off_clamp((int32_t)HMI_HOME_OFF_MAX + 1), HMI_HOME_OFF_MAX,
+              "MAX + 1 → 上限");
+      checkEq(ecatcmd::home_off_clamp(2147483647), HMI_HOME_OFF_MAX, "INT32_MAX → 上限");
+      checkEq(ecatcmd::home_off_clamp(0), 0, "0 是合法值, 原样通过");
+
+      /* "界面上显示的数就是线上发的数": spin box 的 setRange 与这道夹取读的是同一组宏 */
+      checkEq(ecatcmd::home_off_clamp(HMI_HOME_OFF_MAX), HMI_HOME_OFF_MAX,
+              "clamp(MAX) == MAX —— range 与夹取没有漂移");
+      checkEq(ecatcmd::home_off_clamp(HMI_HOME_OFF_MIN), HMI_HOME_OFF_MIN, "clamp(MIN) == MIN");
+
+      /* 产品决定: 缺省 1.5 mm。**这条唯一的作用就是让"缺省被悄悄改掉"当场响** */
+      checkEq(HMI_HOME_OFF_DEF, 75000, "缺省回零偏移 = 75000 pul (产品决定, 2026-09-28)");
+      check(HMI_HOME_OFF_DEF >= HMI_HOME_OFF_MIN && HMI_HOME_OFF_DEF <= HMI_HOME_OFF_MAX,
+            "缺省值落在上下限之内");
+      /* 界面上限不许超过软量程缺省值: 超过它的数永远过不了 home_off_fits */
+      check(HMI_HOME_OFF_MAX <= HMI_RANGE, "偏移上限不超过 HMI_RANGE");
+   }
+
+   caseBegin("回零偏移: 装不装得下当前量程 (与 origin_keep_ok 同一条界)");
+   {
+      check(ecatcmd::home_off_fits(75000, 800000),  "量程比偏移宽 → 装得下");
+      check(ecatcmd::home_off_fits(75000, 75000),   "正好相等 → 装得下 (闭区间)");
+      check(!ecatcmd::home_off_fits(75001, 75000),  "刚过一根脉冲 → 装不下");
+      check(!ecatcmd::home_off_fits(75000, 0),      "量程未知 (0) → 不搬: 不知道就别赌");
+      check(!ecatcmd::home_off_fits(75000, -1),     "量程是负的 → 不搬");
+      /* 量程未知时**连 off = 0 也说装不下** —— 它不改变行为 (off = 0 那一档 eff 本来就是 0,
+       * 压根不搬零点), 但它让这一条与 origin_keep_ok 是**同一条界**: `range > 0` 是两者的
+       * 第一句。给它开一个 off == 0 的特例, 下面那条"判据焊在算法上"的断言就松了。 */
+      check(!ecatcmd::home_off_fits(0, 0),          "量程未知 (0) 时连 off = 0 也说装不下");
+      check(!ecatcmd::home_off_fits(-1, 800000),    "负数偏移不存在 (界面是无符号的量)");
+
+      /* ★ **判据与算法焊在一起**: 「装得下」必须恰好等于「收尾那一对数里的 tgt 在量程内」。
+       * 两条判据各写一遍的话, 迟早有一条松一档 —— 而松的那一档 = 收尾时 tgt 被
+       * interpolate() 夹掉 = 一次没人按过的运动。 */
+      bool welded = true;
+      for (int32_t range : { 0, -1, 1, 75000, 800000 })
+         for (int32_t off : { 0, 1, 75000, HMI_HOME_OFF_MAX })
+         {
+            const int32_t tgt = ecatcmd::home_anchor(0, off).tgt;
+            const bool in_range = (range > 0) && ((int64_t)tgt <= (int64_t)range)
+                                  && ((int64_t)tgt >= -(int64_t)range);
+            if (ecatcmd::home_off_fits(off, range) != in_range)
+               welded = false;
+         }
+      check(welded, "home_off_fits == 「tgt 落在 ±range 内」 (全域)");
+   }
+
+   caseBegin("回零偏移: 哪一趟配得上一个非零的 eff");
+   {
+      /* 找原点 (24/29) + 量程够 → 原样生效 */
+      const ecatcmd::HomeOff o = ecatcmd::home_off_decide(75000, false, 800000);
+      checkEq(o.req, 75000, "req 记的是界面那个数");
+      checkEq(o.eff, 75000, "找原点: 生效");
+      checkEq(o.range, 800000, "range 也记下来 (结论句要说清为什么没生效)");
+      check(!o.is_limit, "没被当成找限位");
+
+      /* 找限位 (17/18) + 界面填了 75000 → 一律不搬, 但 req 留着 (结论句要说清这件事) */
+      const ecatcmd::HomeOff l = ecatcmd::home_off_decide(75000, true, 800000);
+      checkEq(l.eff, 0,      "找限位: 不叠加偏移");
+      checkEq(l.req, 75000,  "但界面那个数留着 —— 结论句要说清这一趟没用它");
+      check(l.is_limit,      "并且记得这一趟是找限位");
+
+      /* 装不下 → eff = 0, req 留着 (结论句那一档就是靠这两个数分出来的) */
+      const ecatcmd::HomeOff s = ecatcmd::home_off_decide(75000, false, 1600);
+      checkEq(s.eff, 0,     "装不下: 这一趟不搬零点");
+      checkEq(s.req, 75000, "req 留着");
+      checkEq(s.range, 1600, "range 也留着 (结论句里的 ±1600 就是它)");
+
+      /* 界面那个数本身越界 → 先夹 (夹取在 decide 里面, 调用方不必再夹一次) */
+      checkEq(ecatcmd::home_off_decide(999999999, false, HMI_RANGE).eff, HMI_HOME_OFF_MAX,
+              "界面给的数越界 → 先夹再用");
+
+      /* 0 = 今天的行为: 三档里都该给出"什么都不搬" */
+      checkEq(ecatcmd::home_off_decide(0, false, 800000).eff, 0, "0 → 不搬");
+      checkEq(ecatcmd::home_off_decide(0, true,  800000).eff, 0, "0 + 找限位 → 不搬");
+      checkEq(ecatcmd::home_off_decide(0, false, 0).eff,      0, "0 + 量程未知 → 不搬");
+   }
+
+   caseBegin("回零偏移: 落点重锚的不变式 origin + tgt == 落点");
+   {
+      /* ★ **这一组是"不许再有一次没人按过的移动"的唯一自动证据**。
+       * 收尾那一步要同时写 m_origin 与 m_tgt: 只改 origin 而把 m_tgt 留成 0, 等于命令驱动器
+       * 从 origin+0 走到落点 —— off 个脉冲的全速移动 (缺省 75000). */
+
+      /* off == 0 时逐字退回改造前那两行 —— 现有那条逐字节钉死的结论句因此仍然成立 */
+      const ecatcmd::HomeAnchor z = ecatcmd::home_anchor(123456, 0);
+      checkEq(z.origin, 123456, "off = 0: origin = 落点 (与改造前一样)");
+      checkEq(z.tgt,    0,      "off = 0: tgt = 0 (与改造前一样)");
+      check(!z.degraded,        "off = 0 不是什么退档");
+
+      const int32_t landings[] = { 0, 1, -1, 123456, -123456, 2147483000, -2147483000 };
+      const int32_t offs[]     = { 0, 1, 75000, HMI_HOME_OFF_MAX };
+
+      bool inv = true, sign = true, read = true;
+      for (int32_t L : landings)
+         for (int32_t off : offs)
+         {
+            const ecatcmd::HomeAnchor a = ecatcmd::home_anchor(L, off);
+            if (a.degraded)                       /* 溢出那一档单独在下面验 */
+               continue;
+
+            /* 物理目标一步不动 */
+            if ((int64_t)a.origin + (int64_t)a.tgt != (int64_t)L)
+               inv = false;
+            /* 落点处屏幕读到的就是 -off (需求要的就是它读 -75000) */
+            if ((int64_t)L - (int64_t)a.origin != -(int64_t)off)
+               read = false;
+            /* tgt 就是 -off: 上面那条不变式一旦成立, 这一条把"搬错了方向"挡在外面 */
+            if (a.tgt != -off)
+               sign = false;
+         }
+      check(inv,  "全域: origin + tgt == 落点 (物理目标不动)");
+      check(read, "全域: 落点处的显示坐标 == -off (屏幕读 -75000)");
+      check(sign, "全域: tgt == -off");
+
+      /* 溢出: 落点贴着 int32 边界时退回 off = 0 那一对, 并置 degraded
+       * (有符号溢出是 UB; 而"离边界 21 亿个脉冲还能回零"这件事本就没有意义) */
+      const ecatcmd::HomeAnchor ov = ecatcmd::home_anchor(2147483000, HMI_HOME_OFF_MAX);
+      check(ov.degraded,         "贴边界 + 大偏移 → 认账 (degraded)");
+      checkEq(ov.origin, 2147483000, "退回落点本身");
+      checkEq(ov.tgt,    0,          "退回 tgt = 0 (不搬零点那一档)");
+      check(!ecatcmd::home_anchor(2147483000, 0).degraded, "同一落点 + off = 0 → 不认账");
+      check(!ecatcmd::home_anchor(-2147483000, HMI_HOME_OFF_MAX).degraded,
+            "负边界那一侧离得远 (off 是正的), 不许误判");
+   }
+
    /* ---- 加减速 -------------------------------------------------- */
    caseBegin("回零: 609Ah 由速度派生 —— 斜坡时间 0.1 s, 加速度封顶");
    {
@@ -3041,6 +3209,51 @@ static void test_homing()
             std::to_string(bothn.count(QChar('\n'))));
    }
 
+   /* ---- 回零偏移那一句 (2026-09-28) ------------------------------ */
+   caseBegin("回零偏移: 结论句尾巴那一个方括号的四档");
+   {
+      /* 上一条整句里的 `want` 一字未动 —— 它的 r.off 是缺省的 {0,0,0,false}, 走的正是
+       * 下面第 1 档。★ 下面每一条都与它对着: 那一档**逐字**是改造前那一句, 而四档
+       * 判断的顺序 (is_limit 排在 req 前面) 是靠第 4 条钉住的 */
+      const char *today = " (显示坐标已把这里定为 0)";
+
+      /* 1. 偏移 0 (req == eff == 0) → 今天那一句 */
+      check(ecatcmd::home_off_clause(ecatcmd::HomeOff()) == QString::fromUtf8(today),
+            "偏移 0 → 与改造前逐字相同");
+
+      /* 2. 生效: 屏幕上要能读出"零点在落点的正方向多少个脉冲处" */
+      ecatcmd::HomeOff on;
+      on.req = on.eff = 75000; on.range = 800000;
+      const QString c2 = ecatcmd::home_off_clause(on);
+      check(hasq(c2, "显示坐标 0 在落点正方向 75000 pul 处"), "生效那一档报出偏移量");
+      check(!hasq(c2, "已把这里定为 0"), "而且不许与「已把这里定为 0」同时出现 (互斥)");
+      check(!hasq(c2, "未生效"), "也不许说未生效");
+
+      /* 3. 装不下: 现象 + 当时量程 (操作员要能一眼看出该去改哪个数) */
+      ecatcmd::HomeOff no;
+      no.req = 75000; no.eff = 0; no.range = 1600;
+      const QString c3 = ecatcmd::home_off_clause(no);
+      check(hasq(c3, "回零偏移 75000 pul 未生效"), "装不下那一档要说未生效并报出那个数");
+      check(hasq(c3, "±1600 pul"), "并把当时的量程报出来");
+      check(!hasq(c3, "已把这里定为 0"), "这一档不搬零点, 但话要说「未生效」而不是含糊过去");
+
+      /* 4. ★ 找限位 + 界面填了 75000: req 非 0 而 eff 为 0, **顺序反了会误报「未生效」**。
+       * 这一趟本来就不叠加偏移, 而它的零点确实在释放点上 —— 所以必须仍是今天那一句。 */
+      ecatcmd::HomeOff lim;
+      lim.req = 75000; lim.eff = 0; lim.range = 800000; lim.is_limit = true;
+      check(ecatcmd::home_off_clause(lim) == QString::fromUtf8(today),
+            "找限位 + 界面填了偏移 → 仍是「已把这里定为 0」(顺序: is_limit 在 req 前面)");
+
+      /* 5. 非 HOLDING 的整句里那一句一句都不许出现 —— 那是 home_axis_note 的位置决定的 */
+      ecatcmd::HomeReport rs;
+      rs.axis = 0; rs.method = EM_HOME_MODE_ORIGIN_POS; rs.rc_home = 1;
+      rs.end = ecatcmd::HOME_END_STRANDED;
+      rs.mode_disp = EM_MODE_CSP;
+      rs.off.eff = rs.off.req = 75000; rs.off.range = 800000;
+      check(!hasq(ecatcmd::home_axis_note(rs), "落点正方向"),
+            "没停在保持力矩 → 偏移那一句不出现 (它只属于 HOLDING 档)");
+   }
+
    /* ---- 可能仍带电 --------------------------------------------- */
    caseBegin("两轴回零收尾: 任一根 STRANDED 就要动动力电源告警");
    {
@@ -3604,7 +3817,7 @@ static void test_span()
       check(hasq(okn, "轴Y"), "点名这一根");
       check(hasq(okn, "12345 pul"), "把量到的脉冲数写出来 (单位是英文符号, 与数值之间一个空格)");
       check(hasq(okn, "停在远端边沿"),
-            "说清停在哪儿 (段 2 不重锚零点, 停下时的显示坐标不再是 0)");
+            "说清停在哪儿 (段 2 不重锚零点, 停下时的显示坐标不回到落点)");
       check(no_stars(okn), "字符串里不许出现两个星号 (本仓库复发最多的那条)");
 
       r.ok = false; r.width = HMI_SPAN_NONE; r.why = ecatcmd::SPAN_WHY_NO_EDGE;
