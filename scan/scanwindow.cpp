@@ -66,10 +66,6 @@ static const int kBannerInset = 6;
 /* 默认 CSV 目录, 相对当前工作目录 (从仓库根敲 ./bin/scan.exe 时就落在 scan_out/) */
 static const char *kOutDir = "scan_out";
 
-/* 「读一次」等回话的上限。必须比真机那条腿自己的报错阈值 1800ms 长, 否则它那句诊断
- * 永远来不及发出来, 界面上只剩"没有回应"。 */
-static const int kReadOnceTimeoutMs = 6000;
-
 /* 读数的显示格式 (量级从 nW 到 W 那一带, 不固定小数位):
  *   |v| >= 1e-3 -> 'g' 6 位有效数字;  否则 / 0 -> 'e' 4 位有效数字。
  * 只给操作员核对用, 入 CSV 的是 double, 一位没少。
@@ -79,14 +75,6 @@ static QString fmtWatts(double v)
    if (std::fabs(v) >= 1e-3)
       return QString::number(v, 'g', 6);
    return QString::number(v, 'e', 4);
-}
-
-/* 「读一次」那条固定说明, 只有一份: 按钮装上, refreshMeterPanel() 按不了时把原因拼在它前面 */
-static const QString &readOnceTip()
-{
-   static const QString s = QStringLiteral(
-      "向当前取样源请求一次读数, 结果显示在按钮下方。");
-   return s;
 }
 
 /* ---------------------------------------------------------------- 参数框: 项表 + [保存][取消] */
@@ -353,137 +341,82 @@ void ScanWindow::refreshEditability()
 }
 
 /*
- * 「功率计」那一框的**全部判据**: 灰不灰 + 哪几行露出来。只由 refreshEditability() 调
+ * 「功率计」那一框的**全部判据**: 灰不灰 + 哪几样露出来。只由 refreshEditability() 调
  * (即 30Hz 的 refresh() 末尾), 与其余控件同一条规矩 —— **每拍重算, 不缓存**。
  *
  * 这一框不在可用性表里, 因为它里面没有"参数", 只有一台随时可以接上/断开的仪器; 而它的用处
- * 恰恰是"还没连总线, 先把真机选上" —— 归到那张表里就得先过一个门, 那正是当初要解决的问题。
+ * 恰恰是"还没连总线, 先把真机打开" —— 归到那张表里就得先过一个门, 那正是当初要解决的问题。
  *
- * 三条判据:
- *   ① 连续读数正在跑 -> 取样源与各源参数都锁住 (一条曲线上不能换源), 能按的只有「停止」
- *   ② 扫描正在跑     -> 「开始」**照样能按**, 按下去是「跟随」(自己不发请求, 只画扫描的点)
- *   ③ 真机那一块     -> 选到真机**且它开着**才露; 选项表是空的 (探头没这一项) 也不放开
+ * 四条判据:
+ *   ① 真机没打开     -> 只有「重试」能按 ("装没装 StarLab"与"表头插没插"都要能自己出来)
+ *   ② 扫描正在跑     -> 记录开不了 (跟随的点直接写在扫描那份 CSV 里, 见 addFollowSample),
+ *                       设备三项也不给改
+ *   ③ 正在记录       -> 「停止记录」是唯一能按的那一个
+ *   ④ 正在改设备配置 -> 设备三项自己锁住 (工作线程里是 停流 → 改 → 重开流)
+ *
+ * **`m_mlog->running()` 在这个函数里已经没有用了**: 2026-09-28 起采集常开, 它恒为真。
+ * 凡是拿它当灰化判据的地方都必须改指向 `recording()` —— 漏一处就是"那个控件永久灰着",
+ * 不报错、不崩、自检也照旧全绿 (这一块框进不了自检, 见 docs/scan_sweep.md §36)。
  */
 void ScanWindow::refreshMeterPanel()
 {
-   const bool running = m_ctl->running();
-   const bool rec     = (m_mlog != nullptr && m_mlog->running());
-   const bool held    = (m_mlog != nullptr && m_mlog->held());
-   const bool open    = (m_meter != nullptr && m_meter->isOpen());
-   const int  idx     = (m_cbMeter != nullptr) ? m_cbMeter->currentIndex() : 1;
+   const bool running   = m_ctl->running();
+   const bool open      = (m_meter != nullptr && m_meter->isOpen());
+   const bool recording = (m_mlog != nullptr && m_mlog->recording());
+   const bool cfgBusy   = m_cfgBusy;
+   const bool isOphir   = (m_meter != nullptr && m_meter == m_ophir);
 
-   /* ---- 哪几行露出来 ---- */
-   if (m_manualRow != nullptr)
-      m_manualRow->setVisible(idx == 0);
-   if (m_randomRow != nullptr)
-      m_randomRow->setVisible(idx == 1);
-   if (m_scriptRow != nullptr)
-      m_scriptRow->setVisible(idx == 2);
-   /* 模拟延迟是随机源与脚本源**共用**的一格 (手动源立刻回, 没有这一项), 所以两个下标都露 */
-   if (m_simRow != nullptr)
-      m_simRow->setVisible(idx == 1 || idx == 2);
+   /* ---- 哪几样露出来 ---- */
 
-   const bool dev = (idx == 3 && m_ophir != nullptr && m_ophir->isOpen());
-   if (m_devBox != nullptr)
-      m_devBox->setVisible(dev);
-
-   /* ---- 取样源 ---- */
-   if (m_cbMeter != nullptr)
+   /* 「重试」两个时机: 打开失败, 或**采集卡死** (发了请求没人回, MeterLog 刻意停在那儿等)。
+    * 后者原来靠换源与「停止」→「开始」出去, 那两个入口随面板简化一起没了 */
+   if (m_btnMtrRetry != nullptr)
    {
-      m_cbMeter->setEnabled(!rec);
-      m_cbMeter->setToolTip(rec
-         ? QStringLiteral("连续读数进行中, 取样源不可更改。")
-         : QStringLiteral("扫描与连续读数共用的取样源, 不需要连接总线。\n"
-                          "选择真机需已安装 Ophir StarLab。"));
+      const bool stuck = (m_mlog != nullptr && m_mlog->timedOut());
+      m_btnMtrRetry->setVisible(!m_mtrOpening && ((m_mtrTried && !open) || stuck));
+      m_btnMtrRetry->setEnabled(!m_mtrOpening);
    }
 
-   /* ---- 各源自己那几个参数 ---- */
-   if (m_edManualV != nullptr)
-      m_edManualV->setEnabled(idx == 0 && !rec);
-   if (m_edRandomBase != nullptr)
-      m_edRandomBase->setEnabled(idx == 1 && !rec);
-   if (m_edRandomN != nullptr)
-      m_edRandomN->setEnabled(idx == 1 && !rec);
-   if (m_edSimDelay != nullptr)
-      m_edSimDelay->setEnabled((idx == 1 || idx == 2) && !rec);
-   if (m_edScript != nullptr)
-      m_edScript->setEnabled(idx == 2 && !rec);
-   if (m_btnScript != nullptr)
-      m_btnScript->setEnabled(idx == 2 && !rec);
+   /* 真机那一块 (波长/量程/模式 + 设备信息)。设备没开就没有选项表可填 */
+   if (m_devBox != nullptr)
+      m_devBox->setVisible(open && isOphir);
 
-   /* 真机那三项: 设备开着才可改。空选项表也不放开 (探头没有这一项, 放开就是个假控件) */
+   /* 真机那三项: 设备开着才可改, 扫描中不给改 (那三项会重开流), 空选项表也不放开
+    * (探头没有这一项, 放开就是个假控件)。
+    * 原来这里判的是 `!rec`, 意思是"别在采着的时候改配置" —— 采集常开之后那个意思由 cfgBusy
+    * 承担 (它由工作线程的 infoChanged / configFailed 关掉) */
    for (QComboBox *cb : { m_cbWl, m_cbRange, m_cbMeasMode })
       if (cb != nullptr)
-         cb->setEnabled(dev && cb->count() > 0 && !rec);
+         cb->setEnabled(open && isOphir && cb->count() > 0 && !running && !cfgBusy);
 
-   /* ---- 「读一次」 ----
-    * 它和扫描、连续读数抢同一个未决请求, 三方仲裁在 refresh() 一处; 这里只是把结论画出来 */
-   if (m_btnRead != nullptr)
-   {
-      const bool can = open && !running && !m_readPending && !rec;
-      m_btnRead->setEnabled(can);
-
-      /* 为什么按不了要说清楚 (灰按钮本身不会说话) */
-      QString why;
-      if (m_meter == nullptr)
-         why = QStringLiteral("未选择取样源");
-      else if (!open)
-         why = QStringLiteral("取样源未打开");
-      else if (m_readPending)
-         why = QStringLiteral("已有读数请求未完成");
-      else if (running)
-         why = QStringLiteral("扫描进行中, 请求通道归扫描状态机");
-      else if (rec)
-         why = QStringLiteral("连续读数进行中");
-
-      m_btnRead->setToolTip(why.isEmpty()
-         ? readOnceTip()
-         : QStringLiteral("不可用: ") + why + QStringLiteral("\n\n") + readOnceTip());
-   }
-
-   /* ---- 连续读数那几个 ---- */
+   /* ---- 间隔 ----
+    * **永远可改**: setInterval 只把"下一次"按新值重排, 不打断已经在飞的那一个请求 */
    if (m_edMtrInterval != nullptr)
-   {
-      /* 跟随时可以改 (那时它一个请求都没发, 改了只是把下一拍往后推) */
-      m_edMtrInterval->setEnabled(!rec || held);
-      m_edMtrInterval->setToolTip(rec && !held
-         ? QStringLiteral("连续读数进行中, 间隔不可更改。")
-         : QStringLiteral(
-              "两次请求之间的最小间隔。\n"
-              "实际间隔 = 本值 + 单次往返耗时; 同一时刻只允许一个未完成请求。"));
-   }
+      m_edMtrInterval->setEnabled(true);
 
-   if (m_edMtrAvg != nullptr)
-   {
-      /* 与「间隔」同一个判据: 跟随时可以改 (那时一个请求都没发) */
-      m_edMtrAvg->setEnabled(!rec || held);
-      m_edMtrAvg->setToolTip(rec && !held
-         ? QStringLiteral("连续读数进行中, 平均次数不可更改。")
-         : QStringLiteral(
-              "每次采样连续读取的读数个数 (与扫描的「每点采样」相同)。\n"
-              "1 = 每次读取一个读数; 增大可降低噪声, 代价是每次采样占用 N 次往返。\n"
-              "N 次中任一次失败, 该样本即作废 (ok=false)。\n"
-              "这 N 个读数连续请求, 因此「间隔」是两次采样之间的间隔。"));
-   }
-
+   /* ---- 记录那两个 ----
+    * 「开始记录」的三个理由逐条写出来 (灰按钮本身不会说话)。"扫描中"那一条不能省:
+    * 跟随的点根本不进这份 CSV (addFollowSample 只进缓冲), 按下去只会得到一个只有表头的
+    * 文件 —— 一个"看起来在记录"的空文件比不记录更坏 */
    if (m_btnMtrStart != nullptr)
    {
-      const QString why = !open ? QStringLiteral("取样源未打开")
-                              : (m_readPending ? QStringLiteral("「读一次」请求未完成") : QString());
-      m_btnMtrStart->setEnabled(!rec && why.isEmpty());
+      const QString why = !open ? QStringLiteral("功率计未打开")
+                              : (running ? QStringLiteral("扫描进行中, 跟随的点写入扫描那份 CSV")
+                                         : (recording ? QStringLiteral("已在记录中") : QString()));
+      m_btnMtrStart->setEnabled(why.isEmpty());
       m_btnMtrStart->setToolTip(why.isEmpty()
-         ? (running ? QStringLiteral("扫描进行中: 按下后进入跟随, 曲线显示扫描采到的点, "
-                                     "不向功率计发送请求。")
-                    : QStringLiteral("按设定间隔开始连续读数。"))
-         : QStringLiteral("不可用: ") + why);
+         ? QStringLiteral("按上方路径开始写 CSV; 文件为空时写表头, 已有内容则追加。\n"
+                          "采集与曲线常开, 本按钮只管文件。")
+         : QStringLiteral("不可用: ") + why + QStringLiteral("。"));
    }
 
    if (m_btnMtrStop != nullptr)
-      m_btnMtrStop->setEnabled(rec);
+      m_btnMtrStop->setEnabled(recording);
    if (m_btnMtrClear != nullptr)
       m_btnMtrClear->setEnabled(m_mlog != nullptr && m_mlog->count() > 0);
+   /* 边记边导是允许的: saveBuffer() 是 const, 不碰正在写的那个文件句柄 */
    if (m_btnMtrExport != nullptr)
-      m_btnMtrExport->setEnabled(m_mlog != nullptr && !rec && m_mlog->count() > 0);
+      m_btnMtrExport->setEnabled(m_mlog != nullptr && m_mlog->count() > 0);
 
    /* 输出路径: 正在写文件时锁住 (改了就写进另一个文件, 而界面上还显示着这一个) */
    const bool writing = (m_mlog != nullptr && m_mlog->recording());
@@ -491,6 +424,82 @@ void ScanWindow::refreshMeterPanel()
       m_edMtrCsv->setEnabled(!writing);
    if (m_btnMtrCsv != nullptr)
       m_btnMtrCsv->setEnabled(!writing);
+}
+
+/* ---------------------------------------------------------------- 功率计的打开 */
+
+/* 真机打不开那两句原因。**只查注册表与 dll 资源, 不建 COM 对象、不碰 USB** —— 所以它随时
+ * 可以调, 而 open() 一调就冻住界面。两道闸都是 open() 后面必然会撞上的那两道
+ * (ophircom.cpp 的 create() 起手就是 progIdToClsid / serverPathOf / LoadTypeLibEx),
+ * 提前问一遍只是为了**别让界面白冻 12 秒**再报同一件事。
+ *
+ * **这是预检, 不是判据**: 查得出来不等于打得开 —— 表头没插、通道 0 上没探头、别的程序占着,
+ * 那几种 create() 都过得去, 失败从 open() 自己那句话里出来 (见 m_mtrWhy) */
+QString ScanWindow::ophirOpenWhy()
+{
+   if (!OphirCom::isRegistered())
+      return QStringLiteral("未找到 OphirLMMeasurement COM 对象。请安装 Ophir StarLab。");
+   if (!OphirCom::isAvailable())
+      return QStringLiteral("功率计组件注册不完整。请重装 Ophir StarLab。");
+   return QString();
+}
+
+/* 打开功率计。**全仓库唯一的打开入口**: 构造函数那一次与「重试」都走它 —— 两条路各写一遍
+ * 的话, 迟早一条改了另一条没改 (重试不清那个卡住的未决请求, 或者忘了 repaint)。
+ *
+ * 它做三件事: 两道不阻塞的预检 → open() (阻塞) → 按成败摆状态。
+ *
+ * 打开成功之后**这里不 start() 采集**: 采集是"源开着就该在采"的每拍不变量, 写在 refresh()
+ * 那一处 (全仓库唯一写点)。下面那句 m_mlog->stop() 只是**把卡死解开** —— MeterLog 超时
+ * 之后是刻意停在原地等的 (见 meterlog.h), 而 setSource(同一个指针) 会早退
+ * (meterlog.cpp:44), 只有 stop() 能作废那个未决请求。stop 完不必 start: 下一拍 refresh()
+ * 会把它拉起来 */
+void ScanWindow::openMeter()
+{
+   if (m_mtrOpening)
+      return;              /* 防重入: open() 里跑嵌套事件循环, 重试按钮可能被按第二下 */
+
+   /* 打开之前先记一下"它本来就是开着的" —— 卡死时按「重试」走的就是这一支:
+    * OphirMeter::open() 对已打开的源直接返回 true (ophirmeter.cpp:255), 一趟 COM 都不走,
+    * 真正救回来的是下面那句 m_mlog->stop()。两句话不能混成一句 */
+   const bool was_open = (m_meter != nullptr && m_meter->isOpen());
+
+   m_mtrOpening = true;
+   m_mtrTried   = true;
+   m_mtrWhy.clear();
+
+   refreshMeterPanel();
+   refreshMeterReadout();
+   /* open() 阻塞 (COM 同步开 USB 设备), 正常几百 ms、表头不在时最长 12 s。不先 repaint 的话
+    * 那句「正在打开…」要等 open 回来才画得出来 —— 屏幕上是打开前的旧字, 看起来像没反应 */
+   if (m_lMeter != nullptr)
+      m_lMeter->repaint();
+
+   QString why = (m_meter == m_ophir) ? ophirOpenWhy() : QString();
+
+   if (why.isEmpty())
+   {
+      /* 模拟源 (那个编译开关打开时) 不走预检, open() 恒成功 */
+      if (m_meter == nullptr)
+         why = QStringLiteral("没有取样源");
+      else if (!m_meter->open(&why) && why.isEmpty())
+         why = QStringLiteral("打开失败");
+   }
+
+   m_mtrOpening = false;
+   m_mtrWhy     = why;
+
+   if (why.isEmpty())
+   {
+      if (m_mlog != nullptr)
+         m_mlog->stop();
+      hint(was_open ? QStringLiteral("采集已重新开始。")
+                    : QStringLiteral("功率计已连接, 开始采集。"), false);
+   }
+   else
+      hint(QStringLiteral("功率计打开失败, 请按「重试」。"), true);
+
+   refresh();
 }
 
 /*
@@ -501,24 +510,36 @@ void ScanWindow::refreshMeterPanel()
  */
 void ScanWindow::refreshMeterReadout()
 {
-   /* ---- 状态行 ---- */
+   /* ---- 状态行 ----
+    * 三段: 正在打开… / 未打开 · <原因> / 已打开 · <真机摘要>。
+    * **它同时是"打开失败的原因"唯一的落点** —— 不弹对话框 (表头没插时每按一次弹一个), 而
+    * 横幅只放得下那句 16 字的短句。真机那两句精简过的原因见 ophirOpenWhy(); open() 自己
+    * 回的那几句还很长 (ophirmeter.cpp 那一片), 会原样落到这儿 —— 那一轮精简不在这里做 */
    if (m_lMeter != nullptr && m_meter != nullptr)
    {
-      QString s = QStringLiteral("%1 · %2")
-                     .arg(m_meter->kind())
-                     .arg(m_meter->isOpen() ? QStringLiteral("已打开")
-                                            : QStringLiteral("未打开"));
-      if (m_meter == m_script)
-         s += QStringLiteral(" · %1 个值, 游标 %2")
-                 .arg(m_script->count()).arg(m_script->cursor());
-      else if (m_meter == m_ophir)
+      QString s = m_meter->kind();
+
+      if (m_mtrOpening)
+         s += QStringLiteral(" · 正在打开…");
+      else if (!m_meter->isOpen())
       {
-         /* 真机把接的是什么摆出来 (表头/探头型号序列号)。由工作线程拼好 (ophirmeter.cpp 的
-          * buildSummary), 这里原样显示 */
-         const OphirInfo i = m_ophir->info();
-         if (i.valid && !i.summary.isEmpty())
-            s += QStringLiteral(" · ") + i.summary;
+         s += QStringLiteral(" · 未打开");
+         if (!m_mtrWhy.isEmpty())
+            s += QStringLiteral(" · ") + m_mtrWhy;
       }
+      else
+      {
+         s += QStringLiteral(" · 已打开");
+         if (m_meter == m_ophir)
+         {
+            /* 真机把接的是什么摆出来 (表头/探头型号序列号)。由工作线程拼好 (ophirmeter.cpp
+             * 的 buildSummary), 这里原样显示 */
+            const OphirInfo i = m_ophir->info();
+            if (i.valid && !i.summary.isEmpty())
+               s += QStringLiteral(" · ") + i.summary;
+         }
+      }
+
       m_lMeter->setText(s);
    }
 
@@ -535,8 +556,11 @@ void ScanWindow::refreshMeterReadout()
       const bool wedged = m_mlog->timedOut();
 
       /* 缓冲满了要说出来: 屏幕上那条曲线看着照旧很健康, 只是**最旧的正在被丢掉**, 它已经
-       * 不是全部了。要留全的只有一个办法 —— 让 CSV 记着 (那一份不设上限) */
-      const bool full = m_mlog->full();
+       * 不是全部了。要留全的只有一个办法 —— 让 CSV 记着 (那一份不设上限)。
+       *
+       * 2026-09-28 起采集常开, 缓冲**长期是满的** (那是正常的滚动显示); 于是这句只在
+       * **正在记录**时才出 —— 那时它给的才是可执行的那一半意思 ("这一份文件别停") */
+      const bool full = (m_mlog->full() && m_mlog->recording());
       if (full)
          t += QStringLiteral("  (缓冲已满, 最早的数据正在被丢弃; CSV 记录不受影响)");
 
@@ -585,13 +609,8 @@ void ScanWindow::refreshMeterReadout()
               .arg(st.n)
               .arg(fmtWatts(st.min), fmtWatts(st.max), fmtWatts(st.mean), fmtWatts(st.sd),
                    unitLabel(m_meter)));
-
-      /* 平均次数是"这些数是怎么来的": 一次采样是几个读数平均出来的, 直接决定曲线上那些点
-       * 抖不抖、标准差有多小。= 1 时不写 (那是缺省, 不占地方) */
-      const int avg = m_mlog->average();
-      if (avg > 1 && st.n > 0)
-         m_lMtrStats->setText(m_lMtrStats->text()
-            + QStringLiteral("\n每次 %1 个读数取平均 (标准差按各次平均值计算)").arg(avg));
+      /* 这里原来还有一行"每次 N 个读数取平均"的后缀。2026-09-28 起界面上没有平均次数
+       * 那个旋钮了 (MeterLog::setAverage 留着, 自检在测), 一句永远为真的说明不写 */
    }
 
    /* ---- 文件 ---- */
@@ -902,27 +921,31 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
    /* 它自己的报错上横幅。两种都走这一个信号: 一次读没要回来, 或那份 CSV 写不进去 ——
     * 两种都得让人看见, 却都不该打断采集 (读数还在曲线上, 只是那一份文件不再可信) */
    connect(m_mlog, &MeterLog::failed, this,
-           [this](const QString &e) { hint(QStringLiteral("连续读数: ") + e, true); });
+           [this](const QString &e) { hint(QStringLiteral("采集: ") + e, true); });
 
    /* 信息是工作线程攒好之后发过来的 (跨线程 → 自动排队, 落回 GUI 线程执行) */
    connect(m_ophir, &OphirMeter::infoChanged, this, &ScanWindow::onMeterInfoChanged);
    connect(m_ophir, &OphirMeter::configFailed, this,
-           [this](const QString &e) { hint(QStringLiteral("改功率计配置失败: ") + e, true); });
+           [this](const QString &e) {
+              m_cfgBusy = false;   /* 配置这条路走完了 (失败也是走完), 采集可以回来 */
+              hint(QStringLiteral("改功率计配置失败: ") + e, true);
+           });
 
-   /* 「读一次」要能听见任何一个源的回话 (m_meter 会换): 四个都接上, 靠 m_readPending
-    * 认出"这一份是不是我的"。控制器在跑时它是 false, 那时所有回话都归状态机 */
-   for (PowerMeter *m : { static_cast<PowerMeter *>(m_manual),
-                          static_cast<PowerMeter *>(m_random),
-                          static_cast<PowerMeter *>(m_script),
-                          static_cast<PowerMeter *>(m_ophir) })
-   {
-      connect(m, &PowerMeter::readingReady,  this, &ScanWindow::onReadOnceReady);
-      connect(m, &PowerMeter::readingFailed, this, &ScanWindow::onReadOnceFailed);
-   }
+   /* **源只在这里定一次**, 面板上没有第二条换源的路 (那个下拉框 2026-09-28 删了)。
+    * 窗口此后一个回话都不用听 —— 请求的发放与回话的认领全归 MeterLog (它在 setSource 里
+    * 自己连), 这也是「读一次」那套 m_readPending 仲裁能整块拆掉的原因 */
+#ifdef SCAN_ALLOW_SIM_METER
+   /* 编译开关: 没接表头也想跑通整条流水线时开它。界面形状一个字不变, 只是状态行会如实
+    * 写「随机 (噪声)」而不是「Ophir 功率计」。**扫描那份 CSV 的 `#` 行里记的是 tag()**,
+    * 所以拿开关采出来的数据, 事后看得出不是真机 */
+   m_meter = m_random;                  /* 也要走 openMeter(), 只是它不会失败 */
+#else
+   m_meter = m_ophir;
+#endif
+   /* 这里**不开** —— 打开统一走下面那个 singleShot 里的 openMeter()。放在这里开的话,
+    * 真机那次阻塞发生在 buildUi() 之前, 「正在打开…」就没有地方可写 */
 
-   m_meter  = m_random;                 /* 默认随机源: 一按开始就有数据可看 */
-   m_meter->open(nullptr);
-   m_mlog->setSource(m_meter);          /* 两边永远指着同一个源 (换源时同步, 见 onMeterChanged) */
+   m_mlog->setSource(m_meter);
 
    m_ctl = new ScanController(m_busv, m_meter, this);
 
@@ -1010,6 +1033,15 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
 
    hint(QStringLiteral("未连接。界面为只读状态, 不向总线写入。"), false);
    refresh();
+
+   /* 打开功率计放在**这里**, 不放构造函数中段: ① 到这一刻面板已经建出来, 打开期间那句
+    * 「正在打开…」有地方可写; ② 用带 context 的三参数重载 —— 两参数版是"到点就调",
+    * 窗口先析构时会在一个死对象上跑 (真机最坏 12 s, 关窗比它快是常态)。
+    *
+    * 它**阻塞** (COM 同步打开: 正常几百 ms, 表头没插或 StarLab 坏掉时最长 12 s), 窗口会
+    * 短暂画成"未响应"。这是这条路固有的代价, 不是漏了一步 —— 打开前那句 repaint() 见
+    * openMeter() 的说明 */
+   QTimer::singleShot(0, this, [this] { openMeter(); });
 }
 
 ScanWindow::~ScanWindow()
@@ -1049,8 +1081,8 @@ void ScanWindow::buildUi()
    });
    connect(m_canvas, &MapCanvas::cellPicked, this, [this](int, int) { refresh(); });
 
-   /* 右侧一列 (扫描参数 / 扫描控制 / 功率计 / 色标) 装进 QScrollArea: 这一列比窗口高是常态,
-    * 否则窗口一矮最下面的「色标」就被挤得看不见了 */
+   /* 右侧这一列装进 QScrollArea: 这一列比窗口高是常态, 否则窗口一矮最下面的框就被挤得
+    * 看不见了 */
    QWidget *side = new QWidget;
    side->setMinimumWidth(340);
 
@@ -1060,21 +1092,33 @@ void ScanWindow::buildUi()
    QVBoxLayout *sv = new QVBoxLayout(side);
    sv->setContentsMargins(0, 0, 0, 0);
    sv->setSpacing(8);
-   /* 「轴信号」排在最上面 (2026-09-20 起它是"轴信号 + 限位开关"合成的那一块: 五个灯一行,
-    * 最右边那格是「故障复位」): 它是状态, 要滚才能看到的状态指示器不算指示器 */
-   sv->addWidget(buildAxisPanel());
-   /* 第三块:「回零」。它是动作不是参数, 但回零找的就是上面那三盏灯说的那几个开关 */
-   sv->addWidget(buildHomePanel());
-   /* 「高级选项」**必须**排在 buildParamPanel() 之前: loadSettings() 在它里面被调, 而
-    * loadSettings 要把存下来的值写进那三个勾 —— 勾还没建出来就会被读空 */
-   QWidget *advPanel = buildAdvPanel();
-   /* 「色标」同上, 也是**先建后摆**: applyDefaults() 与 loadSettings() 都在
-    * buildParamPanel() 里面调, 两个都要写那个「自动跟随」勾 —— 勾还没建出来就是一次空指针。
-    * 摆放位置照旧 (它是"看颜色的", 跟着功率计那一块), 所以建在这儿、加到布局里在后面 */
-   QWidget *shadePanel = buildShadePanel();
-   sv->addWidget(buildParamPanel());
-   sv->addWidget(buildScanPanel());
-   sv->addWidget(buildMeterPanel());
+
+   /* ---- 建框: **建序与屏幕上的次序是两回事**, 这一段说了算 ----
+    * 「轴信号」(2026-09-20 起它是"轴信号 + 限位开关"合成的那一块: 五个灯一行, 最右边那格是
+    * 「故障复位」)。
+    *
+    * **下面这两块必须先建**: 「高级选项」那三个勾与「色标」那个「自动跟随」勾都要等参数灌
+    * 进去, 而 loadSettings() 与 applyDefaults() 都在 buildParamPanel() 里面跑 —— 勾还没建
+    * 出来就是读空 / 空指针。所以 2026-09-28 调屏幕次序时, 只动了后面那七行 addWidget。 */
+   QWidget *axisPanel  = buildAxisPanel();
+   QWidget *homePanel  = buildHomePanel();
+   QWidget *advPanel   = buildAdvPanel();     /* 必须在 buildParamPanel() 之前 */
+   QWidget *shadePanel = buildShadePanel();   /* 同上 */
+   QWidget *paramPanel = buildParamPanel();
+   QWidget *scanPanel  = buildScanPanel();
+   QWidget *meterPanel = buildMeterPanel();
+
+   /* ---- 摆位: 屏幕从上到下 ---- */
+   /* 「轴信号」排在最上面: 它是状态, 要滚才能看到的状态指示器不算指示器 */
+   sv->addWidget(axisPanel);
+   /* 取样源 + 连续读数: 手采最常用的一块, 紧着「读一次」 */
+   sv->addWidget(meterPanel);
+   /* 扫描控制: 起停与进度, 紧挨着它要用的那一堆参数 */
+   sv->addWidget(scanPanel);
+   sv->addWidget(paramPanel);
+   /* 「回零与找限位」是动作不是参数, 排在参数之后。它找的就是「轴信号」那几盏灯说的那几个
+    * 开关, 但那个关系靠字面说得清, 不必靠挨着摆 */
+   sv->addWidget(homePanel);
    sv->addWidget(shadePanel);
    /* 高级选项摆在最底下: 它是"设好了就别再动"的东西, 平时不该占视线 */
    sv->addWidget(advPanel);
@@ -1964,18 +2008,22 @@ QWidget *ScanWindow::buildScanPanel()
 /*
  * 参数栏里的「功率计」框 —— **一整个面板, 一直露在外面**。
  *
- * 这一块是"单独接一下功率计看看数"要用的东西: 选源 / 真机那三项 / 读一次 / 按间隔连续读数 /
- * 曲线 / 统计 / 存 CSV。它**一个 EtherCAT 帧都不发** (功率计走 Ophir 的 COM 接口), 所以不插
- * 滑台、不连网卡时整块照常能用 —— 这正是当初要它的原因。
+ * 2026-09-28 起这一块只剩三件事: **仪器**(打开没打开、打开的是哪一台) / **实时读数**(一直在采,
+ * 不需要按任何键) / **记录**(写不写文件)。它**一个 EtherCAT 帧都不发** (功率计走 Ophir 的
+ * COM 接口), 所以不插滑台、不连网卡时整块照常能用 —— 这正是当初要它的原因。
  *
- * 两条决定这一块形状的约束 (见 docs/scan_sweep.md §23):
+ * 那次简化拆掉的东西 (取样源下拉、三个模拟源各自的参数行、模拟延迟、「读一次」、「每次平均」)
+ * 与留下的每一个控件为什么这么排, 见 docs/scan_sweep.md §36。
+ *
+ * 三条决定这一块形状的约束 (见 docs/scan_sweep.md §23):
  *
  *  1. **不能有第二个 OphirMeter**。Ophir 表头是独占的 (ophirmeter.cpp:308, 第二个实例打开
  *     同一个头报 0x80040201), 所以真机那一路只有 m_ophir 这一个实例, 这里只是它的界面。
- *  2. **同一时刻只允许一个未决请求** (powermeter.h:28-31)。这一块里有两处会发请求 ——
- *     「读一次」和连续读数 (MeterLog) —— 加上跑扫描的 ScanController 就是三方。谁的请求归谁,
- *     靠 refresh() 一处仲裁, 靠 setHold / m_readPending 两个开关推过来; 灰不灰在
- *     refreshMeterPanel() 一处算。
+ *  2. **同一时刻只允许一个未决请求** (powermeter.h:28-31)。源只剩真机之后, 会发请求的只剩两方
+ *     —— 连续读数 (MeterLog) 与跑扫描的 ScanController。「读一次」那第三方 2026-09-28 删了,
+ *     `m_readPending` 那套仲裁一并撤掉; 退让仍然靠 setHold 推过去, 在 refresh() 一处算。
+ *  3. **采集常开**。"源开着就该在采"是每拍重算的不变量, 唯一写点在 refresh(); 「开始记录」与
+ *     「停止记录」只管文件, 碰不到采集。滚轮/灰化那些判据全在 refreshMeterPanel() 一处。
  *
  * 2026-09-22 曾经把这一整块搬进一个**独立窗口**、靠菜单栏点开, 参数栏只留一行取样源。
  * 当天又搬回来了: 那个窗口必须先点菜单才看得见, 而"外露"是当初提的要求。
@@ -1986,52 +2034,9 @@ QWidget *ScanWindow::buildMeterPanel()
    QVBoxLayout *v = new QVBoxLayout(box);
    v->setSpacing(6);
 
-   /* ---------------- 取样源 ---------------- */
-
-   /* 下标 0..3 = 四个源, 顺序就是 onMeterChanged 里那个 switch 的分支顺序 ——
-    * 错一个就是在换源的时候悄悄换到别的设备上 */
-   m_cbMeter = new QComboBox(box);
-   m_cbMeter->addItem(m_manual->kind());
-   m_cbMeter->addItem(m_random->kind());
-   m_cbMeter->addItem(m_script->kind());
-   m_cbMeter->addItem(m_ophir->kind());
-   m_cbMeter->setCurrentIndex(1);          /* 默认随机源: 一按开始就有数据可看 */
-   m_cbMeter->setToolTip(QStringLiteral(
-      "扫描与连续读数共用的取样源, 不需要连接总线。\n"
-      "选择真机需已安装 Ophir StarLab。"));
-   connect(m_cbMeter, &QComboBox::currentIndexChanged, this, &ScanWindow::onMeterChanged);
-
-   /* 真机这一项不可用之前不让人选, 但**照样列出来**: 不列的话操作员会以为这程序没有真机
-    * 这条路。灰的是**表里那一项**, 不是整个下拉框 —— 三个模拟源照旧能选。
-    *
-    * 两种坏法不一样, 说给操作员的话也就不一样 (isRegistered 是"装没装", isAvailable 是
-    * "装机的那份 typelib 读不读得出来"), 而第二种在界面上原本只会以"打开失败"的样子出现 */
-   {
-      QString why;
-      if (!OphirCom::isRegistered())
-         why = QStringLiteral("未找到 OphirLMMeasurement COM 对象。"
-                              "请安装 Ophir StarLab (含 PD300R + Juno+ 驱动)。");
-      else if (!OphirCom::isAvailable())
-         why = QStringLiteral("COM 对象已注册, 但 typelib 读取失败 "
-                              "(0x8002801D TYPE_E_LIBNOTREGISTERED)。"
-                              "StarLab 安装损坏, 请重新安装。");
-
-      if (!why.isEmpty())
-      {
-         auto *m = qobject_cast<QStandardItemModel *>(m_cbMeter->model());
-         if (m != nullptr && m->item(3) != nullptr)
-         {
-            m->item(3)->setEnabled(false);
-            m->item(3)->setToolTip(why);
-         }
-      }
-   }
-
-   QHBoxLayout *srcRow = new QHBoxLayout;
-   srcRow->setSpacing(6);
-   srcRow->addWidget(new QLabel(QStringLiteral("取样源"), box));
-   srcRow->addWidget(m_cbMeter, 1);
-   v->addLayout(srcRow);
+   /* ---------------- 仪器 ----------------
+    * 没有"取样源"那一行: 只剩一个源, 写成一个下拉框或一句静态标签都是**不会变的假控件**。
+    * "现在用的是哪一台"由下面状态行第一段的 kind() 承担 */
 
    m_lMeter = new QLabel(box);
    m_lMeter->setWordWrap(true);
@@ -2041,97 +2046,16 @@ QWidget *ScanWindow::buildMeterPanel()
    m_lMeter->setTextFormat(Qt::PlainText);
    v->addWidget(m_lMeter);
 
-   /* ---------------- 各源自己那几个参数 ----------------
-    * 选到谁只露谁那一行。都摊开的话一半的控件永远是灰的, 而这一列本来就不宽 */
-
-   m_manualRow = new QWidget(box);
-   {
-      QHBoxLayout *h = new QHBoxLayout(m_manualRow);
-      h->setContentsMargins(0, 0, 0, 0);
-      h->setSpacing(6);
-      h->addWidget(new QLabel(QStringLiteral("手填值"), m_manualRow));
-      m_edManualV = new QDoubleSpinBox(m_manualRow);
-      m_edManualV->setRange(-1e9, 1e9);
-      m_edManualV->setDecimals(6);
-      m_edManualV->setValue(1.0);
-      connect(m_edManualV, &QDoubleSpinBox::valueChanged, this, &ScanWindow::onManualValueChanged);
-      h->addWidget(m_edManualV, 1);
-   }
-
-   /* 随机源的两个旋钮。**初值都从源自己那儿取** (base()/noise()): 缺省只有一份 —— 在这一列里
-    * 再写一遍 1.0 / 0.05, 就是两处缺省, 迟早对不上 */
-   m_randomRow = new QWidget(box);
-   {
-      QFormLayout *f = new QFormLayout(m_randomRow);
-      f->setContentsMargins(0, 0, 0, 0);
-
-      m_edRandomBase = new QDoubleSpinBox(m_randomRow);
-      m_edRandomBase->setRange(-1e9, 1e9);
-      m_edRandomBase->setDecimals(6);
-      m_edRandomBase->setValue(m_random->base());
-      connect(m_edRandomBase, &QDoubleSpinBox::valueChanged, this,
-              [this](double x) { m_random->setBase(x); });
-      f->addRow(QStringLiteral("基值"), m_edRandomBase);
-
-      m_edRandomN = new QDoubleSpinBox(m_randomRow);
-      m_edRandomN->setRange(0.0, 1e6);
-      m_edRandomN->setDecimals(4);
-      m_edRandomN->setValue(m_random->noise());
-      connect(m_edRandomN, &QDoubleSpinBox::valueChanged, this,
-              [this](double x) { m_random->setNoise(x); });
-      f->addRow(QStringLiteral("噪声"), m_edRandomN);
-   }
-
-   m_scriptRow = new QWidget(box);
-   {
-      QHBoxLayout *h = new QHBoxLayout(m_scriptRow);
-      h->setContentsMargins(0, 0, 0, 0);
-      h->setSpacing(6);
-      h->addWidget(new QLabel(QStringLiteral("脚本"), m_scriptRow));
-      m_edScript = new QLineEdit(m_scriptRow);
-      m_edScript->setPlaceholderText(QStringLiteral("每行一个数值"));
-      /* 框里的文本与真正读的那份表是两份东西, 同步点只有 pushScriptPath() 一处。敲完立刻推
-       * —— 这个框没有一个"确认"的时机可用 */
-      connect(m_edScript, &QLineEdit::textEdited, this, [this] { pushScriptPath(); });
-      h->addWidget(m_edScript, 1);
-      m_btnScript = new QPushButton(QStringLiteral("…"), m_scriptRow);
-      m_btnScript->setFixedWidth(28);
-      connect(m_btnScript, &QPushButton::clicked, this, &ScanWindow::onBrowseScript);
-      h->addWidget(m_btnScript);
-   }
-
-   /* 模拟往返延迟。真机一次往返可能上百毫秒, 而模拟源默认 20ms —— 不把它调大, 就没法在
-    * 没有真机的时候看时序: 「读一次」那个往返时延、连续读数为什么是回话驱动、把延迟调过
-    * 看门狗 (kTimeoutMs) 时超时那一路长什么样。两个模拟源共用这一个数 */
-   m_simRow = new QWidget(box);
-   {
-      QHBoxLayout *h = new QHBoxLayout(m_simRow);
-      h->setContentsMargins(0, 0, 0, 0);
-      h->setSpacing(6);
-      h->addWidget(new QLabel(QStringLiteral("模拟延迟"), m_simRow));
-      m_edSimDelay = new QSpinBox(m_simRow);
-      m_edSimDelay->setRange(0, MeterLog::kTimeoutMs * 4);
-      m_edSimDelay->setSuffix(QStringLiteral(" ms"));
-      m_edSimDelay->setValue(m_random->delayMs());   /* 两个模拟源的缺省是同一个数 */
-      m_edSimDelay->setToolTip(QStringLiteral(
-         "模拟的往返延迟: 源收到请求后延时此时长返回 (真机往返可达数百毫秒)。\n"
-         "用于在无真机条件下验证往返时延与 %1 ms 超时判据。\n"
-         "随机源与脚本源共用; 手动源无此项。").arg(MeterLog::kTimeoutMs));
-      connect(m_edSimDelay, &QSpinBox::valueChanged, this, [this](int ms) {
-         m_random->setDelayMs(ms);
-         m_script->setDelayMs(ms);
-      });
-      h->addWidget(m_edSimDelay, 1);
-   }
-   v->addWidget(m_simRow);
-
-   v->addWidget(m_manualRow);
-   v->addWidget(m_randomRow);
-   v->addWidget(m_scriptRow);
+   /* 「重试」。露不露归 refreshMeterPanel() (两个时机: 打开失败, 或采集卡死), 一开始不露 */
+   m_btnMtrRetry = new QPushButton(QStringLiteral("重试"), box);
+   m_btnMtrRetry->setToolTip(QStringLiteral("重新打开功率计; 打开期间界面会停顿。"));
+   connect(m_btnMtrRetry, &QPushButton::clicked, this, &ScanWindow::onMtrRetryOpen);
+   m_btnMtrRetry->setVisible(false);
+   v->addWidget(m_btnMtrRetry);
 
    /* ---------------- 真机那一块 ----------------
     * 选项表由设备给, 一个都不写死 (探头不同, 能选的波长与量程就不同)。三行连着小标签一起
-    * 收进 m_devBox, 切到模拟源时整块 setVisible(false) —— 露不露归 refreshMeterPanel() */
+    * 收进 m_devBox, 真机没打开时整块 setVisible(false) —— 露不露归 refreshMeterPanel() */
 
    m_devBox = new QWidget(box);
    {
@@ -2157,39 +2081,7 @@ QWidget *ScanWindow::buildMeterPanel()
    }
    v->addWidget(m_devBox);
 
-   /* ---------------- 读一次 ---------------- */
-
-   m_btnRead = new QPushButton(QStringLiteral("读一次"), box);
-   m_btnRead->setToolTip(readOnceTip());
-   connect(m_btnRead, &QPushButton::clicked, this, &ScanWindow::onReadOnceClicked);
-   v->addWidget(m_btnRead);
-
-   m_lReadout = new QLabel(box);
-   m_lReadout->setWordWrap(true);
-   m_lReadout->setStyleSheet(QStringLiteral("color:#7b8391;"));
-   /* 这一格会显示设备来的字 (探头报的过量程原因之类)。明写 PlainText: QLabel 默认 AutoText,
-    * 字里有个 `<` 就会被当 HTML 解析 */
-   m_lReadout->setTextFormat(Qt::PlainText);
-   m_lReadout->setText(QStringLiteral("—"));
-   v->addWidget(m_lReadout);
-
-   /* 「读一次」的兜底。接口约定"恰好回一次"是源那边的义务, 源不回话时这个动作会永远卡住
-    * —— 而它卡住会连带把连续读数的「开始」压死 (三方仲裁里"手动读在飞"是让位条件之一),
-    * 所以兜底必须留着 */
-   m_readTimer = new QTimer(this);
-   m_readTimer->setSingleShot(true);
-   connect(m_readTimer, &QTimer::timeout, this, [this] {
-      if (!m_readPending)
-         return;
-      m_readPending = false;
-      const double took = (double)(m_clock.elapsed() - m_readSentMs);
-      m_lReadout->setText(QStringLiteral("读一次: 无响应 (已等待 %1 s), "
-                                         "取样源未返回数据。")
-                             .arg(took / 1000.0, 0, 'f', 1));
-      refresh();
-   });
-
-   /* ---------------- 连续读数 ---------------- */
+   /* ---------------- 采集与记录 ---------------- */
 
    auto *sep = new QFrame(box);
    sep->setFrameShape(QFrame::HLine);
@@ -2209,40 +2101,32 @@ QWidget *ScanWindow::buildMeterPanel()
       "实际间隔 = 本值 + 单次往返耗时; 同一时刻只允许一个未完成请求。"));
    connect(m_edMtrInterval, &QSpinBox::valueChanged, this, &ScanWindow::onMtrIntervalChanged);
    ivRow->addWidget(m_edMtrInterval, 1);
+   v->addLayout(ivRow);
 
-   m_btnMtrStart = new QPushButton(QStringLiteral("开始"), box);
+   /* 三个按钮**另起一行**: 名字从 2 字变成 4 字之后, 这一行 (340 px 宽) 放不下
+    * 「间隔 + 旋钮 + 开始记录 + 停止记录 + 清空」 */
+   QHBoxLayout *recRow = new QHBoxLayout;
+   recRow->setSpacing(6);
+
+   /* 「开始记录」/「停止记录」**只管文件**。采集与曲线是常开的, 与这两个按钮无关 ——
+    * 这个名字里"记录"两个字不能省: 叫「开始」的话, 按下去屏幕上看不出任何变化 (曲线本来
+    * 就在长), 而"到底开没开文件"要翻到底下那行小字才知道 */
+   m_btnMtrStart = new QPushButton(QStringLiteral("开始记录"), box);
    m_btnMtrStart->setObjectName(QStringLiteral("go"));
-   connect(m_btnMtrStart, &QPushButton::clicked, this, &ScanWindow::onMtrStartClicked);
-   ivRow->addWidget(m_btnMtrStart);
+   connect(m_btnMtrStart, &QPushButton::clicked, this, &ScanWindow::onMtrStartRecordClicked);
+   recRow->addWidget(m_btnMtrStart);
 
-   m_btnMtrStop = new QPushButton(QStringLiteral("停止"), box);
-   connect(m_btnMtrStop, &QPushButton::clicked, this, &ScanWindow::onMtrStopClicked);
-   ivRow->addWidget(m_btnMtrStop);
+   m_btnMtrStop = new QPushButton(QStringLiteral("停止记录"), box);
+   m_btnMtrStop->setToolTip(QStringLiteral("只停写文件; 采集与曲线照旧。"));
+   connect(m_btnMtrStop, &QPushButton::clicked, this, &ScanWindow::onMtrStopRecordClicked);
+   recRow->addWidget(m_btnMtrStop);
 
    m_btnMtrClear = new QPushButton(QStringLiteral("清空"), box);
    m_btnMtrClear->setToolTip(QStringLiteral("仅清除曲线与统计; 已写入 CSV 的数据不变。"));
    connect(m_btnMtrClear, &QPushButton::clicked, this, &ScanWindow::onMtrClearClicked);
-   ivRow->addWidget(m_btnMtrClear);
+   recRow->addWidget(m_btnMtrClear);
 
-   v->addLayout(ivRow);
-
-   /* 一次采样平均几个读数。与扫描参数里那个「每点采样」是同一件事 —— 那边少了它, 噪声大的
-    * 源就没法读稳; 这里少了它, 同一条曲线上扫描那趟与手采那趟的噪声水平就对不上 */
-   QHBoxLayout *avgRow = new QHBoxLayout;
-   avgRow->setSpacing(6);
-   avgRow->addWidget(new QLabel(QStringLiteral("每次平均"), box));
-   m_edMtrAvg = new QSpinBox(box);
-   m_edMtrAvg->setRange(1, MeterLog::kMaxAverage);
-   m_edMtrAvg->setValue(1);
-   m_edMtrAvg->setSuffix(QStringLiteral(" 次"));
-   m_edMtrAvg->setToolTip(QStringLiteral(
-      "每次采样连续读取的读数个数 (与扫描的「每点采样」相同)。\n"
-      "1 = 每次读取一个读数; 增大可降低噪声, 代价是每次采样占用 N 次往返。\n"
-      "N 次中任一次失败, 该样本即作废 (ok=false)。\n"
-      "这 N 个读数连续请求, 因此「间隔」是两次采样之间的间隔。"));
-   connect(m_edMtrAvg, &QSpinBox::valueChanged, this, &ScanWindow::onMtrAvgChanged);
-   avgRow->addWidget(m_edMtrAvg, 1);
-   v->addLayout(avgRow);
+   v->addLayout(recRow);
 
    m_lMtrCount = new QLabel(box);
    m_lMtrCount->setStyleSheet(QStringLiteral("color:#7b8391;"));
@@ -2265,7 +2149,7 @@ QWidget *ScanWindow::buildMeterPanel()
 
    m_curve = new MeterCurve(box);
    m_curve->setLog(m_mlog);
-   m_curve->setPlaceholder(QStringLiteral("按「开始」后显示曲线"));
+   m_curve->setPlaceholder(QStringLiteral("等待第一个读数…"));
    v->addWidget(m_curve);
 
    /* 输出文件。与扫描那份 CSV 同一个目录 (scan_out), 一眼能看出是同一条产线的东西 */
@@ -2283,7 +2167,7 @@ QWidget *ScanWindow::buildMeterPanel()
    m_btnMtrExport = new QPushButton(QStringLiteral("导出当前缓冲"), box);
    m_btnMtrExport->setToolTip(QStringLiteral(
       "将当前缓冲中的点导出为新文件。\n"
-      "与「开始」写入的文件无关 (该文件为边采边写)。"));
+      "与「开始记录」写入的文件无关。"));
    connect(m_btnMtrExport, &QPushButton::clicked, this, &ScanWindow::onMtrExportClicked);
    v->addWidget(m_btnMtrExport);
 
@@ -2293,7 +2177,7 @@ QWidget *ScanWindow::buildMeterPanel()
    v->addWidget(m_lMtrWritten);
 
    QLabel *note = new QLabel(
-      QStringLiteral("「开始」按上方路径写入: 文件为空或不存在时写入表头, 已有内容则追加, "
+      QStringLiteral("「开始记录」按上方路径写入: 文件为空或不存在时写入表头, 已有内容则追加, "
                      "不覆盖。文件名留空时按时间戳自动生成。"),
       box);
    note->setWordWrap(true);
@@ -2314,12 +2198,9 @@ QWidget *ScanWindow::buildMeterPanel()
          m_mlog->setInterval(m_edMtrInterval->value());
    }
 
-   m_manualRow->setVisible(false);      /* 一开始选的是随机源。之后每拍由 refreshMeterPanel 定 */
-   m_randomRow->setVisible(true);
-   m_scriptRow->setVisible(false);
-   m_devBox->setVisible(false);
+   m_devBox->setVisible(false);   /* 真机还没打开。之后每拍由 refreshMeterPanel 定 */
 
-   onMeterInfoChanged();      /* 一开始选的是模拟源 -> 真机那三行不用填 */
+   onMeterInfoChanged();   /* 把设备信息填进去 (还没打开时它什么都不填) */
    return box;
 }
 
@@ -2971,88 +2852,27 @@ void ScanWindow::onZeroHereClicked()
 
 /* ---------------------------------------------------------------- 功率计 */
 
-void ScanWindow::onMeterChanged(int idx)
+/* 「重试」—— 打开失败、或采集卡死时的**唯一出口**。它就是再走一遍 openMeter(), 没有第二条
+ * 打开路径: 打开前那句 repaint、两道预检、失败原因落进 m_mtrWhy、成功之后把卡住的采集解开,
+ * 这些只有那一处有。两条路各写一遍的话, 迟早一条改了另一条没改 */
+void ScanWindow::onMtrRetryOpen()
 {
-   if (m_ctl->running())
-   {
-      /* 扫描中途换源 = 同一张图上的数据来自两个不同的东西, 禁掉。
-       * 回退时必须挡掉信号, 否则 setCurrentIndex 会再进来一次, 两个下标之间来回弹 */
-      hint(QStringLiteral("扫描进行中, 取样源不可更改。"), false);
-      QSignalBlocker b(m_cbMeter);
-      m_cbMeter->setCurrentIndex(m_cbMeter->findText(m_meter->kind()));
-      return;
-   }
-
-   /* 同理, 连续读数正在跑时也不能换: 那条曲线上会是两个不同的东西采的数。
-    * 下拉框本身在 refreshMeterPanel() 里已经灰了, 这里是兜底 (键盘/程序设值也能到这儿) */
-   if (m_mlog != nullptr && m_mlog->running())
-   {
-      hint(QStringLiteral("连续读数进行中"), false);
-      QSignalBlocker b(m_cbMeter);
-      m_cbMeter->setCurrentIndex(m_cbMeter->findText(m_meter->kind()));
-      return;
-   }
-
-   m_meter->close();
-
-   PowerMeter *pick = nullptr;
-   switch (idx)
-   {
-   case 0:  pick = m_manual; break;
-   case 2:  pick = m_script; break;
-   case 3:  pick = m_ophir;  break;
-   default: pick = m_random; break;
-   }
-   m_meter = pick;
-
-   /* 换了源, 上一个未决请求就作废: 回话即使来了也不该再算数 —— 两个读一次槽都靠
-    * m_readPending 与 sender() 认出这一点 */
-   if (m_readTimer != nullptr)
-      m_readTimer->stop();
-   m_readPending = false;
-
-   /* open() 对真机是阻塞的 (枚举 USB → 开设备 → 读探头 → 开流), 上限 12s */
-   QString err;
-   const bool ok = m_meter->open(&err);
-
-   /* 必须告诉控制器, 否则它还在听旧的源 (旧源还活着, 会照常出数) */
-   m_ctl->setMeter(m_meter);
-
-   /* 连续读数器跟着换。它自己会把未决的请求作废、缓冲清掉 (见 MeterLog::setSource 的说明),
-    * 那边是"一条曲线只画一个源" */
-   m_mlog->setSource(m_meter);
-
-   /* 换了源, 「读一次」上次那行读数就是上一个东西的了 —— 清掉, 免得留在那里被当成新的。
-    * 曲线上那一份由 MeterLog::setSource 一起清 */
-   if (m_lReadout != nullptr)
-      m_lReadout->setText(QStringLiteral("—"));
-
-   if (!err.isEmpty())
-      hint(QStringLiteral("功率计打开失败: ") + err, true);
-   else if (ok && m_meter == m_ophir)
-   {
-      const OphirInfo i = m_ophir->info();
-      hint(i.summary.isEmpty()
-              ? QStringLiteral("取样源已切换为「%1」。").arg(m_meter->kind())
-              : QStringLiteral("功率计已连接: ") + i.summary,
-           false);
-   }
-   else
-      hint(QStringLiteral("取样源已切换为「%1」。").arg(m_meter->kind()), false);
-
-   refresh();
+   openMeter();
 }
 
 /* 设备信息回来了: 真机那三行填设备的选项表与当前选中项。
  * **灰不灰与露不露都不归这里管** —— 那是 refreshMeterPanel() 每拍算的 (空选项表也在那边判)。
  * 只在 infoChanged 时跑, 不放进 30Hz 的 refresh(): 那个频率下重填下拉框会跟操作员正在点的
- * 那一下抢, 而且每帧重建选项是白烧 CPU。 */
+ * 那一下抢, 而且每帧重建选项是白烧 CPU。
+ *
+ * 它同时是"改配置这一段结束了"的**一条**回话路 (另一条是 configFailed): 工作线程每次
+ * 停流 → 改 → 重开流 走完都会发一次 infoChanged, 不管改没改成功 */
 void ScanWindow::onMeterInfoChanged()
 {
+   m_cfgBusy = false;
+
    if (m_cbWl == nullptr)
       return;                    /* 还没建出来 (构造期不会有 infoChanged, 这里只是兜底) */
-
-   const bool is_ophir = (m_meter == m_ophir);
 
    const OphirInfo i = m_ophir->info();
 
@@ -3074,9 +2894,6 @@ void ScanWindow::onMeterInfoChanged()
 
    m_lDevInfo->setText(dev);
 
-   if (!is_ophir)
-      return;
-
    /* 填的时候挡掉信号, 否则每 addItem 一次都会被当成操作员改配置 (一连串 stop/set/start) */
    m_meterCfgQuiet = true;
 
@@ -3096,7 +2913,15 @@ void ScanWindow::onMeterInfoChanged()
 }
 
 /* 操作员改了波长/量程/模式。异步 —— 工作线程收到后是 停流 → 改 → 重新开流, 改完再发一次
- * infoChanged 回来 (见 ophirmeter.h), 这里不阻塞等结果 */
+ * infoChanged 回来 (见 ophirmeter.h), 这里不阻塞等结果。
+ *
+ * **这一段期间采集必须让位** (setHold): 那三项是"改配置方法不能在 streaming 时调"的手册要求,
+ * 而工作线程自己会停流再重开。不让位的话, 那个窗口里飞出去的请求会撞在一次配置改写上,
+ * 得到一个 ok=false 的样本和一条红横幅 —— 不是错数, 但是白挨一次。
+ *
+ * m_cfgBusy 是"这一段还没完"的旗标, 由 infoChanged 或 configFailed 关掉 (两条路都是
+ * 工作线程走完了才发)。**工作线程自己死了就两条都到不了** —— 那时采集会一直停着、界面上
+ * "采集中"的字还在而数不涨。这个缺口是已知的, 出路是「重试」(它会把 m_mlog 停掉重启) */
 void ScanWindow::onMeterCfgChanged()
 {
    if (m_meterCfgQuiet || m_meter != m_ophir || !m_ophir->isOpen())
@@ -3104,158 +2929,39 @@ void ScanWindow::onMeterCfgChanged()
    if (m_ctl->running())
       return;                 /* 扫描中那三个框本来就是灰的, 这是兜底 */
 
+   m_cfgBusy = true;
+   if (m_mlog != nullptr)
+      m_mlog->setHold(true);
+
    m_ophir->setWavelengthIndex(m_cbWl->currentIndex());
    m_ophir->setRangeIndex(m_cbRange->currentIndex());
    m_ophir->setModeIndex(m_cbMeasMode->currentIndex());
 }
 
-void ScanWindow::onManualValueChanged(double v)
-{
-   m_manual->setValue(v);
-}
+/* ---------------------------------------------------------------- 采集与记录 */
 
-/* ---------------------------------------------------------------- 脚本源 */
-
-void ScanWindow::onBrowseScript()
-{
-   const QString f = QFileDialog::getOpenFileName(
-      this, QStringLiteral("选择脚本文件 (每行一个数值)"), m_last_dir,
-      QStringLiteral("文本 (*.txt *.csv *.dat);;所有文件 (*)"));
-   if (f.isEmpty())
-      return;
-
-   m_edScript->setText(QDir::toNativeSeparators(f));
-   m_last_dir = QFileInfo(f).absolutePath();
-   pushScriptPath();
-}
-
-/* 框里的文本和实际用的脚本是两份东西: 文本是给眼睛看的, 真正读数是 m_script 里那份。
- * 两者唯一的同步点就在这里。 */
-bool ScanWindow::pushScriptPath()
-{
-   const QString f = m_edScript->text().trimmed();
-   if (f == m_script->path())
-      return true;           /* 没变就不重读文件 */
-
-   QString err;
-   if (!m_script->setPath(f, &err))
-   {
-      hint(QStringLiteral("脚本读取失败: ") + err, true);
-      return false;
-   }
-
-   /* 这个源正被用着: 关一次再开, 否则读的还是旧那份表 */
-   if (m_meter == m_script)
-   {
-      m_script->close();
-      m_script->open(&err);
-      if (!err.isEmpty())
-         hint(QStringLiteral("脚本源打开失败: ") + err, true);
-   }
-   return true;
-}
-
-/* ---------------------------------------------------------------- 读一次 */
-
-/* 发一次普通请求, 走的是扫描用的同一条路, 所以它通了 = 采集那条路也通了。
+/* 「开始记录」—— **只管文件**。按下去之前曲线就在长, 按下去之后还是那样长, 区别只在于有没有
+ * 一个 CSV 在落盘 (2026-09-28 用户原话: "开始只是开始记录")。
  *
- * 硬闸: PowerMeter 约定 (powermeter.h) 调用方保证同一时刻只有一个未决请求。扫描跑着时
- * "调用方"是 ScanController, 连续读数跑着时是 MeterLog —— 任一个在场, 这里按下去
- * 就是两个请求撞在同一个源上, 于是 CSV 里会悄悄少一个点或者错一个点, 且不报错。
- * refreshMeterPanel() 里那条 setEnabled 是闸门, 这里再兜一次底。
- *
- * 两个槽里要比一次 sender(): 换取样源时未决请求作废, 但旧源的回话可能已排在事件队列里,
- * 只有当前源的回话算数。四个源都是本窗口的子对象、一样长寿, 所以 sender() 是安全的。 */
-void ScanWindow::onReadOnceClicked()
+ * 所以这里既不 start() 也不 stop() 采集: 采集是"源开着就该在采"的每拍不变量, 唯一写点在
+ * refresh()。反过来说, 这个按钮只在**采集已经在跑**的前提下动文件 —— 采集没跑 (功率计没
+ * 打开) 时开一个文件, 得到的是一份只有表头的东西 */
+void ScanWindow::onMtrStartRecordClicked()
 {
-   if (m_meter == nullptr || !m_meter->isOpen() || m_ctl->running() || m_readPending)
-      return;
-   if (m_mlog != nullptr && m_mlog->running())
-   {
-      hint(QStringLiteral("连续读数进行中"), false);
-      return;
-   }
-
-   /* 顺序有讲究: 先把 m_readPending / 起始时刻 / 兜底定时器都摆好, 最后才发请求 ——
-    * 没打开时三个模拟实现是直接 emit readingFailed (在 requestReading() 的调用栈里就回来
-    * 了, 见 powermeter.cpp), 倒过来就是在别人的调用栈里改自己的状态。 */
-   m_readPending = true;
-   m_readSentMs  = m_clock.elapsed();
-   m_readTimer->start(kReadOnceTimeoutMs);
-   m_lReadout->setText(QStringLiteral("读一次 [%1]: 读取中…").arg(m_meter->kind()));
-   refresh();                       /* 立刻把按钮灰掉, 免得连按出两个请求 */
-
-   m_meter->requestReading();
-}
-
-void ScanWindow::onReadOnceReady(double watts)
-{
-   /* 不是我们的那一份就是扫描的读数, 一个字都别动 */
-   if (!m_readPending || sender() != m_meter)
-      return;
-
-   m_readPending = false;
-   m_readTimer->stop();
-
-   const double took = (double)(m_clock.elapsed() - m_readSentMs);
-   /* 单位跟源头走, 不硬写 W (powermeter.h 的 unit()): 这一行是"拿这台仪器量出来的一个数",
-    * 单位说错了比不说更坏 */
-   m_lReadout->setText(QStringLiteral("读一次 [%1]: %2 %3   (往返 %4 ms)")
-                          .arg(m_meter->kind(), fmtWatts(watts), unitLabel(m_meter))
-                          .arg(took, 0, 'f', 0));
-   refresh();
-}
-
-void ScanWindow::onReadOnceFailed(const QString &err)
-{
-   if (!m_readPending || sender() != m_meter)
-      return;
-
-   m_readPending = false;
-   m_readTimer->stop();
-
-   const double took = (double)(m_clock.elapsed() - m_readSentMs);
-   /* 失败原文照贴 —— 没插表头 / 过量程 / 流没起来 是三种完全不同的错, 原话只有源知道 */
-   m_lReadout->setText(QStringLiteral("读一次 [%1]: 失败, %2   (往返 %3 ms)")
-                          .arg(m_meter->kind(), err)
-                          .arg(took, 0, 'f', 0));
-   refresh();
-}
-
-/* ---------------------------------------------------------------- 连续读数 */
-
-/* 开始。与扫描互斥靠的是 refresh() 那一处的仲裁: 扫描在跑时这里**照样能按**, 按下去是
- * 「跟随」—— 曲线画扫描采回来的那些点, 自己一个请求都不发, 也不另开文件 (那些点本来就写在
- * 扫描那份 CSV 里)。 */
-void ScanWindow::onMtrStartClicked()
-{
-   if (m_mlog == nullptr || m_mlog->running())
+   if (m_mlog == nullptr || m_mlog->recording())
       return;
 
    if (m_meter == nullptr || !m_meter->isOpen())
    {
-      hint(QStringLiteral("取样源未打开"), true);
+      hint(QStringLiteral("功率计未打开, 无法开始记录。"), true);
       return;
    }
 
-   const int interval = m_edMtrInterval->value();
-   m_mlog->setInterval(interval);
-
-   /* ---- 扫描在跑: 进「跟随」, 不开文件 ----
-    * 这一路不发请求 (仲裁在 refresh()), 点是从扫描那边推过来的。这里再开一个文件只会得到
-    * 一份空表头 —— 一个"看起来在记录"的空文件比不记录更坏。 */
+   /* 扫描进行中开不了这份文件: 那些点写在扫描那份 CSV 里, 这一份只会得到一个空表头。
+    * 按钮本来就是灰的, 这里是兜底 (键盘也能到这儿) */
    if (m_ctl->running())
    {
-      QString err;
-      if (!m_mlog->start(interval, &err))
-      {
-         hint(err, true);
-         return;
-      }
-      hint(QStringLiteral("扫描进行中, 已切换为跟随: 曲线显示扫描采到的点, "
-                          "不发送请求, 不写文件。"),
-           false);
-      refresh();
+      hint(QStringLiteral("扫描进行中, 跟随的点写入扫描那份 CSV。"), false);
       return;
    }
 
@@ -3265,38 +2971,30 @@ void ScanWindow::onMtrStartClicked()
     * 推过去, 因为新文件的表头是 beginRecord 里一次写完的 */
    pushMeterMeta();
 
-   /* 先开文件再开采集: 开不了就不采 —— 让人守着一个"以为在存"的记录是最坏的一种
-    * (与扫描那边 append 失败即自动中止同一个道理) */
    QString err;
    if (!m_mlog->beginRecord(m_edMtrCsv->text().trimmed(), &err))
    {
-      hint(QStringLiteral("CSV 打开失败, 未开始采集: ") + err, true);
+      hint(QStringLiteral("CSV 打开失败: ") + err, true);
       return;
    }
 
-   if (!m_mlog->start(interval, &err))
-   {
-      m_mlog->endRecord();
-      hint(err, true);
-      return;
-   }
-
-   hint(QStringLiteral("连续读数开始: 间隔 %1 ms, 数据写入 %2。")
-           .arg(interval)
+   hint(QStringLiteral("开始记录: 数据写入 %1。")
            .arg(QDir::toNativeSeparators(m_mlog->recordPath())), false);
    refresh();
 }
 
-void ScanWindow::onMtrStopClicked()
+/* 「停止记录」—— 同样只管文件。**采集与曲线照旧** (2026-09-28 用户原话: "只停记录"),
+ * 所以这里不调 m_mlog->stop(): 那个会连采集一起停, 而下一拍 refresh() 又把它拉起来 ——
+ * 白闪一次, 还可能丢掉一个正在飞的请求 */
+void ScanWindow::onMtrStopRecordClicked()
 {
    if (m_mlog == nullptr)
       return;
 
    const int n = m_mlog->written();
-   m_mlog->stop();
    m_mlog->endRecord();
 
-   hint(QStringLiteral("连续读数已停止 (本次写入 %1 行)。").arg(n), false);
+   hint(QStringLiteral("已停止记录 (本次写入 %1 行)。").arg(n), false);
    refresh();
 }
 
@@ -3305,8 +3003,8 @@ void ScanWindow::onMtrClearClicked()
    if (m_mlog == nullptr)
       return;
 
-   /* 采集跑着时清空 = 曲线从头开始, 但**已经写进 CSV 的那些不动** —— 文件是追加的,
-    * 缓冲只是"眼前这一段"。要说清楚, 否则会以为把文件也清了 */
+   /* 清空只是把**眼前这一段**丢掉, 已经写进 CSV 的那些不动 —— 文件是追加的。
+    * 要说清楚, 否则会以为把文件也清了 */
    m_mlog->clear();
    refresh();
 }
@@ -3317,19 +3015,9 @@ void ScanWindow::onMtrIntervalChanged(int ms)
       m_mlog->setInterval(ms);
 }
 
-void ScanWindow::onMtrAvgChanged(int n)
-{
-   if (m_mlog != nullptr)
-      m_mlog->setAverage(n);
-
-   /* meta 跟着变: 平均次数直接决定这些数是怎么来的 (几倍于原始读数的稳定度), 换文件时
-    * 必须记下**当时**那个数 —— 见 pushMeterMeta() */
-   pushMeterMeta();
-}
-
 /* 把"这几行是哪个仪器什么配置采的"推给连续读数器, 它建文件时写进去 (meterlog.h 的 setMeta)。
- * 调用的三个时机: 开始、导出、改平均次数 —— 前两个是"马上要写文件了", 第三个是元数据本身
- * 变了。做在这里而不是每拍推一次: 每拍都要拼一遍字符串, 而它只在写文件的那一刻有用。 */
+ * 调用的两个时机: 开始记录、导出 —— 都是"马上要写文件了"。做在这里而不是每拍推一次:
+ * 每拍都要拼一遍字符串, 而它只在写文件的那一刻有用。 */
 void ScanWindow::pushMeterMeta()
 {
    if (m_mlog == nullptr)
@@ -3408,15 +3096,9 @@ void ScanWindow::onStartClicked()
    if (m_ctl->running())
       return;
 
-   /* 「读一次」在飞时不能起扫。按钮上那条条件挡不住这条缝: 「读一次」按下之后到回话
-    * 回来之间, 按钮一直是可用的 (那期间只有 m_readPending 变了, 而"能不能开始"原先没看它)。
-    * 两个请求撞在同一个源上不报错, 只会让 CSV 悄悄少一个点。 */
-   if (m_readPending)
-   {
-      hint(QStringLiteral("「读一次」请求未完成"),
-           true);
-      return;
-   }
+   /* 这里原来有一道 !m_readPending 的闸, 写着"「读一次」在飞时不能起扫"。2026-09-28 那个
+    * 按钮删了, 隐患从根上没了 —— 源只剩真机之后, 会发请求的只剩 ScanController 与
+    * MeterLog 两方, 而它们的交接就是下面那句 setHold(true) */
 
    applyCsvDefaultName();
 
@@ -3431,13 +3113,17 @@ void ScanWindow::onStartClicked()
     * 旁边的「开不了」红字)。这里只留一句"出发了": 区域、点数、时长、数据写到哪 */
    const Params p = currentParams();
 
-   /* 连续读数让位。**就在这儿、就在 m_ctl->start() 前一行** —— 这是"让位"这件事唯一
-    * 需要做的动作, 因为仲裁点是 GUI 线程里这十几条指令, 中间没有事件循环, 不存在
-    * "那边正好在同一时刻发了一个请求"这种缝。scanwindow.h 里说 m_ctl 与 m_mlog 都归
-    * 这一个窗口管, 就是为的这个。
+   /* 采集让位。**就在这儿、就在 m_ctl->start() 前一行** —— 这是"让位"这件事唯一需要做的
+    * 动作, 因为仲裁点是 GUI 线程里这十几条指令, 中间没有事件循环, 不存在"那边正好在同一
+    * 时刻发了一个请求"这种缝。scanwindow.h 里说 m_ctl 与 m_mlog 都归这一个窗口管, 就是
+    * 为的这个。
     *
-    * 让位而不是拒绝: 一开始要的行为就是"扫描跑着时功率计那一路跟着扫描走" (见 meterlog.h),
-    * 所以扫描起来 = 那边进 hold, 曲线改画扫描采到的点, 数据不丢 */
+    * 让位而不是拒绝: 要的行为就是"扫描跑着时功率计那一路跟着扫描走" (见 meterlog.h),
+    * 所以扫描起来 = 那边进 hold, 曲线改画扫描采到的点, 数据不丢。
+    *
+    * **这一句与 refresh() 里那句 setHold 是一对**: 那一边每拍算的是稳态, 这一边补的是
+    * m_ctl->start() 到下一拍 refresh() 之间那一次事件循环的缝 —— 那条缝里 tick() 会看到
+    * m_ctl 还没 running, 于是发出一个请求, 撞上控制器刚发的第一个点 */
    if (m_mlog != nullptr)
       m_mlog->setHold(true);
 
@@ -3448,14 +3134,10 @@ void ScanWindow::onStartClicked()
       return;
    }
 
-   /* 开跑之前把源重开一遍 —— 脚本源要靠这个把游标拨回第一个数。
-    * 真机不跟着做: 它那次 close/open 要收线程 → 枚举 USB → 开设备 → 读探头 → 重新开流,
-    * 几百毫秒起步, 而它本来就没有"游标"要复位 (取数按设备时间戳走水位线)。 */
-   if (m_meter != m_ophir)
-   {
-      m_meter->close();
-      m_meter->open(nullptr);
-   }
+   /* 这里原来有一段"非真机才把源重开一遍"—— 脚本源要靠 close/open 把游标拨回第一个数。
+    * 源只剩真机之后没有游标要复位 (真机取数按设备时间戳走水位线), 整块删掉;
+    * 真机更不能这么做: 那次 close/open 要收线程 → 枚举 USB → 开设备 → 读探头 → 重新开流,
+    * 几百毫秒起步, 而且会白冻一次界面 */
 
    /* 出发那一句必须在 m_ctl->start 之后: 它念的是控制器真建出来的网格 (gridNx/totalPoints) */
    hint(QStringLiteral("扫描开始: 区域 %1 × %2 mm (±%3), 共 %4 × %5 = %6 点, "
@@ -4101,11 +3783,10 @@ void ScanWindow::refresh()
    /* 回零中不能起扫: 回零把轴留在使能, 扫描半路撞上既不会自动中止也等不到插补 ——
     * 状态机会以为到了点, 其实一格没动。纵深防御, armRun() 里那道才是权威。
     *
-    * **!m_readPending 是 2026-09-22 补上的**: 原先没有它, 于是"点「读一次」→ 立刻点「开始
-    * 扫描」"这一个动作序列会让两个请求撞在同一个源上 (回话还没到, 按钮已经是可用的),
-    * 而 powermeter.h 说这种情况不报错、只会静默分错数。 */
+    * 这里原有一条 !m_readPending (2026-09-22 为"点「读一次」→ 立刻点「开始扫描」"这条
+    * 动作序列补的)。2026-09-28「读一次」删了, 那一条跟着撤 —— 见 §23.4 */
    m_btnStart->setEnabled(!running && m_connected && meter_ok && params_ok
-                          && !t.homing && !m_readPending);
+                          && !t.homing);
 
    const ScanController::State st = m_ctl->state();
    m_btnPause->setEnabled(running && st != ScanController::State::Paused);
@@ -4148,20 +3829,35 @@ void ScanWindow::refresh()
    /* ---- 功率计那一框的字 ---- */
    refreshMeterReadout();
 
-   /* ---- 三个请求发起方的仲裁。**全仓库只此一处** ----
+   /* ---- 两个请求发起方的仲裁 + 采集常开。**全仓库只此一处** ----
     *
     * powermeter.h:28-31 定死了: 同一时刻只允许一个未决请求, 违约不报错、只会静默分错数。
-    * 三个发起方: ① ScanController (扫描中) ② 「读一次」 ③ 连续读数 (MeterLog)。
-    * 优先级就是上面这个顺序 —— 前一个在场, 后一个让位。
+    * 2026-09-28 之前有三个发起方 (① 扫描 ②「读一次」③ 连续读数), 那个按钮删了之后只剩两方,
+    * 优先级也只剩一条: 扫描在场, 采集让位。
     *
-    * 让位不是"拒绝", 是"不开新的口"：每个发起方本来就是一问一答, 已经发出去的那一个照旧
+    * 让位不是"拒绝", 是"不开新的口": 两个发起方本来就是一问一答, 已经发出去的那一个照旧
     * 回收 (各家的 sender()/pending 比对会把不属于自己的那份丢掉)。所以这里只需要每拍把
-    * 两个开关摆成此刻该有的样子 —— 与别处一样, 不记"谁先按的"。 */
+    * 开关摆成此刻该有的样子 —— 与别处一样, 不记"谁先按的"。
+    *
+    * `m_cfgBusy` 是第三个让位理由 (改波长/量程/模式期间, 工作线程在停流改配置), 它不由
+    * 这里置位 —— 置位在 onMeterCfgChanged(), 清位在工作线程的回话里。
+    *
+    * **采集常开是"每拍重算的不变量", 不是构造里那一锤子**: 源开着就该在采。好处有三个 ——
+    * 打开成功之后不需要任何额外的 start(); 任何来源的一次意外 stop() (包括「重试」为了
+    * 解开卡死而调的那一次) 都会在下一拍被纠回来; 与"每拍重算、不缓存"这条既有规矩一致。
+    *
+    * **卡死那一支不救**: 那种情况下 running() 已经是 true, 这一句不会动它 —— 停在原地等
+    * 是 MeterLog 刻意的行为 (见 meterlog.h), 出路是「重试」 */
    if (m_mlog != nullptr)
    {
-      /* 扫描在跑、或手动读在飞 -> 进 hold: 不发请求, 但**不算停止** (曲线上照旧能画扫描
-       * 采回来的点, 见 pointLogged 那个槽) */
-      m_mlog->setHold(m_ctl->running() || m_readPending);
+      if (m_meter != nullptr && m_meter->isOpen() && !m_mlog->running())
+      {
+         QString err;
+         /* 失败不喊: 下一拍还会再来一次。真正的"采不到数"由 MeterLog::failed 报 */
+         m_mlog->start(m_edMtrInterval->value(), &err);
+      }
+
+      m_mlog->setHold(m_ctl->running() || m_cfgBusy);
       m_mlog->tick(m_clock.elapsed());
    }
 

@@ -117,31 +117,22 @@ private:
    void onResumeRunClicked();
    void onAbortClicked();
    void onRetestClicked();
-   /* 「取样源」。**不连总线也要能选真机**, 所以它不受任何门管 —— 那一整块框的判据全在
-    * refreshMeterPanel() 一处 (见它的注释) */
-   void onMeterChanged(int idx);
    /* 设备信息回来了: 真机那三行填选项表 / 当前选中项。**灰不灰与露不露都不归这里管**,
     * 那是 refreshMeterPanel() 每拍算的 */
    void onMeterInfoChanged();
    /* 操作员改了波长/量程/模式 (真机才有那三项) */
    void onMeterCfgChanged();
-   void onManualValueChanged(double v);
-   /* 脚本: 框里的文本与真正读的那份表是两份东西, 同步点只有 pushScriptPath() 一处 */
-   void onBrowseScript();
-   bool pushScriptPath();
-   /* 「读一次」。与 ScanController、以及连续读数器抢同一个未决请求, 三方仲裁在 refresh()
-    * 一处; 靠 m_readPending 认出回调是不是自己那一份 */
-   void onReadOnceClicked();
-   void onReadOnceReady(double watts);
-   void onReadOnceFailed(const QString &err);
-   /* 连续读数: 开始 / 停止 / 清空 / 换输出文件 / 把当前缓冲整份导出 */
-   void onMtrStartClicked();
-   void onMtrStopClicked();
+   /* 「重试」—— 打开失败、或采集卡死时的唯一出口。与构造函数里那一次打开**走同一条路**
+    * (openMeter), 没有第二条打开路径 */
+   void onMtrRetryOpen();
+   /* 记录: 开始 / 停止 / 清空 / 换输出文件 / 把当前缓冲整份导出。
+    * **它们只管文件** —— 采集与曲线与此无关 (2026-09-28 起采集常开, 见 openMeter 的注释) */
+   void onMtrStartRecordClicked();
+   void onMtrStopRecordClicked();
    void onMtrClearClicked();
    void onMtrBrowseCsv();
    void onMtrExportClicked();
    void onMtrIntervalChanged(int ms);
-   void onMtrAvgChanged(int n);
    /* "这几行是哪个仪器什么配置采的" -> MeterLog::setMeta (建文件那一刻写进 CSV 的头几行) */
    void pushMeterMeta();
 
@@ -261,25 +252,45 @@ private:
    /* 连续读数那份 CSV 的文件名留空时按时间戳起一个 (与 applyCsvDefaultName 是两件事) */
    void applyMtrCsvDefaultName();
 
+   /* ---- 功率计的打开 ----
+   * **唯一的打开入口**, 构造函数与「重试」都走它。它做三件事: 两道"装没装"的闸 (不阻塞)、
+   * m_meter->open() (阻塞, 正常几百 ms, 最坏 12 s)、按成败摆状态。
+   *
+   * 打开成功之后**这里不 start() 采集** —— 采集是"源开着就该在采"的每拍不变量, 写在
+   * refresh() 那一处 (全仓库唯一写点), 见那段注释。任何来源的一次意外 stop() 都会在
+   * 下一拍被纠回来, 包括这里的 m_mlog->stop()。 */
+   void openMeter();
+   /* 真机打不开那两句原因 (纯注册表查询, 不阻塞)。空 = 可以试着开 */
+   static QString ophirOpenWhy();
+
    /* ---- 三件套 ---- */
    EcatThread       *m_thr  = nullptr;
    EcatBusView      *m_busv = nullptr;
    ScanController   *m_ctl  = nullptr;
    MapCanvas        *m_canvas = nullptr;
 
-   /* 四个功率计都留着, m_meter 指向当前选中的那个。m_ophir 是真机那一个 (PD300R + Juno+),
-    * 有自己的工作线程, 还会主动报 infoChanged。**它只有这一个实例**: Ophir 表头是独占的
-    * (第二个实例打开同一个头会 0x80040201), 所以不能有第二个 OphirMeter */
+   /* 功率计的那一个源。**m_meter 在构造里定死一次, 此后不再改变** —— 界面上已经没有换源的
+    * 地方了 (onMeterChanged 随下拉框一起删了)。
+    *
+    * 默认构建下它就是 m_ophir。三个模拟源留下来只为一个用途: 编译开关
+    * `SCAN_ALLOW_SIM_METER` (CMakeLists, 默认 OFF) 打开时 m_meter 指向 m_random, 于是
+    * **没有硬件也能把整条扫描流水线跑通**。类本身在 powermeter.h —— selftest.cpp 的
+    * test_meter_sources() 直接构造它们三个, 与界面无关, 所以它们一个都不能删。
+    *
+    * m_ophir 有自己的工作线程, 还会主动报 infoChanged。**它只有这一个实例**: Ophir 表头是
+    * 独占的 (第二个实例打开同一个头会 0x80040201), 所以不能有第二个 OphirMeter */
    ManualMeter *m_manual = nullptr;
    RandomMeter *m_random = nullptr;
    ScriptMeter *m_script = nullptr;
    OphirMeter  *m_ophir  = nullptr;
    PowerMeter  *m_meter  = nullptr;
 
-   /* ---- 连续读数那一版 ----
-    * m_mlog 常驻 (它不依赖界面: 跟随扫描时点照收)。
-    * 三方仲裁 (扫描 / 「读一次」/ 连续读数) 的唯一写点就是 refresh() —— 全在这一个函数里,
-    * 因为接口约定"同一时刻只允许一个未决请求" (powermeter.h:28-31)。 */
+   /* ---- 采集与记录那一版 ----
+    * m_mlog 常驻, 且**采集常开** —— "源开着就该在采"是 refresh() 里每拍重算的不变量,
+    * 不是一次按下去的事件。
+    * 两方仲裁 (扫描 / 采集) 的唯一写点也是 refresh() —— 全在那一个函数里, 因为接口约定
+    * "同一时刻只允许一个未决请求" (powermeter.h:28-31)。
+    * 「读一次」那第三方 2026-09-28 删了 (见 docs/scan_sweep.md §36)。 */
    MeterLog   *m_mlog  = nullptr;
    MeterCurve *m_curve = nullptr;
 
@@ -371,47 +382,40 @@ private:
 
    /* ---- 功率计 ----
     * **这一块框不在可用性表里** (2026-09-22 起): 它里面没有"参数", 只有一台随时可以接上/断开的
-    * 仪器, 而它的用处恰恰是"还没连总线, 先把真机选上"。所以它不需要先过一个门。判据全在
+    * 仪器, 而它的用处恰恰是"还没连总线, 先把真机打开"。所以它不需要先过一个门。判据全在
     * refreshMeterPanel() 一处, 与其余控件同一条规矩 (每拍重算, 不缓存)。
     *
-    * 2026-09-22 曾经把这七样东西搬进一个独立的功率计窗口、参数栏只留一行取样源; 当天又搬回来
-    * —— 那个窗口要靠菜单点开, 而"外露"是这一块的要求 (见 docs/scan_sweep.md §23)。 */
-   QComboBox      *m_cbMeter   = nullptr;
-   QLabel         *m_lMeter    = nullptr;   /* 状态行: kind · 已打开/没打开 · 真机摘要 */
-   QDoubleSpinBox *m_edManualV = nullptr;   /* 手填值源 */
-   QDoubleSpinBox *m_edRandomBase = nullptr;/* 随机源的基值 (随机源本来就有这一个旋钮) */
-   QDoubleSpinBox *m_edRandomN = nullptr;   /* 随机源的噪声幅度 */
-   QLineEdit      *m_edScript  = nullptr;   /* 脚本源: 框里的文本 */
-   QPushButton    *m_btnScript = nullptr;
-   /* 两个模拟源共用的"模拟往返延迟": 真机一次往返可能上百毫秒, 而模拟源默认是 20ms ——
-    * 想在没有真机的时候看时序 (间隔、超时、一个未决请求那条约束) 就得把它调大 */
-   QWidget  *m_simRow     = nullptr;
-   QSpinBox *m_edSimDelay = nullptr;
+    * 2026-09-28 起**取样源只剩真机一个**, 下拉框与各源参数行连同「读一次」一起删了
+    * (见 docs/scan_sweep.md §36)。面板只剩三件事: 仪器状态 / 实时读数 / 记录。 */
+   QLabel      *m_lMeter    = nullptr;   /* 状态行: kind · 已打开/没打开 · 原因或真机摘要 */
+   /* 「重试」。打开失败、以及采集卡死 (MeterLog::timedOut) 时唯一的出口 ——
+    * 那两条路原来各靠换源与「停止」→「开始」出去, 随面板简化一起没了 */
+   QPushButton *m_btnMtrRetry = nullptr;
+   bool         m_mtrOpening  = false;   /* 打开中: 防重入 (嵌套事件循环能造出重入) */
+   bool         m_mtrTried    = false;   /* 试过一次(不论成败) —— 失败且没打开才露「重试」 */
+   /* 上一次打开失败的原因 (openMeter 写, 状态行读)。**存下来而不是每拍现问**:
+    * 它有两个来源 —— 打开前那两道注册表闸, 与 open() 自己回的那句错误 —— 后者只在失败
+    * 那一瞬间拿得到。成功时清空 */
+   QString      m_mtrWhy;
+   /* 改波长/量程/模式期间让采集让位。**它是一段有头有尾的窗口**, 由工作线程回话关闭
+    * (infoChanged 或 configFailed); 工作线程自己死了就两条都到不了 —— 那时采集会一直停着,
+    * 界面上"采集中"的字还在而数不涨。这个缺口写在这里, 见 refreshMeterPanel 的说明 */
+   bool         m_cfgBusy     = false;
    /* 真机那三项。选项表由设备给 (探头不同, 能选的波长与量程就不同), 一个都不写死。
     * 每一项没有单独的"那一行"要露/藏: 整块 m_devBox 一起显隐, 而某一项设备根本没有时
     * 它是**空的 + 灰的** (判据在 refreshMeterPanel 里) */
    QComboBox *m_cbWl = nullptr, *m_cbRange = nullptr, *m_cbMeasMode = nullptr;
    QLabel    *m_lDevInfo = nullptr;
-   /* 各源自己那一行: 选到谁只露谁 (都摊开的话一半的控件永远是灰的) */
-   QWidget *m_manualRow = nullptr, *m_randomRow = nullptr, *m_scriptRow = nullptr;
-   /* 真机那一块 (波长/量程/模式 + 设备信息), 只在选到真机且它开着时才露 */
+   /* 真机那一块 (波长/量程/模式 + 设备信息), 只在真机开着时才露 */
    QWidget *m_devBox = nullptr;
    /* 填充那三个下拉框时挡掉信号: 每 addItem 一次都会被当成操作员改配置 (一串 stop/set/start) */
    bool m_meterCfgQuiet = false;
 
-   /* 「读一次」的按钮、读数与未决状态。兜底定时器必须留着: 接口约定"恰好回一次"是源那边的
-    * 义务, 源不回时这个动作会永远卡住 —— 而它卡住会连带把连续读数的「开始」压死 */
-   QPushButton    *m_btnRead   = nullptr;
-   QLabel         *m_lReadout  = nullptr;
-   QTimer         *m_readTimer = nullptr;
-   bool            m_readPending = false;
-   qint64          m_readSentMs  = 0;   /* m_clock 的读数, 单调钟 */
-
-   /* 连续读数 (见 meterlog.h) */
+   /* ---- 采集与记录 (见 meterlog.h) ----
+    * **采集常开**, 记录是另一个动作: 「开始记录」只开那份 CSV, 采集与曲线照旧跑 */
    QSpinBox    *m_edMtrInterval  = nullptr;
-   QSpinBox    *m_edMtrAvg       = nullptr;   /* 一次采样平均几个读数 (1 = 每次都要) */
-   QPushButton *m_btnMtrStart    = nullptr;
-   QPushButton *m_btnMtrStop     = nullptr;
+   QPushButton *m_btnMtrStart    = nullptr;   /* 「开始记录」 */
+   QPushButton *m_btnMtrStop     = nullptr;   /* 「停止记录」 */
    QPushButton *m_btnMtrClear    = nullptr;
    QPushButton *m_btnMtrExport   = nullptr;
    QLineEdit   *m_edMtrCsv       = nullptr;

@@ -95,6 +95,24 @@ set_target_properties(scan PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin"
 )
 
+# ---------------------------------------------------------------- 无真机跑通整条流水线 (可选)
+#
+# 2026-09-28 起「功率计」面板上只剩真机一个取样源 (见 docs/scan_sweep.md §36), 于是
+# **默认构建下没真机就一趟扫描也起不来**: ScanController::preflight 会拒。现场要的是一台
+# 产品, 那个取舍是确认过的 —— 但它带来一个副作用: 没有功率计就没法演示/回归整条扫描路。
+#
+# 这个开关就是留的那个口子: 打开时构造期把取样源换成随机源, **界面形状一个字不变**
+# (面板仍是简化后的样子), 只是状态行会如实写「随机 (噪声)」。
+#
+#   cmake -S . -B out/build/hmi-qt-ucrt64 -DSCAN_ALLOW_SIM_METER=ON
+#
+# 只在 GUI 目标上定义, 不进 SCAN_COMMON_SRC —— 自检**不需要**它: 那边本来就拿模拟源跑
+# (FakeBus + 三个模拟功率计), 没有"没有硬件"这个问题。
+option(SCAN_ALLOW_SIM_METER "无真机时用随机源顶替, 以便跑通整条扫描流水线" OFF)
+if (SCAN_ALLOW_SIM_METER)
+  target_compile_definitions(scan PRIVATE SCAN_ALLOW_SIM_METER)
+endif()
+
 target_compile_options(scan PRIVATE
   $<$<COMPILE_LANGUAGE:C>:$<$<C_COMPILER_ID:GNU>:-Wall -Wextra -Wno-unused-parameter>>
   $<$<COMPILE_LANGUAGE:CXX>:$<$<CXX_COMPILER_ID:GNU>:-Wall -Wextra>>
