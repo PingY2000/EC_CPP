@@ -122,6 +122,14 @@ private:
    void onMeterInfoChanged();
    /* 操作员改了波长/量程/模式 (真机才有那三项) */
    void onMeterCfgChanged();
+   /* 操作员换了一台设备 (下拉里那一列序列号)。**与上面那一条不同**: 它列的不是配置而是
+    * 哪一台仪器, 所以不能挂在那个 connect 循环上 —— 走这儿: 记下序列号 -> 停采集 -> 清缓冲
+    * -> 重开 (openMeter)。切换是**无声地清缓冲**的, 那条 tooltip 就在下拉框上 */
+   void onMtrDeviceChanged(int idx);
+   /* 「添加」: 把旋钮上那个波长**写进表头**并选中 (设备那张表是只读的, 表里没有的值没有
+    * 下标可用 —— 这是本程序唯一一处写设备)。与那三个下拉框同一套: m_cfgBusy + setHold,
+    * 靠 infoChanged / configFailed 收尾。写入后会向设备读回一次列表核对 */
+   void onMtrAddWavelength();
    /* 「重试」—— 打开失败、或采集卡死时的唯一出口。与构造函数里那一次打开**走同一条路**
     * (openMeter), 没有第二条打开路径 */
    void onMtrRetryOpen();
@@ -411,6 +419,27 @@ private:
    /* 填充那三个下拉框时挡掉信号: 每 addItem 一次都会被当成操作员改配置 (一串 stop/set/start) */
    bool m_meterCfgQuiet = false;
 
+   /* ---- 设备那一行 ----
+    * **常驻**, 不在 m_devBox 里, 也不在 m_mtrCfgQuiet 那套信号闸的保护范围内: 它列的是
+    * "哪一台仪器" (ScanUSB 给的序列号), 换成它等于换一台设备而不是改它的配置, 所以它**另接**
+    * onMtrDeviceChanged, 不进那三个框的 connect 循环。枚举结果为空时它是灰的 (refreshMeterPanel)
+    *
+    * 它的值也是**唯一**进 scan.ini 的那一项 (meter/serial): "上一次用的是这一台"是操作习惯,
+    * 与波长/量程/模式那种设备内部状态不同 (见 scanprefs.h) */
+   QComboBox *m_cbMtrDev = nullptr;
+
+   /* ---- 自定义波长 ----
+    * 设备给的波长表是只读的, 表里没有的值**根本没有下标可用**, 所以只有"写进设备"这一条路
+    * (ophirmeter.h 的 addCustomWavelength)。范围的两个端点只写一遍: 这里的量程与工作线程
+    * 的越界拒绝都读 ophirmeter.h 里那两个常量 */
+   QSpinBox    *m_sbWlAdd  = nullptr;
+   QPushButton *m_btnWlAdd = nullptr;
+   /* 正在加的那个波长 (nm), -1 = 没有这一件事在等着回话。
+    * **为什么要有它**: 成功那条回话是 infoChanged, 而那条信号"改了波长/量程/模式"也用 ——
+    * 不记着这一趟是"加波长", 就没法只在那一种情形下报"已加入" (报错了更糟: 每次改配置成功
+    * 都会冒出一句)。失败那条回话 configFailed 会把它清掉 */
+   int          m_wlAddNm  = -1;
+
    /* ---- 采集与记录 (见 meterlog.h) ----
     * **采集常开**, 记录是另一个动作: 「开始记录」只开那份 CSV, 采集与曲线照旧跑 */
    QSpinBox    *m_edMtrInterval  = nullptr;
@@ -420,10 +449,11 @@ private:
    QPushButton *m_btnMtrExport   = nullptr;
    QLineEdit   *m_edMtrCsv       = nullptr;
    QPushButton *m_btnMtrCsv      = nullptr;
-   QLabel      *m_lMtrCount      = nullptr;   /* 缓冲 N 点 / 采集中 / 跟随扫描中 / **卡住了** */
-   QLabel      *m_lMtrLast       = nullptr;   /* 最近一次读数 (大字号) */
+   QLabel      *m_lMtrCount      = nullptr;   /* 缓冲 N 点 / 采集中 / 跟随扫描中 / **卡住了**
+                                               * 记录中时末尾还有 "已写入 N 行" —— 原来那是
+                                               * 单独一行, 并入这里 (2026-09-28 §37) */
+   QLabel      *m_lMtrLast       = nullptr;   /* 最近一次读数 (大字号, 按量级换前缀) */
    QLabel      *m_lMtrStats      = nullptr;
-   QLabel      *m_lMtrWritten    = nullptr;
 
    /* ---- 「轴信号」那块表的两个网格 (见 LampGrid)。同一张表上左右排开, 前两格归
     * m_axGrid, 后三格归 m_limGrid ---- */

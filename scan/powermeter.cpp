@@ -5,6 +5,8 @@
 #include <QTextStream>
 #include <QTimer>
 
+#include <cmath>
+
 namespace scan {
 
 QStringList meterMetaLines(const PowerMeter *m)
@@ -31,6 +33,91 @@ QString unitLabel(const PowerMeter *m)
    if (m == nullptr || m->unit().isEmpty())
       return QStringLiteral("单位不明");
    return m->unit();
+}
+
+/* ---------------------------------------------------------------- 屏幕上的量级换算 */
+
+/* 档位: |v| >= 1 -> W,  >= 1e-3 -> mW,  更小 -> μW。
+ * 两个界都用 1 的幂, 于是 0.001 W 显示 1 mW、0.999 W 显示 999 mW 而不是 0.999 W ——
+ * **同一量级里口径一致**比"尽量短"要紧。v == 0 归 W (屏幕写 "0 W")。
+ *
+ * `*divisor` 是**除数** (0.0015 W 除掉 1e-3 得 1.5 mW), 与 powermeter.h / metercurve.h
+ * 那两句"调用方拿各个数去除"是同一个约定 —— 写成 1e3 再让调用方乘的话, 三处的读法就分了岔。
+ *
+ * 唯一的前置条件: 单位**确实是 "W"**。这不是一句防御性代码, 是这个换算的**全部依据** ——
+ * J 是能量、dBm 是对数、空是"不知道", 三种都不许乘除 (见 powermeter.h)。 */
+static void pickPrefix(double v, double *divisor, QString *label)
+{
+   const double a = std::fabs(v);
+
+   *divisor = 1.0;
+   *label   = QStringLiteral("W");
+   if (v == 0.0)
+      return;
+   if (a < 1e-3)
+   {
+      *divisor = 1e-6;
+      *label   = QStringLiteral("μW");
+   }
+   else if (a < 1.0)
+   {
+      *divisor = 1e-3;
+      *label   = QStringLiteral("mW");
+   }
+}
+
+PowerText scalePower(double v, const QString &unit)
+{
+   PowerText out;
+   out.value = v;
+   out.label = unit;
+
+   if (unit != QLatin1String("W"))
+      return out;                       /* J / dBm / 空: 原样 */
+
+   double  div = 1.0;
+   QString lab;
+   pickPrefix(v, &div, &lab);
+   out.value = v / div;
+   out.label = lab;
+   return out;
+}
+
+QString scaleFor(double max_abs, const QString &unit, double *divisor)
+{
+   if (divisor != nullptr)
+      *divisor = 1.0;
+   if (unit != QLatin1String("W"))
+      return unit;                      /* 不换前缀: 单位字也原样 (空 -> 空) */
+
+   double  div = 1.0;
+   QString lab;
+   pickPrefix(max_abs, &div, &lab);
+   if (divisor != nullptr)
+      *divisor = div;
+   return lab;
+}
+
+QString formatReading(double v)
+{
+   /* 0 先单独写掉: 零**没有量级**, 科学计数法在它身上只是噪声 —— 而挡住光的时候屏幕上正是
+    * 一片 0 (大字读数、统计那几个数), "0.0000e+00 W" 比 "0 W" 难读得多。
+    * v == 0.0 对 -0.0 也成立 (IEEE), 于是不会出现 "-0.0000e+00" 这种写法 */
+   if (v == 0.0)
+      return QStringLiteral("0");
+
+   if (std::fabs(v) >= 1e-3)
+      return QString::number(v, 'g', 6);
+   return QString::number(v, 'e', 4);
+}
+
+QString powerText(double v, const QString &unit)
+{
+   if (unit.isEmpty())
+      return formatReading(v) + QStringLiteral(" 单位不明");
+
+   const PowerText t = scalePower(v, unit);
+   return formatReading(t.value) + QLatin1Char(' ') + t.label;
 }
 
 /* 三个模拟实现都用 QTimer::singleShot 把 emit 挪出调用栈: 直接 emit 会让状态机的槽在

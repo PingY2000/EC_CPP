@@ -138,11 +138,33 @@ QString unitFromDeviceInfo(const QString &sensor_type, const QString &mode_name)
    return QString();      /* 认不出来。**不猜**, 见 ophirmeter.h 的说明 */
 }
 
+/* 见 ophirmeter.h。设备给的选项串格式不由我们定, 所以只认"最前面那一串数字"这一条:
+ * 多一个字符都不影响 (nm / NM / 空格), 少一个数字就认不出 (-1)。 */
+int wavelengthNm(const QString &option)
+{
+   int i = 0;
+   while (i < option.size() && !option.at(i).isDigit())
+      ++i;
+   if (i >= option.size())
+      return -1;                     /* 一个数字都没有 */
+
+   long v = 0;
+   int  digits = 0;
+   while (i < option.size() && option.at(i).isDigit())
+   {
+      v = v * 10 + (option.at(i).unicode() - u'0');
+      ++i;
+      if (++digits > 6)              /* 一串阿拉伯数字不像波长: 当认不出, 别让它溢出 */
+         return -1;
+   }
+   return (int)v;
+}
+
 struct OphirMeter::Private
 {
    QThread *thread = nullptr;
 
-   QMutex         mx;
+   mutable QMutex mx;           /* mutable: wantedSerial() 是 const 的, 它也要加这把锁 */
    QWaitCondition ready;
    bool           open_done = false;
    bool           open_ok   = false;
@@ -154,6 +176,8 @@ struct OphirMeter::Private
    int        want_wl    = -1;  /* -1 = 没有待改的 */
    int        want_range = -1;
    int        want_mode  = -1;
+   int        want_add_wl = -1;  /* 要加进设备的那个波长 (nm); -1 = 没有 */
+   QString    want_serial;       /* 想打开哪一台; 空 = 枚举到的第一台 */
 
    mutable QMutex info_mx;
    OphirInfo      info;
@@ -250,6 +274,26 @@ OphirInfo OphirMeter::info() const
    return p->info;
 }
 
+/* 两个"下一次打开用哪一台"的接口。**必须在 open() 之前设** (工作线程一启动就读它),
+ * 形状与 want_wl 那几个待改项一样: 界面写、工作线程读, 用同一把锁。 */
+void OphirMeter::setWantedSerial(const QString &serial)
+{
+   QMutexLocker<QMutex> lk(&p->mx);
+   p->want_serial = serial;
+}
+
+QString OphirMeter::wantedSerial() const
+{
+   QMutexLocker<QMutex> lk(&p->mx);
+   return p->want_serial;
+}
+
+void OphirMeter::addCustomWavelength(int nm)
+{
+   QMutexLocker<QMutex> lk(&p->mx);
+   p->want_add_wl = nm;
+}
+
 bool OphirMeter::open(QString *err)
 {
    if (isOpen())
@@ -268,7 +312,10 @@ bool OphirMeter::open(QString *err)
       p->open_done = false;
       p->open_ok   = false;
       p->open_err.clear();
+      /* 上次那几条待改项一律作废 (它们是对**上一台**说的); want_serial **不清** ——
+       * 它是"我要哪一台", 恰恰要在这一趟里用上 */
       p->want_wl = p->want_range = p->want_mode = -1;
+      p->want_add_wl = -1;
       p->want_ms = 0;
    }
    p->want.storeRelease(0);
@@ -340,12 +387,25 @@ void OphirMeter::runSession()
    /* Apartment 模型: 本线程必须先 CoInitializeEx, 之后每一次 COM 调用都得在这个线程里 */
    ComApartment apt;
 
+   /* 上一次那一份设备表先作废: 枚举还没跑到, 界面上不该留着**上一次会话**的序列号 ——
+    * 它可能已经不在了 (被拔走 / 换了 USB 口), 而那一行是让人照着换设备的 */
+   {
+      QMutexLocker<QMutex> lk(&p->info_mx);
+      p->info.device_serials.clear();
+   }
+
    auto failOpen = [this](const QString &msg) {
-      QMutexLocker<QMutex> lk(&p->mx);
-      p->open_err  = msg;
-      p->open_ok   = false;
-      p->open_done = true;
-      p->ready.wakeAll();
+      {
+         QMutexLocker<QMutex> lk(&p->mx);
+         p->open_err  = msg;
+         p->open_ok   = false;
+         p->open_done = true;
+         p->ready.wakeAll();
+      }
+      /* **打开失败也要报一次**。枚举出来的设备表在打开之前就发布了, 界面正等着它 ——
+       * "这台打不开, 换一台再按重试"是那一行唯一的用处, 不给它这一次 infoChanged,
+       * 多设备里坏的那台一挡就一台也换不了 (见 ophirmeter.h 的 device_serials) */
+      emit infoChanged();
    };
 
    if (!apt.owned)
@@ -378,10 +438,37 @@ void OphirMeter::runSession()
       return;
    }
 
-   long h = 0;
-   if (!com.openUsbDevice(serials.first(), &h, &err))
+   /* 枚举结果**在打开之前**就发布出去。多设备时"这台打不开, 换一台再试"这条路全指望它:
+    * 打不开的时候界面也得看得见列表, 否则一台也换不了 (型号要打开之后才知道, 所以这里
+    * 只有序列号 —— Ophir 的枚举接口就只给序列号) */
    {
-      failOpen(QStringLiteral("打开设备 %1 失败: %2").arg(serials.first(), err));
+      QMutexLocker<QMutex> lk(&p->info_mx);
+      p->info.device_serials = serials;
+   }
+
+   QString wanted;
+   {
+      QMutexLocker<QMutex> lk(&p->mx);
+      wanted = p->want_serial;
+   }
+
+   /* 指定了哪一台就打哪一台。**指定那台不在时不许悄悄换成第一台** —— 两台表头接在同一个
+    * 台面上时, 悄悄换一台就是拿另一个探头的数据当这一个用 */
+   QString pick = serials.first();
+   if (!wanted.isEmpty())
+   {
+      if (!serials.contains(wanted))
+      {
+         failOpen(QStringLiteral("未找到上次那台功率计 (%1)。请确认它已插好。").arg(wanted));
+         return;
+      }
+      pick = wanted;
+   }
+
+   long h = 0;
+   if (!com.openUsbDevice(pick, &h, &err))
+   {
+      failOpen(QStringLiteral("打开设备 %1 失败: %2").arg(pick, err));
       return;
    }
 
@@ -392,6 +479,7 @@ void OphirMeter::runSession()
    };
 
    OphirInfo info;
+   info.device_serials = serials;      /* 成功那一份也要带上 (下面整份覆盖 p->info) */
    OphirCom::DeviceInfo dinfo;
    if (!com.getDeviceInfo(h, &dinfo, &err))
    {
@@ -490,18 +578,66 @@ void OphirMeter::runSession()
 
    while (!p->quit.loadAcquire())
    {
-      int wl = -1, rg = -1, md = -1;
+      int wl = -1, rg = -1, md = -1, addwl = -1;
       {
          QMutexLocker<QMutex> lk(&p->mx);
-         wl = p->want_wl; rg = p->want_range; md = p->want_mode;
+         wl = p->want_wl; rg = p->want_range; md = p->want_mode; addwl = p->want_add_wl;
          p->want_wl = p->want_range = p->want_mode = -1;
+         p->want_add_wl = -1;
       }
 
-      if (wl >= 0 || rg >= 0 || md >= 0)
+      if (wl >= 0 || rg >= 0 || md >= 0 || addwl >= 0)
       {
          /* 手册: "Configuration methods cannot be called while a channel is streaming" */
          QString e2;
          bool ok = com.stopStream(h, k_channel, &e2);
+
+         /* 自定义波长: 先写进设备, 再**当场把列表读回来核对**。
+          * 「写成了什么」只有读回来的那一份表说得清 —— 写成功 ≠ 设备接受了这个值,
+          * 而找不到就什么都不改 (不进下拉、不进 CSV): 让一个没生效的波长进文件,
+          * 那份文件就开始说假话 (§37) */
+         if (ok && addwl >= 0)
+         {
+            if (addwl < k_wl_min_nm || addwl > k_wl_max_nm)
+            {
+               ok = false;
+               e2 = QStringLiteral("波长超出 %1-%2 nm。请换一个值。").arg(k_wl_min_nm).arg(k_wl_max_nm);
+            }
+            else if (!com.addWavelength(h, k_channel, addwl, &e2))
+            {
+               ok = false;               /* e2 已是 COM 的原话 */
+            }
+            else
+            {
+               QStringList opts;
+               long        idx = -1;
+               QString     e3;
+               if (!com.getWavelengths(h, k_channel, &idx, &opts, &e3))
+               {
+                  ok = false;
+                  e2 = QStringLiteral("写入后读回波长列表失败: %1").arg(e3);
+               }
+               else
+               {
+                  int found = -1;
+                  for (int i = 0; i < opts.size(); i++)
+                  {
+                     if (wavelengthNm(opts.at(i)) == addwl)
+                     {
+                        found = i;
+                        break;
+                     }
+                  }
+                  if (found < 0)
+                  {
+                     ok = false;
+                     e2 = QStringLiteral("设备不接受这个波长。请换一个值。");
+                  }
+                  else
+                     wl = found;         /* 落到下面那句 setWavelength —— 顺手选中它 */
+               }
+            }
+         }
 
          if (ok && wl >= 0) ok = com.setWavelength(h, k_channel, wl, &e2);
          if (ok && rg >= 0) ok = com.setRange(h, k_channel, rg, &e2);

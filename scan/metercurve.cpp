@@ -50,12 +50,17 @@ void MeterCurve::setSourceName(const QString &s)
    update();
 }
 
-void MeterCurve::setUnit(const QString &u)
+void MeterCurve::setUnit(const QString &u, double scale)
 {
-   if (u == m_unit)
+   /* scale 为 0 / 负 / 非数一律退回 1: 除它会把整条纵轴画成 inf 或翻过来 */
+   if (!(scale > 0.0))
+      scale = 1.0;
+
+   if (u == m_unit && scale == m_scale)
       return;
 
-   m_unit = u;
+   m_unit  = u;
+   m_scale = scale;
 
    /* 「单位不明」那句话只说在 tooltip 里: 图顶上那一行很窄 (参数栏就 320 宽), 而一个 "?"
     * 已经够让人停下来问一句"这是什么单位"了 —— 那正是要的效果。
@@ -164,8 +169,10 @@ void MeterCurve::paintEvent(QPaintEvent *)
          p.setPen(QColor(C_GRID));
          p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y));
          p.setPen(QColor(C_MUTED));
+         /* 刻度印的是**换算后**的数 (w / m_scale), 单位字也换过 (见 setUnit) ——
+          * 两者一起换才有一致的读法; 网格线位置仍按原始 w 画 */
          p.drawText(QRectF(0, y - 8, gutter - 5, 16), Qt::AlignRight | Qt::AlignVCenter,
-                    QString::number(w, 'g', 3));
+                    QString::number(w / m_scale, 'g', 3));
       }
    }
 

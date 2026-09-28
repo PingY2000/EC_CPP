@@ -66,16 +66,10 @@ static const int kBannerInset = 6;
 /* 默认 CSV 目录, 相对当前工作目录 (从仓库根敲 ./bin/scan.exe 时就落在 scan_out/) */
 static const char *kOutDir = "scan_out";
 
-/* 读数的显示格式 (量级从 nW 到 W 那一带, 不固定小数位):
- *   |v| >= 1e-3 -> 'g' 6 位有效数字;  否则 / 0 -> 'e' 4 位有效数字。
- * 只给操作员核对用, 入 CSV 的是 double, 一位没少。
- * **它只格式化数字, 不带单位** —— 单位一律由 unitLabel() 跟着取样源给 (真机可能是 J) */
-static QString fmtWatts(double v)
-{
-   if (std::fabs(v) >= 1e-3)
-      return QString::number(v, 'g', 6);
-   return QString::number(v, 'e', 4);
-}
+/* 读数的显示格式 (量级从 nW 到 W 那一带, 不固定小数位) 已经搬到 powermeter.cpp 的
+ * formatReading(): 「最近读数」与「统计」那四个数共用它, 而单位换算 (powerText / scaleFor)
+ * 也要用它 —— 三处各写一遍的话, 迟早一处改了另两处没改。那里在 SCAN_COMMON_SRC 里,
+ * 自检直接测得到 */
 
 /* ---------------------------------------------------------------- 参数框: 项表 + [保存][取消] */
 
@@ -381,6 +375,14 @@ void ScanWindow::refreshMeterPanel()
    if (m_devBox != nullptr)
       m_devBox->setVisible(open && isOphir);
 
+   /* 「设备」那一行**常驻** (它不在 m_devBox 里): 打不开的时候正是最需要它的时候 ——
+    * 那台换一台再按「重试」就是它的用处。灰只有两个理由: 枚举结果还没到 (空表), 或正在打开。
+    *
+    * **扫描中不给换**: 换设备会清缓冲 + 重开, 而扫描每一个点的读数都从这条路上来 ——
+    * 半途换一台就是让同一份 CSV 里混两台探头的数据。这与那三个配置框的判据是同一条 */
+   if (m_cbMtrDev != nullptr)
+      m_cbMtrDev->setEnabled(m_cbMtrDev->count() > 0 && !m_mtrOpening && !running);
+
    /* 真机那三项: 设备开着才可改, 扫描中不给改 (那三项会重开流), 空选项表也不放开
     * (探头没有这一项, 放开就是个假控件)。
     * 原来这里判的是 `!rec`, 意思是"别在采着的时候改配置" —— 采集常开之后那个意思由 cfgBusy
@@ -388,6 +390,14 @@ void ScanWindow::refreshMeterPanel()
    for (QComboBox *cb : { m_cbWl, m_cbRange, m_cbMeasMode })
       if (cb != nullptr)
          cb->setEnabled(open && isOphir && cb->count() > 0 && !running && !cfgBusy);
+
+   /* 「添加波长」与那三项同一格: 它也是"停流 → 改 → 重开"的一段 (而且它还要写设备),
+    * 所以扫描中与 cfgBusy 期间都不放开。**它不判 count()>0**: 波长表空着的时候添加正是
+    * 唯一的出路 */
+   if (m_btnWlAdd != nullptr)
+      m_btnWlAdd->setEnabled(open && isOphir && !running && !cfgBusy);
+   if (m_sbWlAdd != nullptr)
+      m_sbWlAdd->setEnabled(open && isOphir && !running && !cfgBusy);
 
    /* ---- 间隔 ----
     * **永远可改**: setInterval 只把"下一次"按新值重排, 不打断已经在飞的那一个请求 */
@@ -568,6 +578,13 @@ void ScanWindow::refreshMeterReadout()
          t = wedged ? QStringLiteral("请求无响应, 采集等待中 · ") + t
                     : (m_mlog->held() ? QStringLiteral("跟随扫描中 · ") + t
                                       : QStringLiteral("采集中 · ") + t);
+
+      /* 「本次写了多少行」并进这一行 (原来它是底下单独的一行, 那行还兼着写一句「未写入
+       * 文件」—— 后者删了: 没在写的时候它不说清任何事)。**只在记录中出**: 停了之后那一行
+       * 数已经由「已停止记录 (本次写入 N 行)」那句横幅交代过了, 常驻在屏幕上反而是过期的 */
+      if (m_mlog->recording())
+         t += QStringLiteral("   已写入 %1 行").arg(m_mlog->written());
+
       m_lMtrCount->setText(t);
       m_lMtrCount->setStyleSheet(wedged ? QStringLiteral("color:#ffb020; font-weight:bold;")
                                         : full ? QStringLiteral("color:#ffb020;")
@@ -586,10 +603,13 @@ void ScanWindow::refreshMeterReadout()
       }
       else if (v.last().ok)
       {
-         /* 单位跟源头走 (unitLabel): 模拟源是 W, 真机是设备自己报的 W/J, 认不出来写
-          * 「单位不明」—— 这里**不许**硬写一个 W (powermeter.h 的 unit()) */
-         m_lMtrLast->setText(QStringLiteral("%1 %2")
-                                .arg(fmtWatts(v.last().watts), unitLabel(m_meter)));
+         /* 数值与单位一起给 (powerText): 单位跟源头走 (模拟源是 W, 真机是设备自己报的 W/J,
+          * 认不出来写「单位不明」—— 这里**不许**硬写一个 W), 而**确实是 W 时**按量级换成
+          * mW / μW 显示 (0.00035 W 这种大字读起来费劲)。
+          *
+          * **只有屏幕换, CSV 不换**: 文件里照旧是原始值 + `# meter_unit=W`,
+          * 所以屏幕上的单位可能与文件里的不同 —— 这是定下来的口径 (§37) */
+         m_lMtrLast->setText(powerText(v.last().watts, unitLabel(m_meter)));
          m_lMtrLast->setStyleSheet(QString());
       }
       else
@@ -599,36 +619,42 @@ void ScanWindow::refreshMeterReadout()
       }
    }
 
-   /* ---- 统计 ---- */
+   /* ---- 统计与曲线共用同一个量级 ----
+    * 统计那四个数**共用一个前缀**, 按这一段里最大的那个 |值| 选 (scaleFor): 否则会出现
+    * "最小 0.5 mW  最大 1.5 mW" 这种一行两个单位的读法, 比固定用 W 还难对。曲线的纵轴
+    * 拿的是**同一个**前缀 —— 那一行字与那根轴说的是同一段数据, 两处换出不同的单位就是
+    * 自相矛盾。
+    *
+    * 单位字也从 scaleFor 出, **不能再写 unitLabel()**: 数已经除过了, 单位字还写 W 的话
+    * "最小 0.5 最大 1.5 (W)" 就是一句错话。空单位照旧说「单位不明」 */
+   const MeterLog::Stats st = m_mlog->stats();
+   const double  maxAbs  = (st.n > 0) ? std::fabs(st.max) : 0.0;
+   double        scale   = 1.0;
+   const QString shownUnit = scaleFor(maxAbs, m_meter != nullptr ? m_meter->unit() : QString(),
+                                      &scale);
+   const QString shownLabel = shownUnit.isEmpty() ? QStringLiteral("单位不明") : shownUnit;
+
    if (m_lMtrStats != nullptr)
    {
-      const MeterLog::Stats st = m_mlog->stats();
       m_lMtrStats->setText(st.n == 0
          ? QStringLiteral("暂无可用读数")
          : QStringLiteral("n=%1   最小 %2   最大 %3\n平均 %4   标准差 %5 (%6)")
               .arg(st.n)
-              .arg(fmtWatts(st.min), fmtWatts(st.max), fmtWatts(st.mean), fmtWatts(st.sd),
-                   unitLabel(m_meter)));
+              .arg(formatReading(st.min / scale), formatReading(st.max / scale),
+                   formatReading(st.mean / scale), formatReading(st.sd / scale),
+                   shownLabel));
       /* 这里原来还有一行"每次 N 个读数取平均"的后缀。2026-09-28 起界面上没有平均次数
        * 那个旋钮了 (MeterLog::setAverage 留着, 自检在测), 一句永远为真的说明不写 */
    }
 
-   /* ---- 文件 ---- */
-   if (m_lMtrWritten != nullptr)
-   {
-      m_lMtrWritten->setText(m_mlog->recording()
-         ? QStringLiteral("正在写入: %1   (本次 %2 行)")
-              .arg(QDir::toNativeSeparators(m_mlog->recordPath())).arg(m_mlog->written())
-         : QStringLiteral("未写入文件"));
-   }
-
-   /* ---- 曲线 ---- */
+   /* ---- 曲线 ----
+    * 纵轴跟统计那一行用**同一个**前缀与除数 (上面算好的 shownUnit / scale): 刻度上印的是
+    * 换过的数, 单位字也换过, 两者一起才对得上。
+    * **空单位照传** —— 图那边画一个 "?" 并把理由放进 tooltip, 而不是自己挑一个 W 画上 */
    if (m_curve != nullptr)
    {
       m_curve->setSourceName(m_meter != nullptr ? m_meter->kind() : QString());
-      /* 单位传给图, **空字符串照传** —— 图那边画一个 "?" 并把理由放进 tooltip,
-       * 而不是自己挑一个 W 画上 (见 metercurve.h 的 setUnit) */
-      m_curve->setUnit(m_meter != nullptr ? m_meter->unit() : QString());
+      m_curve->setUnit(shownUnit, scale);
       m_curve->update();
    }
 
@@ -928,6 +954,10 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
    connect(m_ophir, &OphirMeter::configFailed, this,
            [this](const QString &e) {
               m_cfgBusy = false;   /* 配置这条路走完了 (失败也是走完), 采集可以回来 */
+              /* 加波长那一趟失败时**必须**把这面旗放下来: 它只能由"成功"那条回话兑现,
+               * 留着的话下一次改波长成功会冒出一句张冠李戴的"已加入波长"。
+               * e 里已经是"现象 + 出路"那一句 (例如「设备不接受这个波长。请换一个值。」) */
+              m_wlAddNm = -1;
               hint(QStringLiteral("改功率计配置失败: ") + e, true);
            });
 
@@ -1776,9 +1806,19 @@ void ScanWindow::onSpanClicked()
 QWidget *ScanWindow::buildParamPanel()
 {
    QGroupBox *box = new QGroupBox(QStringLiteral("扫描参数"), this);
-   QFormLayout *f = new QFormLayout(box);
-   f->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
-   f->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
+
+   /* **两列**: 每一行并排两组「标签 + 控件」。十一个参数纵排下来太高 (2026-09-28 §37),
+    * 而参数栏那 340 px 横着放得下两组。
+    *
+    * 用 QGridLayout 而不是 QFormLayout —— 后者一行只能放一组。列号按 `(槽位 % 2) * 2` 算
+    * (标签占偶数列、控件占奇数列), 与 hmi/axispanel.cpp 那张读数表同一个写法。
+    *
+    * **这里没有一处按下标去定位控件** (没有 itemAt / takeAt): 灰化与「保存 / 取消」都按
+    * m_panels[PI_PARAM].items 里的**指针**走 (见 refreshEditability), 换布局动不到那些 */
+   QGridLayout *f = new QGridLayout(box);
+   /* 两个控件列各自吃掉多余宽度; 标签列不伸展 (它们只要那么宽) */
+   f->setColumnStretch(1, 1);
+   f->setColumnStretch(3, 1);
 
    /* 区域与分辨率这两个长度量的单位是 **mm** (2026-09-22 起界面上这么写)。
     * 代码内部、以及 CSV 表头里的 `area_x_unit` / `pulses_per_unit` 仍旧叫 "unit" ——
@@ -1866,18 +1906,51 @@ QWidget *ScanWindow::buildParamPanel()
    /* [保存][取消] 摆在框标题那一行的右端, 不占这个表单的任何一行 */
    panelBar(PI_PARAM, box);
 
-   f->addRow(QStringLiteral("区域 X"), m_edAreaX);
-   f->addRow(QStringLiteral("区域 Y"), m_edAreaY);
-   f->addRow(QStringLiteral("分辨率"), m_edRes);
-   f->addRow(QStringLiteral("1 mm ="), m_edPpu);
-   f->addRow(QStringLiteral("扫描速度"), m_edSpeed);
-   f->addRow(QStringLiteral("手动速度"), m_edManSpeed);
-   f->addRow(QStringLiteral("单点停留"), m_edDwell);
-   f->addRow(QStringLiteral("稳定窗口"), m_edSettle);
-   f->addRow(QStringLiteral("每点采样"), m_edSamples);
-   f->addRow(QStringLiteral("起始方向"), m_cbDir);
-   f->addRow(QStringLiteral("扫描方式"), m_cbMode);
-   f->addRow(QStringLiteral("CSV"), csvRow);
+   /* 摆位: `row` / `col` 是游标, col = 0 表示这一格是某行的左半, 2 表示右半。
+    * 每 pair 一次推进一格, 填满一行 (两格) 才换行 */
+   int row = 0, col = 0;
+
+   auto pair = [&](const QString &name, QWidget *w)
+   {
+      const int c = (col == 0) ? 0 : 2;
+      /* 标签右对齐: 与改两列之前那张表单同一个读法 (控件紧挨着标签左侧那一列) */
+      f->addWidget(new QLabel(name, box), row, c, Qt::AlignRight | Qt::AlignVCenter);
+      f->addWidget(w, row, c + 1);
+      if (c == 0)
+         col = 1;
+      else
+      {
+         col = 0;
+         row++;
+      }
+   };
+
+   /* 跨四列的一整行 (CSV 那一行, 以及底下三句说明): 先把只填了一半的那一行封掉 */
+   auto lone = [&](QLayout *l, QWidget *w)
+   {
+      if (col != 0)
+      {
+         col = 0;
+         row++;
+      }
+      if (l != nullptr)
+         f->addLayout(l, row, 0, 1, 4);
+      else
+         f->addWidget(w, row, 0, 1, 4);
+      row++;
+   };
+
+   pair(QStringLiteral("区域 X"),   m_edAreaX);
+   pair(QStringLiteral("区域 Y"),   m_edAreaY);
+   pair(QStringLiteral("分辨率"),   m_edRes);
+   pair(QStringLiteral("1 mm ="),   m_edPpu);
+   pair(QStringLiteral("扫描速度"), m_edSpeed);
+   pair(QStringLiteral("手动速度"), m_edManSpeed);
+   pair(QStringLiteral("单点停留"), m_edDwell);
+   pair(QStringLiteral("稳定窗口"), m_edSettle);
+   pair(QStringLiteral("每点采样"), m_edSamples);
+   pair(QStringLiteral("起始方向"), m_cbDir);
+   pair(QStringLiteral("扫描方式"), m_cbMode);
 
    m_btnDef = new QPushButton(QStringLiteral("恢复默认"), box);
    {
@@ -1887,11 +1960,21 @@ QWidget *ScanWindow::buildParamPanel()
    }
    connect(m_btnDef, &QPushButton::clicked, this, &ScanWindow::onRestoreDefaults);
 
-   QHBoxLayout *defRow = new QHBoxLayout;
-   defRow->setContentsMargins(0, 0, 0, 0);
-   defRow->addStretch(1);
-   defRow->addWidget(m_btnDef);
-   f->addRow(defRow);
+   /* 「恢复默认」与「扫描方式」同一行: 它自带名字 (按钮上那四个字), 所以**不要标签**,
+    * 直接摆在右半那一格, 靠右对齐 */
+   {
+      QWidget *w = new QWidget(box);
+      QHBoxLayout *h = new QHBoxLayout(w);
+      h->setContentsMargins(0, 0, 0, 0);
+      h->addStretch(1);
+      h->addWidget(m_btnDef);
+      f->addWidget(w, row, 3);
+      col = 0;
+      row++;
+   }
+
+   /* CSV 必须跨四列: 路径那个框是这一框里最需要宽度的一个 */
+   lone(csvRow, nullptr);
 
    m_lGrid = new QLabel(box);
    m_lGrid->setStyleSheet(QStringLiteral("color:#c8ced8;"));
@@ -1901,9 +1984,9 @@ QWidget *ScanWindow::buildParamPanel()
    m_lWarn = new QLabel(box);
    m_lWarn->setWordWrap(true);
    m_lWarn->setStyleSheet(QStringLiteral("color:#ff8f8f;"));
-   f->addRow(m_lGrid);
-   f->addRow(m_lEst);
-   f->addRow(m_lWarn);
+   lone(nullptr, m_lGrid);
+   lone(nullptr, m_lEst);
+   lone(nullptr, m_lWarn);
 
    /* 必须显式把缺省值填进控件: QDoubleSpinBox 初值是 0, 会被自己夹到最小值 0.1 —— 界面看着
     * 像那么回事, 而扫描区域其实只有 0.1 mm。必须在下面那些 connect 之前, 否则每 set 一个
@@ -2035,7 +2118,7 @@ QWidget *ScanWindow::buildMeterPanel()
    v->setSpacing(6);
 
    /* ---------------- 仪器 ----------------
-    * 没有"取样源"那一行: 只剩一个源, 写成一个下拉框或一句静态标签都是**不会变的假控件**。
+    * 仍然没有"取样源"那一行: 只剩一个源, 写成一个下拉框或一句静态标签都是**不会变的假控件**。
     * "现在用的是哪一台"由下面状态行第一段的 kind() 承担 */
 
    m_lMeter = new QLabel(box);
@@ -2046,9 +2129,26 @@ QWidget *ScanWindow::buildMeterPanel()
    m_lMeter->setTextFormat(Qt::PlainText);
    v->addWidget(m_lMeter);
 
+   /* 「设备」那一行 —— 台面上可能不止一台表头 (2026-09-28 §37)。
+    *
+    * **它有个前提别弄混: 枚举只发生在打开设备的时候** (ScanUSB 在 runSession 开头跑一次),
+    * 所以开着的时候再插一台要按「重试」才看得见 —— 而「重试」在一切正常时是藏着的, 那种
+    * 情形得重开程序。这里**不加**「刷新」按钮是刻意的: 这一轮要的就是去冗余 */
+   QHBoxLayout *devRow = new QHBoxLayout;
+   devRow->setSpacing(6);
+   devRow->addWidget(new QLabel(QStringLiteral("设备"), box));
+   m_cbMtrDev = new QComboBox(box);
+   m_cbMtrDev->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+   m_cbMtrDev->setToolTip(QStringLiteral("切换设备会停下采集并清空缓冲。"));
+   /* **不接 onMeterCfgChanged**: 它列的不是配置而是"哪一台仪器" (见 scanwindow.h) */
+   connect(m_cbMtrDev, &QComboBox::currentIndexChanged, this, &ScanWindow::onMtrDeviceChanged);
+   devRow->addWidget(m_cbMtrDev, 1);
+   v->addLayout(devRow);
+
    /* 「重试」。露不露归 refreshMeterPanel() (两个时机: 打开失败, 或采集卡死), 一开始不露 */
    m_btnMtrRetry = new QPushButton(QStringLiteral("重试"), box);
-   m_btnMtrRetry->setToolTip(QStringLiteral("重新打开功率计; 打开期间界面会停顿。"));
+   /* 加一句"重新枚举设备": 枚举只发生在打开里, 开着的时候插的那台要按这里才看得见 (§37) */
+   m_btnMtrRetry->setToolTip(QStringLiteral("重新打开功率计并重新枚举设备; 打开期间界面会停顿。"));
    connect(m_btnMtrRetry, &QPushButton::clicked, this, &ScanWindow::onMtrRetryOpen);
    m_btnMtrRetry->setVisible(false);
    v->addWidget(m_btnMtrRetry);
@@ -2073,6 +2173,30 @@ QWidget *ScanWindow::buildMeterPanel()
       addDevRow(QStringLiteral("量程"), &m_cbRange);
       addDevRow(QStringLiteral("模式"), &m_cbMeasMode);
 
+      /* 「添加波长」—— 设备给的那几档之外的值。它是**写设备**的动作, 所以与上面三个下拉框
+       * 一样归 m_devBox (真机开着才露) , 可不可按另算 (见 refreshMeterPanel) */
+      {
+         QWidget *row = new QWidget(m_devBox);
+         QHBoxLayout *h = new QHBoxLayout(row);
+         h->setContentsMargins(0, 0, 0, 0);
+         h->setSpacing(6);
+
+         m_sbWlAdd = new QSpinBox(row);
+         m_sbWlAdd->setRange(k_wl_min_nm, k_wl_max_nm);   /* 与工作线程的越界拒绝同一份常量 */
+         m_sbWlAdd->setSuffix(QStringLiteral(" nm"));
+         m_sbWlAdd->setToolTip(QStringLiteral(
+            "把 330-1100 之间的一个值写进表头并选中。\n"
+            "写入后会向设备读回一次列表核对。"));
+         h->addWidget(m_sbWlAdd, 1);
+
+         m_btnWlAdd = new QPushButton(QStringLiteral("添加"), row);
+         m_btnWlAdd->setToolTip(QStringLiteral("写进设备并选中; 写入后向设备读回一次列表核对。"));
+         connect(m_btnWlAdd, &QPushButton::clicked, this, &ScanWindow::onMtrAddWavelength);
+         h->addWidget(m_btnWlAdd);
+
+         f->addRow(QStringLiteral("添加波长"), row);
+      }
+
       m_lDevInfo = new QLabel(m_devBox);
       m_lDevInfo->setWordWrap(true);
       m_lDevInfo->setTextFormat(Qt::PlainText);   /* 同样是设备给的字 */
@@ -2088,9 +2212,11 @@ QWidget *ScanWindow::buildMeterPanel()
    sep->setFrameShadow(QFrame::Sunken);
    v->addWidget(sep);
 
-   QHBoxLayout *ivRow = new QHBoxLayout;
-   ivRow->setSpacing(6);
-   ivRow->addWidget(new QLabel(QStringLiteral("间隔"), box));
+   /* 「间隔」与「开始记录」**同一行** (原来两行)。放得下: 这一行是 2 字标签 + 一个旋钮 +
+    * 一个 4 字按钮; 名字更长的两个按钮另起一行 */
+   QHBoxLayout *recRow = new QHBoxLayout;
+   recRow->setSpacing(6);
+   recRow->addWidget(new QLabel(QStringLiteral("间隔"), box));
 
    m_edMtrInterval = new QSpinBox(box);
    m_edMtrInterval->setRange(MeterLog::kMinIntervalMs, MeterLog::kMaxIntervalMs);
@@ -2100,33 +2226,33 @@ QWidget *ScanWindow::buildMeterPanel()
       "两次请求之间的最小间隔。\n"
       "实际间隔 = 本值 + 单次往返耗时; 同一时刻只允许一个未完成请求。"));
    connect(m_edMtrInterval, &QSpinBox::valueChanged, this, &ScanWindow::onMtrIntervalChanged);
-   ivRow->addWidget(m_edMtrInterval, 1);
-   v->addLayout(ivRow);
-
-   /* 三个按钮**另起一行**: 名字从 2 字变成 4 字之后, 这一行 (340 px 宽) 放不下
-    * 「间隔 + 旋钮 + 开始记录 + 停止记录 + 清空」 */
-   QHBoxLayout *recRow = new QHBoxLayout;
-   recRow->setSpacing(6);
+   recRow->addWidget(m_edMtrInterval, 1);
 
    /* 「开始记录」/「停止记录」**只管文件**。采集与曲线是常开的, 与这两个按钮无关 ——
     * 这个名字里"记录"两个字不能省: 叫「开始」的话, 按下去屏幕上看不出任何变化 (曲线本来
-    * 就在长), 而"到底开没开文件"要翻到底下那行小字才知道 */
+    * 就在长), 而"到底开没开文件"要翻到下面计数行那截小字才知道 */
    m_btnMtrStart = new QPushButton(QStringLiteral("开始记录"), box);
    m_btnMtrStart->setObjectName(QStringLiteral("go"));
    connect(m_btnMtrStart, &QPushButton::clicked, this, &ScanWindow::onMtrStartRecordClicked);
    recRow->addWidget(m_btnMtrStart);
 
+   v->addLayout(recRow);
+
+   QHBoxLayout *stopRow = new QHBoxLayout;
+   stopRow->setSpacing(6);
+
    m_btnMtrStop = new QPushButton(QStringLiteral("停止记录"), box);
    m_btnMtrStop->setToolTip(QStringLiteral("只停写文件; 采集与曲线照旧。"));
    connect(m_btnMtrStop, &QPushButton::clicked, this, &ScanWindow::onMtrStopRecordClicked);
-   recRow->addWidget(m_btnMtrStop);
+   stopRow->addWidget(m_btnMtrStop);
 
    m_btnMtrClear = new QPushButton(QStringLiteral("清空"), box);
    m_btnMtrClear->setToolTip(QStringLiteral("仅清除曲线与统计; 已写入 CSV 的数据不变。"));
    connect(m_btnMtrClear, &QPushButton::clicked, this, &ScanWindow::onMtrClearClicked);
-   recRow->addWidget(m_btnMtrClear);
+   stopRow->addWidget(m_btnMtrClear);
+   stopRow->addStretch(1);
 
-   v->addLayout(recRow);
+   v->addLayout(stopRow);
 
    m_lMtrCount = new QLabel(box);
    m_lMtrCount->setStyleSheet(QStringLiteral("color:#7b8391;"));
@@ -2152,7 +2278,14 @@ QWidget *ScanWindow::buildMeterPanel()
    m_curve->setPlaceholder(QStringLiteral("等待第一个读数…"));
    v->addWidget(m_curve);
 
-   /* 输出文件。与扫描那份 CSV 同一个目录 (scan_out), 一眼能看出是同一条产线的东西 */
+   /* 输出文件。与扫描那份 CSV 同一个目录 (scan_out), 一眼能看出是同一条产线的东西。
+    *
+    * 「导出当前缓冲」并进这一行 (原来自占一行), 于是这一框底下**只剩这一行** —— 原来在它
+    * 下面还有「未写入文件」那行与一整段说明, 两样都删了 (2026-09-28 §37: 前者是"没在写"时
+    * 也不说清任何事的一句, 后者是手册里的话)。
+    *
+    * 原来那段说明里唯一真管用的两条 (空文件写表头 / 已有内容追加) 收在「开始记录」的 tooltip
+    * 上, 那句本来就在那儿写着 */
    QHBoxLayout *csvRow = new QHBoxLayout;
    csvRow->setSpacing(6);
    csvRow->addWidget(new QLabel(QStringLiteral("CSV"), box));
@@ -2162,35 +2295,31 @@ QWidget *ScanWindow::buildMeterPanel()
    m_btnMtrCsv->setFixedWidth(28);
    connect(m_btnMtrCsv, &QPushButton::clicked, this, &ScanWindow::onMtrBrowseCsv);
    csvRow->addWidget(m_btnMtrCsv);
-   v->addLayout(csvRow);
 
+   /* 「导出当前缓冲」: 名字**不缩成「导出」**—— 导的到底是哪一段数据是这一行的关键
+    * (缓冲里是滚动的这一段, 而 CSV 记的是全部), 那两个字一省就说不清了 */
    m_btnMtrExport = new QPushButton(QStringLiteral("导出当前缓冲"), box);
    m_btnMtrExport->setToolTip(QStringLiteral(
       "将当前缓冲中的点导出为新文件。\n"
       "与「开始记录」写入的文件无关。"));
    connect(m_btnMtrExport, &QPushButton::clicked, this, &ScanWindow::onMtrExportClicked);
-   v->addWidget(m_btnMtrExport);
+   csvRow->addWidget(m_btnMtrExport);
 
-   m_lMtrWritten = new QLabel(box);
-   m_lMtrWritten->setWordWrap(true);
-   m_lMtrWritten->setStyleSheet(QStringLiteral("color:#7b8391;"));
-   v->addWidget(m_lMtrWritten);
+   v->addLayout(csvRow);
 
-   QLabel *note = new QLabel(
-      QStringLiteral("「开始记录」按上方路径写入: 文件为空或不存在时写入表头, 已有内容则追加, "
-                     "不覆盖。文件名留空时按时间戳自动生成。"),
-      box);
-   note->setWordWrap(true);
-   note->setStyleSheet(QStringLiteral("color:#5f6875;"));
-   v->addWidget(note);
-
-   /* 这两个数**记进 scan.ini** (间隔与输出路径是"这台机器怎么采", 不是"上趟数据的范围")。
+   /* 这几个数**记进 scan.ini** (间隔 / 输出路径 / 上次那台设备是"这台机器怎么采", 不是
+    * "上趟数据的范围")。
     * 读在这里而不是 loadSettings() 里: 那一句在 buildParamPanel() 里就调了, 比这一框建得早
     * (见 buildUi 顶上那段注释里的先后次序) */
    {
       const Prefs pf = prefsLoad(prefsPath());
       m_edMtrInterval->setValue(pf.meter_interval_ms);   /* 越界的值控件自己夹回量程内 */
       m_edMtrCsv->setText(QDir::toNativeSeparators(pf.meter_csv));
+
+      /* 上次那台设备: **在 open() 之前**把它交给源, 工作线程一启动就按它选 (这里就是
+       * 构造函数那一次打开之前 —— openMeter 在 buildUi 之后才调) */
+      if (m_ophir != nullptr && !pf.meter_serial.isEmpty())
+         m_ophir->setWantedSerial(pf.meter_serial);
 
       /* 用**控件里**的值下推, 不用 ini 里那个: 上面那一句可能刚夹过 (手改坏的 ini 不该让
        * 采集用一个没验过的节奏) */
@@ -2504,9 +2633,14 @@ void ScanWindow::saveSettings()
    pf.npn_sw_invert   = m_cbDiInvert->isChecked();
    pf.shade_auto      = m_cbShadeAuto->isChecked();
 
-   /* 功率计那两格也跟着落盘。取样源本身**不记** —— 那是设备自己的状态, 理由见 scanprefs.h */
+   /* 功率计那几格也跟着落盘。取样源本身**不记** —— 理由见 scanprefs.h。
+    *
+    * 设备那一项与网卡同一条规矩: 清单还没到 / 下拉是空的 (设备没插、表头枚举不到) 时**别把
+    * 记住的抹掉**, 留着上一次那台 */
    pf.meter_interval_ms = m_edMtrInterval->value();
    pf.meter_csv         = m_edMtrCsv->text().trimmed();
+   if (m_cbMtrDev != nullptr && !m_cbMtrDev->currentText().isEmpty())
+      pf.meter_serial = m_cbMtrDev->currentText();
 
    prefsSave(prefsPath(), pf);
    m_savedNic = pf.nic;
@@ -2871,10 +3005,44 @@ void ScanWindow::onMeterInfoChanged()
 {
    m_cfgBusy = false;
 
+   /* 这一趟回话如果是"加波长"等的那一次, 报一句 —— 值取自**写进去的那个数**而不是列表里
+    * 那一项的设备原文 (设备可能回 "532nm" 也可能回别的写法, 而操作员刚敲的是这个数) */
+   if (m_wlAddNm >= 0)
+   {
+      hint(QStringLiteral("已加入波长 %1 nm 并选中。").arg(m_wlAddNm), false);
+      m_wlAddNm = -1;
+   }
+
    if (m_cbWl == nullptr)
       return;                    /* 还没建出来 (构造期不会有 infoChanged, 这里只是兜底) */
 
    const OphirInfo i = m_ophir->info();
+
+   /* ---- 「设备」那一行 ----
+    * 只在**项目真的变了**时重填: 每来一次 infoChanged 就 clear + addItems 的话, 会跟操作员
+    * 正在点的那一下抢 (下拉框弹开着被清空, 点中的是别的项)。
+    *
+    * 这一趟**在打开失败时也会跑到** (failOpen 也发 infoChanged): 列表是枚举的结果, 与打开
+    * 成没成功无关 —— 正是"这台打不开, 换一台"要靠的那一份。
+    * 重填期间挡掉信号: currentIndexChanged 在这一行等于"操作员换了设备", 不是"设备信息更新" */
+   if (m_cbMtrDev != nullptr)
+   {
+      QStringList have;
+      for (int k = 0; k < m_cbMtrDev->count(); k++)
+         have << m_cbMtrDev->itemText(k);
+
+      if (have != i.device_serials)
+      {
+         QSignalBlocker blocker(m_cbMtrDev);
+         m_cbMtrDev->clear();
+         m_cbMtrDev->addItems(i.device_serials);
+
+         /* 选中现在开着的这一台 (没有就退到第一台) */
+         const int k = m_cbMtrDev->findText(i.device_serial);
+         if (k >= 0)
+            m_cbMtrDev->setCurrentIndex(k);
+      }
+   }
 
    /* 两行设备事实 + 一行版本 (诊断用)。版本那两行取不到就不占地方 —— 它们是驱动层给的东西
     * (getVersion / getDriverVersion), 摆出来是为了出事时能一眼说清"装的是哪一版" */
@@ -2936,6 +3104,61 @@ void ScanWindow::onMeterCfgChanged()
    m_ophir->setWavelengthIndex(m_cbWl->currentIndex());
    m_ophir->setRangeIndex(m_cbRange->currentIndex());
    m_ophir->setModeIndex(m_cbMeasMode->currentIndex());
+}
+
+/* 操作员在下拉里换了**另一台表头**。与上面那一条的区别是"换的是哪一台仪器"而不是"改它的
+ * 一项配置", 所以: 停采集 → 把旧的那只还回去 (表头独占) → 清缓冲 → 按新序列号打开。
+ *
+ * **切设备会无声地清掉缓冲** —— 曲线与统计回到空, 已写进 CSV 的一个字节不动 (与「清空」
+ * 同一个口径)。不这么做的话, 两台探头的读数会画成同一条曲线、混进同一段统计里 */
+void ScanWindow::onMtrDeviceChanged(int idx)
+{
+   if (m_cbMtrDev == nullptr || m_ophir == nullptr || m_meter != m_ophir)
+      return;
+   if (m_mtrOpening || m_ctl->running())
+      return;                    /* 扫描中那个框本来就是灰的, 这是兜底 (键盘也能到这儿) */
+
+   const QString serial = m_cbMtrDev->itemText(idx);
+   if (serial.isEmpty())
+      return;
+
+   /* 已经开着的就是这一台: 什么都不做。重填列表时那句 findText 会把当前这台选上, 而
+    * "再选一遍"不该把采集停一下、缓冲清掉 —— 那一下是白挨的 */
+   if (m_ophir->isOpen() && serial == m_ophir->info().device_serial)
+      return;
+
+   m_ophir->setWantedSerial(serial);
+
+   /* 先作废在飞的那个请求 (它是对旧那台说的), 再收线程把旧那台还回去 ——
+    * OphirMeter::open() 对自己**已经开着**的情形直接返回 true, 不 close 就是白换一台 */
+   if (m_mlog != nullptr)
+      m_mlog->stop();
+   m_ophir->close();
+   if (m_mlog != nullptr)
+      m_mlog->clear();
+
+   openMeter();
+}
+
+/* 「添加」: 把旋钮上那个波长写进设备并选中。
+ *
+ * 与那三个下拉框走**同一套协议** (m_cfgBusy + setHold → 等 infoChanged / configFailed):
+ * 工作线程收到后是 停流 → 写 → 读回核对 → 重开流, 一句话不多。两处都置 m_wlAddNm: 成功那
+ * 条路要在 infoChanged 里报一句"已加入", 而那条回话与"改了波长"共用 —— 不记着是这一件事的
+ * 话, 每次改配置成功都会冒出一句"已加入波长" */
+void ScanWindow::onMtrAddWavelength()
+{
+   if (m_sbWlAdd == nullptr || m_ophir == nullptr || m_meter != m_ophir)
+      return;
+   if (!m_ophir->isOpen() || m_ctl->running() || m_cfgBusy)
+      return;                    /* 同上: 那个按钮本来就是灰的, 这是兜底 */
+
+   m_cfgBusy  = true;
+   m_wlAddNm  = m_sbWlAdd->value();
+   if (m_mlog != nullptr)
+      m_mlog->setHold(true);
+
+   m_ophir->addCustomWavelength(m_wlAddNm);
 }
 
 /* ---------------------------------------------------------------- 采集与记录 */

@@ -147,4 +147,40 @@ private:
 QStringList meterMetaLines(const PowerMeter *m);   /* 裸 "key=value", 由写文件的那方加 "# " */
 QString     unitLabel(const PowerMeter *m);        /* 空 -> 「单位不明」 */
 
+/* ---- 屏幕上的量级换算 (W / mW / μW) ----
+ *
+ * **只动屏幕, 不动文件。** CSV 那一列与 `# meter_unit=` 照旧是设备报的原值与原单位 ——
+ * 读文件的人要能直接解析, 而且一条曲线中途换单位就是一条会骗人的线。
+ * 于是**屏幕上显示的单位可能与 CSV 里的 meter_unit 不同**, 这是定下来的口径 (§37)。
+ *
+ * **只在单位确实是 "W" 时才换。** 判出 J (能量)、dBm (对数)、空 (单位不明) 一律原样:
+ * 除 1000 会把 0 dBm 变成 −30, 那是错的; 「单位不明」更不该被加上一个前缀。 */
+struct PowerText
+{
+   double  value = 0.0;      /* 换算后的数值 */
+   QString label;            /* "W" / "mW" / "μW" / 原单位 */
+};
+
+/* 单个数的量级。|v| >= 1 -> W;  >= 1e-3 -> mW;  更小 -> μW。
+ * **v == 0 用 W** (屏幕上写 "0 W", 不写 "0.00 μW"); 负值按 |v| 选档, 符号留着 */
+PowerText scalePower(double v, const QString &unit);
+
+/* 一整行的量级: 按这一行里最大的那个 |值| 选一个前缀, **整行共用一个** ——
+ * 否则 "最小 0.5 mW  最大 1.5 mW" 这种一行两个单位的读法更难看懂。
+ * 返回单位字, 把除数写进 *divisor (调用方自己拿各个数去除: 0.0015 W 除以 1e-3 得 1.5 mW)。
+ * 单位不是 "W" 时单位字原样返回、*divisor 写 1 —— 空单位也是 (调用方不必分两种写法) */
+QString scaleFor(double max_abs, const QString &unit, double *divisor);
+
+/* 一个数 + 单位, 一次拼好: "1.5 W" / "1.50 mW" / "350 μW" / "单位不明"。
+ * 单位空时数值**原样**格式化 (不乘不除) */
+QString powerText(double v, const QString &unit);
+
+/* 一个数的显示格式 (量级从 nW 到 W 那一带, 不固定小数位):
+ *   **v == 0 -> "0"**;  |v| >= 1e-3 -> 'g' 6 位有效数字;  更小 -> 'e' 4 位有效数字。
+ * 零单独写掉: 它**没有量级**, 写 "0" 而不是 "0.0000e+00" —— 挡住光的时候屏幕上正是一片 0,
+ * 而 v == 0.0 对 -0.0 也成立, 于是也不会出现 "-0.0000e+00"。
+ * **只格式化数字, 不带单位**。给操作员核对用, 入 CSV 的是 double, 一位没少。
+ * 「最近读数」与「统计」两处共用它; 统计那一行要四个数共用一个前缀, 所以它单独露出来 */
+QString formatReading(double v);
+
 }   /* namespace scan */

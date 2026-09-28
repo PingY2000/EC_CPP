@@ -34,10 +34,14 @@ public:
    void setPlaceholder(const QString &s);
    /* 左上角那行说明 (源的名字)。空 = 不画 */
    void setSourceName(const QString &s);
-   /* 纵轴的单位字 ("W" / "J" …)。**传空 = 认不出来**, 那时画一个 "?" 并把理由放进 tooltip
-    * —— 真机报的是 W 还是 J 由探头与测量模式定, 而 COM 一个字段都不给 (powermeter.h 的
-    * unit())。这里替它画一个 W 是最坏的那种错: 图看着正常, 单位是编的 */
-   void setUnit(const QString &u);
+   /* 纵轴的单位字 ("W" / "J" / "mW" "μW" …)。**传空 = 认不出来**, 那时画一个 "?" 并把
+    * 理由放进 tooltip —— 真机报的是 W 还是 J 由探头与测量模式定, 而 COM 一个字段都不给
+    * (powermeter.h 的 unit())。
+    *
+    * scale 是**只在刻度数字上**用的除数 (见 powermeter.h 的 scaleFor): 传 1e-3 就是"这一轴
+    * 的单位是 mW" (刻度印 w / 1e-3), 而缓冲里的数与折线仍按原始值画 —— 自动量程、折线形状
+    * 一位都不变。**两者必须一致**: 单位写 mW 而刻度印 W 的数, 那图就在骗人 */
+   void setUnit(const QString &u, double scale = 1.0);
 
    QSize sizeHint() const override;
 
@@ -49,6 +53,7 @@ private:
    QString   m_placeholder;
    QString   m_src_name;
    QString   m_unit;
+   double    m_scale = 1.0;      /* 刻度数字的除数, 见 setUnit */
 };
 
 }   /* namespace scan */

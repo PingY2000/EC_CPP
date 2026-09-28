@@ -680,6 +680,28 @@ static void test_meter_meta()
             "模式名认得出来就够 (不需要探头也认得)");
    }
 
+   caseBegin("meter: 波长选项串 -> nm (加波长写进去的那个值, 读回来要靠它认)");
+   {
+      /* 格式由设备定, 这里只认"最前面那一串数字" —— 认法只有一条, 界面从不假设格式 */
+      checkEq(wavelengthNm(QStringLiteral("1064nm")),     1064, "\"1064nm\"");
+      checkEq(wavelengthNm(QStringLiteral("1064 nm")),    1064, "\"1064 nm\"");
+      checkEq(wavelengthNm(QStringLiteral("532")),         532, "\"532\"");
+      checkEq(wavelengthNm(QStringLiteral("1064NM")),     1064, "大小写无关 (取数字, 不看单位)");
+      checkEq(wavelengthNm(QStringLiteral("  330 nm")),    330, "前面有空格");
+      checkEq(wavelengthNm(QStringLiteral("--")),           -1, "一个数字都没有 → -1");
+      checkEq(wavelengthNm(QString()),                      -1, "空串 → -1");
+      /* 7 位以上那一串不当波长: 别把一个纯数字的设备状态串读成"波长" */
+      checkEq(wavelengthNm(QStringLiteral("20260928")),     -1, "太长的一串数字不算");
+   }
+
+   caseBegin("meter: 自定义波长的允许范围 (界面旋钮与工作线程的越界拒绝读同一份)");
+   {
+      checkEq(k_wl_min_nm,  330, "下限");
+      checkEq(k_wl_max_nm, 1100, "上限");
+      /* 写进去的那个值必须落在范围内 —— 界面旋钮把范围钉住了, 这是那条规则的单一出处 */
+      check(k_wl_min_nm < k_wl_max_nm, "下限严格小于上限");
+   }
+
    caseBegin("meter: 两份 CSV 的 meta 行 —— 谁采的 / 什么单位 / 什么配置");
    {
       QTemporaryDir dir;
@@ -3825,6 +3847,109 @@ static void test_meter_sources()
 
    /* 这就是那个闸门要挡的东西 —— 而闸门在界面上 (ScanWindow::refresh 里那条 setEnabled),
     * 那层要 Qt Widgets, 本文件按约定不链。所以这条约定靠上面这条测试说明为什么必须挡。 */
+
+   /* ---------------------------------------------------------------- 屏幕上的量级换算 */
+   caseBegin("meter: 量级换算 (W / mW / μW) —— 只换屏幕, 且只对确实是 W 的换");
+   {
+      /* ---- 单个数 ---- */
+      {
+         const PowerText a = scalePower(1.5, QStringLiteral("W"));
+         check(a.label == QStringLiteral("W"), "1.5 W 就是 W", a.label.toStdString());
+         checkNear(a.value, 1.5, "1.5 W 数值不动");
+
+         const PowerText b = scalePower(0.0015, QStringLiteral("W"));
+         check(b.label == QStringLiteral("mW"), "0.0015 W -> mW", b.label.toStdString());
+         checkNear(b.value, 1.5, "0.0015 W -> 1.5 mW");
+
+         const PowerText c = scalePower(3.5e-4, QStringLiteral("W"));
+         check(c.label == QStringLiteral("μW"), "3.5e-4 W -> μW", c.label.toStdString());
+         checkNear(c.value, 350.0, "3.5e-4 W -> 350 μW");
+
+         /* 0 归 W: 屏幕上写 "0 W", 不写 "0.00 μW" —— 一个没有量级的数不该被安一个前缀 */
+         const PowerText z = scalePower(0.0, QStringLiteral("W"));
+         check(z.label == QStringLiteral("W"), "0 W 不给前缀", z.label.toStdString());
+         checkNear(z.value, 0.0, "0 W 还是 0");
+
+         /* 负值按 |v| 选档, 符号留着 (反转的探头也会报负数) */
+         const PowerText n = scalePower(-0.0015, QStringLiteral("W"));
+         check(n.label == QStringLiteral("mW"), "-0.0015 也走 mW", n.label.toStdString());
+         checkNear(n.value, -1.5, "负号保留");
+
+         /* 边界: 1.0 归 W, 1e-3 归 mW (两个界都用 1 的幂 —— 同一量级里口径一致) */
+         check(scalePower(1.0, QStringLiteral("W")).label == QStringLiteral("W"), "1.0 是 W");
+         check(scalePower(0.999, QStringLiteral("W")).label == QStringLiteral("mW"), "0.999 是 mW");
+         check(scalePower(1e-3, QStringLiteral("W")).label == QStringLiteral("mW"), "1e-3 是 mW");
+         check(scalePower(9.99e-4, QStringLiteral("W")).label == QStringLiteral("μW"),
+               "9.99e-4 是 μW");
+      }
+
+      /* ---- 不是 W 的一律原样。**除 1000 会把 0 dBm 变成 −30 —— 那是错的** ---- */
+      {
+         const PowerText j = scalePower(2.5e-4, QStringLiteral("J"));
+         check(j.label == QStringLiteral("J") && std::fabs(j.value - 2.5e-4) < 1e-15,
+               "J (能量) 不换: 同一个探头换个模式就不是功率", j.label.toStdString());
+
+         const PowerText d = scalePower(0.0, QStringLiteral("dBm"));
+         check(d.label == QStringLiteral("dBm") && std::fabs(d.value) < 1e-15,
+               "dBm 是对数, 不许乘除", d.label.toStdString());
+
+         const PowerText u = scalePower(3.5e-4, QString());
+         check(u.label.isEmpty() && std::fabs(u.value - 3.5e-4) < 1e-15,
+               "单位不明: 数值一个字节不动");
+      }
+
+      /* ---- 一个数 + 单位, 一次拼好 ---- */
+      {
+         const QString t1 = powerText(1.5, QStringLiteral("W"));
+         check(t1 == QStringLiteral("1.5 W"), "1.5 W", t1.toStdString());
+         const QString t2 = powerText(3.5e-4, QStringLiteral("W"));
+         check(t2 == QStringLiteral("350 μW"), "350 μW", t2.toStdString());
+         /* 判不出来照旧是「单位不明」那一句, 数值原样 —— 与 unitLabel() 同一句话 */
+         const QString t3 = powerText(3.5e-4, QString());
+         check(t3 == QStringLiteral("3.5000e-04 单位不明"), "单位不明 + 原值", t3.toStdString());
+         const QString t4 = powerText(0.0, QString());
+         check(t4 == QStringLiteral("0 单位不明"), "0 + 单位不明", t4.toStdString());
+         /* 屏幕上真出现过的那个写法: 挡住光时大字读数就是 0 —— "0.0000e+00 W" 不好读 */
+         const QString t5 = powerText(0.0, QStringLiteral("W"));
+         check(t5 == QStringLiteral("0 W"), "0 W 就是 0 W", t5.toStdString());
+      }
+
+      /* ---- 一整行共用一个前缀 (统计那四个数) ---- */
+      {
+         double div = 0.0;
+         const QString u1 = scaleFor(1.5, QStringLiteral("W"), &div);
+         check(u1 == QStringLiteral("W") && std::fabs(div - 1.0) < 1e-15,
+               "一行到 1.5 W -> 整行用 W");
+
+         const QString u2 = scaleFor(0.0015, QStringLiteral("W"), &div);
+         check(u2 == QStringLiteral("mW") && std::fabs(div - 1e-3) < 1e-18,
+               "一行最大 1.5 mW -> 整行用 mW (最小值也就跟着是这个前缀)");
+         checkNear(0.0015 / div, 1.5, "divisor 是**除数**: 0.0015 W 除掉它得 1.5 mW");
+
+         /* 判不出来时: 除数必须是 1 —— 忘了置 1 的话调用方会拿上一次的除数去除 */
+         const QString u3 = scaleFor(0.0015, QString(), &div);
+         check(u3.isEmpty() && std::fabs(div - 1.0) < 1e-15, "单位不明: 除数归 1, 单位字照旧空");
+         const QString u4 = scaleFor(0.0015, QStringLiteral("J"), &div);
+         check(u4 == QStringLiteral("J") && std::fabs(div - 1.0) < 1e-15, "J: 除数归 1");
+         /* 传 nullptr 也不能崩 (调用方只想要单位字) */
+         const QString u5 = scaleFor(2.0, QStringLiteral("W"), nullptr);
+         check(u5 == QStringLiteral("W"), "divisor 可以不接");
+      }
+
+      /* ---- 只有数字, 不带单位 ---- */
+      {
+         check(formatReading(1.5) == QStringLiteral("1.5"), "1.5",
+               formatReading(1.5).toStdString());
+         /* 小于 1e-3 走 'e' —— Qt 的 precision 是**小数点后**的位数, 所以是 4 位小数 */
+         check(formatReading(3.5e-4) == QStringLiteral("3.5000e-04"), "小到那个程度就走科学计数",
+               formatReading(3.5e-4).toStdString());
+         check(formatReading(0.0) == QStringLiteral("0"), "0 就是 0 (零没有量级, 不走科学计数)",
+               formatReading(0.0).toStdString());
+         /* -0.0 也是 0: 探头的零点漂移可能给出负零, 那一下不该写成 "-0.0000e+00" */
+         check(formatReading(-0.0) == QStringLiteral("0"), "-0.0 也写成 0",
+               formatReading(-0.0).toStdString());
+      }
+   }
 }
 
 /* ---------------------------------------------------------------- 真机功率计 */

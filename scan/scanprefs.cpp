@@ -31,6 +31,7 @@ static const char *shade_auto = "shade/auto_fit";
  * 回去, 不自己拼键名 (拼第二遍就会有一边改名一边忘的那天) */
 static const char *mtr_int    = "meter/interval_ms";
 static const char *mtr_csv    = "meter/csv";
+static const char *mtr_serial = "meter/serial";
 }
 
 QString prefsPath()
@@ -84,6 +85,7 @@ Prefs prefsLoad(const QString &path)
     * 会被 MeterLog 夹到下限, 于是"没记过"表现成 20ms 而不是 200ms */
    p.meter_interval_ms = s.value(QLatin1String(k::mtr_int), p.meter_interval_ms).toInt();
    p.meter_csv         = s.value(QLatin1String(k::mtr_csv)).toString();
+   p.meter_serial      = s.value(QLatin1String(k::mtr_serial)).toString();
 
    return p;
 }
@@ -132,6 +134,7 @@ void prefsSave(const QString &path, const Prefs &p)
 
    s.setValue(QLatin1String(k::mtr_int),    p.meter_interval_ms);
    s.setValue(QLatin1String(k::mtr_csv),    p.meter_csv);
+   s.setValue(QLatin1String(k::mtr_serial), p.meter_serial);
 
    /* 显式 sync: 不靠析构时机保证写盘 */
    s.sync();

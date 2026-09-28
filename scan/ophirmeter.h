@@ -43,8 +43,16 @@ struct OphirInfo
    int range_index = -1;
    int mode_index  = -1;
 
+   /* 这一次 ScanUSB 看到的**所有**表头序列号 (Ophir COM 只给序列号, 型号要打开之后才知道)。
+    * **打开成功与否都发布** —— 多设备时"这台打不开, 换一台再试"这条路全靠它 */
+   QStringList device_serials;
+
    QString summary;          /* 状态行那句话, 由工作线程拼好 */
 };
+
+/* 自定义波长的允许范围。**单一出处**: 界面那个旋钮的范围与工作线程的越界拒绝都读它 */
+const int k_wl_min_nm = 330;
+const int k_wl_max_nm = 1100;
 
 /* 由**设备自己的两个字**判读数单位: 当前的测量模式名 (Ophir 的模式名里带 Power / Energy)
  * 与探头类型 (热释电测的是脉冲能量)。
@@ -56,6 +64,14 @@ struct OphirInfo
  * 认不出来就返回空, **不猜** —— 空的意思是"我不知道", 界面照原样写「单位不明」。
  * 见 docs/scan_sweep.md §25。 */
 QString unitFromDeviceInfo(const QString &sensor_type, const QString &mode_name);
+
+/* 从设备给的**波长选项串**里取出 nm 数: "1064nm" / "1064 nm" / "532" -> 1064 / 1064 / 532。
+ * 认法只有一条: 取最前面那一串连续数字。**格式由设备定, 这里不假设** (CSV 里见过 "1064nm"
+ * 这一种); 一个数字都没有 -> -1, 调用方当"认不出"。
+ *
+ * 它有两个用处: 在"写进去的那个值读回来了没有"这件事上做比对, 以及找出它在新列表里的下标
+ * (setWavelength 只吃下标)。两处必须用同一个解析, 否则自己写的值自己认不出来 */
+int wavelengthNm(const QString &option);
 
 class OphirMeter : public PowerMeter
 {
@@ -86,6 +102,22 @@ public:
    void setWavelengthIndex(int idx);
    void setRangeIndex(int idx);
    void setModeIndex(int idx);
+
+   /*
+    * 往设备里**加**一个波长并选中它 (异步, 范围 k_wl_min_nm ~ k_wl_max_nm)。
+    *
+    * **这是本程序唯一一处写设备。** 设备那张波长表是只读的选项表, 表里没有的值根本没有下标
+    * 可用 —— 所以"自定义波长"只有这一条路。写完**立刻把列表读回来核对**: 只有新值真的出现
+    * 在读回来的那份表里才算成功 (那一份才是"设备接受了什么"), 否则 configFailed 且什么都不改。
+    * 界面侧与 setWavelengthIndex 同一套: 置 m_cfgBusy, 等 infoChanged / configFailed。
+    */
+   void addCustomWavelength(int nm);
+
+   /* 想打开哪一台 (序列号, 来自 info().device_serials)。空 = 没指定, 用枚举到的第一台。
+    * **必须在 open() 之前设**: 工作线程一启动就按它选设备。设了但枚举不到那一台会快失败,
+    * 并明说"未找到上次那台" —— 悄悄换成第一台是最坏的一种做法 */
+   void setWantedSerial(const QString &serial);
+   QString wantedSerial() const;
 
 signals:
    void infoChanged();
