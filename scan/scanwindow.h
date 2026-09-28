@@ -128,7 +128,9 @@ private:
    void onMtrDeviceChanged(int idx);
    /* 「添加」: 把旋钮上那个波长**写进表头**并选中 (设备那张表是只读的, 表里没有的值没有
     * 下标可用 —— 这是本程序唯一一处写设备)。与那三个下拉框同一套: m_cfgBusy + setHold,
-    * 靠 infoChanged / configFailed 收尾。写入后会向设备读回一次列表核对 */
+    * 靠 infoChanged / configFailed 收尾。写入后会向设备读回一次列表核对。
+    * **2026-09-28 晚起没人能按到它了** (§37.12: 那一行在界面上藏起来了) —— 槽留着,
+    * 恢复显示就又能用 */
    void onMtrAddWavelength();
    /* 「重试」—— 打开失败、或采集卡死时的唯一出口。与构造函数里那一次打开**走同一条路**
     * (openMeter), 没有第二条打开路径 */
@@ -433,10 +435,12 @@ private:
     * 与波长/量程/模式那种设备内部状态不同 (见 scanprefs.h) */
    QComboBox *m_cbMtrDev = nullptr;
 
-   /* ---- 自定义波长 ----
+   /* ---- 自定义波长 (**2026-09-28 晚起在界面上藏起来了**, 见 §37.12) ----
     * 设备给的波长表是只读的, 表里没有的值**根本没有下标可用**, 所以只有"写进设备"这一条路
     * (ophirmeter.h 的 addCustomWavelength)。范围的两个端点只写一遍: 这里的量程与工作线程
-    * 的越界拒绝都读 ophirmeter.h 里那两个常量 */
+    * 的越界拒绝都读 ophirmeter.h 里那两个常量。
+    * **下面这三样都还在、还在算, 只是那一行不显示** (保留但不露): 恢复显示 = 删掉
+    * buildMeterPanel 里那两句 setVisible(false), 别处一行都不用动 */
    QSpinBox    *m_sbWlAdd  = nullptr;
    QPushButton *m_btnWlAdd = nullptr;
    /* 正在加的那个波长 (nm), -1 = 没有这一件事在等着回话。

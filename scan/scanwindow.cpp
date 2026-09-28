@@ -393,7 +393,9 @@ void ScanWindow::refreshMeterPanel()
 
    /* 「添加波长」与那三项同一格: 它也是"停流 → 改 → 重开"的一段 (而且它还要写设备),
     * 所以扫描中与 cfgBusy 期间都不放开。**它不判 count()>0**: 波长表空着的时候添加正是
-    * 唯一的出路 */
+    * 唯一的出路。
+    * **这一行的控件 2026-09-28 晚起是藏着的** (§37.12): 下面这两句照旧算, 只是没人看得见 ——
+    * 留着是为了"恢复显示"那一刻不用再想可用性怎么写 (藏 ≠ 删) */
    if (m_btnWlAdd != nullptr)
       m_btnWlAdd->setEnabled(open && isOphir && !running && !cfgBusy);
    if (m_sbWlAdd != nullptr)
@@ -2221,7 +2223,16 @@ QWidget *ScanWindow::buildMeterPanel()
       addDevRow(QStringLiteral("模式"), &m_cbMeasMode);
 
       /* 「添加波长」—— 设备给的那几档之外的值。它是**写设备**的动作, 所以与上面三个下拉框
-       * 一样归 m_devBox (真机开着才露) , 可不可按另算 (见 refreshMeterPanel) */
+       * 一样归 m_devBox (真机开着才露) , 可不可按另算 (见 refreshMeterPanel)
+       *
+       * **2026-09-28 晚: 整行藏起来** (用户原话"隐藏添加波长功能", 见 §37.12)。**代码一个
+       * 字节没删** —— 那个槽、那条写设备的协议、`OphirMeter::addCustomWavelength` 与自检里
+       * 钉着它的那几条断言都照旧在 ("保留但不露", 与 `MeterLog::setAverage` 同一个处理);
+       * 想恢复就把下面那两句 `setVisible(false)` 删掉, 别的都不用动。
+       *
+       * **行与它的标签要一起藏**: `addRow(QString, QWidget*)` 自己造的那个标签不属于这一行,
+       * 只藏行的话左边那一列会留下「添加波长」四个字。两个都藏了 QFormLayout 就把整行收掉
+       * (2026-09-28 实测: 隐藏前 form 高 101 px, 之后 72 px —— 正好少一行, 不留空行) */
       {
          QWidget *row = new QWidget(m_devBox);
          QHBoxLayout *h = new QHBoxLayout(row);
@@ -2242,6 +2253,10 @@ QWidget *ScanWindow::buildMeterPanel()
          h->addWidget(m_btnWlAdd);
 
          f->addRow(QStringLiteral("添加波长"), row);
+
+         row->setVisible(false);
+         if (QWidget *wlLabel = f->labelForField(row))
+            wlLabel->setVisible(false);
       }
 
       /* 诊断那一行 —— **只剩** ROM 版本 / 探头类型 / 驱动报的两个版本号 (2026-09-28 §37.10:
