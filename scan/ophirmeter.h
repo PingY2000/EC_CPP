@@ -47,6 +47,11 @@ struct OphirInfo
     * **打开成功与否都发布** —— 多设备时"这台打不开, 换一台再试"这条路全靠它 */
    QStringList device_serials;
 
+   /* 与 device_serials **一一对应**的显示名 (见 deviceLabel), 给人看的: 界面那个「设备」下拉
+    * 每一行写的是它。**空 = 还没读过这一台** (探一下打不开 / 还没探过), 界面那时退回显示序列号。
+    * 认设备一律用 device_serials (判据), 这个只用来说话 */
+   QStringList device_labels;
+
    QString summary;          /* 状态行那句话, 由工作线程拼好 */
 };
 
@@ -64,6 +69,17 @@ const int k_wl_max_nm = 1100;
  * 认不出来就返回空, **不猜** —— 空的意思是"我不知道", 界面照原样写「单位不明」。
  * 见 docs/scan_sweep.md §25。 */
 QString unitFromDeviceInfo(const QString &sensor_type, const QString &mode_name);
+
+/* 「设备」下拉里那一项怎么写 (纯函数, 只拼字):
+ *   PD300R (s/n: 3216298) · Juno (s/n: 754170)
+ * **探头在前、表头在后** (现场要的就是这个读法 —— 先认探头, 那才是决定量程与波长的那个)。
+ * 每半段是「名字 (s/n: 序列号)」; 名字或序列号缺一个就少写那一半, 两个都缺就整段不写 ——
+ * 一段都没有时返回空, 界面那时退回显示序列号 (认设备用的始终是序列号, 这个只给人看)。
+ *
+ * 表头的序列号**用枚举到的那个** (调用方传进来的), 不用设备回报的那一个: 下拉里那一项是用
+ * 序列号认的, 名字里写另一个串只会让人对不上。 */
+QString deviceLabel(const QString &head_name, const QString &head_serial,
+                    const QString &sensor_name, const QString &sensor_serial);
 
 /* 从设备给的**波长选项串**里取出 nm 数: "1064nm" / "1064 nm" / "532" -> 1064 / 1064 / 532。
  * 认法只有一条: 取最前面那一串连续数字。**格式由设备定, 这里不假设** (CSV 里见过 "1064nm"

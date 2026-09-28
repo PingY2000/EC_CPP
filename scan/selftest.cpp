@@ -694,6 +694,41 @@ static void test_meter_meta()
       checkEq(wavelengthNm(QStringLiteral("20260928")),     -1, "太长的一串数字不算");
    }
 
+   caseBegin("meter: 「设备」下拉里那一项怎么写字 (探头在前、表头在后)");
+   {
+      /* 现场要的读法: 先认探头 (量程与波长是它定的), 表头跟在后面 */
+      check(deviceLabel(QStringLiteral("Juno"),   QStringLiteral("754170"),
+                        QStringLiteral("PD300R"), QStringLiteral("3216298"))
+               == QStringLiteral("PD300R (s/n: 3216298) · Juno (s/n: 754170)"),
+            "两样都知道 → 探头在前、表头在后",
+            deviceLabel(QStringLiteral("Juno"), QStringLiteral("754170"),
+                        QStringLiteral("PD300R"), QStringLiteral("3216298")).toStdString());
+
+      /* 表头读到了、探头那一路没读到 (通道上没探头 / 读信息失败): 只剩表头那半段 */
+      check(deviceLabel(QStringLiteral("Juno"), QStringLiteral("754170"), QString(), QString())
+               == QStringLiteral("Juno (s/n: 754170)"),
+            "没有探头信息 → 只剩表头那半段",
+            deviceLabel(QStringLiteral("Juno"), QStringLiteral("754170"), QString(), QString())
+               .toStdString());
+
+      /* 设备没报名字 (只报了序列号): 括号里那一半是判据, 不许丢 */
+      check(deviceLabel(QString(), QStringLiteral("754170"), QString(), QString())
+               == QStringLiteral("(s/n: 754170)"),
+            "只有序列号时也要把 s/n 写出来",
+            deviceLabel(QString(), QStringLiteral("754170"), QString(), QString()).toStdString());
+
+      /* 名字有、序列号没有: 不写一个空括号 */
+      check(deviceLabel(QStringLiteral("Juno+"), QString(), QString(), QString())
+               == QStringLiteral("Juno+"),
+            "没序列号时不留空括号",
+            deviceLabel(QStringLiteral("Juno+"), QString(), QString(), QString()).toStdString());
+
+      /* 什么都不知道 -> 空串。界面那时退回显示序列号 (认设备用的始终是序列号) */
+      check(deviceLabel(QString(), QString(), QString(), QString()).isEmpty(),
+            "全空 → 空串 (界面退回显示序列号)",
+            deviceLabel(QString(), QString(), QString(), QString()).toStdString());
+   }
+
    caseBegin("meter: 自定义波长的允许范围 (界面旋钮与工作线程的越界拒绝读同一份)");
    {
       checkEq(k_wl_min_nm,  330, "下限");

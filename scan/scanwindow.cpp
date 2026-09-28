@@ -345,7 +345,7 @@ void ScanWindow::refreshEditability()
  *   ① 真机没打开     -> 只有「重试」能按 ("装没装 StarLab"与"表头插没插"都要能自己出来)
  *   ② 扫描正在跑     -> 记录开不了 (跟随的点直接写在扫描那份 CSV 里, 见 addFollowSample),
  *                       设备三项也不给改
- *   ③ 正在记录       -> 「停止记录」是唯一能按的那一个
+ *   ③ 正在记录       -> 那一个按钮改名「停止记录」, 并且**永远可按** (停写文件不需要前提)
  *   ④ 正在改设备配置 -> 设备三项自己锁住 (工作线程里是 停流 → 改 → 重开流)
  *
  * **`m_mlog->running()` 在这个函数里已经没有用了**: 2026-09-28 起采集常开, 它恒为真。
@@ -404,24 +404,38 @@ void ScanWindow::refreshMeterPanel()
    if (m_edMtrInterval != nullptr)
       m_edMtrInterval->setEnabled(true);
 
-   /* ---- 记录那两个 ----
-    * 「开始记录」的三个理由逐条写出来 (灰按钮本身不会说话)。"扫描中"那一条不能省:
-    * 跟随的点根本不进这份 CSV (addFollowSample 只进缓冲), 按下去只会得到一个只有表头的
-    * 文件 —— 一个"看起来在记录"的空文件比不记录更坏 */
-   if (m_btnMtrStart != nullptr)
+   /* ---- 记录那**一个**按钮 (开与关共用, 见 §37.10) ----
+    * 字与可用性都在这里定, 别处不再碰它。开着的时候**永远可按** —— 停写文件不需要任何前提;
+    * 没开的时候那三个理由逐条写出来 (灰按钮本身不会说话)。"扫描中"那一条不能省: 跟随的点
+    * 根本不进这份 CSV (addFollowSample 只进缓冲), 按下去只会得到一个只有表头的文件 ——
+    * 一个"看起来在记录"的空文件比不记录更坏。
+    * 两个字都**先比再写**: 这是 30 Hz 那条路上的一格, 每拍无条件 setText 会让按钮每拍重绘一次 */
+   if (m_btnMtrRec != nullptr)
    {
-      const QString why = !open ? QStringLiteral("功率计未打开")
-                              : (running ? QStringLiteral("扫描进行中, 跟随的点写入扫描那份 CSV")
-                                         : (recording ? QStringLiteral("已在记录中") : QString()));
-      m_btnMtrStart->setEnabled(why.isEmpty());
-      m_btnMtrStart->setToolTip(why.isEmpty()
-         ? QStringLiteral("按上方路径开始写 CSV; 文件为空时写表头, 已有内容则追加。\n"
-                          "采集与曲线常开, 本按钮只管文件。")
-         : QStringLiteral("不可用: ") + why + QStringLiteral("。"));
-   }
+      const QString want = recording ? QStringLiteral("停止记录") : QStringLiteral("开始记录");
+      if (m_btnMtrRec->text() != want)
+         m_btnMtrRec->setText(want);
 
-   if (m_btnMtrStop != nullptr)
-      m_btnMtrStop->setEnabled(recording);
+      if (recording)
+      {
+         m_btnMtrRec->setEnabled(true);
+         if (m_btnMtrRec->toolTip() != QStringLiteral("只停写文件; 采集与曲线照旧。"))
+            m_btnMtrRec->setToolTip(QStringLiteral("只停写文件; 采集与曲线照旧。"));
+      }
+      else
+      {
+         const QString why = !open ? QStringLiteral("功率计未打开")
+                                 : (running ? QStringLiteral("扫描进行中, 跟随的点写入扫描那份 CSV")
+                                            : QString());
+         m_btnMtrRec->setEnabled(why.isEmpty());
+         const QString tip = why.isEmpty()
+            ? QStringLiteral("按上方路径开始写 CSV; 文件为空时写表头, 已有内容则追加。\n"
+                             "采集与曲线常开, 本按钮只管文件。")
+            : QStringLiteral("不可用: ") + why + QStringLiteral("。");
+         if (m_btnMtrRec->toolTip() != tip)
+            m_btnMtrRec->setToolTip(tip);
+      }
+   }
    if (m_btnMtrClear != nullptr)
       m_btnMtrClear->setEnabled(m_mlog != nullptr && m_mlog->count() > 0);
    /* 边记边导是允许的: saveBuffer() 是 const, 不碰正在写的那个文件句柄 */
@@ -521,48 +535,61 @@ void ScanWindow::openMeter()
 void ScanWindow::refreshMeterReadout()
 {
    /* ---- 状态行 ----
-    * 三段: 正在打开… / 未打开 · <原因> / 已打开 · <真机摘要>。
-    * **它同时是"打开失败的原因"唯一的落点** —— 不弹对话框 (表头没插时每按一次弹一个), 而
-    * 横幅只放得下那句 16 字的短句。真机那两句精简过的原因见 ophirOpenWhy(); open() 自己
-    * 回的那几句还很长 (ophirmeter.cpp 那一片), 会原样落到这儿 —— 那一轮精简不在这里做 */
+    * **只在"还没打开"的时候出现**: 正在打开… / 未打开 · <原因>。
+    * 打开着的时候**整行不显示** (2026-09-28 用户报的那一条: 那一行另一半原本把真机接的东西
+    * 摆出来 —— 表头/探头型号序列号 + 波长/量程/模式 + 单位 —— 而那些字屏幕上别处全都有:
+    * 波长那三项就在它下面那三个下拉框里, 型号与序列号在设备信息那一行, 源的名字在曲线左上角
+    * (m_curve->setSourceName), 单位在大字读数与统计那一行。同样的话说两遍, 而这一行占的是
+    * 最显眼的位置。见 docs/scan_sweep.md §37.8)
+    *
+    * **剩下这一半一句都不能少**: 它是"打开失败的原因"**唯一的落点** —— 不弹对话框 (表头没插时
+    * 每按一次弹一个), 而横幅只放得下那句 16 字的短句。真机那两句精简过的原因见 ophirOpenWhy();
+    * open() 自己回的那几句还很长 (ophirmeter.cpp 那一片), 会原样落到这儿 —— 精简不在这里做。
+    *
+    * OphirInfo::summary 还在拼、自检也还钉着 (selftest.cpp:4031 要求它点出表头与探头), 只是
+    * 界面不再拿它显示 —— 与「MeterLog::setAverage() 保留但不露」同一个处理 (§36.11) */
    if (m_lMeter != nullptr && m_meter != nullptr)
    {
-      QString s = m_meter->kind();
+      const bool open_ok = (m_meter->isOpen() && !m_mtrOpening);
 
-      if (m_mtrOpening)
-         s += QStringLiteral(" · 正在打开…");
-      else if (!m_meter->isOpen())
+      if (!open_ok)
       {
-         s += QStringLiteral(" · 未打开");
-         if (!m_mtrWhy.isEmpty())
-            s += QStringLiteral(" · ") + m_mtrWhy;
-      }
-      else
-      {
-         s += QStringLiteral(" · 已打开");
-         if (m_meter == m_ophir)
+         QString s = m_meter->kind();
+
+         if (m_mtrOpening)
+            s += QStringLiteral(" · 正在打开…");
+         else
          {
-            /* 真机把接的是什么摆出来 (表头/探头型号序列号)。由工作线程拼好 (ophirmeter.cpp
-             * 的 buildSummary), 这里原样显示 */
-            const OphirInfo i = m_ophir->info();
-            if (i.valid && !i.summary.isEmpty())
-               s += QStringLiteral(" · ") + i.summary;
+            s += QStringLiteral(" · 未打开");
+            if (!m_mtrWhy.isEmpty())
+               s += QStringLiteral(" · ") + m_mtrWhy;
          }
+         m_lMeter->setText(s);
       }
 
-      m_lMeter->setText(s);
+      /* 只在**状态真的换了**时才动它: 这一拍要跑 30 次。
+       * 用 isHidden() 判而不是 isVisible(): 后者在父窗口还没显示时恒为 false, 分不出
+       * "我藏了它"与"它还没被显示过" */
+      if (m_lMeter->isHidden() != open_ok)
+         m_lMeter->setVisible(!open_ok);
    }
 
    if (m_mlog == nullptr)
       return;
 
-   /* ---- 计数 ---- */
+   /* ---- 状态那一行 (原来叫"计数行") ----
+    * 2026-09-28 §37.11 起它**只说有事才说的话**, 三件:
+    *   - 「请求无响应, 采集等待中。」—— 超时那一个是**停着等**的, 不是继续采 (见 meterlog.h),
+    *     计数不涨这一点必须在界面上有个说法, 否则看起来就像程序死了;
+    *   - 「跟随扫描中。」—— 这一段里读数是扫描那边采的;
+    *   - 「已写入 N 行」—— **只在记录中出**: 停了之后那个数已经由「已停止记录 (本次写入 N 行)」
+    *     那句横幅交代过了, 常驻在屏幕上反而是过期的。
+    * **原来那两个前缀没有了**: 「采集中 ·」是常开的、永远为真的一句话 (与"每次 N 个读数取平均"
+    * 那条同一条理由), 而「缓冲 N 点」挪进了下面统计行 —— 它在那儿本来就是 `n=<同一个数>`,
+    * 一个数说两遍。三件都没有 (不记录、也没卡) 时**整行不显示**, 不留一个空行
+    * (先比 isHidden 再 setVisible, 与 §37.8 同一个写法) */
    if (m_lMtrCount != nullptr)
    {
-      QString t = QStringLiteral("缓冲 %1 点").arg(m_mlog->count());
-
-      /* 超时那一个是**停着等**的, 不是继续采 (见 meterlog.h): 计数不涨这一点必须在界面上
-       * 有个说法, 否则看起来就像程序死了 */
       const bool wedged = m_mlog->timedOut();
 
       /* 缓冲满了要说出来: 屏幕上那条曲线看着照旧很健康, 只是**最旧的正在被丢掉**, 它已经
@@ -571,24 +598,31 @@ void ScanWindow::refreshMeterReadout()
        * 2026-09-28 起采集常开, 缓冲**长期是满的** (那是正常的滚动显示); 于是这句只在
        * **正在记录**时才出 —— 那时它给的才是可执行的那一半意思 ("这一份文件别停") */
       const bool full = (m_mlog->full() && m_mlog->recording());
-      if (full)
-         t += QStringLiteral("  (缓冲已满, 最早的数据正在被丢弃; CSV 记录不受影响)");
 
-      if (m_mlog->running())
-         t = wedged ? QStringLiteral("请求无响应, 采集等待中 · ") + t
-                    : (m_mlog->held() ? QStringLiteral("跟随扫描中 · ") + t
-                                      : QStringLiteral("采集中 · ") + t);
+      QString t;
+      if (wedged)
+         t = QStringLiteral("请求无响应, 采集等待中。");
+      else if (m_mlog->running() && m_mlog->held())
+         t = QStringLiteral("跟随扫描中。");
 
-      /* 「本次写了多少行」并进这一行 (原来它是底下单独的一行, 那行还兼着写一句「未写入
-       * 文件」—— 后者删了: 没在写的时候它不说清任何事)。**只在记录中出**: 停了之后那一行
-       * 数已经由「已停止记录 (本次写入 N 行)」那句横幅交代过了, 常驻在屏幕上反而是过期的 */
       if (m_mlog->recording())
-         t += QStringLiteral("   已写入 %1 行").arg(m_mlog->written());
+      {
+         const QString w = QStringLiteral("已写入 %1 行").arg(m_mlog->written());
+         t = t.isEmpty() ? w : t + QStringLiteral("   ") + w;
+      }
+      if (full)
+      {
+         const QString note =
+            QStringLiteral("(缓冲已满, 最早的数据正在被丢弃; CSV 记录不受影响)");
+         t = t.isEmpty() ? note : t + QStringLiteral("   ") + note;
+      }
 
       m_lMtrCount->setText(t);
       m_lMtrCount->setStyleSheet(wedged ? QStringLiteral("color:#ffb020; font-weight:bold;")
                                         : full ? QStringLiteral("color:#ffb020;")
                                                : QStringLiteral("color:#7b8391;"));
+      if (m_lMtrCount->isHidden() != t.isEmpty())
+         m_lMtrCount->setVisible(!t.isEmpty());
    }
 
    /* ---- 最近一次读数 (大字号) ----
@@ -620,10 +654,10 @@ void ScanWindow::refreshMeterReadout()
    }
 
    /* ---- 统计与曲线共用同一个量级 ----
-    * 统计那四个数**共用一个前缀**, 按这一段里最大的那个 |值| 选 (scaleFor): 否则会出现
-    * "最小 0.5 mW  最大 1.5 mW" 这种一行两个单位的读法, 比固定用 W 还难对。曲线的纵轴
-    * 拿的是**同一个**前缀 —— 那一行字与那根轴说的是同一段数据, 两处换出不同的单位就是
-    * 自相矛盾。
+    * 剩下那两个数 (最小 / 最大) **共用一个前缀**, 按这一段里最大的那个 |值| 选 (scaleFor):
+    * 否则会出现 "最小 0.5 mW  最大 1.5 mW" 这种一行两个单位的读法, 比固定用 W 还难对。
+    * 曲线的纵轴拿的是**同一个**前缀 —— 那一行字与那根轴说的是同一段数据, 两处换出不同的
+    * 单位就是自相矛盾。
     *
     * 单位字也从 scaleFor 出, **不能再写 unitLabel()**: 数已经除过了, 单位字还写 W 的话
     * "最小 0.5 最大 1.5 (W)" 就是一句错话。空单位照旧说「单位不明」 */
@@ -636,13 +670,22 @@ void ScanWindow::refreshMeterReadout()
 
    if (m_lMtrStats != nullptr)
    {
+      /* 2026-09-28 §37.11: 这一行开头那个 `n=<样本数>` 换成「缓冲 N 点」(用户原话:
+       * "缓冲 284点 替换 n= 原有位置"), 并且**平均 与 标准差 两个数去掉** —— 那一行原来
+       * 两行高, 现在一行。
+       *
+       * **两个数不是同一个数, 是刻意取的**: `n` 数的是**能用的**样本 (ok=true), 而缓冲
+       * 点数是**全部** (含失败的)。这一行现在报的是后者 —— 它就是"这一段曲线有多长",
+       * 与「导出当前缓冲」导出多少、缓冲满没满直接对得上, 而统计那三个数只在 ok 的样本上算。
+       * 要 n 的话它已经隐含在 `暂无可用读数` 那一支里了 (n=0 才出)。
+       *
+       * 平均/标准差仍然在 MeterLog 里照算 (自检在测它俩, 见 meterlog.h 的 Stats), 只是
+       * 界面不再显示 —— 与"setAverage 保留但不露"同一个处理 */
       m_lMtrStats->setText(st.n == 0
          ? QStringLiteral("暂无可用读数")
-         : QStringLiteral("n=%1   最小 %2   最大 %3\n平均 %4   标准差 %5 (%6)")
-              .arg(st.n)
-              .arg(formatReading(st.min / scale), formatReading(st.max / scale),
-                   formatReading(st.mean / scale), formatReading(st.sd / scale),
-                   shownLabel));
+         : QStringLiteral("缓冲 %1 点   最小 %2   最大 %3 (%4)")
+              .arg(m_mlog->count())
+              .arg(formatReading(st.min / scale), formatReading(st.max / scale), shownLabel));
       /* 这里原来还有一行"每次 N 个读数取平均"的后缀。2026-09-28 起界面上没有平均次数
        * 那个旋钮了 (MeterLog::setAverage 留着, 自检在测), 一句永远为真的说明不写 */
    }
@@ -2105,8 +2148,9 @@ QWidget *ScanWindow::buildScanPanel()
  *  2. **同一时刻只允许一个未决请求** (powermeter.h:28-31)。源只剩真机之后, 会发请求的只剩两方
  *     —— 连续读数 (MeterLog) 与跑扫描的 ScanController。「读一次」那第三方 2026-09-28 删了,
  *     `m_readPending` 那套仲裁一并撤掉; 退让仍然靠 setHold 推过去, 在 refresh() 一处算。
- *  3. **采集常开**。"源开着就该在采"是每拍重算的不变量, 唯一写点在 refresh(); 「开始记录」与
- *     「停止记录」只管文件, 碰不到采集。滚轮/灰化那些判据全在 refreshMeterPanel() 一处。
+ *  3. **采集常开**。"源开着就该在采"是每拍重算的不变量, 唯一写点在 refresh(); 记录那**一个**
+ *     按钮 (开与关共用, §37.10) 只管文件, 碰不到采集。滚轮/灰化那些判据全在
+ *     refreshMeterPanel() 一处。
  *
  * 2026-09-22 曾经把这一整块搬进一个**独立窗口**、靠菜单栏点开, 参数栏只留一行取样源。
  * 当天又搬回来了: 那个窗口必须先点菜单才看得见, 而"外露"是当初提的要求。
@@ -2119,13 +2163,13 @@ QWidget *ScanWindow::buildMeterPanel()
 
    /* ---------------- 仪器 ----------------
     * 仍然没有"取样源"那一行: 只剩一个源, 写成一个下拉框或一句静态标签都是**不会变的假控件**。
-    * "现在用的是哪一台"由下面状态行第一段的 kind() 承担 */
+    * "现在用的是哪一台"由下面的「设备」下拉承担 (2026-09-28 之前是状态行的第一段 kind()) */
 
    m_lMeter = new QLabel(box);
    m_lMeter->setWordWrap(true);
    m_lMeter->setStyleSheet(QStringLiteral("color:#7b8391;"));
-   /* 这一句里全是设备给的字 (表头/探头型号、序列号), 明写 PlainText: QLabel 默认 AutoText,
-    * 字里有个 `<` 就会被当 HTML 解析 */
+   /* 这里面除了本程序写的那半句, 还有 COM 原样回来的字 (打不开的原因), 明写 PlainText:
+    * QLabel 默认 AutoText, 字里有个 `<` 就会被当 HTML 解析 */
    m_lMeter->setTextFormat(Qt::PlainText);
    v->addWidget(m_lMeter);
 
@@ -2140,6 +2184,9 @@ QWidget *ScanWindow::buildMeterPanel()
    m_cbMtrDev = new QComboBox(box);
    m_cbMtrDev->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
    m_cbMtrDev->setToolTip(QStringLiteral("切换设备会停下采集并清空缓冲。"));
+   /* 每一项**字**是「探头 (s/n: …) · 表头 (s/n: …)」、**data** 是序列号 (见选项里那一项是怎么
+    * 填的: onMeterInfoChanged)。型号要打开设备才读得到, 所以工作线程在打开那一趟里会替别的
+    * 表头各探一遍 —— 探不到的那几台就只有序列号 (说明与代价见 docs/scan_sweep.md §37.9) */
    /* **不接 onMeterCfgChanged**: 它列的不是配置而是"哪一台仪器" (见 scanwindow.h) */
    connect(m_cbMtrDev, &QComboBox::currentIndexChanged, this, &ScanWindow::onMtrDeviceChanged);
    devRow->addWidget(m_cbMtrDev, 1);
@@ -2197,6 +2244,10 @@ QWidget *ScanWindow::buildMeterPanel()
          f->addRow(QStringLiteral("添加波长"), row);
       }
 
+      /* 诊断那一行 —— **只剩** ROM 版本 / 探头类型 / 驱动报的两个版本号 (2026-09-28 §37.10:
+       * 原来那行「<表头> / <探头>   序列号 <探头> (表头 <表头>)」是**设备的身份**, 而下拉里
+       * 每一项写的就是它, 同一件事在相隔两行的地方说两遍。下面那一段的可见性由
+       * onMeterInfoChanged() 控制 (空则整行藏起来, 不留一个空行) */
       m_lDevInfo = new QLabel(m_devBox);
       m_lDevInfo->setWordWrap(true);
       m_lDevInfo->setTextFormat(Qt::PlainText);   /* 同样是设备给的字 */
@@ -2212,8 +2263,9 @@ QWidget *ScanWindow::buildMeterPanel()
    sep->setFrameShadow(QFrame::Sunken);
    v->addWidget(sep);
 
-   /* 「间隔」与「开始记录」**同一行** (原来两行)。放得下: 这一行是 2 字标签 + 一个旋钮 +
-    * 一个 4 字按钮; 名字更长的两个按钮另起一行 */
+   /* 「间隔」/ 记录那一个按钮 / 「清空」**同一行** (§37.5 那次是两行: 间隔一行, 三个按钮一行;
+    * §37.10 开始与停止并成一个按钮之后, 这一行是 2 字标签 + 一个旋钮 + 4 字按钮 + 2 字按钮,
+    * 340 px 栏宽放得下 —— 落地时在屏幕上确认 (见 §37.7 第 19 条)) */
    QHBoxLayout *recRow = new QHBoxLayout;
    recRow->setSpacing(6);
    recRow->addWidget(new QLabel(QStringLiteral("间隔"), box));
@@ -2228,32 +2280,31 @@ QWidget *ScanWindow::buildMeterPanel()
    connect(m_edMtrInterval, &QSpinBox::valueChanged, this, &ScanWindow::onMtrIntervalChanged);
    recRow->addWidget(m_edMtrInterval, 1);
 
-   /* 「开始记录」/「停止记录」**只管文件**。采集与曲线是常开的, 与这两个按钮无关 ——
-    * 这个名字里"记录"两个字不能省: 叫「开始」的话, 按下去屏幕上看不出任何变化 (曲线本来
-    * 就在长), 而"到底开没开文件"要翻到下面计数行那截小字才知道 */
-   m_btnMtrStart = new QPushButton(QStringLiteral("开始记录"), box);
-   m_btnMtrStart->setObjectName(QStringLiteral("go"));
-   connect(m_btnMtrStart, &QPushButton::clicked, this, &ScanWindow::onMtrStartRecordClicked);
-   recRow->addWidget(m_btnMtrStart);
+   /* **开与关共用这一个按钮** (2026-09-28 用户原话: "开始记录和停止记录共用一个按钮"):
+    * 字随状态换 (没写文件 = 「开始记录」, 写着了 = 「停止记录」), 于是"按下去会发生什么"永远
+    * 写在按钮上 —— 不必再靠一个灰着的兄弟按钮去猜现在在哪一态。字与可用性每拍在
+    * refreshMeterPanel() 里重算 (那两个字**只在那里**写), 这里只给初始态。
+    *
+    * 它**只管文件**: 采集与曲线是常开的, 与这个按钮无关 —— 名字里"记录"两个字不能省:
+    * 叫「开始」的话, 按下去屏幕上看不出任何变化 (曲线本来就在长), 而"到底开没开文件"要翻到
+    * 下面计数行那截小字才知道 */
+   m_btnMtrRec = new QPushButton(QStringLiteral("开始记录"), box);
+   m_btnMtrRec->setObjectName(QStringLiteral("go"));
+   connect(m_btnMtrRec, &QPushButton::clicked, this, &ScanWindow::onMtrRecordToggled);
+   recRow->addWidget(m_btnMtrRec);
 
-   v->addLayout(recRow);
-
-   QHBoxLayout *stopRow = new QHBoxLayout;
-   stopRow->setSpacing(6);
-
-   m_btnMtrStop = new QPushButton(QStringLiteral("停止记录"), box);
-   m_btnMtrStop->setToolTip(QStringLiteral("只停写文件; 采集与曲线照旧。"));
-   connect(m_btnMtrStop, &QPushButton::clicked, this, &ScanWindow::onMtrStopRecordClicked);
-   stopRow->addWidget(m_btnMtrStop);
-
+   /* 「清空」跟在记录那一个按钮后面 (原来它与「停止记录」同一行; 那两个并成一个之后,
+    * 这一行就是"记录与清空"这一组三件) */
    m_btnMtrClear = new QPushButton(QStringLiteral("清空"), box);
    m_btnMtrClear->setToolTip(QStringLiteral("仅清除曲线与统计; 已写入 CSV 的数据不变。"));
    connect(m_btnMtrClear, &QPushButton::clicked, this, &ScanWindow::onMtrClearClicked);
-   stopRow->addWidget(m_btnMtrClear);
-   stopRow->addStretch(1);
+   recRow->addWidget(m_btnMtrClear);
+   recRow->addStretch(1);
 
-   v->addLayout(stopRow);
+   v->addLayout(recRow);
 
+   /* 状态那一行 —— 只在有事可说时才有字 (卡住 / 跟随扫描 / 已写入 N 行), 字与显隐都在
+    * refreshMeterReadout() 里算 (§37.11) */
    m_lMtrCount = new QLabel(box);
    m_lMtrCount->setStyleSheet(QStringLiteral("color:#7b8391;"));
    v->addWidget(m_lMtrCount);
@@ -2267,6 +2318,8 @@ QWidget *ScanWindow::buildMeterPanel()
    }
    v->addWidget(m_lMtrLast);
 
+   /* 统计那一行 —— 一行: `缓冲 N 点   最小 …   最大 … (单位)` (§37.11: 平均与标准差去掉,
+    * 开头那个 `n=` 换成缓冲点数) */
    m_lMtrStats = new QLabel(box);
    m_lMtrStats->setWordWrap(true);
    m_lMtrStats->setTextFormat(Qt::PlainText);
@@ -2639,8 +2692,10 @@ void ScanWindow::saveSettings()
     * 记住的抹掉**, 留着上一次那台 */
    pf.meter_interval_ms = m_edMtrInterval->value();
    pf.meter_csv         = m_edMtrCsv->text().trimmed();
-   if (m_cbMtrDev != nullptr && !m_cbMtrDev->currentText().isEmpty())
-      pf.meter_serial = m_cbMtrDev->currentText();
+   /* 存的是**序列号** (itemData), 不是那一项的字 —— 字里现在带着型号, 而"上次用的是哪一台"
+    * 认的是序列号 (进 ini 的也是它) */
+   if (m_cbMtrDev != nullptr && !m_cbMtrDev->currentData().toString().isEmpty())
+      pf.meter_serial = m_cbMtrDev->currentData().toString();
 
    prefsSave(prefsPath(), pf);
    m_savedNic = pf.nic;
@@ -3019,38 +3074,54 @@ void ScanWindow::onMeterInfoChanged()
    const OphirInfo i = m_ophir->info();
 
    /* ---- 「设备」那一行 ----
+    * 每一项的**字**是「探头 (s/n: …) · 表头 (s/n: …)」(见 ophirmeter.h 的 deviceLabel), 而
+    * **认设备一律用它挂的 data (序列号)**: 字给人看, 序列号才是判据 —— itemText 那一栏随时
+    * 可能从"光秃秃的序列号"变成带型号的那一句 (工作线程探过之后)。
+    *
     * 只在**项目真的变了**时重填: 每来一次 infoChanged 就 clear + addItems 的话, 会跟操作员
-    * 正在点的那一下抢 (下拉框弹开着被清空, 点中的是别的项)。
+    * 正在点的那一下抢 (下拉框弹开着被清空, 点中的是别的项)。比的是**字**不是序列号 ——
+    * 序列号没变而字变详细了 (探回来了), 也得重填。
     *
     * 这一趟**在打开失败时也会跑到** (failOpen 也发 infoChanged): 列表是枚举的结果, 与打开
     * 成没成功无关 —— 正是"这台打不开, 换一台"要靠的那一份。
     * 重填期间挡掉信号: currentIndexChanged 在这一行等于"操作员换了设备", 不是"设备信息更新" */
    if (m_cbMtrDev != nullptr)
    {
+      /* 与 device_serials 一一对应; 还没读过的那几台是空 -> 退回显示序列号 */
+      QStringList labels = i.device_labels;
+      labels.resize(i.device_serials.size());
+      for (int k = 0; k < labels.size(); k++)
+         if (labels.at(k).isEmpty())
+            labels[k] = i.device_serials.at(k);
+
       QStringList have;
       for (int k = 0; k < m_cbMtrDev->count(); k++)
          have << m_cbMtrDev->itemText(k);
 
-      if (have != i.device_serials)
+      if (have != labels)
       {
          QSignalBlocker blocker(m_cbMtrDev);
          m_cbMtrDev->clear();
-         m_cbMtrDev->addItems(i.device_serials);
+         for (int k = 0; k < labels.size(); k++)
+            m_cbMtrDev->addItem(labels.at(k), i.device_serials.at(k));
 
          /* 选中现在开着的这一台 (没有就退到第一台) */
-         const int k = m_cbMtrDev->findText(i.device_serial);
+         const int k = m_cbMtrDev->findData(i.device_serial);
          if (k >= 0)
             m_cbMtrDev->setCurrentIndex(k);
       }
    }
 
-   /* 两行设备事实 + 一行版本 (诊断用)。版本那两行取不到就不占地方 —— 它们是驱动层给的东西
-    * (getVersion / getDriverVersion), 摆出来是为了出事时能一眼说清"装的是哪一版" */
-   QString dev = i.valid
-      ? QStringLiteral("%1 / %2   序列号 %3 (表头 %4)\nROM %5   探头类型 %6")
-           .arg(i.device_name, i.sensor_name, i.sensor_serial, i.device_serial,
-                i.rom_version, i.sensor_type)
-      : QStringLiteral("设备信息未读取");
+   /* **只剩诊断那两行** (2026-09-28 §37.10)。原来这里第一行是设备的身份 ——
+    * 「<表头> / <探头>   序列号 <探头> (表头 <表头>)」—— 而上面那个「设备」下拉里每一项写的
+    * 就是表头名、探头名与两个序列号 (deviceLabel, §37.9): 同一件事在相隔两行的地方说两遍,
+    * 而这一行还占着一整行的高度。留下的两行里:
+    *   ROM 版本 / 探头类型 —— 设备报的事实, 屏幕上别处没有;
+    *   对象 / 驱动版本 --- 驱动层给的两个版本号 (getVersion / getDriverVersion), 取不到就不写。
+    * 两样都空 (设备没读回来) 时整行**藏起来**, 不留一个空行 */
+   QString dev;
+   if (i.valid)
+      dev = QStringLiteral("ROM %1   探头类型 %2").arg(i.rom_version, i.sensor_type);
 
    QStringList vers;
    if (!i.com_version.isEmpty())
@@ -3058,9 +3129,16 @@ void ScanWindow::onMeterInfoChanged()
    if (!i.driver_version.isEmpty())
       vers << QStringLiteral("驱动 %1").arg(i.driver_version);
    if (!vers.isEmpty())
-      dev += QStringLiteral("\n版本: ") + vers.join(QStringLiteral("   "));
+   {
+      if (!dev.isEmpty())
+         dev += QLatin1Char('\n');
+      dev += QStringLiteral("版本: ") + vers.join(QStringLiteral("   "));
+   }
 
    m_lDevInfo->setText(dev);
+   /* 先比再写 (30 Hz 那条路): 空 <-> 非空的转换才动可见性 */
+   if (m_lDevInfo->isHidden() != dev.isEmpty())
+      m_lDevInfo->setVisible(!dev.isEmpty());
 
    /* 填的时候挡掉信号, 否则每 addItem 一次都会被当成操作员改配置 (一连串 stop/set/start) */
    m_meterCfgQuiet = true;
@@ -3118,11 +3196,13 @@ void ScanWindow::onMtrDeviceChanged(int idx)
    if (m_mtrOpening || m_ctl->running())
       return;                    /* 扫描中那个框本来就是灰的, 这是兜底 (键盘也能到这儿) */
 
-   const QString serial = m_cbMtrDev->itemText(idx);
+   /* **序列号在 data 里, 不在字里** —— 字是「PD300R (s/n: …) · Juno (s/n: …)」那种给人看的
+    * 说法 (见 ophirmeter.h 的 deviceLabel), 拿它去开设备是不行的 */
+   const QString serial = m_cbMtrDev->itemData(idx).toString();
    if (serial.isEmpty())
       return;
 
-   /* 已经开着的就是这一台: 什么都不做。重填列表时那句 findText 会把当前这台选上, 而
+   /* 已经开着的就是这一台: 什么都不做。重填列表时那句 findData 会把当前这台选上, 而
     * "再选一遍"不该把采集停一下、缓冲清掉 —— 那一下是白挨的 */
    if (m_ophir->isOpen() && serial == m_ophir->info().device_serial)
       return;
@@ -3163,16 +3243,34 @@ void ScanWindow::onMtrAddWavelength()
 
 /* ---------------------------------------------------------------- 采集与记录 */
 
-/* 「开始记录」—— **只管文件**。按下去之前曲线就在长, 按下去之后还是那样长, 区别只在于有没有
- * 一个 CSV 在落盘 (2026-09-28 用户原话: "开始只是开始记录")。
+/* 记录那**一个**按钮 (2026-09-28 用户原话: "开始记录和停止记录共用一个按钮")。按下去之前先看
+ * 现在在不在写文件: 写着就停, 没写就开 —— 两个动作都**只管文件**。
  *
- * 所以这里既不 start() 也不 stop() 采集: 采集是"源开着就该在采"的每拍不变量, 唯一写点在
- * refresh()。反过来说, 这个按钮只在**采集已经在跑**的前提下动文件 —— 采集没跑 (功率计没
- * 打开) 时开一个文件, 得到的是一份只有表头的东西 */
-void ScanWindow::onMtrStartRecordClicked()
+ * 「开」这一支: 按下去之前曲线就在长, 按下去之后还是那样长, 区别只在于有没有一个 CSV 在落盘
+ * (2026-09-28 用户原话: "开始只是开始记录")。所以这里既不 start() 也不 stop() 采集: 采集是
+ * "源开着就该在采"的每拍不变量, 唯一写点在 refresh()。反过来说, 这个分支只在**采集已经在跑**
+ * 的前提下动文件 —— 采集没跑 (功率计没打开) 时开一个文件, 得到的是一份只有表头的东西。
+ *
+ * 「停」这一支: **采集与曲线照旧** (2026-09-28 用户原话: "只停记录"), 所以这里不调
+ * m_mlog->stop(): 那个会连采集一起停, 而下一拍 refresh() 又把它拉起来 —— 白闪一次, 还可能
+ * 丢掉一个正在飞的请求。
+ *
+ * **判据是 `recording()`, 不是按钮上那两个字**: 字由 refreshMeterPanel() 每拍重算, 这条路上
+ * 只认 MeterLog 自己的状态 (灰按钮与键盘都能到这儿) */
+void ScanWindow::onMtrRecordToggled()
 {
-   if (m_mlog == nullptr || m_mlog->recording())
+   if (m_mlog == nullptr)
       return;
+
+   if (m_mlog->recording())
+   {
+      const int n = m_mlog->written();
+      m_mlog->endRecord();
+
+      hint(QStringLiteral("已停止记录 (本次写入 %1 行)。").arg(n), false);
+      refresh();
+      return;
+   }
 
    if (m_meter == nullptr || !m_meter->isOpen())
    {
@@ -3203,21 +3301,6 @@ void ScanWindow::onMtrStartRecordClicked()
 
    hint(QStringLiteral("开始记录: 数据写入 %1。")
            .arg(QDir::toNativeSeparators(m_mlog->recordPath())), false);
-   refresh();
-}
-
-/* 「停止记录」—— 同样只管文件。**采集与曲线照旧** (2026-09-28 用户原话: "只停记录"),
- * 所以这里不调 m_mlog->stop(): 那个会连采集一起停, 而下一拍 refresh() 又把它拉起来 ——
- * 白闪一次, 还可能丢掉一个正在飞的请求 */
-void ScanWindow::onMtrStopRecordClicked()
-{
-   if (m_mlog == nullptr)
-      return;
-
-   const int n = m_mlog->written();
-   m_mlog->endRecord();
-
-   hint(QStringLiteral("已停止记录 (本次写入 %1 行)。").arg(n), false);
    refresh();
 }
 

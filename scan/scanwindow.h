@@ -133,10 +133,9 @@ private:
    /* 「重试」—— 打开失败、或采集卡死时的唯一出口。与构造函数里那一次打开**走同一条路**
     * (openMeter), 没有第二条打开路径 */
    void onMtrRetryOpen();
-   /* 记录: 开始 / 停止 / 清空 / 换输出文件 / 把当前缓冲整份导出。
+   /* 记录: **开始与停止同一个按钮** (按字换名, 见 §37.10) / 清空 / 换输出文件 / 把当前缓冲整份导出。
     * **它们只管文件** —— 采集与曲线与此无关 (2026-09-28 起采集常开, 见 openMeter 的注释) */
-   void onMtrStartRecordClicked();
-   void onMtrStopRecordClicked();
+   void onMtrRecordToggled();
    void onMtrClearClicked();
    void onMtrBrowseCsv();
    void onMtrExportClicked();
@@ -413,6 +412,9 @@ private:
     * 每一项没有单独的"那一行"要露/藏: 整块 m_devBox 一起显隐, 而某一项设备根本没有时
     * 它是**空的 + 灰的** (判据在 refreshMeterPanel 里) */
    QComboBox *m_cbWl = nullptr, *m_cbRange = nullptr, *m_cbMeasMode = nullptr;
+   /* 诊断那一行 (ROM 版本 / 探头类型 / 驱动报的两个版本号)。
+    * **设备的身份 (型号 + 序列号) 不在这里** —— 它现在只由「设备」下拉说 (§37.9/§37.10);
+    * 这一段在设备没读回来、两个版本号也取不到时是**空的**, 那时整行藏起来 (见 onMeterInfoChanged) */
    QLabel    *m_lDevInfo = nullptr;
    /* 真机那一块 (波长/量程/模式 + 设备信息), 只在真机开着时才露 */
    QWidget *m_devBox = nullptr;
@@ -423,6 +425,9 @@ private:
     * **常驻**, 不在 m_devBox 里, 也不在 m_mtrCfgQuiet 那套信号闸的保护范围内: 它列的是
     * "哪一台仪器" (ScanUSB 给的序列号), 换成它等于换一台设备而不是改它的配置, 所以它**另接**
     * onMtrDeviceChanged, 不进那三个框的 connect 循环。枚举结果为空时它是灰的 (refreshMeterPanel)
+    *
+    * **每一项的 data 才是序列号, 字只是给人看的** (字是「探头 (s/n: …) · Juno (s/n: …)」那种
+    * 说法, 见 ophirmeter.h 的 deviceLabel / §37.9): 认设备、写 ini 一律走 data
     *
     * 它的值也是**唯一**进 scan.ini 的那一项 (meter/serial): "上一次用的是这一台"是操作习惯,
     * 与波长/量程/模式那种设备内部状态不同 (见 scanprefs.h) */
@@ -441,19 +446,21 @@ private:
    int          m_wlAddNm  = -1;
 
    /* ---- 采集与记录 (见 meterlog.h) ----
-    * **采集常开**, 记录是另一个动作: 「开始记录」只开那份 CSV, 采集与曲线照旧跑 */
+    * **采集常开**, 记录是另一个动作: 那一个按钮只管那份 CSV, 采集与曲线照旧跑 */
    QSpinBox    *m_edMtrInterval  = nullptr;
-   QPushButton *m_btnMtrStart    = nullptr;   /* 「开始记录」 */
-   QPushButton *m_btnMtrStop     = nullptr;   /* 「停止记录」 */
+   /* **开与关共用这一个按钮** (§37.10): 没在写文件时写「开始记录」, 写着了写「停止记录」。
+    * 名字与可用性每拍由 refreshMeterPanel() 重算 —— 别处不要再动它 */
+   QPushButton *m_btnMtrRec      = nullptr;
    QPushButton *m_btnMtrClear    = nullptr;
    QPushButton *m_btnMtrExport   = nullptr;
    QLineEdit   *m_edMtrCsv       = nullptr;
    QPushButton *m_btnMtrCsv      = nullptr;
-   QLabel      *m_lMtrCount      = nullptr;   /* 缓冲 N 点 / 采集中 / 跟随扫描中 / **卡住了**
-                                               * 记录中时末尾还有 "已写入 N 行" —— 原来那是
-                                               * 单独一行, 并入这里 (2026-09-28 §37) */
+   QLabel      *m_lMtrCount      = nullptr;   /* 状态那一行: **只在有事可说时才有字** ——
+                                               * 卡住 / 跟随扫描中 / 已写入 N 行, 三件都没有
+                                               * 时整行藏起来 (2026-09-28 §37.11)。原来开头的
+                                               * 「采集中 ·」与「缓冲 N 点」都去掉了 */
    QLabel      *m_lMtrLast       = nullptr;   /* 最近一次读数 (大字号, 按量级换前缀) */
-   QLabel      *m_lMtrStats      = nullptr;
+   QLabel      *m_lMtrStats      = nullptr;   /* 一行: 缓冲 N 点 + 最小 + 最大 (§37.11) */
 
    /* ---- 「轴信号」那块表的两个网格 (见 LampGrid)。同一张表上左右排开, 前两格归
     * m_axGrid, 后三格归 m_limGrid ---- */

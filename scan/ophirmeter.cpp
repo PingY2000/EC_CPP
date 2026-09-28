@@ -3,7 +3,9 @@
 
 #include <QDateTime>
 #include <QDeadlineTimer>
+#include <QHash>
 #include <QMutexLocker>
+#include <QSet>
 #include <QThread>
 #include <QWaitCondition>
 
@@ -138,6 +140,34 @@ QString unitFromDeviceInfo(const QString &sensor_type, const QString &mode_name)
    return QString();      /* 认不出来。**不猜**, 见 ophirmeter.h 的说明 */
 }
 
+/* 见 ophirmeter.h: 「探头 (s/n: …) · 表头 (s/n: …)」。纯拼字, 不碰设备 —— 所以自检能直接测
+ * 它 (带上真机那一趟验的是"读回来的字对不对", 这个验的是"拼出来的话对不对", 两件事)。 */
+QString deviceLabel(const QString &head_name, const QString &head_serial,
+                    const QString &sensor_name, const QString &sensor_serial)
+{
+   /* 半段 = 「名字 (s/n: 序列号)」。缺一半就少写那一半:
+    *   名字有、序列号没有 -> 就写名字 (设备没报序列号时别硬凑一个空的括号)
+    *   名字没有、序列号有 -> 写 "(s/n: 序列号)" —— 括号里的东西是判据, 留着 */
+   auto half = [](const QString &name, const QString &serial) {
+      if (name.isEmpty())
+         return serial.isEmpty() ? QString() : QStringLiteral("(s/n: %1)").arg(serial);
+      if (serial.isEmpty())
+         return name;
+      return QStringLiteral("%1 (s/n: %2)").arg(name, serial);
+   };
+
+   /* **探头在前, 表头在后** —— 现场要的就是这个读法 (先认探头: 量程与波长是它定的) */
+   QStringList parts;
+   const QString sensor = half(sensor_name, sensor_serial);
+   if (!sensor.isEmpty())
+      parts << sensor;
+   const QString head = half(head_name, head_serial);
+   if (!head.isEmpty())
+      parts << head;
+
+   return parts.join(QStringLiteral(" · "));
+}
+
 /* 见 ophirmeter.h。设备给的选项串格式不由我们定, 所以只认"最前面那一串数字"这一条:
  * 多一个字符都不影响 (nm / NM / 空格), 少一个数字就认不出 (-1)。 */
 int wavelengthNm(const QString &option)
@@ -178,6 +208,13 @@ struct OphirMeter::Private
    int        want_mode  = -1;
    int        want_add_wl = -1;  /* 要加进设备的那个波长 (nm); -1 = 没有 */
    QString    want_serial;       /* 想打开哪一台; 空 = 枚举到的第一台 */
+
+   /* 下拉那一项的字 (序列号 -> deviceLabel 拼出来的那句话)。**跨会话留着** (它在 p 上, 不在
+    * 某一次会话里): 同一台表头一个进程只探一次 —— 见 runSession 里那段。
+    * dev_probed 记的是"试过了"而不是"成功了": 探不动的那一台 (别的程序占着 / 没反应) 不再
+    * 每按一次「重试」都去撞一次 (撞一次最长 12 秒)。只碰工作线程, 不加锁 */
+   QHash<QString, QString> dev_labels;
+   QSet<QString>           dev_probed;
 
    mutable QMutex info_mx;
    OphirInfo      info;
@@ -440,11 +477,23 @@ void OphirMeter::runSession()
 
    /* 枚举结果**在打开之前**就发布出去。多设备时"这台打不开, 换一台再试"这条路全指望它:
     * 打不开的时候界面也得看得见列表, 否则一台也换不了 (型号要打开之后才知道, 所以这里
-    * 只有序列号 —— Ophir 的枚举接口就只给序列号) */
-   {
+    * 只有序列号 —— Ophir 的枚举接口就只给序列号)。
+    *
+    * 每一台的字 (名字) 另有一份 device_labels, 与这个表一一对应: 还不知道的那几项是空,
+    * 界面那时退回显示序列号。名字由下面那段"探一遍"补上, 补完**再发布一次** */
+   auto labelsOf = [&]() {
+      QStringList labels;
+      for (const QString &s : serials)
+         labels << p->dev_labels.value(s, QString());
+      return labels;
+   };
+   auto publishList = [&]() {
+      const QStringList labels = labelsOf();
       QMutexLocker<QMutex> lk(&p->info_mx);
       p->info.device_serials = serials;
-   }
+      p->info.device_labels  = labels;
+   };
+   publishList();
 
    QString wanted;
    {
@@ -453,7 +502,8 @@ void OphirMeter::runSession()
    }
 
    /* 指定了哪一台就打哪一台。**指定那台不在时不许悄悄换成第一台** —— 两台表头接在同一个
-    * 台面上时, 悄悄换一台就是拿另一个探头的数据当这一个用 */
+    * 台面上时, 悄悄换一台就是拿另一个探头的数据当这一个用。
+    * **这一步在探别的表头之前**: 那一句要快, 不该先等几个开设备的来回 */
    QString pick = serials.first();
    if (!wanted.isEmpty())
    {
@@ -464,6 +514,42 @@ void OphirMeter::runSession()
       }
       pick = wanted;
    }
+
+   /* ---- 替**别的**表头各探一遍, 只为把型号写进下拉 ----
+    * 枚举接口只给序列号; 型号与探头要**打开**才读得到。想让「设备」下拉里每一项都写着
+    * "PD300R (s/n: …) · Juno (s/n: …)", 那些我们本来不会打开的表头就得先探一次:
+    * openUsbDevice → getDeviceInfo / getSensorInfo → closeDevice。
+    *
+    * **只读**: 不写任何东西 (不改配置、不加波长)、不开流, 拿完信息立刻把设备还回去 (表头是
+    * 独占的, 不还回去下面那句 openUsbDevice 就撞上自己了)。**要打开的那一台不探** —— 它马上
+    * 就要被正式打开一次, 那一次读回来的字比探出来的全 (见下面那句 deviceLabel)。
+    *
+    * 探不动 (别的程序占着 / USB 没反应) 就让它只有序列号, 而且**一个进程里不再试**: 每按一次
+    * 「重试」都去撞一次 12 秒没有意义。代价与已知限制见 docs/scan_sweep.md §37.9 */
+   for (const QString &s : serials)
+   {
+      if (s == pick || p->dev_probed.contains(s))
+         continue;
+      p->dev_probed.insert(s);
+
+      long h2 = 0;
+      QString e2;
+      if (!com.openUsbDevice(s, &h2, &e2))
+         continue;
+
+      OphirCom::DeviceInfo d2;
+      OphirCom::SensorInfo s2;
+      const bool ok_dev = com.getDeviceInfo(h2, &d2, &e2);
+      const bool ok_sen = com.getSensorInfo(h2, k_channel, &s2, &e2);
+      com.closeDevice(h2, nullptr);
+
+      if (!ok_dev)
+         continue;                     /* 连它是什么都不知道 -> 只有序列号 */
+      p->dev_labels.insert(s, deviceLabel(d2.name, s,
+                                          ok_sen ? s2.name : QString(),
+                                          ok_sen ? s2.serial : QString()));
+   }
+   publishList();                       /* 再发布一次: 现在每一项都有型号了 */
 
    long h = 0;
    if (!com.openUsbDevice(pick, &h, &err))
@@ -507,6 +593,11 @@ void OphirMeter::runSession()
    info.sensor_name   = sinfo.name;
    info.sensor_type   = sinfo.type;
    info.sensor_serial = sinfo.serial;
+
+   /* 这一台的真实型号也记进那张表: 下拉里它那一项立刻从光秃秃的序列号变成
+    * "PD300R (s/n: …) · Juno (s/n: …)" (界面在 infoChanged 里重填那一栏)。
+    * 表头序列号用**枚举到的那个** pick, 不用 dinfo.serial —— 那一项是用 pick 认的 */
+   p->dev_labels.insert(pick, deviceLabel(dinfo.name, pick, sinfo.name, sinfo.serial));
 
    /* ---- 读当前的波长 / 量程 / 测量模式 ----
     * 只读不改 (手册: 不要拿型号自行推断规格)。这三项对某些探头不适用, 那时 index = -1、
@@ -559,6 +650,8 @@ void OphirMeter::runSession()
 
    info.valid   = true;
    info.summary = buildSummary(info);
+   /* 名字到这儿才齐 (上面那一句刚把 pick 的写进表) */
+   info.device_labels = labelsOf();
    {
       QMutexLocker<QMutex> lk(&p->info_mx);
       p->info = info;
