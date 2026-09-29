@@ -196,6 +196,11 @@ private:
       QWidget *w = nullptr;
       bool     lock_running = false;  /* 运行中也锁住 (几何 / 输出路径这类) */
       bool     need_manual = false;   /* 只在"色阶手动定标"时才可用 (自动跟随时它是多余的) */
+      /* 装载态也锁住 (2026-09-29)。**不是 lock_running 的复刻**: 只有"这一趟怎么走 /
+       * 往哪写"那一族打 true —— 装进来的 (ix, iy) 绑在那份几何上, 而扫描速度 / 手动速度
+       * 在装载态是**真改得动**的 (按「继续」时才被读), 锁它们就是"亮了却没用"。
+       * 加在末尾并给默认值, 别的面板那些 GateItem{…} 初始化式一处都不用改。 */
+      bool     lock_loaded = false;
    };
    struct PanelItems
    {

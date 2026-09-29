@@ -474,6 +474,100 @@ std::string csvParseForResume(const std::string &text, const Params &p,
    return diff;
 }
 
+std::string csvAlignParams(const std::string &text, const Params &cur, Params *out)
+{
+   /* 逐 `#` 行取那四项。**四项缺一不可**: 本程序写出来的表头永远四项俱全 (见 csvMetaLines),
+    * 少一项只可能是手改或截断的文件 —— 那种文件按哪一项去对齐都是猜, 不如说"表头不完整"。
+    * (今天那种文件也会被拒, 只是拒在 csvParseForResume 里, 报出来的是"区域Y -1 → 27"。) */
+   bool   have[4] = {false, false, false, false};
+   double v[4]    = {0.0, 0.0, 0.0, 0.0};
+
+   std::string line;
+   size_t pos = 0;
+   while (pos <= text.size())
+   {
+      const size_t nl = text.find('\n', pos);
+      line = (nl == std::string::npos) ? text.substr(pos) : text.substr(pos, nl - pos);
+      if (!line.empty() && line.back() == '\r')
+         line.pop_back();
+
+      if (!line.empty() && line[0] != '#')
+         break;      /* 表头全在开头那一串 `#` 行里, 列名行一出现就不用再看了 */
+
+      double d = 0;
+      if (metaGet(line, "area_x_unit", &d))     { have[0] = true; v[0] = d; }
+      if (metaGet(line, "area_y_unit", &d))     { have[1] = true; v[1] = d; }
+      if (metaGet(line, "res_unit", &d))        { have[2] = true; v[2] = d; }
+      if (metaGet(line, "pulses_per_unit", &d)) { have[3] = true; v[3] = d; }
+
+      if (nl == std::string::npos)
+         break;
+      pos = nl + 1;
+   }
+
+   if (!(have[0] && have[1] && have[2] && have[3]))
+      return "CSV 中没有几何参数 (表头不完整), 无法确认与当前参数是否为同一片区域。";
+
+   /* 名前缀与 csvParseForResume 那句诊断**同源** (docs/scan_sweep.md §24.1 钉着那四个名字):
+    * 同一个东西在两条路上不许有两个叫法 */
+   struct Bound
+   {
+      const char *name;
+      double      lo, hi;
+   };
+   static const Bound kBound[4] = {
+      { "区域X(mm)",    kGeomAreaMin, kGeomAreaMax },
+      { "区域Y(mm)",    kGeomAreaMin, kGeomAreaMax },
+      { "分辨率 (mm)",  kGeomResMin,  kGeomResMax  },
+      { "每 mm 脉冲数",  kGeomPpuMin,  kGeomPpuMax  },
+   };
+
+   for (int i = 0; i < 4; i++)
+   {
+      if (v[i] >= kBound[i].lo && v[i] <= kBound[i].hi)
+         continue;
+
+      /* 说清是哪一项、读到的是多少: setValue 会把它**静默夹小**, 夹完之后续扫那句
+       * "几何不一致"就没有人看得懂了。用 %g 不用定点 —— 0.0001 那种值按 3 位小数印
+       * 出来是 "0.000", 恰好把要说的那个数藏掉了 */
+      char buf[240];
+      std::snprintf(buf, sizeof(buf),
+                    "CSV 的%s = %g, 超出面板可设的范围, 无法按它对齐。请另建文件。",
+                    kBound[i].name, v[i]);
+      return std::string(buf);
+   }
+
+   /* 只改那四项, 别的字段原样 (= cur 的) —— 于是这一份整份交给 validate() 也是对的 */
+   Params q = cur;
+   q.area_x_unit     = v[0];
+   q.area_y_unit     = v[1];
+   q.res_unit        = v[2];
+   q.pulses_per_unit = v[3];
+
+   /* 量程跟着新几何重算, 与 currentParams() 同一条规矩 ("量程永远按区域自动算")。
+    * ★ **不重算会误判**: range_pul 是从**旧**几何算出来的数, 而它比新区域还小的场合
+    * (例如当前 3×3 mm = 800000 pul 的量程, CSV 是 40×40 mm = 1000000 pul) 下面那句
+    * validate() 会拿旧量程去量新区域, 判它"超出量程" —— 一个完全正常的 CSV 会被拒。 */
+   q.range_pul = autoRangePul(q);
+
+   /* 手改坏的几何 (分辨率大于区域 / 点数超上限) 在这里拦掉。不拦的话面板会停在一份
+    * validate() 不认的参数上 —— 那一份连 prefsSave 都不采纳 (prefsMergeParams),
+    * 盘上屏幕上就成了两份; 而且接着 resume() 报的那句是说给"参数"听的, 不是给 CSV 听的。
+    * 不把 validate() 那句话原样搬出去: 它自带一句「请调小分辨率」, 而这里改不了 CSV。 */
+   if (!validate(q).empty())
+   {
+      char buf[280];
+      std::snprintf(buf, sizeof(buf),
+                    "CSV 的几何参数不合法: 区域 %g × %g mm, 分辨率 %g mm。请另建文件。",
+                    v[0], v[1], v[2]);
+      return std::string(buf);
+   }
+
+   if (out != nullptr)
+      *out = q;
+   return std::string();
+}
+
 void csvLoadGrid(const std::string &text, const Params &p,
                  std::vector<char> *have, std::vector<double> *watts)
 {

@@ -52,6 +52,15 @@ struct Params
  * validate() 报的是它, rebuildPlan() 拦的也是它。 */
 constexpr long long kMaxPlanPoints = 200000;
 
+/* 参数栏那四个几何输入框的可设范围 (2026-09-29)。**界面按这四个数 setRange, 判据也按它们判**
+ * (见 csvAlignParams) —— 两处各写一份的话, "CSV 里的值设得进面板吗"这件事迟早跟界面对不上。
+ *
+ * 为什么要有这条判据: QDoubleSpinBox::setValue 会把超范围的值**静默夹进来** (600 变成 500),
+ * 于是"照 CSV 对齐"会悄悄对齐成另一个值, 而续扫那边一句"几何不一致"说得人不明不白。 */
+constexpr double kGeomAreaMin = 0.1,   kGeomAreaMax = 500.0;     /* mm */
+constexpr double kGeomResMin  = 0.001, kGeomResMax  = 50.0;      /* mm */
+constexpr double kGeomPpuMin  = 100.0, kGeomPpuMax  = 1000000.0; /* pul/mm */
+
 /* Params::meter_interval_ms 的量程。**与 MeterLog::kMinIntervalMs / kMaxIntervalMs 必须
  * 逐字一致** (那一头夹的是连续读数真的用的间隔, 这一头夹的是同一件事的估计与预算)。
  * 本文件刻意不依赖 Qt (见开头 VEL_MIN 那段), 所以只能照抄一份 —— 但这次**钉住了**:
@@ -138,6 +147,20 @@ std::string csvRowLine(const Row &r);
 std::string csvParseForResume(const std::string &text, const Params &p,
                               std::vector<char> *done, int *max_index,
                               std::string *started_iso, int *zero_epoch);
+
+/* 续扫前: 该不该把面板对齐到这份 CSV 的几何 (2026-09-29)。
+ *
+ * 返回空串 = 可以, *out 就是拿去设进那四个控件的那一份 (**在 cur 的基础上改那四项几何**,
+ * 别的字段一个都不动 —— 所以它整份交给 validate() 也是对的)。唯一的例外是 range_pul:
+ * 它本来就是"由区域算出来的"数 (见 autoRangePul), 这里跟着新几何重算一遍 —— 不重算的话
+ * validate() 会拿旧量程去量新区域, 一个正常的 CSV 会被误判成"几何不合法";
+ * 非空 = 一句给操作员看的理由, 调用方**一个数都不许设进面板**。
+ *
+ * 与 csvParseForResume 分工不同, 两边都不动对方那一个: 那一个的活是"比出差异"(它照旧一个字
+ * 不改, 现在退居兜底 —— 手改过的 CSV、以及任何不走界面的调用方), 这一个的活是"把值取出来,
+ * 并且先确认它真的设得进面板" (范围见上面 kGeom*; 手改坏的几何过不了 validate() 也在这一关
+ * 拦掉 —— 不拦的话面板会停在一份连 prefsSave 都不采纳的参数上, 盘上屏幕上就分成两份了)。 */
+std::string csvAlignParams(const std::string &text, const Params &cur, Params *out);
 
 /* 把数值读回网格, 用于续扫之后重画热力图。一格多行时取最后一行;
  * 列的位置从列名行按名字找, 不写死下标。 */

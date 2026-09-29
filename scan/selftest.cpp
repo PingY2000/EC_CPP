@@ -136,6 +136,7 @@ public:
 
    void setTarget(int a, int32_t w) override
    {
+      ntarget++;
       if (t_.range > 0)
       {
          if (w >  t_.range) w =  t_.range;
@@ -145,7 +146,10 @@ public:
       t_.ax[a].at_target = (t_.ax[a].want == t_.ax[a].tgt);
    }
 
-   void setSpeed(int a, uint32_t v) override { t_.ax[a].vel = v; }
+   /* 只数下发次数: "一格都没走"最硬的一句是 nspeed == 0 —— armRun 在 startPoint() 之前
+    * 就 setSpeed 两次, 所以"速度一次都没设过"等价于"压根没进 armRun"。单看 want 有歧义
+    * (want 初值就是 0, 而 postStop() 也写 want) */
+   void setSpeed(int a, uint32_t v) override { nspeed++; t_.ax[a].vel = v; }
 
    /* 与 EcatThread::doStop 同义: 目标就地冻住, **保持使能** */
    void postStop() override
@@ -257,6 +261,10 @@ public:
    int32_t want(int i) const   { return t_.ax[i].want; }
    int32_t tgt(int i) const    { return t_.ax[i].tgt; }
    int32_t pos(int i) const    { return t_.ax[i].pos; }
+
+   /* 下发计数器 (2026-09-29 加): 只给"装载了到底走没走"这一条用, 不参与假动力学 */
+   int     ntarget = 0;
+   int     nspeed  = 0;
 
 private:
    /* 唯一一处把 sw / dig / 反转合成 limit_active 的地方 —— 与 publish() 同一个函数 */
@@ -416,10 +424,28 @@ struct Rig
       return ctrl.start(csv, err);
    }
 
+   /* 2026-09-29 起续扫拆成两步, 这个助理走的是**老路**的一口气 (读入 + 立刻开跑),
+    * 既有用例钉的就是"读入 + 启动"这条语义, 所以这里合成一行, 断言一个字不用改。
+    * 只读入不开跑那一条路见下面的 loadOnlyScan() */
    bool resumeScan(const QString &csv, bool accept, QString *err, QString *why)
    {
       ctrl.tick(now);
-      return ctrl.resume(csv, accept, err, why);
+      if (!ctrl.loadResume(csv, accept, err, why))
+         return false;
+      return ctrl.beginLoadedRun(err);
+   }
+
+   /* 只装载: 选完文件把数据读进来, 一步不走 (State::Loaded) */
+   bool loadOnlyScan(const QString &csv, QString *err, QString *why = nullptr)
+   {
+      ctrl.tick(now);
+      return ctrl.loadResume(csv, false, err, why);
+   }
+
+   bool beginLoadedRun(QString *err)
+   {
+      ctrl.tick(now);
+      return ctrl.beginLoadedRun(err);
    }
 
    bool retestAt(int ix, int iy, QString *err)
@@ -738,6 +764,546 @@ static void test_csv()
    outside += "0,99,0,0,0,0,0,1,1,,0,0,0,0,0,0\n";       /* ix 超出 55 */
    check(!csvParseForResume(outside, p, nullptr, nullptr, nullptr, nullptr).empty(),
          "an out-of-grid index rejected");
+}
+
+/* 续扫前把面板对齐到 CSV 的几何 (2026-09-29, docs/scan_sweep.md §44)。
+ *
+ * 这一支是**纯判据**: "能不能按这份 CSV 对齐"。界面那一步 (把结论设进那四个控件 / 最终没成
+ * 时退回去) 在 scanwindow.cpp 里, 自检够不着 —— 所以这里把每一种情形钉死, 屏幕前只需要看
+ * "那四个数有没有真的跟着变" (报告时这两半要分开说)。 */
+static void test_csvalign()
+{
+   caseBegin("csvalign: 四项照单全收, 别的字段一个都不动");
+
+   const Params csv_p;        /* 27×27 mm / 0.5 mm / 50000 pul per mm —— 表头照它写 */
+   Params cur = csv_p;
+   cur.area_x_unit     = 30.0;
+   cur.area_y_unit     = 30.0;
+   cur.res_unit        = 0.25;
+   cur.pulses_per_unit = 10000.0;
+   /* 那四项之外的都设成与缺省不同的值: 对齐不许碰它们 */
+   cur.speed_pul_s       = 5000;
+   cur.dwell_ms          = 50;
+   cur.settle_ms         = 20;
+   cur.samples_per_point = 3;
+   cur.serpentine        = false;
+   cur.start_positive    = false;
+   cur.meter_interval_ms = 500;
+   cur.range_pul         = autoRangePul(cur);
+
+   const std::string head = csvMetaLines(csv_p, "2026-09-29T10:00:00", 1);
+
+   Params out;
+   const std::string r = csvAlignParams(head, cur, &out);
+   check(r.empty(), "一份正常的表头照收", r);
+   checkNear(out.area_x_unit, 27.0, "区域X 按 CSV");
+   checkNear(out.area_y_unit, 27.0, "区域Y 按 CSV");
+   checkNear(out.res_unit, 0.5, "分辨率按 CSV");
+   checkNear(out.pulses_per_unit, 50000.0, "每 mm 脉冲数按 CSV");
+   checkEq(out.speed_pul_s, 5000, "扫描速度不许被动");
+   checkEq(out.dwell_ms, 50, "停留不许被动");
+   checkEq(out.settle_ms, 20, "稳定不许被动");
+   checkEq(out.samples_per_point, 3, "采样次数不许被动");
+   check(!out.serpentine, "蛇形不许被动");
+   check(!out.start_positive, "起始方向不许被动");
+   checkEq(out.meter_interval_ms, 500, "功率计间隔不许被动");
+   /* 量程是"由区域算出来的"(autoRangePul), 所以它**要**跟着变 —— 这是"别的字段一个都不动"
+    * 的唯一例外, 理由见 csvAlignParams 里那段 (不重算会拿旧量程量新区域) */
+   checkEq(out.range_pul, autoRangePul(out), "量程按新几何重算");
+   checkEq((long long)out.range_pul, (long long)autoRangePul(csv_p), "而且就是那份几何的量程");
+
+   caseBegin("csvalign: 本来就一样就一个字都不说");
+   Params same;
+   const std::string r2 = csvAlignParams(head, csv_p, &same);
+   check(r2.empty(), "表头与当前一致时也是空串", r2);
+   check(same.speed_pul_s == csv_p.speed_pul_s && same.dwell_ms == csv_p.dwell_ms
+            && same.settle_ms == csv_p.settle_ms
+            && same.samples_per_point == csv_p.samples_per_point
+            && same.serpentine == csv_p.serpentine
+            && same.start_positive == csv_p.start_positive
+            && same.meter_interval_ms == csv_p.meter_interval_ms,
+         "而且整份逐项等于原来那一份");
+   /* range_pul 是唯一的例外: 它由区域算出来。csv_p 里那个 0 是"还没算过"的写法
+    * (UI 那条路上 currentParams() 从来不留 0), 出来的是算好的那一份 */
+   checkEq((long long)same.range_pul, (long long)autoRangePul(csv_p), "量程归一成算好的那一份");
+
+   caseBegin("csvalign: 表头不全就拒绝, 而且一个数都不许写出去");
+   /* out 里先放哨兵: 拒绝时**连一项都不许被写过** —— 界面那一侧就是"一个控件都不动" */
+   Params sent;
+   sent.area_x_unit = -7; sent.area_y_unit = -8; sent.res_unit = -9; sent.pulses_per_unit = -10;
+   const std::string r3 = csvAlignParams(csvColumnHeader(), csv_p, &sent);
+   check(!r3.empty() && r3.find("表头不完整") != std::string::npos, "连表头都没有", r3);
+   checkNear(sent.area_x_unit, -7, "拒绝时不许写 out");
+
+   /* 只有三项: 本程序写出来的表头永远四项俱全 (csvMetaLines), 少一项只可能是手改/截断的文件 */
+   std::string three =
+      "# scan v1\n# area_x_unit=27.000000 area_y_unit=27.000000 res_unit=0.500000\n";
+   three += csvColumnHeader();
+   const std::string r4 = csvAlignParams(three, csv_p, &sent);
+   check(!r4.empty() && r4.find("表头不完整") != std::string::npos, "缺一项也算表头不完整", r4);
+
+   caseBegin("csvalign: 值超出面板可设的范围就拒绝 (setValue 会静默把它夹小)");
+   {
+      Params big = csv_p;
+      big.area_x_unit = 600.0;
+      const std::string r5 = csvAlignParams(csvMetaLines(big, "x", 1), csv_p, &sent);
+      check(!r5.empty() && r5.find("区域X(mm)") != std::string::npos
+               && r5.find("600") != std::string::npos,
+            "区域 600 mm 超出上限, 说出是哪一项", r5);
+
+      Params tiny = csv_p;
+      tiny.res_unit = 0.0001;
+      const std::string r6 = csvAlignParams(csvMetaLines(tiny, "x", 1), csv_p, &sent);
+      check(!r6.empty() && r6.find("分辨率") != std::string::npos, "分辨率 0.0001 mm 低于下限", r6);
+      /* ★ 那句话里的数必须**原样**印出来: 按 3 位小数印就成了 0.000, 恰好把要说的那个数藏掉 */
+      check(r6.find("0.0001") != std::string::npos, "而且原样印出读到的是多少", r6);
+
+      Params ppu = csv_p;
+      ppu.pulses_per_unit = 50.0;
+      const std::string r7 = csvAlignParams(csvMetaLines(ppu, "x", 1), csv_p, &sent);
+      check(!r7.empty() && r7.find("每 mm 脉冲数") != std::string::npos,
+            "每 mm 脉冲数 50 低于下限", r7);
+   }
+
+   caseBegin("csvalign: 那份几何自己就不合法也拒绝");
+   {
+      Params bad = csv_p;
+      bad.area_x_unit = 0.2;         /* 分辨率 0.5 > 区域 0.2 */
+      const std::string r8 = csvAlignParams(csvMetaLines(bad, "x", 1), csv_p, &sent);
+      check(!r8.empty() && r8.find("不合法") != std::string::npos, "分辨率大于区域", r8);
+   }
+
+   caseBegin("csvalign: 区域变大不许被旧量程误判 (range_pul 是算出来的, 不是一条参数)");
+   {
+      /* 当前是很小的一片: 量程被 kCanvasHalfUnits 托到 16 mm = 800000 pul。
+       * CSV 是 40×40 mm -> 最远点 20 mm = 1000000 pul, 比那个量程还远 ——
+       * 不重算 range_pul 的话 validate() 会拿旧量程量新区域, 一个完全正常的 CSV 被拒。 */
+      Params small = csv_p;
+      small.area_x_unit = 3.0;
+      small.area_y_unit = 3.0;
+      small.range_pul   = autoRangePul(small);
+
+      Params wide = csv_p;
+      wide.area_x_unit = 40.0;
+      wide.area_y_unit = 40.0;
+
+      Params out2;
+      const std::string r9 = csvAlignParams(csvMetaLines(wide, "x", 1), small, &out2);
+      check(r9.empty(), "40×40 的 CSV 对齐得进去, 不该被旧量程拦下", r9);
+      checkNear(out2.area_x_unit, 40.0, "区域X 按 CSV");
+      checkEq((long long)out2.range_pul, (long long)autoRangePul(wide), "量程重算成新几何那一份");
+   }
+
+   caseBegin("csvalign: 老的兜底一个字没变 (对齐之外那条路还在)");
+   {
+      /* csvParseForResume 照旧比差异、照旧拒绝 —— 它现在管的是手改过的 CSV 与不走界面的调用方 */
+      Params other = csv_p;
+      other.res_unit = 0.25;
+      const std::string d = csvParseForResume(head, other, nullptr, nullptr, nullptr, nullptr);
+      check(!d.empty(), "几何不同仍然给差异句", d);
+      check(d.find("分辨率") != std::string::npos, "而且照旧指名道姓", d);
+   }
+}
+
+/* ---------------------------------------------------------------- 续扫装载 */
+
+/* 做一份"没采完"的 CSV: 跑够 npoints 个点就中止。返回文件里已经采完的点数 (-1 = 起不来) */
+static int makePartialCsv(const QString &csv, const Params &p, int npoints)
+{
+   Rig r;
+   r.ctrl.setParams(p);
+   r.ctrl.rebuildPlan();
+   r.meter.setValue(3.0);
+
+   QString err;
+   if (!r.startScan(csv, &err))
+      return -1;
+
+   r.runUntil([&] { return r.ctrl.completedPoints() >= npoints; });
+   r.ctrl.abort(QStringLiteral("操作员按了中止"));
+   return r.ctrl.completedPoints();
+}
+
+static bool writeTextFile(const QString &path, const QString &text)
+{
+   QFile f(path);
+   if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+      return false;
+   const QByteArray b = text.toUtf8();
+   f.write(b);
+   f.close();
+   return true;
+}
+
+/* 一格一格数 doneMask 里为真的格子 —— 画布上那半张图的直接证据 */
+static int countDoneCells(const ScanController &c)
+{
+   int n = 0;
+   for (int ix = 0; ix < c.gridNx(); ix++)
+      for (int iy = 0; iy < c.gridNy(); iy++)
+         if (c.cellDone(ix, iy))
+            n++;
+   return n;
+}
+
+/* 续扫拆成两步 (2026-09-29): 打开一份 CSV **只读入**, 按「继续」才开始补点。
+ *
+ * 这个函数钉的就是"拆开"这件事本身 —— 装载完一步不走 / 「继续」才走 / 拦下时留在装载态 /
+ * 那两条前提在「继续」那一刻重查 / 装载失败不留痕 / 「中止」放弃装载 / 装载态不许新建。
+ * 老的一口气那条路 (resumeScan = 读入 + 立刻开跑) 照旧在 test_run 里钉着。 */
+static void test_resumeload()
+{
+   QTemporaryDir dir;
+
+   caseBegin("resumeload: 打开 CSV 只读入, 滑台一步不走");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);      /* 窗口在「连接 / 设为区域中心」时做的事 */
+
+      const QString csv = dir.filePath("loaded.csv");
+      const int in_file = makePartialCsv(csv, p, 3);
+      checkEq(in_file, 3, "先做一份只采了 3 个点的文件");
+
+      QString err, why;
+      check(r.loadOnlyScan(csv, &err, &why), "装载", (err + " | " + why).toStdString());
+      check(why.isEmpty(), "世代一致, 没有要确认的差异", why.toStdString());
+
+      check(r.ctrl.state() == ScanController::State::Loaded, "状态是 Loaded");
+      check(!r.ctrl.running(), "Loaded 不算 running");
+
+      /* **"一步没走"最硬的两句**: armRun 在 startPoint() 之前就 setSpeed 两次, 所以
+       * "一次速度都没设过"等价于"压根没进 armRun"。单看 want 有歧义 —— 它初值就是 0,
+       * 而 postStop() 也写 want */
+      checkEq(r.bus.nspeed, 0, "一次速度都没设过 (armRun 没被走到)");
+      checkEq(r.bus.ntarget, 0, "一个目标都没下发");
+
+      checkEq(r.ctrl.pendingPoints(), 25 - in_file, "待补点数 = 总点数 - 文件里已有的");
+      checkEq(r.ctrl.completedPoints(), in_file, "上半场读进结果网格");
+      checkEq(countDoneCells(r.ctrl), in_file, "上半场那几格在 doneMask 里为真 (画布会画出来)");
+      check(r.ctrl.csvPath().endsWith(QStringLiteral("loaded.csv")),
+            "追加句柄开着的是这份文件", r.ctrl.csvPath().toStdString());
+
+      /* 拨 50 拍: 状态机一个字节都不该动。**不能用 runToIdle()** —— 它只认 Done/Aborted,
+       * 装载态会让它空转满 120 s 才失败, 看起来像卡死 */
+      const ScanController::State st0 = r.ctrl.state();
+      const int32_t px0 = r.bus.pos(0), py0 = r.bus.pos(1);
+      const int32_t wx0 = r.bus.want(0), wy0 = r.bus.want(1);
+      for (int k = 0; k < 50; k++)
+         r.stepOnce();
+      check(r.ctrl.state() == st0, "拨 50 拍之后状态没变");
+      checkEq(r.bus.pos(0), px0, "拨 50 拍之后 X 位置没动");
+      checkEq(r.bus.pos(1), py0, "拨 50 拍之后 Y 位置没动");
+      checkEq(r.bus.want(0), wx0, "拨 50 拍之后 X 目标没动");
+      checkEq(r.bus.want(1), wy0, "拨 50 拍之后 Y 目标没动");
+      checkEq(r.bus.ntarget, 0, "拨 50 拍之后还是一个目标都没下发");
+      checkEq(r.bus.nspeed, 0, "拨 50 拍之后还是一次速度都没设过");
+      checkEq(r.ctrl.completedPoints(), in_file, "拨 50 拍之后已采点数没变");
+
+      /* ---- 按「继续」才开始走 ---- */
+      caseBegin("resumeload: 按「继续」才开始补点, 补的是待补集合里第一个");
+
+      const std::vector<Point> plan = buildPlan(p);
+      int first_pending = -1;
+      for (size_t i = 0; i < plan.size(); i++)
+      {
+         if (!r.ctrl.cellDone(plan[i].ix, plan[i].iy))
+         {
+            first_pending = (int)i;
+            break;
+         }
+      }
+      checkEq(first_pending, in_file, "待补集合的第一个 = 点列里第 in_file 个 (不是第 0 个)");
+
+      err.clear();
+      check(r.beginLoadedRun(&err), "按「继续」", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Moving, "这才走到 Moving");
+      checkEq(r.bus.nspeed, 2, "armRun 在 startPoint 之前设了两次速度");
+      checkEq(r.ctrl.index(), first_pending, "第一个补的是待补集合里的第一个 (按点列顺序)");
+
+      check(r.runToIdle(), "补完这一轮");
+      checkEq(r.ctrl.completedPoints(), 25, "补完全部 25 格");
+      checkEq(r.ctrl.pendingPoints(), 0, "待补点数归零");
+
+      /* 「继续」只在装载态算数: 跑完之后再按一次, 不该把整张网格重跑一遍 */
+      err.clear();
+      check(!r.beginLoadedRun(&err), "一轮跑完之后再按「继续」不成");
+      check(r.ctrl.state() == ScanController::State::Done, "而且没把状态搅乱");
+   }
+
+   /* 装载时那句 m_ord_i = 0 是硬需求, 而**只有"这个控制器刚跑过一轮"才看得出来**:
+    * pendingPoints() 就是 m_order.size() - m_ord_i, 而 m_ord_i 唯一被清零的地方是 armRun。
+    * 漏掉它, 装载完之后它还是上一轮跑到的下标 —— 画布左上角那行「N / M 点, 剩 K」是**无条件**
+    * 读 pendingPoints() 的, 于是屏幕上印一个负数, 而那个位置 scanwindow.cpp 根本管不着 */
+   caseBegin("resumeload: 装载前刚跑过一轮 → 待补点数不能从上一轮的下标接着算");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      QString err, why;
+
+      check(r.startScan(dir.filePath("first_round.csv"), &err), "先跑完一整轮", err.toStdString());
+      check(r.runToIdle(), "跑完");
+      checkEq(r.ctrl.pendingPoints(), 0, "跑完之后是 0 (m_ord_i 停在 25 上)");
+
+      const QString csv = dir.filePath("after_round.csv");
+      const int in_file = makePartialCsv(csv, p, 3);
+      checkEq(in_file, 3, "只采了 3 个点的文件");
+
+      check(r.loadOnlyScan(csv, &err, &why), "装载", err.toStdString());
+      checkEq(r.ctrl.pendingPoints(), 25 - in_file,
+              "待补点数 = 25 - 文件里已有的 (不是 22 - 25 那个负数)");
+   }
+
+   caseBegin("resumeload: 按「继续」被拦下时留在装载态, 装载不丢");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      const QString csv = dir.filePath("cont.csv");
+      const int in_file = makePartialCsv(csv, p, 3);
+      checkEq(in_file, 3, "只采了 3 个点的文件");
+
+      QString err, why;
+      check(r.loadOnlyScan(csv, &err, &why), "装载", err.toStdString());
+      const int pend = r.ctrl.pendingPoints();
+      checkEq(pend, 25 - in_file, "要补的点 = 总点数 - 文件里已有的");
+
+      r.bus.setInOp(false);
+      err.clear();
+      check(!r.beginLoadedRun(&err), "总线不在 OP 时「继续」被拦下");
+      check(err.contains(QStringLiteral("OP")), "那句话点名 OP", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Loaded, "仍然停在装载态");
+      checkEq(r.ctrl.pendingPoints(), pend, "要补的点一个没丢");
+      checkEq(r.bus.ntarget, 0, "还是一步没走");
+
+      r.bus.setInOp(true);
+      err.clear();
+      check(r.beginLoadedRun(&err), "接好之后按一次就成", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Moving, "走起来了");
+      r.ctrl.abort(QStringLiteral("收尾"));
+   }
+
+   /* 装载与「继续」之间多了一段"人看着屏幕"的时间, 而这段时间里**工作线程自己会搬零点**
+    * (掉线重连时沿用不了就重取)。界面锁得住按钮, 锁不住工作线程 —— 所以那两问只能落在
+    * 控制器里。下面两条各钉一道 */
+   caseBegin("resumeload: 装载之后搬过零点 → 「继续」被拦下");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      const QString csv = dir.filePath("epoch.csv");
+      checkEq(makePartialCsv(csv, p, 3), 3, "只采了 3 个点的文件");
+
+      QString err, why;
+      check(r.loadOnlyScan(csv, &err, &why), "装载", err.toStdString());
+
+      r.ctrl.setZeroEpoch(r.ctrl.zeroEpoch() + 1);   /* 回零 / 设中心 / 重连时重取 */
+      err.clear();
+      check(!r.beginLoadedRun(&err), "零点世代变了 → 拦下");
+      check(err.contains(QStringLiteral("零点")), "那句话点名零点", err.toStdString());
+      check(err.contains(QStringLiteral("中止")), "而且说了出路", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Loaded, "留在装载态");
+      checkEq(r.bus.ntarget, 0, "一个目标都没下发");
+
+      r.ctrl.abort(QStringLiteral("收尾"));
+   }
+
+   caseBegin("resumeload: 装载之后改了几何 → 「继续」被拦下");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      const QString csv = dir.filePath("geom.csv");
+      checkEq(makePartialCsv(csv, p, 3), 3, "只采了 3 个点的文件");
+
+      QString err, why;
+      check(r.loadOnlyScan(csv, &err, &why), "装载", err.toStdString());
+
+      /* 绕过界面那道锁直接改 (界面上那四项是灰的) —— armRun 只查 paramsError(),
+       * **不查 m_order 的下标还对不对得上 m_plan**, 所以这一道非有不可 */
+      Params q = p;
+      q.res_unit = 0.25;
+      r.ctrl.setParams(q);
+      checkEq(r.ctrl.totalPoints(), 81, "点列真的换了 (9×9), 老下标已经对不上");
+
+      err.clear();
+      check(!r.beginLoadedRun(&err), "几何变了 → 拦下");
+      check(err.contains(QStringLiteral("几何")), "那句话点名几何", err.toStdString());
+      check(err.contains(QStringLiteral("中止")), "而且说了出路", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Loaded, "留在装载态");
+
+      r.ctrl.abort(QStringLiteral("收尾"));
+   }
+
+   caseBegin("resumeload: 装载失败不留痕 (四种拒绝都排在动状态之前)");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      QString err;
+
+      /* (a) 点已经采完 */
+      {
+         const QString full = dir.filePath("full.csv");
+         Rig rf;
+         rf.ctrl.setParams(p);
+         rf.ctrl.rebuildPlan();
+         rf.meter.setValue(3.0);
+         check(rf.startScan(full, &err), "先跑完一整轮", err.toStdString());
+         check(rf.runToIdle(), "跑完");
+
+         err.clear();
+         check(!r.loadOnlyScan(full, &err), "采完的文件装不进来");
+         check(err.contains(QStringLiteral("已全部采完")), "那句话说了原因", err.toStdString());
+         check(r.ctrl.state() != ScanController::State::Loaded, "没进装载态");
+      }
+
+      /* (b) 几何对不上 (手写一份别的分辨率的 CSV, 不走界面那次对齐) */
+      {
+         Params other = p;
+         other.res_unit = 0.25;
+         std::string text = csvMetaLines(other, "2026-09-17T10:00:00", 0);
+         text += csvColumnHeader();
+         text += "\n";
+
+         const QString bad = dir.filePath("other_geom.csv");
+         check(writeTextFile(bad, QString::fromStdString(text)), "写一份几何不同的 CSV");
+
+         err.clear();
+         check(!r.loadOnlyScan(bad, &err), "几何不同的装不进来");
+         check(err.contains(QStringLiteral("分辨率")), "那句话照旧指名道姓", err.toStdString());
+         check(r.ctrl.state() != ScanController::State::Loaded, "没进装载态");
+      }
+   }
+
+   caseBegin("resumeload: 「中止」放弃装载 (回未装载, 画布上那半张图一起清掉)");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      const QString csv = dir.filePath("discard.csv");
+      const int in_file = makePartialCsv(csv, p, 3);
+      checkEq(in_file, 3, "只采了 3 个点的文件");
+
+      QString err, why;
+      check(r.loadOnlyScan(csv, &err, &why), "装载", err.toStdString());
+
+      /* 一个点都没跑过 → 不该有"扫描结束"这回事 */
+      int finished = 0;
+      QObject::connect(&r.ctrl, &ScanController::runFinished,
+                       [&finished](bool) { finished++; });
+
+      checkEq(r.ctrl.pendingPoints(), 25 - in_file, "装载着, 有待补的点");
+      checkEq(countDoneCells(r.ctrl), in_file, "画布上有上半场");
+
+      r.ctrl.abort(QStringLiteral("操作员放弃装载"));
+
+      check(r.ctrl.state() == ScanController::State::Idle, "回到未装载 (Idle)");
+      check(!r.ctrl.running(), "本来就也没在跑");
+      checkEq(r.ctrl.pendingPoints(), 0, "待补点数清零");
+      checkEq(finished, 0, "没有发 runFinished");
+      /* 句柄真的关了 —— 单点重测那条路的判据就是 !m_log.isOpen(), 关着它才拒
+       * (csvPath() 不能当证据: ScanLog::close() 刻意不清 m_path) */
+      err.clear();
+      check(!r.retestAt(0, 0, &err), "装载丢掉之后单点重测也拒 (无文件可追加 = 句柄确实关了)");
+      check(err.contains(QStringLiteral("无文件可追加")), "而且拒的理由就是这一条",
+            err.toStdString());
+      /* 清掉那半张图不是"顺手": 那三个结果数组从文件里读进来之后**谁都不会替它清**
+       * (rebuildPlan 几何没变就提前 return, start 只重排 m_order)。不清的话,
+       * "中止装载 → 开始扫描"之后图上画的是被放弃的那份文件的值 */
+      checkEq(countDoneCells(r.ctrl), 0, "画布上那份上半场也清掉了");
+      checkEq(r.ctrl.completedPoints(), 0, "已采点数归零");
+
+      /* 用户答复里明说的那条出路: 放弃之后能按「开始扫描」新建一轮 */
+      err.clear();
+      check(r.startScan(dir.filePath("after_abort.csv"), &err),
+            "放弃装载之后能新建一轮", err.toStdString());
+      r.ctrl.abort(QStringLiteral("收尾"));
+   }
+
+   caseBegin("resumeload: 装载态下不许新建一轮 / 不许单点重测");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      const QString csv = dir.filePath("blocked.csv");
+      checkEq(makePartialCsv(csv, p, 3), 3, "只采了 3 个点的文件");
+
+      QString err, why;
+      check(r.loadOnlyScan(csv, &err, &why), "装载", err.toStdString());
+      const int pend = r.ctrl.pendingPoints();
+
+      err.clear();
+      check(!r.startScan(dir.filePath("never.csv"), &err), "装载态下 start 被拒");
+      check(err.contains(QStringLiteral("中止")), "那句话说了出路", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Loaded, "还在装载态");
+      checkEq(r.ctrl.pendingPoints(), pend, "要补的点没被动过");
+
+      /* 这一句**特别容易漏**: retest 下面那句 !m_log.isOpen() 在装载态恰好不成立
+       * (续扫句柄正开着), 所以它不是这道闸 —— 放开的话 m_order 会被换成那一个点,
+       * "要补哪些点"当场没了, 一声不响 */
+      err.clear();
+      check(!r.retestAt(0, 0, &err), "装载态下 retest 被拒");
+      check(err.contains(QStringLiteral("中止")), "那句话也说了出路", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Loaded, "还在装载态");
+      checkEq(r.ctrl.pendingPoints(), pend, "要补的点集合没被动过");
+
+      r.ctrl.abort(QStringLiteral("收尾"));
+   }
+
+   caseBegin("resumeload: 老路 (读入 + 立刻开跑) 一个字没变");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      const QString csv = dir.filePath("old_path.csv");
+      checkEq(makePartialCsv(csv, p, 3), 3, "只采了 3 个点的文件");
+
+      QString err, why;
+      check(r.resumeScan(csv, false, &err, &why),
+            "老路照旧接受", (err + " | " + why).toStdString());
+      check(r.ctrl.state() == ScanController::State::Moving, "而且当场就在走 (中间没停过)");
+      check(!r.ctrl.loaded(), "不是装载态");
+
+      check(r.runToIdle(), "跑完");
+      checkEq(r.ctrl.completedPoints(), 25, "补齐 25 格");
+   }
 }
 
 static void test_meter_meta()
@@ -6301,6 +6867,8 @@ int main(int argc, char **argv)
 
    test_grid();
    test_csv();
+   test_csvalign();
+   test_resumeload();
    test_arrive();
    test_run();
    test_aborts();

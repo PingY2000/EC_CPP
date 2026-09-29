@@ -297,6 +297,9 @@ void ScanWindow::panelRevert(int pi)
 void ScanWindow::refreshEditability()
 {
    const bool running = m_ctl->running();
+   /* 装载态锁的是 Running 那一批里"这一趟怎么走 / 往哪写"的那些 (GateItem.lock_loaded),
+    * 不是整批复用 —— 速度那两项在装载态是**真改得动**的 (按「继续」时才读), 锁它们是错的 */
+   const bool loaded = m_ctl->loaded();
 
    for (int pi = 0; pi < m_panels.size(); pi++)
    {
@@ -305,8 +308,9 @@ void ScanWindow::refreshEditability()
 
       for (const GateItem &it : p.items)
       {
-         bool ok = !(running && it.lock_running);
-         any_locked = any_locked || (running && it.lock_running);
+         const bool lock = (running && it.lock_running) || (loaded && it.lock_loaded);
+         bool ok = !lock;
+         any_locked = any_locked || lock;
          /* 空的下拉框打不开: 真机那三项在设备没报这一项时是空的 */
          if (ok)
             if (const auto *cb = qobject_cast<const QComboBox *>(it.w))
@@ -339,9 +343,12 @@ void ScanWindow::refreshEditability()
          p.btnCancel->setEnabled(dirty && !any_locked);
    }
 
-   /* 不是参数、但也只能在运行外按的动作按钮 (原先是跟着那张"扫描中锁住"的表走的) */
+   /* 不是参数、但也只能在运行外按的动作按钮 (原先是跟着那张"扫描中锁住"的表走的)。
+    * **装载态下也灰**: "再打开一份"的后半段是破坏性的 (清点表 / 覆写画布 / 关旧句柄排在开新
+    * 句柄之前), 新句柄没开成就会留下一个撕裂的装载态。要换一份先「中止」—— 与几何那几项
+    * 同一条规矩 */
    if (m_btnOpen != nullptr)
-      m_btnOpen->setEnabled(!running);
+      m_btnOpen->setEnabled(!running && !loaded);
 
    /* 「功率计」那一整块框。它不在上面那张表里, 判据全在 refreshMeterPanel() 里 —— 从这一处
     * 转过去, 于是"可用性只有一处写"这条规矩在这一块上也成立 */
@@ -360,7 +367,12 @@ void ScanWindow::refreshEditability()
  *   ② 扫描正在跑     -> 设备三项不给改 (那三项 = 停流 → 改 → 重开流, 手册要求不能与采集并行)。
  *                       2026-09-29 §41.4 之前这里还写着"记录也开不了 (跟随的点直接写在扫描那份
  *                       CSV 里)" —— 跟随那条路撤掉之后, 扫描期间记录下来的就是曲线上那些数,
- *                       没有"记了个空文件"这回事, 那一条判据去掉了
+ *                       没有"记了个空文件"这回事, 那一条判据去掉了。
+ *                       **同一条判据也管"已装载续扫"** (§45): 续扫那份 CSV 的表头是**上次**
+ *                       beginNew 写的 meterMetaLines (哪台仪器 / 什么探头 / 什么波长), 追加时
+ *                       不重写 —— 装载期间换掉, 按「继续」补出来的行与表头说的不是一台仪器,
+ *                       而**文件里看不出来**。这一点在"已中止"态也有, 只是装载态把这个窗口
+ *                       从几秒拉长到可以停几个小时
  *   ③ 正在记录       -> 那一个按钮改名「停止记录」, 并且**永远可按** (停写文件不需要前提)
  *   ④ 正在改设备配置 -> 设备三项自己锁住 (工作线程里是 停流 → 改 → 重开流)
  *
@@ -371,6 +383,7 @@ void ScanWindow::refreshEditability()
 void ScanWindow::refreshMeterPanel()
 {
    const bool running   = m_ctl->running();
+   const bool loaded    = m_ctl->loaded();   /* 装载态: 判据②的同一条, 理由见上面那段 */
    const bool open      = (m_meter != nullptr && m_meter->isOpen());
    const bool recording = (m_mlog != nullptr && m_mlog->recording());
    const bool cfgBusy   = m_cfgBusy;
@@ -395,9 +408,12 @@ void ScanWindow::refreshMeterPanel()
     * 那台换一台再按「重试」就是它的用处。灰只有两个理由: 枚举结果还没到 (空表), 或正在打开。
     *
     * **扫描中不给换**: 换设备会清缓冲 + 重开, 而扫描每一个点的读数都从这条路上来 ——
-    * 半途换一台就是让同一份 CSV 里混两台探头的数据。这与那三个配置框的判据是同一条 */
+    * 半途换一台就是让同一份 CSV 里混两台探头的数据。这与那三个配置框的判据是同一条
+    * (**装载状态也锁**, 理由见上面判据②那段)。
+    * 旁边那个「重试」**不锁** —— armRun 要求功率计打开, 装载着却打不开表的时候,
+    * 那正是唯一的出路 */
    if (m_cbMtrDev != nullptr)
-      m_cbMtrDev->setEnabled(m_cbMtrDev->count() > 0 && !m_mtrOpening && !running);
+      m_cbMtrDev->setEnabled(m_cbMtrDev->count() > 0 && !m_mtrOpening && !running && !loaded);
 
    /* 真机那三项: 设备开着才可改, 扫描中不给改 (那三项会重开流), 空选项表也不放开
     * (探头没有这一项, 放开就是个假控件)。
@@ -405,7 +421,7 @@ void ScanWindow::refreshMeterPanel()
     * 承担 (它由工作线程的 infoChanged / configFailed 关掉) */
    for (QComboBox *cb : { m_cbWl, m_cbRange, m_cbMeasMode })
       if (cb != nullptr)
-         cb->setEnabled(open && isOphir && cb->count() > 0 && !running && !cfgBusy);
+         cb->setEnabled(open && isOphir && cb->count() > 0 && !running && !loaded && !cfgBusy);
 
    /* 「添加波长」与那三项同一格: 它也是"停流 → 改 → 重开"的一段 (而且它还要写设备),
     * 所以扫描中与 cfgBusy 期间都不放开。**它不判 count()>0**: 波长表空着的时候添加正是
@@ -413,9 +429,9 @@ void ScanWindow::refreshMeterPanel()
     * **这一行的控件 2026-09-28 晚起是藏着的** (§37.12): 下面这两句照旧算, 只是没人看得见 ——
     * 留着是为了"恢复显示"那一刻不用再想可用性怎么写 (藏 ≠ 删) */
    if (m_btnWlAdd != nullptr)
-      m_btnWlAdd->setEnabled(open && isOphir && !running && !cfgBusy);
+      m_btnWlAdd->setEnabled(open && isOphir && !running && !loaded && !cfgBusy);
    if (m_sbWlAdd != nullptr)
-      m_sbWlAdd->setEnabled(open && isOphir && !running && !cfgBusy);
+      m_sbWlAdd->setEnabled(open && isOphir && !running && !loaded && !cfgBusy);
 
    /* ---- 间隔 ----
     * **永远可改**: setInterval 只把"下一次"按新值重排, 不打断已经在飞的那一个请求。
@@ -2086,27 +2102,27 @@ QWidget *ScanWindow::buildParamPanel()
     * 代码内部、以及 CSV 表头里的 `area_x_unit` / `pulses_per_unit` 仍旧叫 "unit" ——
     * 那是**文件格式**, 改名会让已有的 CSV 再也接不上 (见 docs/scan_sweep.md §3) */
    m_edAreaX = new QDoubleSpinBox(box);
-   m_edAreaX->setRange(0.1, 500.0);
+   m_edAreaX->setRange(kGeomAreaMin, kGeomAreaMax);
    m_edAreaX->setDecimals(3);
    m_edAreaX->setSingleStep(1.0);
    m_edAreaX->setSuffix(QStringLiteral(" mm"));
    m_edAreaX->setToolTip(QStringLiteral("扫描区域的 X 边长 (mm), 以原点为中心, 范围 ±(X/2)。"));
 
    m_edAreaY = new QDoubleSpinBox(box);
-   m_edAreaY->setRange(0.1, 500.0);
+   m_edAreaY->setRange(kGeomAreaMin, kGeomAreaMax);
    m_edAreaY->setDecimals(3);
    m_edAreaY->setSingleStep(1.0);
    m_edAreaY->setSuffix(QStringLiteral(" mm"));
 
    m_edRes = new QDoubleSpinBox(box);
-   m_edRes->setRange(0.001, 50.0);
+   m_edRes->setRange(kGeomResMin, kGeomResMax);
    m_edRes->setDecimals(3);
    m_edRes->setSingleStep(0.1);
    m_edRes->setSuffix(QStringLiteral(" mm"));
    m_edRes->setToolTip(QStringLiteral("分辨率 (mm); 点数 = (floor(区域 / 分辨率) + 1)²。"));
 
    m_edPpu = new QDoubleSpinBox(box);
-   m_edPpu->setRange(100.0, 1000000.0);
+   m_edPpu->setRange(kGeomPpuMin, kGeomPpuMax);
    m_edPpu->setDecimals(0);
    m_edPpu->setSingleStep(1000.0);
    m_edPpu->setSuffix(QStringLiteral(" pul"));
@@ -2281,23 +2297,28 @@ QWidget *ScanWindow::buildParamPanel()
     *    「正在扫描时依然有一部分扫描参数是亮的」)。
     *
     * 剩下的「单点停留 / 稳定窗口 / 每点采样」**不锁**: 控制器每个点读一次, 改完从下一个点起
-    * 算数 —— 那才是真的改得动。 */
+    * 算数 —— 那才是真的改得动。
+    *
+    * **装载态 (2026-09-29) 锁的只有第 1 族** (第四个字段 lock_loaded): 装进来的 (ix,iy) 绑在
+    * 那份几何上, 与运行中同一个理由。第 2 族**恰恰不能锁** —— 它们运行中锁是因为"改了白改",
+    * 而装载态一点没跑, 那两项按「继续」时由 armRun 真读, 也就是真改得动; 锁上就是"亮了却
+    * 没用", 与上面那句判据相反。 */
    addPanel(PI_PARAM, box,
             QList<GateItem>{
-               GateItem{ m_edAreaX,    true,  false },   /* 区域 X */
-               GateItem{ m_edAreaY,    true,  false },   /* 区域 Y */
-               GateItem{ m_edRes,      true,  false },   /* 分辨率 */
-               GateItem{ m_edPpu,      true,  false },   /* 1 mm = N 脉冲 */
-               GateItem{ m_edSpeed,    true,  false },   /* 扫描速度: 一轮只设一次 */
-               GateItem{ m_edManSpeed, true,  false },   /* 手动速度: 扫描中推不出去 */
+               GateItem{ m_edAreaX,    true,  false, true },   /* 区域 X */
+               GateItem{ m_edAreaY,    true,  false, true },   /* 区域 Y */
+               GateItem{ m_edRes,      true,  false, true },   /* 分辨率 */
+               GateItem{ m_edPpu,      true,  false, true },   /* 1 mm = N 脉冲 */
+               GateItem{ m_edSpeed,    true,  false },         /* 扫描速度: 一轮只设一次 */
+               GateItem{ m_edManSpeed, true,  false },         /* 手动速度: 扫描中推不出去 */
                GateItem{ m_edDwell,    false, false },
                GateItem{ m_edSettle,   false, false },
                GateItem{ m_edSamples,  false, false },
-               GateItem{ m_cbDir,      true,  false },   /* 起始方向: 改的是轨迹 */
-               GateItem{ m_cbMode,     true,  false },   /* 扫描方式: 同上 */
-               GateItem{ m_edCsv,      true,  false },   /* 输出路径: 跑着的时候换文件没意义 */
-               GateItem{ m_btnCsv,     true,  false },
-               GateItem{ m_btnDef,     true,  false },   /* 恢复默认: 一按就是几何全变 */
+               GateItem{ m_cbDir,      true,  false, true },   /* 起始方向: 改的是轨迹 */
+               GateItem{ m_cbMode,     true,  false, true },   /* 扫描方式: 同上 */
+               GateItem{ m_edCsv,      true,  false, true },   /* 输出路径: 句柄已经按装载那条开着 */
+               GateItem{ m_btnCsv,     true,  false, true },
+               GateItem{ m_btnDef,     true,  false, true },   /* 恢复默认: 一按就是几何全变 */
             });
 
    return box;
@@ -4126,17 +4147,79 @@ void ScanWindow::onOpenCsvClicked()
    m_last_dir = QFileInfo(f).absolutePath();
    m_edCsv->setText(QDir::toNativeSeparators(f));
 
+   /* ---- 先把参数栏对齐到这份 CSV 的几何 (2026-09-29, docs/scan_sweep.md §44) -------------
+    * 续扫要求几何逐项一致, 而"一致"只有一种做法: CSV 里那些 (ix,iy) 只在那份文件的几何下
+    * 才指向那些位置。从前是**拒绝**并让人回参数栏手抄那四个数 (区域 X/Y、分辨率、每 mm
+    * 脉冲数), 现在是直接抄过去。
+    *
+    * 下推走的就是控件自己的 valueChanged (与「恢复默认」同一条路), 于是参数栏那套"改了没
+    * 保存"的语义自动到位: 标题出现「● 未保存」、[保存]/[取消] 亮起来, 按「取消」= 退回
+    * 对齐之前那份值。**不需要为这件事新加任何控件。**
+    *
+    * 判据在 scanplan.cpp 的 csvAlignParams 里 (纯函数, 自检钉得住): 表头缺几何 / 值超出
+    * 面板可设范围 / 那份几何过不了 validate() —— 三种都**拒绝且一个数都不动**。 */
+   std::string text;
+   {
+      QString rerr;
+      if (!readCsvText(f, &text, &rerr))
+      {
+         hint(QStringLiteral("无法接续: ") + rerr, true);
+         return;
+      }
+   }
+
+   Params cand = currentParams();     /* 那四项之外取的就是面板当下的值, 对齐不该动它们 */
+   const std::string aerr = csvAlignParams(text, cand, &cand);
+   if (!aerr.empty())
+   {
+      hint(QString::fromStdString(aerr), true);
+      return;
+   }
+
+   const double old[4] = { m_edAreaX->value(), m_edAreaY->value(),
+                           m_edRes->value(),   m_edPpu->value() };
+   const bool changed = (old[0] != cand.area_x_unit) || (old[1] != cand.area_y_unit)
+                     || (old[2] != cand.res_unit)    || (old[3] != cand.pulses_per_unit);
+
+   if (changed)
+   {
+      m_edAreaX->setValue(cand.area_x_unit);
+      m_edAreaY->setValue(cand.area_y_unit);
+      m_edRes  ->setValue(cand.res_unit);
+      m_edPpu  ->setValue(cand.pulses_per_unit);
+   }
+
+   /* 退回去的那一手: 续扫最终没成时把四个控件退回原样 (也就退回了控制器与量程)。
+    * 「要么整件事成了, 要么屏幕回到按之前那样」—— 点已采完 / 限位闸拦下 / 写不进文件
+    * 都跟参数无关, 让面板留着一份"为这趟改过而结果没跑"的几何只会让人看不懂。
+    * (退回之后「● 未保存」那个标记也跟着回到按之前的样子 —— 基线比对是幂等的) */
+   auto restore = [this, old]()
+   {
+      m_edAreaX->setValue(old[0]);
+      m_edAreaY->setValue(old[1]);
+      m_edRes  ->setValue(old[2]);
+      m_edPpu  ->setValue(old[3]);
+   };
+
+   /* 只有真变了才说这一句 —— 横幅就一个槽, 那四个数就在旁边的参数栏里 (横幅 1 句 / 40 字) */
+   const QString aligned = changed ? QStringLiteral("已按 CSV 对齐扫描参数, ") : QString();
+
+   /* 读入而已, **不开跑** (2026-09-29): 装载好的上半场已经在画布上, 要补的点也算好了,
+    * 滑台一步没走 —— 开始补点是操作员按「继续」的事 (见 onResumeRunClicked) */
    QString err, why;
-   if (m_ctl->resume(f, false, &err, &why))
+   if (m_ctl->loadResume(f, false, &err, &why))
    {
       m_banner->setVisible(false);
-      hint(QStringLiteral("续扫: 已读入 %1。").arg(QDir::toNativeSeparators(f)), false);
+      hint(QStringLiteral("续扫: %1已读入 %2。")
+              .arg(aligned, QDir::toNativeSeparators(f)), false);
       refresh();
       return;
    }
 
    if (!err.isEmpty())
    {
+      if (changed)
+         restore();
       hint(QStringLiteral("无法接续: ") + err, true);
       return;
    }
@@ -4145,18 +4228,20 @@ void ScanWindow::onOpenCsvClicked()
     * 下半场和上半场可能不在同一个物理位置上。
     * 不弹确认框: 直接按"允许世代差异"续下去, 把那句 why 留在红横幅上 (不自动消失的横幅
     * 比会被条件反射按掉的模态可靠), 觉得接得不对可随时「中止」, 已采的点都在 CSV 里。 */
-   const QString mismatch = why;   /* resume 会把 why 重新写一遍, 先留住这一句 */
+   const QString mismatch = why;   /* loadResume 会把 why 重新写一遍, 先留住这一句 */
 
    err.clear();
    why.clear();
-   if (!m_ctl->resume(f, true, &err, &why))
+   if (!m_ctl->loadResume(f, true, &err, &why))
    {
+      if (changed)
+         restore();
       hint(QStringLiteral("仍然无法接续: ") + (err.isEmpty() ? why : err), true);
       return;
    }
 
-   hint(QStringLiteral("续扫: %1\n%2")
-           .arg(QDir::toNativeSeparators(f), mismatch), true);
+   hint(QStringLiteral("续扫: %1%2\n%3")
+           .arg(aligned, QDir::toNativeSeparators(f), mismatch), true);
    refresh();
 }
 
@@ -4169,12 +4254,37 @@ void ScanWindow::onPauseClicked()
 
 void ScanWindow::onResumeRunClicked()
 {
-   m_ctl->resumeRun();
+   /* 两个来源 (2026-09-29): 装载态 = 开始补点 (要报错), 暂停态 = 接着跑完当前点 (void) */
+   if (m_ctl->loaded())
+   {
+      QString err;
+      if (!m_ctl->beginLoadedRun(&err))
+      {
+         hint(err, true);      /* 留在装载态: 接好线 / 换一份再按一次就行 */
+         refresh();
+         return;
+      }
+      hint(QStringLiteral("续扫: 开始补 %1 点。").arg(m_ctl->pendingPoints()), false);
+   }
+   else
+   {
+      m_ctl->resumeRun();
+   }
    refresh();
 }
 
 void ScanWindow::onAbortClicked()
 {
+   /* 装载态那一支是"放弃这次装载": 一个点都没跑过, 所以那句话不能说"已采数据位于…"
+    * (那份文件是**别人**采的, 这一趟一个字没写)。画布也一起清 —— 见 abortInternal */
+   if (m_ctl->loaded())
+   {
+      m_ctl->abort(QStringLiteral("操作员放弃装载"));
+      hint(QStringLiteral("已放弃这次装载。"), false);
+      refresh();
+      return;
+   }
+
    m_ctl->abort(QStringLiteral("操作员中止"));
    hint(QStringLiteral("已中止。已采数据位于 %1。")
            .arg(QDir::toNativeSeparators(m_ctl->csvPath())), false);
@@ -4744,14 +4854,19 @@ void ScanWindow::refresh()
     *
     * 这里原有一条 !m_readPending (2026-09-22 为"点「读一次」→ 立刻点「开始扫描」"这条
     * 动作序列补的)。2026-09-28「读一次」删了, 那一条跟着撤 —— 见 §23.4 */
-   m_btnStart->setEnabled(!running && m_connected && meter_ok && params_ok
+   const bool loaded = m_ctl->loaded();
+
+   m_btnStart->setEnabled(!running && !loaded && m_connected && meter_ok && params_ok
                           && !t.homing);
 
    const ScanController::State st = m_ctl->state();
    m_btnPause->setEnabled(running && st != ScanController::State::Paused);
-   m_btnResume->setEnabled(st == ScanController::State::Paused);
-   m_btnAbort->setEnabled(running);
-   m_btnRetest->setEnabled(!running && m_canvas->selectedIx() >= 0);
+   /* 「继续」有两个来源 (2026-09-29): 暂停之后接着跑, 或者装载之后开始补点。
+    * 两条路都叫"继续", 差别在那半句状态行上 (「已暂停…」/「已装载续扫数据 (未启动)」) */
+   m_btnResume->setEnabled(st == ScanController::State::Paused || loaded);
+   m_btnAbort->setEnabled(running || loaded);   /* 装载态 = 放弃这次装载 */
+   /* 「重测选中点」装载态下不放开: 它会把"要补哪些点"换成那一个点 */
+   m_btnRetest->setEnabled(!running && !loaded && m_canvas->selectedIx() >= 0);
 
    /* ---- 进度 ---- */
    if (running || st == ScanController::State::Paused)

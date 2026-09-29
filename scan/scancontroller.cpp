@@ -132,6 +132,26 @@ bool ScanController::running() const
        || m_st == State::Reading || m_st == State::Paused;
 }
 
+/* 为什么 Loaded **不在** running() 里 (2026-09-29)。
+ *
+ * 它是"归族"问题, 不是"少改几处": 装载态**没有扫描循环**, 与 Idle 同类 —— 手动那条路
+ * (回零 / 使能 / 画布点动) 在装载态本来就是活的, 与空闲态一模一样。塞进 running() 会立刻
+ * 长出两处错: tick() 开始跑 healthProblem() (驱动器报一个限位位就自动中止一次**根本没跑过**
+ * 的扫描), pause()/abort() 的语义变成"暂停/中止了一轮不存在的扫描"。
+ *
+ * 代价是"装载态"这件事要在各判据处**显式点名** (窗口那几处按钮、refreshEditability、
+ * refreshMeterPanel、stateText 与 tick 的两个 switch)。换来的是 tick/pause/resumeRun/abort
+ * 那几条路一个字都不用动。 */
+
+void ScanController::clearResults()
+{
+   /* 尺寸不变 (m_done.size() 就是 nx*ny): cellDone() 是按 m_nx 索引进来的, clear() 会让
+    * 一个本该为假的判断变成越界读 */
+   m_done.assign(m_done.size(), 0);
+   m_have.assign(m_have.size(), 0);
+   m_watts.assign(m_watts.size(), 0.0);
+}
+
 const Point *ScanController::currentPoint() const
 {
    if (m_cur < 0 || (size_t)m_cur >= m_plan.size())
@@ -157,6 +177,7 @@ QString ScanController::stateText() const
    switch (m_st)
    {
    case State::Idle:     return QStringLiteral("空闲, 参数可改");
+   case State::Loaded:   return QStringLiteral("已装载续扫数据 (未启动)");
    case State::Moving:   return settlingNow() ? QStringLiteral("到位中 (已进稳定窗口)")
                                               : QStringLiteral("移动中");
    case State::Dwelling: return QStringLiteral("停留 (等待机械余振衰减)");
@@ -387,6 +408,11 @@ bool ScanController::start(const QString &csv_path, QString *err)
    if (running())
       return fail(err, QStringLiteral("扫描进行中, 请先「中止」。"));
 
+   /* 装载态下"新建一轮"没有意义 —— 一份续扫正等着补点, 而这一按会把它的上半场与待补集合
+    * 一起丢掉。界面那边「开始扫描」是灰的, 这一句是照 armRun 那个体例留的第二道 */
+   if (loaded())
+      return fail(err, QStringLiteral("已装载一份续扫, 请先「中止」。"));
+
    QString pe = paramsError();
    if (!pe.isEmpty())
       return fail(err, pe);
@@ -420,11 +446,22 @@ bool ScanController::start(const QString &csv_path, QString *err)
    return true;
 }
 
-bool ScanController::resume(const QString &csv_path, bool accept_zero_epoch_change,
-                            QString *err, QString *why)
+/* 续扫第一步: 把那份 CSV 读进来 (2026-09-29 与"开跑"拆开)。
+ *
+ * 今天打开的路径只到这里为止 —— 上半场画在画布上、要补的点算好、句柄按追加开着, 而滑台
+ * **一步没走**。开始走是 beginLoadedRun() 的事, 由操作员按「继续」触发。
+ *
+ * 装载态**不可重入** (上面那句守卫): 它的后半段是破坏性的 (清 m_order / 覆写 m_done /
+ * 关旧句柄), 而其中关旧句柄与开新句柄之间没有退路 —— 新的没开成, 旧的就回不来了, 留下一个
+ * "状态写着装载态、m_order 空、句柄关着"的撕裂态, 之后按「继续」永远失败。与其在失败路径上
+ * 补一堆回滚, 不如让这条路不可达 (界面那边「打开 CSV 续扫」在装载态也是灰的)。 */
+bool ScanController::loadResume(const QString &csv_path, bool accept_zero_epoch_change,
+                                QString *err, QString *why)
 {
    if (running())
       return fail(err, QStringLiteral("扫描进行中, 请先「中止」。"));
+   if (loaded())
+      return fail(err, QStringLiteral("已装载一份续扫, 请先「中止」。"));
 
    if (why != nullptr) why->clear();
 
@@ -493,18 +530,55 @@ bool ScanController::resume(const QString &csv_path, bool accept_zero_epoch_chan
    m_cur       = -1;
    m_run_ms    = -1;      /* elapsed_ms 从这次接上的那一刻算起 */
 
-   if (!armRun(err))
-   {
-      m_log.close();
-      return false;
-   }
+   /* 这三行原本在 armRun 的收尾里 (与"走起来"同一口气), 装载时必须自己来 ——
+    * 尤其 m_ord_i: pendingPoints() 是 m_order.size() - m_ord_i, 而它唯一被清零的地方就是
+    * armRun 那一行。漏掉的话装载完"待补点数"会从上一轮的下标上接着算, 出负数 (画布左上角
+    * 那行「N / M 点, 剩 K」是无条件读它的)。 */
+   m_run_p   = m_p;       /* 装载这一份几何 = 后面两道重查的基线 */
+   m_bad_wkc = 0;
+   m_ord_i   = 0;
+   m_load_epoch = m_zero_epoch;   /* 零点世代基线, beginLoadedRun 重查 */
+
+   enter(State::Loaded);
    return true;
+}
+
+/* 续扫第二步: 操作员按了「继续」。
+ *
+ * 开工之前把**装载那一刻的两条前提**重查一遍。这两件事都能在"装载好、还没按继续"那段
+ * 时间里变掉, 而 m_order 里那些 (ix, iy) 绑的就是它们:
+ *   1. 几何 —— 界面那几项是锁着的, 这一道是控制器侧的兜底 (armRun 只查 paramsError(),
+ *      **不查 m_order 的下标还对不对得上 m_plan**);
+ *   2. 零点世代 —— 界面锁不住这个: 工作线程自己会在"沿用不了只好重取"那条路上搬零点,
+ *      而零点一搬, 补的点就整体平移到别的物理位置, 却与上半场拼进同一张图。
+ * 拦下时留在装载态 (一个字节不动), 接好线 / 重开一份再按一次就行。 */
+bool ScanController::beginLoadedRun(QString *err)
+{
+   if (m_st != State::Loaded)
+      return fail(err, QStringLiteral("还没装载续扫数据, 请先打开一份 CSV。"));
+
+   if (!sameGeom(m_run_p, m_p))
+      return fail(err, QStringLiteral("装载时的几何已被改过, 请「中止」后重新打开这份 CSV。"));
+
+   if (m_zero_epoch != m_load_epoch)
+      return fail(err,
+         QStringLiteral("装载之后零点被搬动过 (第 %1 次 → 第 %2 次)。"
+                        "请「中止」后重新打开这份 CSV。")
+            .arg(m_load_epoch).arg(m_zero_epoch));
+
+   return armRun(err);   /* 成功时 armRun 已经 startPoint → enter(Moving) */
 }
 
 bool ScanController::retest(int ix, int iy, QString *err)
 {
    if (running())
       return fail(err, QStringLiteral("扫描进行中, 单点重测需等扫描停止。"));
+
+   /* 装载态下重测会把 m_order 换成那一个点 —— "要补哪些点"当场没了, 一声不响。
+    * 而这里**特别容易漏**: 下面那句 !m_log.isOpen() 在装载态恰好**不成立** (续扫句柄
+    * 正开着), 所以它不是这道闸。界面那边「重测选中点」是灰的 */
+   if (loaded())
+      return fail(err, QStringLiteral("已装载一份续扫, 请先「中止」。"));
 
    if (!m_log.isOpen())
       return fail(err, QStringLiteral(
@@ -576,6 +650,21 @@ void ScanController::abort(const QString &why)
 
 void ScanController::abortInternal(const QString &why, bool automatic)
 {
+   /* 装载态 = **放弃这次装载**, 不是"中止一轮" (2026-09-29)。一个点都没跑过, 所以:
+    * 关掉追加句柄、丢掉要补的点、把结果数组清干净 (否则「中止装载 → 开始扫描」之后,
+    * 图上这一轮还没测过的格子画的是那份被放弃文件里的值 —— rebuildPlan 几何没变就提前
+    * return, start() 只重排 m_order, 那三个数组谁都不会替它清), 回到"未装载"。
+    * **不发 runFinished**: 那一路的槽会弹「扫描已结束 (未完成)」, 而这里没有"结束"可言。 */
+   if (m_st == State::Loaded)
+   {
+      m_log.close();
+      m_order.clear();
+      m_cur = -1;
+      clearResults();
+      enter(State::Idle);
+      return;
+   }
+
    if (!running())
    {
       if (automatic && !why.isEmpty())
@@ -781,6 +870,9 @@ void ScanController::tick(int64_t now_ms)
    case State::Idle:
    case State::Aborted:
    case State::Done:
+   /* Loaded 到不了这儿: 上面那句 if (!running()) 已经 return 了 —— 装载态没有扫描循环,
+    * 安全检查归 armRun (按「继续」时把每一条重查一遍)。列在这里是让 switch 保持穷尽 */
+   case State::Loaded:
       return;
    }
 }

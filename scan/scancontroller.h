@@ -36,6 +36,9 @@ public:
    enum class State
    {
       Idle,      /* 没在跑; 参数可改 */
+      Loaded,    /* 已装载一份续扫 (上半场在画布上、句柄开着、要补的点算好了), 但**一步没走**
+                  * (2026-09-29)。**不算 running** —— 它属于"没在扫描循环里"那一族 (与 Idle
+                  * 同类), 理由见 running() 上面那段注释 */
       Moving,    /* 已下发目标, 等两轴到位且稳 (含 settle 窗口) */
       Dwelling,  /* 到了, 停 dwell_ms */
       Reading,
@@ -70,6 +73,7 @@ public:
 
    State state() const { return m_st; }
    bool  running() const;              /* Moving/Dwelling/Reading/Paused */
+   bool  loaded() const { return m_st == State::Loaded; }   /* 装载好等着按「继续」 */
    QString stateText() const;          /* 状态栏那一行中文 */
 
    /* 正在走的点在 m_plan 里的下标; 不在跑时 -1 */
@@ -100,10 +104,20 @@ public:
    /* 开始新一轮: 新建 CSV (父目录自动建)。过不了 Preflight 就返回 false 并说明 */
    bool start(const QString &csv_path, QString *err);
 
-   /* 断点续扫: 读一个已有 CSV, 校验几何一致 → 只补没采过的点 → 继续追加同一个文件。
-    * zero_epoch 不一致时 (中间重连过、零点可能变过) 返回 false, why 里要求操作员确认 */
-   bool resume(const QString &csv_path, bool accept_zero_epoch_change,
-               QString *err, QString *why);
+   /* 断点续扫, 拆成两步 (2026-09-29: 打开 CSV 之后**不直接开跑**, 先把数据读进来)。
+    *
+    * loadResume: 读一个已有 CSV, 校验几何一致 → 只补没采过的点 → 继续追加同一个文件,
+    * 然后**停在 State::Loaded** —— 上半场已经画在画布上、要补的点已经算好、句柄开着,
+    * 而滑台一步没走。zero_epoch 不一致时 (中间重连过、零点可能变过) 返回 false,
+    * why 里要求操作员确认 (照旧)。
+    *
+    * beginLoadedRun: 操作员按下「继续」才开始走。开工前把**装载那一刻的两条前提重查一遍**
+    * (几何还是那一份吗 / 零点世代还是那一个吗) —— 这两件事都能在"装载好、还没按继续"那段
+    * 时间里变掉, 而 m_order 里那些 (ix, iy) 绑的就是它们。拦下时返回 false 且**留在装载态**
+    * (接好线再按一次就行), err 里是那句红横幅。 */
+   bool loadResume(const QString &csv_path, bool accept_zero_epoch_change,
+                   QString *err, QString *why);
+   bool beginLoadedRun(QString *err);
 
    /* 单点重测: 走回 (ix,iy) 再采一次, 追加一行 flags=retest。
     * 要求已经有一轮在跑 (否则没有文件可追加), 且几何参数没被改过 */
@@ -162,6 +176,9 @@ private:
    void enter(State s);
    void stopMotion();                   /* postStop + 丢掉未决读数 */
    void abortInternal(const QString &why, bool automatic);
+   /* 三个结果数组归零, **网格尺寸保持原样** (cellDone 是按 m_nx 索引进来的, 不能 clear)。
+    * 只有"放弃装载"那一条路要它 —— 见 abortInternal 里装载态那一支 */
+   void clearResults();
 
    /* 每 tick 的安全检查。返回空串 = 健康; 非空 = 原因 (调用方据此自动中止) */
    QString healthProblem(const BusTelem &t);
@@ -211,6 +228,10 @@ private:
    int     m_bad_wkc = 0;
    /* CSV 表头里记的零点世代; 续扫时对不上 = 中途重连过 */
    int     m_zero_epoch = -1;
+   /* 装载那一刻的零点世代 (loadResume 记下, beginLoadedRun 重查)。与上面那个分开:
+    * 那个是"文件里写的世代 vs 现在", 这个是"装载时 vs 现在" —— 危险的是装载与启动之间
+    * 零点动了, 与那份 CSV 写没写世代无关, 所以这一比不依赖文件 (§45.5) */
+   int     m_load_epoch = -1;
 
    /* 限位记录: 只由 setLimitLines 换, 只在 armRun 里读 (理由见上面那个 setter)。
     * has_pos 全为 false 时 limitPlanWhy 一律给空串 —— 于是"没记过"这条路
