@@ -346,9 +346,15 @@ void ScanWindow::refreshEditability()
    /* 不是参数、但也只能在运行外按的动作按钮 (原先是跟着那张"扫描中锁住"的表走的)。
     * **装载态下也灰**: "再打开一份"的后半段是破坏性的 (清点表 / 覆写画布 / 关旧句柄排在开新
     * 句柄之前), 新句柄没开成就会留下一个撕裂的装载态。要换一份先「中止」—— 与几何那几项
-    * 同一条规矩 */
+    * 同一条规矩。
+    *
+    * **没连接也灰** (2026-09-30): 读一份 CSV 本身一个总线帧都不发, 但装载完之后能做的事只有
+    * 按「继续」补点, 而那一条要总线 —— 不连就按下它, 屏幕上只会多出一张谁也动不了的半场图。
+    * 判据与「开始扫描」那一条同一个 (用户原话: 「续扫csv等按钮 在没有连接的时候也是亮的
+    * 不合理 应该等按这个按钮合理的时候才亮起」)。**「中止」不在此列**: 它是"退出去"的那一个,
+    * 断了线正得靠它退出装载态 (见 refresh() 里那一行) */
    if (m_btnOpen != nullptr)
-      m_btnOpen->setEnabled(!running && !loaded);
+      m_btnOpen->setEnabled(!running && !loaded && m_connected);
 
    /* 「功率计」那一整块框。它不在上面那张表里, 判据全在 refreshMeterPanel() 里 —— 从这一处
     * 转过去, 于是"可用性只有一处写"这条规矩在这一块上也成立 */
@@ -1343,15 +1349,18 @@ void ScanWindow::buildUi()
     * 「轴信号」(2026-09-20 起它是"轴信号 + 限位开关"合成的那一块: 五个灯一行, 最右边那格是
     * 「故障复位」)。
     *
-    * **下面这两块必须先建**: 「高级选项」那三个勾与「色标」那个「自动跟随」勾都要等参数灌
+    * **下面这几块必须先建**: 「高级选项」那三个勾与「色标」那个「自动跟随」勾都要等参数灌
     * 进去, 而 loadSettings() 与 applyDefaults() 都在 buildParamPanel() 里面跑 —— 勾还没建
     * 出来就是读空 / 空指针。所以 2026-09-28 调屏幕次序时, 只动了后面那七行 addWidget。 */
    QWidget *axisPanel  = buildAxisPanel();
    QWidget *homePanel  = buildHomePanel();
    QWidget *advPanel   = buildAdvPanel();     /* 必须在 buildParamPanel() 之前 */
    QWidget *shadePanel = buildShadePanel();   /* 同上 */
-   QWidget *paramPanel = buildParamPanel();
+   /* **「扫描控制」也在它之前** (2026-09-30): 输出路径那两件 (m_edCsv / m_btnCsv) 自这一轮起
+    * 由 buildScanPanel() 建 (那一行搬进「扫描控制」了), 而 buildParamPanel() 末尾那张项表
+    * 按**指针**收着它们。建序反了, 表里存进去的就是两个空指针 —— 下一拍 setEnabled 直接崩 */
    QWidget *scanPanel  = buildScanPanel();
+   QWidget *paramPanel = buildParamPanel();
    QWidget *meterPanel = buildMeterPanel();
 
    /* ---- 摆位: 屏幕从上到下 ---- */
@@ -2092,7 +2101,9 @@ QWidget *ScanWindow::buildParamPanel()
     * (标签占偶数列、控件占奇数列), 与 hmi/axispanel.cpp 那张读数表同一个写法。
     *
     * **这里没有一处按下标去定位控件** (没有 itemAt / takeAt): 灰化与「保存 / 取消」都按
-    * m_panels[PI_PARAM].items 里的**指针**走 (见 refreshEditability), 换布局动不到那些 */
+    * m_panels[PI_PARAM].items 里的**指针**走 (见 refreshEditability), 换布局动不到那些。
+    * **2026-09-30 就是这么动的**: 输出路径那一行**连控件一起**搬进「扫描控制」, 而项表里
+    * 那两条一个字节没改 —— 灰化、运行中锁住、"改没改"照旧全归这一框管 */
    QGridLayout *f = new QGridLayout(box);
    /* 两个控件列各自吃掉多余宽度; 标签列不伸展 (它们只要那么宽) */
    f->setColumnStretch(1, 1);
@@ -2170,16 +2181,13 @@ QWidget *ScanWindow::buildParamPanel()
    m_cbMode->addItem(QStringLiteral("逐行往返"));
    m_cbMode->addItem(QStringLiteral("每行同向") );
 
-   m_edCsv = new QLineEdit(box);
-   m_edCsv->setPlaceholderText(QStringLiteral("scan_out/scan_YYYYmmdd_HHMMSS.csv"));
-   /* 成员而非局部量: 可用性表要按它算 (见 GateItem) */
-   m_btnCsv = new QPushButton(QStringLiteral("…"), box);
-   m_btnCsv->setFixedWidth(28);
-   connect(m_btnCsv, &QPushButton::clicked, this, &ScanWindow::onBrowseCsv);
-   QHBoxLayout *csvRow = new QHBoxLayout;
-   csvRow->setContentsMargins(0, 0, 0, 0);
-   csvRow->addWidget(m_edCsv, 1);
-   csvRow->addWidget(m_btnCsv);
+   /* 输出路径那一行 (m_edCsv + m_btnCsv) **不在这里建** (2026-09-30): 那一行整个搬进
+    * 「扫描控制」了, 归 buildScanPanel() 建 (用户原话: 「扫描参数的csv栏并入扫描控制中」;
+    * 见 buildScanPanel() 里那一段注)。
+    *
+    * **底下那张项表里照旧留着这两条, 一条都不许抽掉**: 那张表是**指针**表 —— 控件摆在哪个
+    * 布局里它管不着, 而"改没改"是按它比的 (panelDiffers 逐项与基线比对)。抽掉这两条,
+    * 改一次输出路径就不会再点亮这一框标题上的「未保存」, 「取消」也退不回那个路径了。 */
 
    /* [保存][取消] 摆在框标题那一行的右端, 不占这个表单的任何一行 */
    panelBar(PI_PARAM, box);
@@ -2203,7 +2211,7 @@ QWidget *ScanWindow::buildParamPanel()
       }
    };
 
-   /* 跨四列的一整行 (CSV 那一行, 以及底下三句说明): 先把只填了一半的那一行封掉 */
+   /* 跨四列的一整行 (顶上那三句说明): 先把只填了一半的那一行封掉 */
    auto lone = [&](QLayout *l, QWidget *w)
    {
       if (col != 0)
@@ -2217,6 +2225,23 @@ QWidget *ScanWindow::buildParamPanel()
          f->addWidget(w, row, 0, 1, 4);
       row++;
    };
+
+   /* ---- 三句说明摆在这一框的**最上面** (2026-09-30) ----
+    * 用户原话: 「扫描参数最后的文字说明提升到扫描参数最上面」。在这之前它们在这一框的最底下,
+    * 与参数之间隔着十一个控件 —— 改完一项要往下找才看得见"这一趟多少点、多长时间、参数对不对",
+    * 而它们说的正是**下面那些控件此刻算出来的结果**: 摆在最上面, 一改就看见它跟着变。
+    * 三句各跨四列 (标签要占满整行才不挤)。 */
+   m_lGrid = new QLabel(box);
+   m_lGrid->setStyleSheet(QStringLiteral("color:#c8ced8;"));
+   m_lEst  = new QLabel(box);
+   m_lEst->setWordWrap(true);
+   m_lEst->setStyleSheet(QStringLiteral("color:#7b8391;"));
+   m_lWarn = new QLabel(box);
+   m_lWarn->setWordWrap(true);
+   m_lWarn->setStyleSheet(QStringLiteral("color:#ff8f8f;"));
+   lone(nullptr, m_lGrid);
+   lone(nullptr, m_lEst);
+   lone(nullptr, m_lWarn);
 
    pair(QStringLiteral("区域 X"),   m_edAreaX);
    pair(QStringLiteral("区域 Y"),   m_edAreaY);
@@ -2250,21 +2275,6 @@ QWidget *ScanWindow::buildParamPanel()
       col = 0;
       row++;
    }
-
-   /* CSV 必须跨四列: 路径那个框是这一框里最需要宽度的一个 */
-   lone(csvRow, nullptr);
-
-   m_lGrid = new QLabel(box);
-   m_lGrid->setStyleSheet(QStringLiteral("color:#c8ced8;"));
-   m_lEst  = new QLabel(box);
-   m_lEst->setWordWrap(true);
-   m_lEst->setStyleSheet(QStringLiteral("color:#7b8391;"));
-   m_lWarn = new QLabel(box);
-   m_lWarn->setWordWrap(true);
-   m_lWarn->setStyleSheet(QStringLiteral("color:#ff8f8f;"));
-   lone(nullptr, m_lGrid);
-   lone(nullptr, m_lEst);
-   lone(nullptr, m_lWarn);
 
    /* 必须显式把缺省值填进控件: QDoubleSpinBox 初值是 0, 会被自己夹到最小值 0.1 —— 界面看着
     * 像那么回事, 而扫描区域其实只有 0.1 mm。必须在下面那些 connect 之前, 否则每 set 一个
@@ -2316,7 +2326,9 @@ QWidget *ScanWindow::buildParamPanel()
                GateItem{ m_edSamples,  false, false },
                GateItem{ m_cbDir,      true,  false, true },   /* 起始方向: 改的是轨迹 */
                GateItem{ m_cbMode,     true,  false, true },   /* 扫描方式: 同上 */
-               GateItem{ m_edCsv,      true,  false, true },   /* 输出路径: 句柄已经按装载那条开着 */
+               /* 输出路径与它那个「…」: 句柄已经按装载那条开着。**控件 2026-09-30 起摆在
+                * 「扫描控制」那一框里**, 而这两条留在这张表不动 —— 表里收的是指针 (见上面) */
+               GateItem{ m_edCsv,      true,  false, true },
                GateItem{ m_btnCsv,     true,  false, true },
                GateItem{ m_btnDef,     true,  false, true },   /* 恢复默认: 一按就是几何全变 */
             });
@@ -2353,6 +2365,24 @@ QWidget *ScanWindow::buildScanPanel()
    m_btnOpen->setToolTip(QStringLiteral("读回已有数据, 仅补采未完成的点, 继续追加同一文件。"));
    connect(m_btnOpen, &QPushButton::clicked, this, &ScanWindow::onOpenCsvClicked);
 
+   /* ---- 输出路径那一行 (2026-09-30 从「扫描参数」搬来的) ----
+    * 用户原话: 「扫描参数的csv栏并入扫描控制中」。搬的只是**摆位**: 这两个控件的可用性
+    * (运行中 / 装载态锁住) 与"改没改"仍在「扫描参数」那张项表里 —— 那张表收的是**指针**,
+    * 与控件摆在哪一框无关 (理由见 buildParamPanel 里那一段)。所以这里的控件**一个 setEnabled
+    * 都不许写**: 参数控件的可用性只有 refreshEditability() 一处写点。
+    *
+    * 摆在「打开 CSV 续扫」下面: 这两件说的是同一份文件 (它决定"往哪写", 那个决定"接着哪份写")。
+    * 路径框那一份说明在占位字上, 不另加标签 (搬之前它也是这么摆的) */
+   m_edCsv = new QLineEdit(box);
+   m_edCsv->setPlaceholderText(QStringLiteral("scan_out/scan_YYYYmmdd_HHMMSS.csv"));
+   m_btnCsv = new QPushButton(QStringLiteral("…"), box);
+   /* **不设固定宽** (2026-09-30): 原先这里是 setFixedWidth(28), 而样式表给 QPushButton 的
+    * 内边距是 5px 12px、边框 1px —— 28 宽留给字的只剩 **2 px**, 那个「…」被剪成**一个点**
+    * (用户原话: 「后面的选择文件按钮要是三个点而不是一个点」)。不设固定宽就按 sizeHint 走
+    * (本机 100% 缩放下量到 32 px; 150% 缩放下三个点分得开), 字号 / DPI 变了它自己跟着长。
+    * 同一处毛病 m_btnMtrCsv 也有, 一起改 (那一行现在藏着, 见 buildMeterPanel) */
+   connect(m_btnCsv, &QPushButton::clicked, this, &ScanWindow::onBrowseCsv);
+
    m_lProg = new QLabel(box);
    m_lProg->setStyleSheet(QStringLiteral("color:#c8ced8;"));
    m_lTime = new QLabel(box);
@@ -2371,9 +2401,15 @@ QWidget *ScanWindow::buildScanPanel()
    r2->addWidget(m_btnRetest, 1);
    r2->addWidget(m_btnOpen, 1);
 
+   QHBoxLayout *r3 = new QHBoxLayout;
+   r3->setContentsMargins(0, 0, 0, 0);
+   r3->addWidget(m_edCsv, 1);
+   r3->addWidget(m_btnCsv);
+
    QVBoxLayout *v = new QVBoxLayout(box);
    v->addLayout(r1);
    v->addLayout(r2);
+   v->addLayout(r3);
    v->addWidget(m_lProg);
    v->addWidget(m_lTime);
    return box;
@@ -2656,7 +2692,9 @@ QWidget *ScanWindow::buildMeterPanel()
    m_edMtrCsv = new QLineEdit(m_csvBox);
    csvRow->addWidget(m_edMtrCsv, 1);
    m_btnMtrCsv = new QPushButton(QStringLiteral("…"), m_csvBox);
-   m_btnMtrCsv->setFixedWidth(28);
+   /* 与「扫描控制」里那个 m_btnCsv 同一条: **不设固定宽** (原先是 setFixedWidth(28), 那会把
+    * 这个「…」剪成一个点, 见 buildScanPanel 里那段量出来的数)。这一行 2026-09-29 起整块藏着,
+    * 所以屏幕上暂时看不到差别 —— 照改是为了"恢复显示"那一刻它俩还是同一个样子 */
    connect(m_btnMtrCsv, &QPushButton::clicked, this, &ScanWindow::onMtrBrowseCsv);
    csvRow->addWidget(m_btnMtrCsv);
 
@@ -4869,11 +4907,18 @@ void ScanWindow::refresh()
    const ScanController::State st = m_ctl->state();
    m_btnPause->setEnabled(running && st != ScanController::State::Paused);
    /* 「继续」有两个来源 (2026-09-29): 暂停之后接着跑, 或者装载之后开始补点。
-    * 两条路都叫"继续", 差别在那半句状态行上 (「已暂停…」/「已装载续扫数据 (未启动)」) */
-   m_btnResume->setEnabled(st == ScanController::State::Paused || loaded);
+    * 两条路都叫"继续", 差别在那半句状态行上 (「已暂停…」/「已装载续扫数据 (未启动)」)。
+    * **两个来源都要连接** (2026-09-30): 它按下去就**发新动作** (接着走点), 没总线走不动。
+    * 暂停着掉线那一路本来也很快就自己结束 (running() 为真时 tick() 的健康检查照样在跑) */
+   m_btnResume->setEnabled((st == ScanController::State::Paused || loaded) && m_connected);
+   /* 「中止」**刻意不判连接** (2026-09-30): 它是"退出去"的那一个 —— 装载态下总线断了, 人得
+    * 能按它放弃这次装载、把几何解锁; 判上连接就成了"断了线就卡在装载态里出不来"。
+    * 它不向上面的「开始扫描 / 继续 / 重测选中点」看齐, 是因为那三个要**发新动作**,
+    * 而这个只收尾 (收尾最坏也只是写不出去, 工作线程那边本来就拦得住) */
    m_btnAbort->setEnabled(running || loaded);   /* 装载态 = 放弃这次装载 */
-   /* 「重测选中点」装载态下不放开: 它会把"要补哪些点"换成那一个点 */
-   m_btnRetest->setEnabled(!running && !loaded && m_canvas->selectedIx() >= 0);
+   /* 「重测选中点」装载态下不放开: 它会把"要补哪些点"换成那一个点。
+    * **没连接也不放开** (2026-09-30): 它走 armRun 重走一点, 没有总线一步也走不了 */
+   m_btnRetest->setEnabled(!running && !loaded && m_connected && m_canvas->selectedIx() >= 0);
 
    /* ---- 进度 ---- */
    if (running || st == ScanController::State::Paused)

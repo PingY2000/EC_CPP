@@ -356,7 +356,8 @@ private:
    QSpinBox       *m_edSamples = nullptr;
    QComboBox      *m_cbDir   = nullptr;
    QComboBox      *m_cbMode  = nullptr;
-   QLineEdit      *m_edCsv   = nullptr;
+   QLineEdit      *m_edCsv   = nullptr;   /* 扫描那份 CSV 的路径; 2026-09-30 起摆在「扫描控制」里,
+                                           * 但"改没改 / 运行中锁不锁"仍归「扫描参数」那张项表 (见 .cpp) */
    QPushButton    *m_btnDef  = nullptr;   /* 恢复默认 */
 
    QLabel *m_lGrid = nullptr;
@@ -532,7 +533,8 @@ private:
    /* 「取消」正在回灌控件。回灌时那对色阶值会因为"先写 lo、此时 hi 还是新值"错配一下, 而
     * 那条横幅说的是"操作员把数改坏了" —— 程序自己回灌不该弹它 (见 onShadeLoChanged) */
    bool m_panelRevert = false;
-   QPushButton     *m_btnCsv = nullptr;    /* 「扫描参数」的 CSV「…」(进可用性表, 故不能是局部量) */
+   QPushButton     *m_btnCsv = nullptr;    /* 输出路径右边那个「…」; 2026-09-30 起在「扫描控制」里,
+                                           * 而进的是「扫描参数」的项表 (故不能是局部量) */
    /* 上一次推给工作线程的两个连接期参数: 只用来认出"勾了但本次连接不生效"这个情形 */
    bool m_advLastWantDig  = true;
    bool m_advLastNpnWrite = true;
