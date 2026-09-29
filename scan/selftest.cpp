@@ -352,24 +352,57 @@ struct Rig
 {
    FakeBus        bus;
    FakeMeter      meter;
+   MeterLog       mlog;
    ScanController ctrl { &bus, &meter };
    int64_t        now = 1000;
+
+   /* 采样按"到齐那一刻状态机在哪个状态"分桶。**只有 fed_read 里的采样能进一个点** ——
+    * 另外几桶全是"这一个不属于任何一个点"的证据 (见 ScanController::feedMeterSample) */
+   int fed_move  = 0;
+   int fed_read  = 0;
+   int fed_pause = 0;
+   int fed_other = 0;
 
    Rig()
    {
       meter.setNow(now);
       meter.setLatency(60);
       meter.open(nullptr);
+
+      /* 连续读数那一路。2026-09-29 起它是**唯一**向功率计发请求的人 (功率计"同一时刻只有
+       * 一个未决请求"那条约束现在只剩一个发起方), 而扫描点从这条流里取数 */
+      mlog.tick(now);            /* 先把钟对齐, 再挂源 (与 MeterRig 构造同一个理由) */
+      mlog.setSource(&meter);
+      QString e;
+      mlog.start(MeterLog::kDefaultIntervalMs, &e);
+
+      /* 记桶与喂数写在**同一个 lambda 里**, 顺序就写在脸上: 先按此刻的状态记一笔, 再交给
+       * 状态机。分成两个 connect 的话, 谁先谁后靠连接顺序, 那是看不见的约定 */
+      QObject::connect(&mlog, &MeterLog::sampled,
+                       [this](int64_t ms, double w, bool ok) {
+                          switch (ctrl.state())
+                          {
+                          case ScanController::State::Reading:  fed_read++;  break;
+                          case ScanController::State::Moving:
+                          case ScanController::State::Dwelling: fed_move++;  break;
+                          case ScanController::State::Paused:   fed_pause++; break;
+                          default:                              fed_other++; break;
+                          }
+                          ctrl.feedMeterSample(ms, w, ok);
+                       });
+
       ctrl.tick(now);            /* 让状态机的钟和这里的钟对齐, 再开始 */
    }
 
-   /* 拨一格表: 机械走 → 状态机看一眼 → 功率计回包 */
+   /* 拨一格表: 机械走 → 连续读数那一拍 → 状态机看一眼。
+    * 顺序是这一轮的意思所在: 采样**先**到 (可能正落在读数期间), 状态机再看一眼 */
    void stepOnce(int dt = 20)
    {
       bus.step(dt);
       meter.setNow(now);
-      ctrl.tick(now);
+      mlog.tick(now);
       meter.pump(now);
+      ctrl.tick(now);
       now += dt;
    }
 
@@ -546,6 +579,60 @@ static void test_grid()
    Params narrow = p;
    narrow.range_pul = 100000;                            /* 只有 ±2 单位 */
    check(!fitsRange(narrow, &why2), "area outside the range rejected", why2);
+
+   /* ---- 连续读数那个「间隔」(2026-09-29) ----
+    * 它是 Params 里第二个"界面上没有、只在 validate 里管"的字段 (第一个是 meter_timeout_ms),
+    * 也是「预计全程」与 ScanController 的读取预算共用的那一个数。 */
+   caseBegin("grid: 「间隔」进了参数 —— 量程、量程边界与估计时长");
+
+   /* 本文件 (scanplan) 刻意不依赖 Qt, 于是它只能照抄一份 MeterLog 的夹取范围。照抄的东西
+    * 会漂 —— 所以这两条把它钉住 (VEL_MIN/VEL_MAX 那两个至今只有一句注释, 是没钉的) */
+   checkEq(kMeterIntervalMinMs, MeterLog::kMinIntervalMs,
+           "kMeterIntervalMinMs 与 MeterLog::kMinIntervalMs 逐字一致");
+   checkEq(kMeterIntervalMaxMs, MeterLog::kMaxIntervalMs,
+           "kMeterIntervalMaxMs 与 MeterLog::kMaxIntervalMs 逐字一致");
+
+   bad = p;
+   bad.meter_interval_ms = kMeterIntervalMinMs - 1;
+   check(!validate(bad).empty(), "19 ms 越界被拒");
+   check(validate(bad).find("20..60000") != std::string::npos,
+         "拒绝的话里写着量程 (两个数都是常量拼的)", validate(bad));
+
+   bad = p;
+   bad.meter_interval_ms = kMeterIntervalMinMs;
+   check(validate(bad).empty(), "20 ms 刚好放行", validate(bad));
+
+   bad = p;
+   bad.meter_interval_ms = kMeterIntervalMaxMs;
+   check(validate(bad).empty(), "60000 ms 刚好放行", validate(bad));
+
+   bad = p;
+   bad.meter_interval_ms = kMeterIntervalMaxMs + 1;
+   check(!validate(bad).empty(), "60001 ms 越界被拒");
+
+   /* 「预计全程」逐字算一遍 (缺省那份参数):
+    *   步长 0.5 mm × 50000 pul/mm = 25000 pul, 速度 20000 pul/s
+    *   移动 = 25000 / 20000 * 1000 = 1250 ms, 进近段按 30% 粗加成 1625
+    *   稳定 100 + 停留 200                                        → 1925
+    *   采样: 一个点一次, 一次要等一个间隔 (200) 加一次往返 (50)      → 250
+    *   合计 2175 ms/点
+    * 这一条钉的是"那个 50 是往返、间隔要另加" —— 少了它「预计全程」会少报好几倍 */
+   checkEq(estimatePerPointMs(p), 2175, "缺省参数每点 2175 ms (不是 1975)");
+   checkEq(estimatePerPointMs(p) * (long long)buildPlan(p).size(), 6579375,
+           "3025 点 ≈ 110 分钟");
+
+   /* 间隔改了, 估计跟着走; 每点采样次数也照乘 */
+   Params fast = p;
+   fast.meter_interval_ms = 20;
+   checkEq(estimatePerPointMs(fast), 1925 + 70, "间隔 20 ms → 每点只多了 70 ms 的等待");
+
+   Params four = p;
+   four.samples_per_point = 4;
+   checkEq(estimatePerPointMs(four), 1925 + 250 * 4, "4 次采样 = 4 份 (间隔 + 往返)");
+
+   /* 那个数进不了 CSV 表头 —— 它不是几何, 也不是续扫要比的东西 */
+   check(csvMetaLines(p, "2026-09-29T00:00:00", 0).find("meter_interval") == std::string::npos,
+         "「间隔」不写进 CSV 表头 (格式一个字节没动)");
 }
 
 static void test_csv()
@@ -910,7 +997,13 @@ static void test_run()
    check(done, "the run reaches Done");
    check(rig.ctrl.state() == ScanController::State::Done, "state is Done");
    checkEq(rig.ctrl.completedPoints(), 25, "25 cells completed");
-   checkEq(rig.meter.readings(), 25, "25 readings taken");
+   /* 这一点**恰好**消耗一笔采样 (samples_per_point = 1)。原来的判据是 meter.readings()
+    * == 25 (那时候一个点 = 控制器自己发一次请求), 2026-09-29 起扫描不发请求了 —— 同一层
+    * 的说法改成"到齐的采样里落进读数期间的正好 25 笔", 钉的还是"不多不少一个点一笔" */
+   checkEq(rig.fed_read, 25, "25 samples landed while a point was reading");
+   checkEq(rig.fed_other, 0, "没有一个采样落在 Idle/Done 里 (扫描之外它也不进任何点)");
+   check(rig.fed_move > 0,
+         "移动/停留期间也到齐过采样 —— 它们一个都没进点 (这才是那句话的意思)");
 
    /* 每个格子都该有数, 且都在正确的位置上 */
    int valued = 0;
@@ -979,6 +1072,9 @@ static void test_run()
    check(r2.bus.telemetry().ax[0].enabled, "still enabled (holding torque) while paused");
 
    const int done_at_pause = r2.ctrl.completedPoints();
+   /* 暂停期间连续读数照旧在采 (曲线一直在长), 而那些采样**一个都不属于任何一个点** ——
+    * 收下它们就等于把一个跨了暂停的平均值写进下一行 */
+   check(r2.fed_pause > 0, "暂停期间到齐过采样, 它们一个都没进点");
 
    r2.ctrl.resumeRun();
    check(r2.ctrl.state() == ScanController::State::Moving, "back to Moving");
@@ -1042,6 +1138,78 @@ static void test_run()
       if (c == '\n')
          rows4++;
    check(rows4 > rows3, "appended to the same file rather than starting a new one");
+
+   /* ---- 扫描取数改成"从连续读数那条流里取"之后 (2026-09-29) 的那几条判据 ----
+    * 台架把 MeterLog::sampled 一路接到 ScanController::feedMeterSample, 所以下面几条跑的是
+    * 真机那条链路, 不是直接戳状态机 */
+   caseBegin("run: 一个点要 N 笔采样都到齐 (samples_per_point = 4)");
+   {
+      Rig r;
+      Params p = Rig::smallParams();
+      p.samples_per_point = 4;
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+
+      QString err;
+      check(r.startScan(dir.filePath("n4.csv"), &err), "start", err.toStdString());
+      check(r.runToIdle(), "the run reaches Done");
+      checkEq(r.ctrl.completedPoints(), 25, "all 25 cells completed");
+      checkNear(r.ctrl.cellValue(0, 0), 3.0, "the average of 4 identical samples");
+      /* 差一笔都不行: 少一笔它就还停在 Reading 上等 (而不是拿 3 笔凑一个平均) */
+      checkEq(r.fed_read, 25 * 4, "每点恰好消耗 4 笔采样");
+   }
+
+   caseBegin("run: 没读到的那些采样不算进平均, 也不当场判死");
+   {
+      Rig r;
+      Params p = Rig::smallParams();
+      p.samples_per_point = 3;
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(6.0);
+
+      QString err;
+      check(r.startScan(dir.filePath("failsamp.csv"), &err), "start", err.toStdString());
+
+      /* 走到"正在读这一个点"上, 手动塞一笔 ok=false 的进去 (真机上是"这次没要回来") */
+      check(r.runUntil([&] { return r.ctrl.state() == ScanController::State::Reading; }, 20000),
+            "进到读数状态");
+      r.ctrl.feedMeterSample(r.now, 0.0, false);
+      check(r.ctrl.state() == ScanController::State::Reading,
+            "一笔没读到不会当场判死这个点 (它只是不算数)");
+
+      check(r.runToIdle(), "这一轮照旧跑完");
+      checkEq(r.ctrl.completedPoints(), 25, "25 点全走过");
+      checkNear(r.ctrl.cellValue(0, 0), 6.0,
+                "平均值里没有那一笔 0 —— 它是丢掉的, 不是记成 0 W");
+      checkEq(r.fed_read, 25 * 3, "喂进去的那一笔失败不算数, 每点仍然是 3 笔");
+   }
+
+   caseBegin("run: 一笔采样都到不了 → 期限一到就收尾 (报的是这次给的预算)");
+   {
+      Rig r;
+      Params p = Rig::smallParams();
+      p.samples_per_point = 4;                 /* 预算 = 2000 + 4 × 200 = 2800 ms */
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.mlog.stop();                           /* 这条流不喂了 (源没开 / 被 hold 住就是这种情形) */
+
+      const QString csv = dir.filePath("nofeed.csv");
+      QString err;
+      check(r.startScan(csv, &err), "start", err.toStdString());
+      check(r.runUntil([&] { return r.ctrl.completedPoints() >= 1; }, 20000),
+            "第一个点收尾了 (没等成死等)");
+      check(!r.ctrl.cellHasValue(0, 0), "没采到数: 记的是 ok=false, 不是 0 W");
+
+      std::string text;
+      check(readCsvText(csv, &text, &err), "read it back", err.toStdString());
+      const std::string want = "功率计超时 2800 ms (到 0/4 笔采样)";
+      check(text.find(want) != std::string::npos,
+            "超时那一行写的是**这次给的预算** (2000 + 4×200), 不是 meter_timeout_ms", want);
+      /* flags 要进 CSV 的一列, 逗号会把列数撑开 */
+      check(want.find(',') == std::string::npos, "那句 flags 里没有逗号");
+   }
 }
 
 static void test_aborts()
@@ -1421,6 +1589,9 @@ static void test_prefs()
       p.params.samples_per_point = 4;
       p.params.serpentine       = false;
       p.params.start_positive   = false;
+      /* 功率计那一族: 间隔与**曲线时长窗**都是"这台机器怎么看数", 与网卡名同一类 */
+      p.meter_interval_ms = 1234;
+      p.meter_window_min  = 37;
       p.nic = QStringLiteral("\\Device\\NPF_{9A3C1E7B-4D2F-4A18-9C55-6B0E2F7A1D43}");
       p.manual_speed = 12345;
 
@@ -1438,8 +1609,36 @@ static void test_prefs()
       check(!b.params.serpentine, "serpentine=false survives");
       check(!b.params.start_positive, "start_positive=false survives");
       checkEq(b.manual_speed, 12345, "manual speed");
+      checkEq(b.meter_interval_ms, 1234, "功率计间隔");
+      checkEq(b.meter_window_min, 37, "曲线时长窗 (分钟)");
       check(b.nic == p.nic, "the Npcap device path survives INI escaping",
             b.nic.toStdString());
+   }
+
+   caseBegin("prefs: 曲线时长窗缺项 / 手改坏 —— 都落到 MeterLog 的缺省与量程上");
+   {
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      /* 老 ini (没有这个键): 缺省就是 5 分钟, 不是 0 —— 0 会让 MeterLog 夹到 1 分钟,
+       * 于是"没记过"表现成"上次设过 1 分钟" */
+      checkEq(prefsLoad(ini).meter_window_min, 5, "没有那个键时给 5 分钟");
+
+      /* 手改成垃圾: toInt() 给 0 -> MeterLog 夹到 1; 一千万也夹到 120。
+       * 这一段钉的是"控件夹得住、这里也夹得住" —— 曲线不该用一个没验过的窗口 */
+      Prefs p;
+      p.meter_window_min = 0;
+      MeterLog log;
+      log.setWindowMinutes(p.meter_window_min);
+      checkEq(log.windowMinutes(), MeterLog::kMinWindowMinutes, "0 -> 1 分钟");
+
+      p.meter_window_min = 10000000;
+      log.setWindowMinutes(p.meter_window_min);
+      checkEq(log.windowMinutes(), MeterLog::kMaxWindowMinutes, "一千万 -> 120 分钟");
+
+      p.meter_window_min = 5;
+      log.setWindowMinutes(p.meter_window_min);
+      checkEq(log.windowMinutes(), 5, "正常的照记");
    }
 
    caseBegin("prefs: 不能扫的参数盖不掉上一次能用的那份");
@@ -4825,6 +5024,9 @@ static void test_meterlog()
    {
       MeterRig r(1);
       QString e;
+      /* 窗口放到最大: 采满 20000 笔要模拟 10 分钟, 而缺省窗口只有 5 分钟 —— 不放大的话
+       * 先到的是窗口, 这一条测的就成了别的东西 (窗口那一条在下面另有一个用例) */
+      r.log.setWindowMinutes(MeterLog::kMaxWindowMinutes);
       r.log.setInterval(MeterLog::kMinIntervalMs);
       r.log.start(MeterLog::kMinIntervalMs, &e);
       check(!r.log.full(), "刚打开的时候没满");
@@ -5206,6 +5408,174 @@ static void test_meterlog()
 
       check(!log.beginRecord(QString(), &err), "空路径 → false");
       check(!err.isEmpty(), "也给了原因", err.toStdString());
+   }
+
+   /* ------------------------------------------------- 曲线时长窗 (2026-09-29) */
+
+   caseBegin("meterlog: 曲线时长 —— 缺省 5 分钟, 越界夹回量程");
+   {
+      MeterLog log;
+      checkEq(log.windowMinutes(), MeterLog::kDefaultWindowMinutes, "缺省就是 5 分钟");
+      checkEq(log.windowMinutes(), 5, "缺省那个数是 5 (与屏幕上写的那个一致)");
+
+      log.setWindowMinutes(0);
+      checkEq(log.windowMinutes(), 1, "0 夹到最小 (没有'不限'这一档)");
+      log.setWindowMinutes(999);
+      checkEq(log.windowMinutes(), 120, "太大夹到最大");
+      log.setWindowMinutes(-7);
+      checkEq(log.windowMinutes(), 1, "负数也夹到最小");
+      log.setWindowMinutes(7);
+      checkEq(log.windowMinutes(), 7, "量程内照记");
+      checkEq(log.count(), 0, "空缓冲上改窗口不出事");
+   }
+
+   caseBegin("meterlog: 时间窗 —— 到点就丢最旧的 (该留谁是一笔一笔算出来的)");
+   {
+      MeterLog log;
+      log.setWindowMinutes(1);                     /* 60000 ms */
+      checkEq((long long)log.windowMinutes(), 1, "窗口 1 分钟");
+
+      /* 记在 **sampled** 上, 不是 sampleAdded: 后者裁一次窗也要喊一次, 那样记下来的笔数
+       * 会比真采到的多 (这个用例里就多一笔), 于是"该留谁"的算式整个偏一格 */
+      QVector<int64_t> seen;
+      QObject::connect(&log, &MeterLog::sampled,
+                       [&](int64_t ms, double, bool) { seen.append(ms); });
+
+      const int64_t t0 = 100000;
+      const int     n  = 500;                      /* 每 200 ms 一笔 = 100 s 的历史 */
+      for (int i = 0; i < n; i++)
+         log.addFollowSample(t0 + (int64_t)i * 200, 1.0 + (double)i);
+
+      checkEq(seen.size(), n, "每一笔都进去过 (窗口只丢旧的, 不吞新的)");
+
+      /* "最早那一笔该留到哪儿"是**算出来的**, 与容量那一条同一个手法 */
+      int keep = 0;
+      while (keep < seen.size() && seen.last() - seen[keep] > 60000)
+         keep++;
+
+      check(keep > 0, "确实裁掉了一段 (不然这一条测的是别的东西)");
+      checkEq((long long)log.count(), (long long)(seen.size() - keep), "留下来的笔数");
+      checkEq((long long)log.samples().first().ms, (long long)seen[keep],
+              "最前面那一笔正是算出来的那一个");
+      checkEq((long long)log.samples().last().ms, (long long)seen.last(),
+              "最后一笔就是刚采到的");
+      check(!log.full(), "裁它的是时间窗, 不是容量");
+      checkEq(log.stats().n, log.count(), "统计只数窗内的 —— 它就跟着成了窗内统计");
+
+      /* 改回大窗口: **已经丢掉的回不来** (内存里真的没了), 这是有意的取舍 */
+      log.setWindowMinutes(2);
+      checkEq((long long)log.count(), (long long)(seen.size() - keep),
+              "改大窗口并不会把丢掉的那些找回来");
+   }
+
+   caseBegin("meterlog: 时间窗比容量先到 —— 缺省参数下裁它的是窗不是容量");
+   {
+      MeterRig r(20);
+      QString e;
+      r.log.setInterval(200);
+      check(r.log.start(200, &e), "start()", e.toStdString());
+
+      r.run(400000, 20);                        /* 模拟 400 s ≈ 6.7 分钟 > 缺省窗口 5 分钟 */
+
+      check(r.log.count() > 0, "采到了数");
+      check(r.log.count() < MeterLog::kCapacity, "离容量远着 (5 分钟 × 200 ms 只有 1500 笔)");
+      check(!r.log.full(), "full() 是假的 —— 裁它的是时间窗");
+
+      /* 缺省占的是 5 分钟那一档 (这一条跑的就是它) */
+      const int64_t win  = (int64_t)MeterLog::kDefaultWindowMinutes * 60000;
+      const int64_t span = r.log.samples().last().ms - r.log.samples().first().ms;
+      check(span <= win, "留下来的不超过窗口那么多");
+      check(span > win - 1000, "而且是真的铺满了那个窗口 (不是早早就停了)");
+   }
+
+   caseBegin("meterlog: 裁窗写在 append 之后 —— 超窗的那些当帧就没了, 基准也不动");
+   {
+      QTemporaryDir dir;
+      check(dir.isValid(), "temp dir");
+      const QString csv = dir.filePath(QStringLiteral("mt0.csv"));
+
+      MeterRig r(20);
+      QString e;
+      r.log.setWindowMinutes(1);
+      r.log.setInterval(200);
+      check(r.log.beginRecord(csv, &e), "beginRecord", e.toStdString());
+      check(r.log.start(200, &e), "start()", e.toStdString());
+
+      r.step();                                  /* 发第一个 */
+      r.step();                                  /* 回话到: 第一笔落进缓冲与文件 */
+      checkEq(r.log.count(), 1, "第一笔到了");
+      const int64_t first_ms = r.log.samples().first().ms;
+
+      /* 一次拨两分钟。真机上这就是"表头拔了 / 采集停了一阵" */
+      r.step(120000);
+      r.step();                                  /* 这一拍的 tick 才看得见新时刻, 于是发出下一笔 */
+      r.step();                                  /* 它回来 */
+
+      /* 超窗的那些**在这一笔到齐的那一刻**就该没了, 不是等到下一笔 —— 裁在 append 之前的话
+       * 基准是上一笔, 这一整批旧数会多留一拍 (屏幕上还在画、统计里还在数) */
+      checkEq(r.log.count(), 1, "超窗的那些当帧就丢了");
+      check((long long)r.log.samples().first().ms > (long long)first_ms,
+            "留下的只有刚到的这一笔");
+
+      const int64_t last_ms = r.log.samples().last().ms;
+      r.log.stop();
+      r.log.endRecord();
+
+      std::string text;
+      QString err;
+      check(readCsvText(csv, &text, &err), "read it back", err.toStdString());
+
+      /* 文件里那些行是一笔一 flush 写下的, 所以基准被搬过的话, 后一行会当场从新基准重算 */
+      const QStringList lines = QString::fromUtf8(text.c_str())
+                                   .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+      check(lines.size() >= 3, "表头 + 两行数据", text.substr(0, 200));
+
+      const QStringList first_cols = lines.value(1).split(QLatin1Char(','));
+      checkEq(first_cols.value(1).toLongLong(), 0, "第一行数据行的 elapsed 是 0");
+
+      const QStringList last_cols = lines.last().split(QLatin1Char(','));
+      checkEq(last_cols.value(1).toLongLong(), last_ms - first_ms,
+              "最后一行的 elapsed 仍然从**第一笔**算起 (断了一大段也没把 m_t0 搬走)");
+   }
+
+   caseBegin("meterlog: sampled 只在真有新采样时喊 (清空与裁窗都不算)");
+   {
+      MeterLog log;
+      log.setWindowMinutes(1);
+
+      int fired = 0;
+      int added = 0;
+      QObject::connect(&log, &MeterLog::sampled,
+                       [&](int64_t, double, bool) { fired++; });
+      QObject::connect(&log, &MeterLog::sampleAdded, [&] { added++; });
+
+      log.addFollowSample(1000, 1.0);
+      checkEq(fired, 1, "塞一笔 → 喊一次 sampled");
+      log.addFollowSample(2000, 1.0);
+      checkEq(fired, 2, "再塞一笔 → 再喊一次");
+
+      log.clear();
+      checkEq(fired, 2, "clear() 不喊 sampled (那不是一个新到的采样)");
+      checkEq((long long)log.count(), 0, "clear 之后缓冲是空的");
+      check(added >= 3, "但 clear 照旧喊 sampleAdded (屏幕要立刻变空)");
+
+      log.addFollowSample(3000, 1.0);
+      checkEq(fired, 3, "清空之后再塞一笔照旧喊");
+
+      /* 裁窗也一样。**这一条最要紧**: 拿一批旧样本 (还都带着 ok=true) 去凑一个扫描点,
+       * 是安静地出一个错的数 */
+      log.setWindowMinutes(2);                   /* 先把窗口放大, 让下面那 400 笔一笔不丢 */
+      for (int i = 0; i < 400; i++)
+         log.addFollowSample(10000 + (int64_t)i * 200, 1.0);
+
+      const int before_fired = fired;
+      const int before_added = added;
+      const int before_count = log.count();
+
+      log.setWindowMinutes(1);                   /* 立刻裁掉一大段 */
+      check(log.count() < before_count, "确实裁掉了");
+      checkEq(fired, before_fired, "裁窗不喊 sampled");
+      check(added > before_added, "但它照旧喊 sampleAdded (曲线当帧就跟着缩)");
    }
 }
 

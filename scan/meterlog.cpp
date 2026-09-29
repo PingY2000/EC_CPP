@@ -108,9 +108,25 @@ void MeterLog::setAverage(int n)
    m_avg = v;
 
    /* 手上那半份**不丢**: 它就按新的 N 凑够为止 —— 已经要回来的数没人再要得回来一次。
-    * 界面在采集期间把这个框灰着, 所以真要改也只改得动跟随模式那一种 (那时手上根本没有
+    * 界面在采集期间把这个框灰着, 所以真要改也只改得动没在采的那一种 (那时手上根本没有
     * 半份, 一个请求都没发) */
    emit stateChanged();
+}
+
+void MeterLog::setWindowMinutes(int min)
+{
+   const int v = std::min(kMaxWindowMinutes, std::max(kMinWindowMinutes, min));
+   if (v == m_window_minutes)
+      return;
+
+   m_window_minutes = v;
+   m_window_ms      = (int64_t)v * 60000;
+
+   /* 立刻按新窗口裁一次, 别等下一笔。采集停着 (setHold / stop) 时根本不 append, 等下一笔
+    * 的话屏幕上会**无限期**留着超窗的数据, 而统计里还在数它。
+    * 只喊 sampleAdded() —— **不喊 sampled()**, 裁是丢掉不是新到一笔 */
+   trimToWindow();
+   emit sampleAdded();
 }
 
 bool MeterLog::start(int interval_ms, QString *err)
@@ -280,6 +296,39 @@ void MeterLog::onFailed(const QString &err)
    emit failed(err);
 }
 
+/* 丢掉比 m_v 里最新一笔早过 m_window_ms 的那些。两条容易写反的地方:
+ *
+ * **一、基准是"缓冲自己的最新一笔", 不是"刚到的这一笔"。** 看着更自然的写法是把它写成
+ * `trimToWindow(s.ms)` —— 而它有个很坏的后果: 中间断了一大段 (表头拔了 / 采集停了一阵)
+ * 之后的第一笔, 用它当基准会把**整个缓冲**一次清空, 于是 record() 里那句
+ * `if (m_v.isEmpty()) m_t0 = s.ms;` (它在 append **之前**读的) 把 m_t0 搬到这一笔上。
+ * m_t0 是 appendCsv() 里 csvRowLine(s, m_t0) 的 elapsed 基准 —— **一份正在写的 CSV 的
+ * 时间轴会从这一行起断成两截**, 而文件本身看着完全正常 (每行都有数, 列数也对)。
+ *
+ * **二、调用点在 m_v.append(s) 之后。** 于是"刚到的这一笔一定留得住" (上面那个循环对
+ * drop == size-1 恒不成立, 缓冲永远不会被清空)。写在 append 之前则基准是**上一笔**, 中间
+ * 断了一大段时那一整批超窗的旧数会多留一拍 —— 屏幕上还在画它、统计里还在数它, 而这一轮
+ * 要消掉的正是这种"看着正常其实已经不是窗内的事"。
+ *
+ * 基准取最新一笔而不是 m_t0: m_t0 是"这场采集是从哪一刻起的" (CSV 与导出的 elapsed 基准),
+ * 这里问的是"最早还能留到哪一刻"。裁之前两者相等, 裁完就不等了 —— 这是有意的, 代价是
+ * 裁过之后导出的那份文件第一行 elapsed 不是 0 (那段数据确实是从中间开始的)。 */
+void MeterLog::trimToWindow()
+{
+   if (m_v.isEmpty())
+      return;
+
+   const int64_t newest = m_v.last().ms;
+
+   int drop = 0;
+   while (drop < m_v.size() && newest - m_v[drop].ms > m_window_ms)
+      ++drop;
+
+   /* 一次挪掉一整段, 不是 drop 次 removeFirst (那会把剩下的整块搬 drop 遍) */
+   if (drop > 0)
+      m_v.remove(0, drop);
+}
+
 void MeterLog::record(const Sample &s)
 {
    if (m_v.size() >= kCapacity)
@@ -289,6 +338,7 @@ void MeterLog::record(const Sample &s)
       m_t0 = s.ms;
 
    m_v.append(s);
+   trimToWindow();
 
    /* 写不进去不打断采集 (读数照旧在曲线上), 但**必须喊出来** —— 一份没人守着的连续记录
     * 悄悄停止落盘, 是这套东西最容易骗人的一种坏法 */
@@ -300,12 +350,13 @@ void MeterLog::record(const Sample &s)
    m_due_ms = m_now_ms + m_interval;
 
    emit sampleAdded();
+   emit sampled(s.ms, s.watts, s.ok);
 }
 
 void MeterLog::addFollowSample(int64_t ms, double watts)
 {
-   /* 跟随模式: 点是扫描采的, 只是借这里的缓冲画出来。**不写 CSV** (扫描那份已经写了),
-    * 也不算进 pending/due —— 这条路上根本没有我们的请求 */
+   /* 外部塞进来的一个点: 不经过取样源, **不写 CSV**, 也不算进 pending/due ——
+    * 这条路上根本没有我们的请求。2026-09-29 起扫描不再走它 (见头文件里的说明) */
    Sample s;
    s.ms    = ms;
    s.watts = watts;
@@ -317,7 +368,10 @@ void MeterLog::addFollowSample(int64_t ms, double watts)
       m_t0 = s.ms;
 
    m_v.append(s);
+   trimToWindow();       /* 与 record() 同一个规矩: 在 append 之后 */
+
    emit sampleAdded();
+   emit sampled(s.ms, s.watts, s.ok);
 }
 
 void MeterLog::clear()

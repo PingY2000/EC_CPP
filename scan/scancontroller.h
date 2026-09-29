@@ -44,12 +44,13 @@ public:
    };
    Q_ENUM(State)
 
-   /* bus 与 meter 不归它管, 由窗口负责, 且必须活过本对象 */
+   /* bus 与 meter 不归它管, 由窗口负责, 且必须活过本对象。
+    *
+    * **meter 只用来问"打开了没"与读表头那几行设备信息 (meterMetaLines)**。2026-09-29 起
+    * 本类**不再向它发请求**: 一个点的值 = 该点读取期间从连续读数那条流里到齐的采样的平均,
+    * 由 feedMeterSample() 送进来。持 const 指针就是为了让 requestReading() 在编译期不可达
+    * —— 功率计"同时只有一个未决请求"那条约束 (powermeter.h) 现在只剩 MeterLog 一个发起方。 */
    ScanController(BusView *bus, PowerMeter *meter, QObject *parent = nullptr);
-
-   /* 换一个取样源。旧的必须显式 disconnect (旧源还活着, 它下次出数会直接喂进状态机);
-    * 不允许在跑的时候换, 由窗口把关。 */
-   void setMeter(PowerMeter *meter);
 
    /* 存下来并重算网格, 不做校验 (输入中间态一定不合法); 关口在 start() */
    void setParams(const Params &p);
@@ -114,6 +115,18 @@ public:
    /* 外部驱动: 每 tick 喂一次单调钟的毫秒数。**这也是自动中止的唯一检查点** */
    void tick(int64_t now_ms);
 
+public slots:
+   /* 连续读数那条流到齐了一笔 (接 MeterLog::sampled)。**只在"正读这一个点"时算数** ——
+    * 移动/停留/暂停期间到齐的采样属于曲线上那条流, 不属于任何一个点。
+    *
+    * ok = false 的那一笔**不算进平均也不当场判死**: 它只是"这一次没要回来", 期限到了自然
+    * 会收尾成 ok=false 的那一行 (与 MeterLog::setAverage 同一个口径 —— 拿缺了一笔的数求
+    * 平均是编出来的, 而它在 CSV 里和别的行长得一模一样)。
+    *
+    * 时刻 ms 收下不用 (当前点用的是 tick 那条单调钟)。Qt 的 connect 只能丢**尾部**参数,
+    * 而 ok 是最后一个, 所以只能整个收下来。 */
+   void feedMeterSample(int64_t ms, double watts, bool ok);
+
    /* CSV 写失败/文件路径, 给状态栏显示 */
    QString csvPath() const { return m_log.path(); }
    int     csvLines() const { return m_log.written(); }
@@ -132,15 +145,10 @@ signals:
    /* 自动中止: 界面必须弹**红色横幅**, 不是一闪而过的提示 */
    void autoAborted(const QString &why);
 
-private slots:
-   void onReadingReady(double watts);
-   void onReadingFailed(const QString &err);
-
 private:
    bool armRun(QString *err);           /* Preflight + 进第一个点 */
    void startPoint(int plan_index);
    void beginReading();
-   void sendReading();
    void finishPoint(bool ok, const std::string &flags);
    void advance();                      /* 当前点收尾 → 下一个点 / Done */
    void enter(State s);
@@ -152,8 +160,8 @@ private:
    /* 有人从旁路改了目标 (扫描期间不允许) */
    bool externalWantChanged(const BusTelem &t, int axis, int32_t *seen);
 
-   BusView    *m_bus   = nullptr;
-   PowerMeter *m_meter = nullptr;
+   BusView          *m_bus   = nullptr;
+   const PowerMeter *m_meter = nullptr;   /* 只读: 问开没开 + 表头那几行, 见构造函数 */
 
    Params  m_p;
    Params  m_plan_p;             /* 当前网格是照哪份参数建的 —— 见 rebuildPlan() */
@@ -168,10 +176,8 @@ private:
    int     m_cur   = -1;         /* m_plan 下标; -1 = 不在点上 */
 
    ArrivalJudge m_judge[EM_MAX_AXES];
-   int      m_nsamp = 0;
+   int      m_nsamp = 0;         /* 这一个点已经到齐的采样数 (那个"半份"就在这里) */
    double   m_acc   = 0.0;
-   bool     m_pending = false;   /* 读数请求已发出、还没回 */
-   int64_t  m_sent_ms = 0;
    int32_t  m_spread[EM_MAX_AXES] = {0, 0};
    int32_t  m_issued[EM_MAX_AXES] = {0, 0};   /* 最后下发的目标 (显示坐标) */
    int64_t  m_issued_ms[EM_MAX_AXES] = {0, 0};
@@ -187,7 +193,11 @@ private:
    int64_t m_now_ms      = 0;    /* 最近一次 tick 的单调钟 */
    int64_t m_state_ms    = -1;   /* 进入当前状态的时刻 */
    int64_t m_run_ms      = -1;   /* 本轮第一次下发的时刻 (CSV 的 elapsed_ms 基准) */
-   int64_t m_deadline_ms = 0;    /* Dwelling 截止 / Reading 超时 */
+   int64_t m_deadline_ms = 0;    /* Dwelling 截止 / Reading 的收尾期限 (见 m_read_budget_ms) */
+   /* Reading 允许待多久 (= m_read_budget_ms, 见 beginReading)。看着像重复, 其实是为了那句
+    * 超时文案: 它要报的是**这次给的预算**, 而 m_deadline_ms 一旦被 tick 比较过就没法反推
+    * (而且报预算比报"等了多久"有用 —— 前者是参数定的, 后者还含着 tick 的相位) */
+   int64_t m_read_budget_ms = 0;
    int64_t m_move_deadline_ms = 0;  /* 走到位的最后期限 —— 卡住/被夹住时的兜底 */
 
    int     m_bad_wkc = 0;

@@ -11,11 +11,15 @@
  *
  * ---- 与 PowerMeter 的约定 ----
  * powermeter.h 写着: **同一时刻只允许一个未决请求**, 违约不报错、只会静默分错数。
- * 本类是三个请求发起方之一 (另外两个是 ScanController 与参数栏那个「读一次」按钮),
- * 谁能让谁, 由 ScanWindow::refresh() 一处仲裁, 靠两个开关推过来:
- *   · setHold(true) —— 「现在不该由我发请求」: 扫描在跑 (跟着扫描显示), 或手动读在飞。
- *                     running() 照旧是 true (还在采), 只是不发、也不计时。
- *   · 外面看到 issuing() 为 true 时不许启扫 (那是"真的在发")。
+ * 那一类"静默分错数"现在**结构上不可能**了: 本类是**唯一的发起方**。
+ *   · 2026-09-28 之前是三个 (本类 / ScanController / 参数栏那个「读一次」按钮), 由
+ *     ScanWindow::refresh() 一处仲裁"谁让谁"; 那一年删掉了「读一次」。
+ *   · **2026-09-29 起扫描也不再自己发请求** —— 它变成这个流的**消费者**: 一个扫描点的值
+ *     就是"该点读取时间段里到齐的采样的平均" (见 ScanController::feedMeterSample), 曲线
+ *     画的也是这条流。于是"让位"只剩一个理由: 改设备配置 (setHold(true), 工作线程在停流)。
+ *     `setHold` 的判据在 ScanWindow::refresh() 一处算, 与从前一样。
+ *   · `issuing()` 今天**没有调用方** (那条"真的在发时不许启扫"的闸随「读一次」一起没了),
+ *     只有自检在用; 留着是因为它是"这一路真的占着源"的唯一判据。
  */
 #pragma once
 
@@ -50,8 +54,21 @@ public:
    /* 一个请求的看门狗。Ophir 那条自己 1800ms 会报 stale, 这里放宽到 3000 让它先开口 */
    static constexpr int kTimeoutMs         = 3000;
    /* 环形缓冲容量。够画一条看得很清楚的曲线, 又不至于把一个长时间段吃光内存。
-    * **满了就在丢最旧的**, 所以 full() 要显示出来 (见 refreshMeterReadout) */
+    * **满了就在丢最旧的**, 所以 full() 要显示出来 (见 refreshMeterReadout)
+    *
+    * 2026-09-29 起它不再是唯一的丢弃规则: 下面那个时间窗通常**先到** (缺省 5 分钟 ×
+    * 缺省间隔 200 ms 只有 1500 点, 离 20000 远着), 于是 full() 在缺省参数下不可达 ——
+    * 它是"长窗口 + 短间隔"那一头才用得上的一道兜底 (间隔 20 ms 时 20000 点 ≈ 6.7 分钟,
+    * 所以窗口设到 7 分钟以上才轮得到它)。两条规则都在 append **之后**裁, 顺序无关。 */
    static constexpr int kCapacity          = 20000;
+
+   /* 曲线与统计只保留最近这么久 (分钟)。**内存里也丢掉**, 不只是"不画" —— 统计 (`stats()`)
+    * 是现算的, 于是它跟着变成"窗内统计"。
+    * 上界 120: 缺省间隔下那个窗口已经比 kCapacity 装得下的那一段还长, 所以不必再给一档
+    * "不限" (给了也是同一个结果, 却多一个要解释的状态)。 */
+   static constexpr int kDefaultWindowMinutes = 5;
+   static constexpr int kMinWindowMinutes     = 1;
+   static constexpr int kMaxWindowMinutes     = 120;
    /* 一次采样最多平均几次。与扫描的 samples_per_point 是同一件事, 只是这份没有参数面板 */
    static constexpr int kMaxAverage        = 64;
 
@@ -107,6 +124,14 @@ public:
    void setAverage(int n);
    int  average() const { return m_avg; }
 
+   /* 曲线与统计只保留最近多少分钟 (夹到 kMinWindowMinutes..kMaxWindowMinutes)。
+    * **改了立刻按新窗口裁一次**并 emit sampleAdded() —— 采集在 setHold 或被停掉时根本不
+    * append, 不立刻裁的话屏幕上会**无限期**留着超窗的数据 (统计里还在数它)。
+    * 裁剪**不 emit sampled()**: 裁是丢掉, 不是新到一个采样 (拿旧样本去凑扫描点的平均
+    * 是另一种错)。 */
+   void setWindowMinutes(int min);
+   int  windowMinutes() const { return m_window_minutes; }
+
    /* 让位 / 收回。hold 期间不发也不排下一次; 放开之后从**当时**重新排, 不补采欠下的 */
    void setHold(bool hold);
 
@@ -145,12 +170,22 @@ public:
    static QString csvHeaderLine();
    static QString csvRowLine(const Sample &s, int64_t t0);
 
-   /* 扫描在跑时由界面推过来的一个点 (跟随模式)。不进 CSV —— 那些点本来就写在扫描那份 CSV 里,
-    * 再写一份就是同一趟数据两个文件, 迟早对不上 */
+   /* 外部塞一个点到缓冲里 (不经过取样源)。
+    * 2026-09-29 起**扫描那条路不走它了** —— 曲线从此画的就是上面这条连续读数的流本身,
+    * 扫描点是它的**消费者** (ScanController::feedMeterSample), 不再往这里塞第二份。
+    * 留着是因为它仍是"不碰硬件也能往缓冲里放数"的唯一入口 (自检靠它把时间窗那一圈跑完),
+    * 与 setAverage 同一个"保留但不露"的处置。
+    * 不走 CSV —— 塞进来的点本来就不在这份采集的账上。 */
    void addFollowSample(int64_t ms, double watts);
 
 signals:
    void sampleAdded();                    /* 曲线要重画 / 统计要刷新 */
+   /* 真的有一笔新采样进了缓冲。**与 sampleAdded() 不是一件事**: 那一个是"屏幕上该重画了"
+    * (清空、裁窗也喊), 这一个只跟着"新到一笔"走 —— 扫描点那笔平均就从这儿取。
+    *
+    * 于是裁窗与 clear() **都不许喊它**: 拿一批旧样本 (还是假的 ok=true) 去凑一个扫描点,
+    * 是安静地出一个错的数。 */
+   void sampled(int64_t ms, double watts, bool ok);
    void stateChanged();                   /* running / hold / 记录开关变了 (按钮可用性) */
    /* 出错了, 原文在 err 里, 同时也留在 lastError()。
     * 两种情形共用这一个信号: 一次读没要回来 (已经记成 ok=false 的样本了), 或 CSV 写不进去
@@ -165,6 +200,10 @@ private:
    /* 记一笔 (成功或失败), 然后排下一次。now 一律取最近一次 tick 喂进来的那个
     * —— 时钟是外面的, 槽里没有别的来源 */
    void record(const Sample &s);
+   /* 按 m_window_ms 丢掉太旧的那些 (基准取缓冲自己的最新一笔)。**只在 m_v.append(s) 之后
+    * 调** —— 那两句注释里的两个坑 (拿刚到的这一笔当基准会清空缓冲并把 m_t0 搬走; 写在
+    * append 之前会让超窗的旧数多留一拍) 都在 meterlog.cpp 里写全了 */
+   void trimToWindow();
    bool appendCsv(const Sample &s);
    QString metaBlock() const;          /* m_meta 那几行 + "# " 前缀 + 换行 */
    void resetBatch();                  /* 丢掉手上这一批还没凑够的读数 */
@@ -179,6 +218,8 @@ private:
 
    int     m_interval = kDefaultIntervalMs;
    int     m_avg      = 1;      /* 一次采样平均几个读数 */
+   int     m_window_minutes = kDefaultWindowMinutes;
+   int64_t m_window_ms      = (int64_t)kDefaultWindowMinutes * 60000;
    int     m_nsamp    = 0;      /* 手上这一批已经收到几个 */
    double  m_acc      = 0.0;    /* 手上这一批的和 */
    int64_t m_now_ms   = 0;      /* 最近一次 tick 的读数 */
@@ -186,7 +227,9 @@ private:
    int64_t m_sent_ms  = 0;      /* 这一次是什么时候发的 (看门狗用) */
 
    QVector<Sample> m_v;
-   int64_t m_t0 = 0;            /* 第一笔的 ms, 导出时的 elapsed 基准 */
+   /* 这场采集第一笔的 ms, CSV 与导出那份的 elapsed 基准。**裁窗一个字都不动它** ——
+    * 裁窗是"缓冲从哪一刻起", 它是"这场采集从哪一刻起", 两者只有裁之前才相等 (见 trimToWindow) */
+   int64_t m_t0 = 0;
 
    QStringList m_meta;          /* 写进文件头的 `#` 行 (裸 key=value) */
 

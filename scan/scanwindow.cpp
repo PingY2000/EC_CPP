@@ -355,8 +355,10 @@ void ScanWindow::refreshEditability()
  *
  * 四条判据:
  *   ① 真机没打开     -> 只有「重试」能按 ("装没装 StarLab"与"表头插没插"都要能自己出来)
- *   ② 扫描正在跑     -> 记录开不了 (跟随的点直接写在扫描那份 CSV 里, 见 addFollowSample),
- *                       设备三项也不给改
+ *   ② 扫描正在跑     -> 设备三项不给改 (那三项 = 停流 → 改 → 重开流, 手册要求不能与采集并行)。
+ *                       2026-09-29 §41.4 之前这里还写着"记录也开不了 (跟随的点直接写在扫描那份
+ *                       CSV 里)" —— 跟随那条路撤掉之后, 扫描期间记录下来的就是曲线上那些数,
+ *                       没有"记了个空文件"这回事, 那一条判据去掉了
  *   ③ 正在记录       -> 那一个按钮改名「停止记录」, 并且**永远可按** (停写文件不需要前提)
  *   ④ 正在改设备配置 -> 设备三项自己锁住 (工作线程里是 停流 → 改 → 重开流)
  *
@@ -414,15 +416,19 @@ void ScanWindow::refreshMeterPanel()
       m_sbWlAdd->setEnabled(open && isOphir && !running && !cfgBusy);
 
    /* ---- 间隔 ----
-    * **永远可改**: setInterval 只把"下一次"按新值重排, 不打断已经在飞的那一个请求 */
+    * **永远可改**: setInterval 只把"下一次"按新值重排, 不打断已经在飞的那一个请求。
+    * 2026-09-29 §41.3 起它**也是扫描的节奏** —— 一个点的 N 笔采样要等这条流喂够, 于是扫描中
+    * 改它, 下一个点的读期限与「预计全程」都跟着变 (手上那个点照旧按它开始时的预算) */
    if (m_edMtrInterval != nullptr)
       m_edMtrInterval->setEnabled(true);
 
    /* ---- 记录那**一个**按钮 (开与关共用, 见 §37.10) ----
     * 字与可用性都在这里定, 别处不再碰它。开着的时候**永远可按** —— 停写文件不需要任何前提;
-    * 没开的时候那三个理由逐条写出来 (灰按钮本身不会说话)。"扫描中"那一条不能省: 跟随的点
-    * 根本不进这份 CSV (addFollowSample 只进缓冲), 按下去只会得到一个只有表头的文件 ——
-    * 一个"看起来在记录"的空文件比不记录更坏。
+    * 没开的时候把理由写出来 (灰按钮本身不会说话)。
+    * **"扫描中"那一条 2026-09-29 §41.4 去掉了**: 它原来写的是「跟随的点写入扫描那份 CSV」,
+    * 而跟随那条路已经撤掉, 扫描的点就是连续读数那条流 —— 扫描期间记录下来的正是曲线上那些
+    * 数, 没有"记了个空文件"这回事。剩下的唯一前提是表开着。
+    * 按钮本身自 §41.1 起**是藏着的**, 这一段照旧每拍算 (§37.12 那个"藏 ≠ 删"的写法);
     * 两个字都**先比再写**: 这是 30 Hz 那条路上的一格, 每拍无条件 setText 会让按钮每拍重绘一次 */
    if (m_btnMtrRec != nullptr)
    {
@@ -438,9 +444,7 @@ void ScanWindow::refreshMeterPanel()
       }
       else
       {
-         const QString why = !open ? QStringLiteral("功率计未打开")
-                                 : (running ? QStringLiteral("扫描进行中, 跟随的点写入扫描那份 CSV")
-                                            : QString());
+         const QString why = !open ? QStringLiteral("功率计未打开") : QString();
          m_btnMtrRec->setEnabled(why.isEmpty());
          const QString tip = why.isEmpty()
             ? QStringLiteral("按上方路径开始写 CSV; 文件为空时写表头, 已有内容则追加。\n"
@@ -456,6 +460,9 @@ void ScanWindow::refreshMeterPanel()
    if (m_btnMtrExport != nullptr)
       m_btnMtrExport->setEnabled(m_mlog != nullptr && m_mlog->count() > 0);
 
+   /* **下面这一族自 2026-09-29 §41.1 起是藏着的** (m_csvBox 与记录那个按钮各有一句
+    * setVisible(false)): 照旧每拍算, 只是没人看得见 (§37.12 那个"藏 ≠ 删"的写法 —— 恢复显示
+    * 那一刻不用再回来想可用性该怎么写)。代价是每帧几毫秒的白算, 与 §37.12 同一个取舍 */
    /* 输出路径: 正在写文件时锁住 (改了就写进另一个文件, 而界面上还显示着这一个) */
    const bool writing = (m_mlog != nullptr && m_mlog->recording());
    if (m_edMtrCsv != nullptr)
@@ -595,7 +602,9 @@ void ScanWindow::refreshMeterReadout()
     * 2026-09-28 §37.11 起它**只说有事才说的话**, 三件:
     *   - 「请求无响应, 采集等待中。」—— 超时那一个是**停着等**的, 不是继续采 (见 meterlog.h),
     *     计数不涨这一点必须在界面上有个说法, 否则看起来就像程序死了;
-    *   - 「跟随扫描中。」—— 这一段里读数是扫描那边采的;
+    *   - 「改设备配置中, 采集暂停。」—— 这一两秒里 setHold 压着, 计数不涨; 2026-09-29 §41.4
+    *     之前这里写的是「跟随扫描中。」, 那是**一句假话**: 扫描期间连续读数照旧在采 (扫描的
+    *     每个点取的就是它), 真正让采集停下的只有"改设备配置"这一件事;
     *   - 「已写入 N 行」—— **只在记录中出**: 停了之后那个数已经由「已停止记录 (本次写入 N 行)」
     *     那句横幅交代过了, 常驻在屏幕上反而是过期的。
     * **原来那两个前缀没有了**: 「采集中 ·」是常开的、永远为真的一句话 (与"每次 N 个读数取平均"
@@ -617,7 +626,7 @@ void ScanWindow::refreshMeterReadout()
       if (wedged)
          t = QStringLiteral("请求无响应, 采集等待中。");
       else if (m_mlog->running() && m_mlog->held())
-         t = QStringLiteral("跟随扫描中。");
+         t = QStringLiteral("改设备配置中, 采集暂停。");
 
       if (m_mlog->recording())
       {
@@ -1035,6 +1044,16 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
 
    m_ctl = new ScanController(m_busv, m_meter, this);
 
+   /* ---- 扫描取数: 从**连续读数那一条流**里取 (2026-09-29 §41.3) ----
+    * 控制器不再自己背靠背发 N 次请求 (那会与连续读数争同一个功率计), 而是当消费者: 每有一笔
+    * 真采样落进 MeterLog, 就喂它一笔; 一个点的值 = 该点读取期间到齐的那些采样的平均。
+    *
+    * 用 sampled 而**不是** sampleAdded: 后者是"屏幕上该重画了" (清空与裁窗也喊), 拿它当采样
+    * 会把这半个点凭空补上一笔旧数。sampled 只跟着"新到一笔"走。
+    *
+    * 直连 (不是队列): 两边都在界面线程 —— MeterLog 的 tick/回包都在这一条线程上跑。 */
+   connect(m_mlog, &MeterLog::sampled, m_ctl, &ScanController::feedMeterSample);
+
    /* 单调钟先起: 没 start 的 QElapsedTimer 读数未定义, 而 pushParams() 会走到 refresh()
     * 里的 m_ctl->tick(elapsed()) */
    m_clock.start();
@@ -1085,16 +1104,14 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
          hint(QStringLiteral("扫描已结束 (未完成)"), false);
       refresh();
    });
-   /* 一格落定。同时喂两个看数据的地方: 画布, 和功率计那一框里的「跟随」曲线。
+   /* 一格落定 —— 只用来让画布重画。
     *
-    * 跟那条之所以是白捡的: 这个信号在 m_watts[cell] 写完**之后**才 emit
-    * (scancontroller.cpp:666), 所以 cellValue/cellHasValue 读到的必然是这一格刚采到的数。
-    * ok=false 的格子 (采失败) 不进曲线 —— 那一格没有数, 补一个 0 出来就是编的。 */
-   connect(m_ctl, &ScanController::pointLogged, this, [this](int ix, int iy, bool) {
+    * 2026-09-29 §41.4: 这里原来还有第二件事, 把这一格的值 addFollowSample 进曲线。那条路
+    * **撤掉了** —— 曲线的时刻 (m_clock) 与扫描点的时刻 (每个点自己的读取段) 本来是两个钟,
+    * 混在一个缓冲里就成了两套时刻; 现在曲线画的就是连续读数那一条流本身, 扫描点在读什么,
+    * 曲线那一小段就是它。 */
+   connect(m_ctl, &ScanController::pointLogged, this, [this](int, int, bool) {
       m_canvas->update();
-
-      if (m_mlog != nullptr && m_mlog->running() && m_ctl->cellHasValue(ix, iy))
-         m_mlog->addFollowSample((int64_t)m_ctl->elapsedMs(), m_ctl->cellValue(ix, iy));
    });
 
    buildUi();
@@ -2219,9 +2236,11 @@ QWidget *ScanWindow::buildScanPanel()
  *
  *  1. **不能有第二个 OphirMeter**。Ophir 表头是独占的 (ophirmeter.cpp:308, 第二个实例打开
  *     同一个头报 0x80040201), 所以真机那一路只有 m_ophir 这一个实例, 这里只是它的界面。
- *  2. **同一时刻只允许一个未决请求** (powermeter.h:28-31)。源只剩真机之后, 会发请求的只剩两方
- *     —— 连续读数 (MeterLog) 与跑扫描的 ScanController。「读一次」那第三方 2026-09-28 删了,
- *     `m_readPending` 那套仲裁一并撤掉; 退让仍然靠 setHold 推过去, 在 refresh() 一处算。
+ *  2. **同一时刻只允许一个未决请求** (powermeter.h:28-31)。**2026-09-29 §41.3 起只有一方**:
+ *     连续读数 (MeterLog)。扫描不再自己发请求, 它消费这条流 (feedMeterSample) —— 于是
+ *     "谁优先"这件事彻底没有了, setHold 也只剩"改设备配置"一个理由, 在 refresh() 一处算。
+ *     沿革: 「读一次」那第三方 2026-09-28 删掉 (连 `m_readPending` 那套仲裁一起撤), 扫描
+ *     那一方 2026-09-29 从"发起方"改成"消费者"。
  *  3. **采集常开**。"源开着就该在采"是每拍重算的不变量, 唯一写点在 refresh(); 记录那**一个**
  *     按钮 (开与关共用, §37.10) 只管文件, 碰不到采集。滚轮/灰化那些判据全在
  *     refreshMeterPanel() 一处。
@@ -2379,19 +2398,28 @@ QWidget *ScanWindow::buildMeterPanel()
    m_btnMtrRec->setObjectName(QStringLiteral("go"));
    connect(m_btnMtrRec, &QPushButton::clicked, this, &ScanWindow::onMtrRecordToggled);
    recRow->addWidget(m_btnMtrRec);
+   /* **藏在代码里, 不是删掉** (2026-09-29 用户原话: "隐藏功率计独立的写入csv功能"): 这个
+    * 按钮连同下面那一整行 CSV (路径框 / 「…」/「导出当前缓冲」) 都不再露面, 而它们的槽、
+    * MeterLog 那半边协议、CSV 格式与自检里那一整族断言**一个字节没动**。这一框从此只做
+    * "看数": 曲线 / 统计 / 大字读数 / 间隔 / 清空。
+    * 要恢复: 删掉这一句与下面 csvBox 的那一句 setVisible(false), 别处一行不用改。 */
+   m_btnMtrRec->setVisible(false);
 
    /* 「清空」跟在记录那一个按钮后面 (原来它与「停止记录」同一行; 那两个并成一个之后,
-    * 这一行就是"记录与清空"这一组三件) */
+    * 这一行就是"记录与清空"这一组三件 —— 现在记录那一件藏了, 这一行是「间隔」+「清空」) */
    m_btnMtrClear = new QPushButton(QStringLiteral("清空"), box);
-   m_btnMtrClear->setToolTip(QStringLiteral("仅清除曲线与统计; 已写入 CSV 的数据不变。"));
+   /* 后半句 ("已写入 CSV 的数据不变") 是给一个**已经藏起来的入口**作注解 —— 屏幕上再没有
+    * "会不会把文件也清了"这个顾虑, 一句说不清任何事的说明不写 (§37 那次删「未写入文件」
+    * 是同一个道理) */
+   m_btnMtrClear->setToolTip(QStringLiteral("仅清除曲线与统计。"));
    connect(m_btnMtrClear, &QPushButton::clicked, this, &ScanWindow::onMtrClearClicked);
    recRow->addWidget(m_btnMtrClear);
    recRow->addStretch(1);
 
    v->addLayout(recRow);
 
-   /* 状态那一行 —— 只在有事可说时才有字 (卡住 / 跟随扫描 / 已写入 N 行), 字与显隐都在
-    * refreshMeterReadout() 里算 (§37.11) */
+   /* 状态那一行 —— 只在有事可说时才有字 (卡住 / 改设备配置 / 已写入 N 行), 字与显隐都在
+    * refreshMeterReadout() 里算 (§37.11; "跟随扫描"那一句 §41.4 改成了"改设备配置中") */
    m_lMtrCount = new QLabel(box);
    m_lMtrCount->setStyleSheet(QStringLiteral("color:#7b8391;"));
    v->addWidget(m_lMtrCount);
@@ -2418,34 +2446,67 @@ QWidget *ScanWindow::buildMeterPanel()
    m_curve->setPlaceholder(QStringLiteral("等待第一个读数…"));
    v->addWidget(m_curve);
 
-   /* 输出文件。与扫描那份 CSV 同一个目录 (scan_out), 一眼能看出是同一条产线的东西。
+   /* ---- 曲线与统计看多长的一段 (2026-09-29) ----
+    * 摆在原来 CSV 那一行的位置上 (图表的正下方)。量程 1…120 分钟, 缺省 5 —— 上界不再往
+    * 上开: 缺省间隔下 120 分钟已经超过缓冲能装下的那一段 (见 MeterLog::kCapacity 的注释),
+    * 多给一档"不限"也只是同一个结果, 却多一个要解释的状态。
+    *
+    * 单位写 `min` 而不是「分」: 仓库既有的时长写法就是这一套 (`200 ms` / `2 h 5 min`,
+    * 见 fmtDur), 与 `pul/s` / `nm` 同一个"英文符号 + 一个空格"的规矩 */
+   QHBoxLayout *winRow = new QHBoxLayout;
+   winRow->setSpacing(6);
+   winRow->addWidget(new QLabel(QStringLiteral("曲线时长"), box));
+
+   m_sbMtrWindow = new QSpinBox(box);
+   m_sbMtrWindow->setRange(MeterLog::kMinWindowMinutes, MeterLog::kMaxWindowMinutes);
+   m_sbMtrWindow->setValue(MeterLog::kDefaultWindowMinutes);
+   m_sbMtrWindow->setSuffix(QStringLiteral(" min"));
+   m_sbMtrWindow->setToolTip(QStringLiteral(
+      "曲线与统计只保留最近这段时间; 更旧的从内存里丢掉。"));
+   connect(m_sbMtrWindow, &QSpinBox::valueChanged, this, &ScanWindow::onMtrWindowChanged);
+   winRow->addWidget(m_sbMtrWindow, 1);
+   winRow->addStretch(1);
+
+   v->addLayout(winRow);
+
+   /* 输出文件那一行。与扫描那份 CSV 同一个目录 (scan_out), 一眼能看出是同一条产线的东西。
     *
     * 「导出当前缓冲」并进这一行 (原来自占一行), 于是这一框底下**只剩这一行** —— 原来在它
     * 下面还有「未写入文件」那行与一整段说明, 两样都删了 (2026-09-28 §37: 前者是"没在写"时
     * 也不说清任何事的一句, 后者是手册里的话)。
     *
     * 原来那段说明里唯一真管用的两条 (空文件写表头 / 已有内容追加) 收在「开始记录」的 tooltip
-    * 上, 那句本来就在那儿写着 */
-   QHBoxLayout *csvRow = new QHBoxLayout;
+    * 上, 那句本来就在那儿写着。
+    *
+    * **2026-09-29 起整行藏起来** (用户原话: "隐藏功率计独立的写入csv功能")。四个控件的父
+    * 改成 m_csvBox 再整块藏, 不是各自 setVisible(false): 后者会在 v 里留下一条**全空的
+    * 子布局**, 它占不占一条 spacing 得靠 Qt 内部行为赌 —— 而"藏一个容器控件"在本函数里
+    * 有现成先例 (上面那个 m_devBox 就是整块藏)。
+    * 代码一个字节没删: 槽、MeterLog::beginRecord/appendCsv/saveBuffer、CSV 格式与自检里
+    * 那一整族断言照旧。要恢复: 删掉下面那一句 setVisible(false) 与「开始记录」那一句。 */
+   m_csvBox = new QWidget(box);
+   QHBoxLayout *csvRow = new QHBoxLayout(m_csvBox);
+   csvRow->setContentsMargins(0, 0, 0, 0);
    csvRow->setSpacing(6);
-   csvRow->addWidget(new QLabel(QStringLiteral("CSV"), box));
-   m_edMtrCsv = new QLineEdit(box);
+   csvRow->addWidget(new QLabel(QStringLiteral("CSV"), m_csvBox));
+   m_edMtrCsv = new QLineEdit(m_csvBox);
    csvRow->addWidget(m_edMtrCsv, 1);
-   m_btnMtrCsv = new QPushButton(QStringLiteral("…"), box);
+   m_btnMtrCsv = new QPushButton(QStringLiteral("…"), m_csvBox);
    m_btnMtrCsv->setFixedWidth(28);
    connect(m_btnMtrCsv, &QPushButton::clicked, this, &ScanWindow::onMtrBrowseCsv);
    csvRow->addWidget(m_btnMtrCsv);
 
    /* 「导出当前缓冲」: 名字**不缩成「导出」**—— 导的到底是哪一段数据是这一行的关键
     * (缓冲里是滚动的这一段, 而 CSV 记的是全部), 那两个字一省就说不清了 */
-   m_btnMtrExport = new QPushButton(QStringLiteral("导出当前缓冲"), box);
+   m_btnMtrExport = new QPushButton(QStringLiteral("导出当前缓冲"), m_csvBox);
    m_btnMtrExport->setToolTip(QStringLiteral(
       "将当前缓冲中的点导出为新文件。\n"
       "与「开始记录」写入的文件无关。"));
    connect(m_btnMtrExport, &QPushButton::clicked, this, &ScanWindow::onMtrExportClicked);
    csvRow->addWidget(m_btnMtrExport);
 
-   v->addLayout(csvRow);
+   v->addWidget(m_csvBox);
+   m_csvBox->setVisible(false);
 
    /* 这几个数**记进 scan.ini** (间隔 / 输出路径 / 上次那台设备是"这台机器怎么采", 不是
     * "上趟数据的范围")。
@@ -2453,7 +2514,18 @@ QWidget *ScanWindow::buildMeterPanel()
     * (见 buildUi 顶上那段注释里的先后次序) */
    {
       const Prefs pf = prefsLoad(prefsPath());
+
+      /* ★ **灌初值必须屏蔽信号**, 与 buildParamPanel() 那条"值灌完再 connect"是同一件事的
+       * 另一种写法 (那个面板能把 connect 挪到后面, 这一框的槽是在建控件时挂的)。
+       * 不屏蔽会**当场崩**: 「间隔」那个槽 2026-09-29 起会调 pushParams() (§41.3, 它也是扫描
+       * 的节奏), 而 pushParams() 走到 refresh() —— 那里面用的按钮与标签这一框还没建出来
+       * (buildMeterPanel 之后还有别的框), 空指针一解引用就是启动即段错误, 一个字都不打。
+       * 屏蔽之后值照旧进控件, 下面那两句显式下推照旧 (m_mlog 拿的是**控件里**的值),
+       * 而 meter_interval_ms 进 Params 由 buildUi() 末尾那次 pushParams() 一处负责。 */
+      const QSignalBlocker bl(m_edMtrInterval), bw(m_sbMtrWindow);
+
       m_edMtrInterval->setValue(pf.meter_interval_ms);   /* 越界的值控件自己夹回量程内 */
+      m_sbMtrWindow->setValue(pf.meter_window_min);      /* 同上: 夹回 1…120 */
       m_edMtrCsv->setText(QDir::toNativeSeparators(pf.meter_csv));
 
       /* 上次那台设备: **在 open() 之前**把它交给源, 工作线程一启动就按它选 (这里就是
@@ -2464,7 +2536,10 @@ QWidget *ScanWindow::buildMeterPanel()
       /* 用**控件里**的值下推, 不用 ini 里那个: 上面那一句可能刚夹过 (手改坏的 ini 不该让
        * 采集用一个没验过的节奏) */
       if (m_mlog != nullptr)
+      {
          m_mlog->setInterval(m_edMtrInterval->value());
+         m_mlog->setWindowMinutes(m_sbMtrWindow->value());
+      }
    }
 
    m_devBox->setVisible(false);   /* 真机还没打开。之后每拍由 refreshMeterPanel 定 */
@@ -2896,6 +2971,8 @@ void ScanWindow::saveSettings()
     * 设备那一项与网卡同一条规矩: 清单还没到 / 下拉是空的 (设备没插、表头枚举不到) 时**别把
     * 记住的抹掉**, 留着上一次那台 */
    pf.meter_interval_ms = m_edMtrInterval->value();
+   /* 曲线时长 (分钟)。它也是**模式**不是数据 (窗口开多大是操作习惯), 所以记 —— 与间隔同一类 */
+   pf.meter_window_min  = m_sbMtrWindow->value();
    pf.meter_csv         = m_edMtrCsv->text().trimmed();
    /* 存的是**序列号** (itemData), 不是那一项的字 —— 字里现在带着型号, 而"上次用的是哪一台"
     * 认的是序列号 (进 ini 的也是它) */
@@ -2968,6 +3045,11 @@ Params ScanWindow::currentParams() const
 
    p.serpentine     = (m_cbMode->currentIndex() == 0);
    p.start_positive = (m_cbDir->currentIndex() == 0);
+
+   /* 连续读数的间隔 (2026-09-29 §41.3): 扫描不再自己发请求, 一个点的 N 笔采样要等这条流喂,
+    * 于是**它也是扫描的节奏** —— 控制器的读期限与「预计全程」都按它算。
+    * 与 meter_timeout_ms 同一个待遇: Params 里的字段、只在 validate() 里校验、不进 CSV 表头。 */
+   p.meter_interval_ms = m_edMtrInterval->value();
 
    /* 量程永远按区域自动算, 不暴露给操作员: 它是个会因为手滑而把区域边缘悄悄削掉的量 */
    p.range_pul = autoRangePul(p);
@@ -3510,13 +3592,12 @@ void ScanWindow::onMtrRecordToggled()
       return;
    }
 
-   /* 扫描进行中开不了这份文件: 那些点写在扫描那份 CSV 里, 这一份只会得到一个空表头。
-    * 按钮本来就是灰的, 这里是兜底 (键盘也能到这儿) */
-   if (m_ctl->running())
-   {
-      hint(QStringLiteral("扫描进行中, 跟随的点写入扫描那份 CSV。"), false);
-      return;
-   }
+   /* 这里原来还有一道兜底: "扫描进行中开不了这份文件 (那些点写在扫描那份 CSV 里, 这一份只会
+    * 得到一个空表头)"。**2026-09-29 §41.4 撤掉** —— 那句话的前提是"跟随的点不进这份 CSV",
+    * 而跟随那条路已经没了: 扫描期间这条流照旧在采, 记下来的是真数。
+    * 撤掉还有一层理由: 记录这一族是**藏着**的 (入口不见, 代码一个字节没删, §41.1), 恢复显示
+    * 只该是"删掉那两句 setVisible(false)"; 留一道前提已不成立的闸, 恢复那天就会挡下一件
+    * 本来能做、而且没有理由不做的事 */
 
    applyMtrCsvDefaultName();
 
@@ -3549,8 +3630,26 @@ void ScanWindow::onMtrClearClicked()
 
 void ScanWindow::onMtrIntervalChanged(int ms)
 {
-   if (m_mlog != nullptr)
-      m_mlog->setInterval(ms);
+   if (m_mlog == nullptr)
+      return;
+
+   /* setInterval 不打断在飞的那一个请求, 只把"下一次"按新值重排 (见 meterlog.h) */
+   m_mlog->setInterval(ms);
+
+   /* 它现在**也是扫描的节奏** (§41.3): 推一遍参数, 下一个点的读期限与「预计全程」就按新值
+    * 算。手上那个点不动 —— 它的预算在 beginReading 那一刻已经定了 (与"改间隔不打断在飞的
+    * 请求"同一条口径)。扫描没在跑时这一句也是对的: 参数区照旧跟着走 */
+   pushParams();
+}
+
+void ScanWindow::onMtrWindowChanged(int min)
+{
+   if (m_mlog == nullptr)
+      return;
+
+   /* setWindowMinutes 自己夹到量程内, 并在值真变了时**当场**裁一次 (不等下一笔) —— 曲线与
+    * 统计当帧就跟着缩 */
+   m_mlog->setWindowMinutes(min);
 }
 
 /* 把"这几行是哪个仪器什么配置采的"推给连续读数器, 它建文件时写进去 (meterlog.h 的 setMeta)。
@@ -3635,8 +3734,11 @@ void ScanWindow::onStartClicked()
       return;
 
    /* 这里原来有一道 !m_readPending 的闸, 写着"「读一次」在飞时不能起扫"。2026-09-28 那个
-    * 按钮删了, 隐患从根上没了 —— 源只剩真机之后, 会发请求的只剩 ScanController 与
-    * MeterLog 两方, 而它们的交接就是下面那句 setHold(true) */
+    * 按钮删了, 隐患从根上没了。
+    *
+    * 2026-09-29 §41.3 之后**连"两个请求发起方"都不成立了**: 功率计上发请求的只剩 MeterLog
+    * 一个, 扫描是它的消费者 (feedMeterSample)。所以起扫不需要向谁要那支话筒 —— 上面这段
+    * 注记留着是为了说明"这道闸为什么没了两次" */
 
    applyCsvDefaultName();
 
@@ -3651,19 +3753,11 @@ void ScanWindow::onStartClicked()
     * 旁边的「开不了」红字)。这里只留一句"出发了": 区域、点数、时长、数据写到哪 */
    const Params p = currentParams();
 
-   /* 采集让位。**就在这儿、就在 m_ctl->start() 前一行** —— 这是"让位"这件事唯一需要做的
-    * 动作, 因为仲裁点是 GUI 线程里这十几条指令, 中间没有事件循环, 不存在"那边正好在同一
-    * 时刻发了一个请求"这种缝。scanwindow.h 里说 m_ctl 与 m_mlog 都归这一个窗口管, 就是
-    * 为的这个。
-    *
-    * 让位而不是拒绝: 要的行为就是"扫描跑着时功率计那一路跟着扫描走" (见 meterlog.h),
-    * 所以扫描起来 = 那边进 hold, 曲线改画扫描采到的点, 数据不丢。
-    *
-    * **这一句与 refresh() 里那句 setHold 是一对**: 那一边每拍算的是稳态, 这一边补的是
-    * m_ctl->start() 到下一拍 refresh() 之间那一次事件循环的缝 —— 那条缝里 tick() 会看到
-    * m_ctl 还没 running, 于是发出一个请求, 撞上控制器刚发的第一个点 */
-   if (m_mlog != nullptr)
-      m_mlog->setHold(true);
+   /* 2026-09-29 §41.3: 这里原来有一句 setHold(true) —— "扫描起来就让连续读数让位"。
+    * **它撤掉了**: 不是让位, 从今往后扫描就是**消费这条流**。扫描期间连续读数照旧采 (曲线
+    * 一直在长), 一个点的值取的就是该点读取期间到齐的那些采样的平均。
+    * 于是"两个发起方抢那支话筒"这件事整个不存在了 —— 发请求的只剩 MeterLog 一个。
+    * 下面 refresh() 里那句 setHold 照旧, 它管的只剩"改设备配置"那一件事。 */
 
    QString err;
    if (!m_ctl->start(path, &err))
@@ -4367,18 +4461,15 @@ void ScanWindow::refresh()
    /* ---- 功率计那一框的字 ---- */
    refreshMeterReadout();
 
-   /* ---- 两个请求发起方的仲裁 + 采集常开。**全仓库只此一处** ----
+   /* ---- 采集常开 + 唯一的让位理由。**全仓库只此一处** ----
     *
     * powermeter.h:28-31 定死了: 同一时刻只允许一个未决请求, 违约不报错、只会静默分错数。
-    * 2026-09-28 之前有三个发起方 (① 扫描 ②「读一次」③ 连续读数), 那个按钮删了之后只剩两方,
-    * 优先级也只剩一条: 扫描在场, 采集让位。
+    * **2026-09-29 §41.3 起功率计上只有一个发起方**: MeterLog。扫描不再自己发请求, 它消费
+    * 这条流 (feedMeterSample)。所以这里没有"谁优先"要算 —— 那个仲裁随第二个发起方一起没了。
     *
-    * 让位不是"拒绝", 是"不开新的口": 两个发起方本来就是一问一答, 已经发出去的那一个照旧
-    * 回收 (各家的 sender()/pending 比对会把不属于自己的那份丢掉)。所以这里只需要每拍把
-    * 开关摆成此刻该有的样子 —— 与别处一样, 不记"谁先按的"。
-    *
-    * `m_cfgBusy` 是第三个让位理由 (改波长/量程/模式期间, 工作线程在停流改配置), 它不由
-    * 这里置位 —— 置位在 onMeterCfgChanged(), 清位在工作线程的回话里。
+    * 剩下的唯一让位理由是 `m_cfgBusy` (改波长/量程/模式期间, 工作线程在停流改配置; 那三项
+    * 是"改配置方法不能在 streaming 时调"的手册要求)。它不由这里置位 —— 置位在
+    * onMeterCfgChanged(), 清位在工作线程的回话里。
     *
     * **采集常开是"每拍重算的不变量", 不是构造里那一锤子**: 源开着就该在采。好处有三个 ——
     * 打开成功之后不需要任何额外的 start(); 任何来源的一次意外 stop() (包括「重试」为了
@@ -4395,7 +4486,7 @@ void ScanWindow::refresh()
          m_mlog->start(m_edMtrInterval->value(), &err);
       }
 
-      m_mlog->setHold(m_ctl->running() || m_cfgBusy);
+      m_mlog->setHold(m_cfgBusy);
       m_mlog->tick(m_clock.elapsed());
    }
 

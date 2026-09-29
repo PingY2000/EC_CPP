@@ -35,9 +35,10 @@ static const char *npn_wr     = "adv/npn_write_drive";
 static const char *npn_sw     = "adv/npn_sw_invert";
 static const char *shade_auto = "shade/auto_fit";
 static const char *shade_unit = "shade/unit";
-/* 功率计那两个键。键名照旧只在这里定义 —— 用它的那边是 load 整个 Prefs、改字段、再 save
+/* 功率计那几个键。键名照旧只在这里定义 —— 用它的那边是 load 整个 Prefs、改字段、再 save
  * 回去, 不自己拼键名 (拼第二遍就会有一边改名一边忘的那天) */
 static const char *mtr_int    = "meter/interval_ms";
+static const char *mtr_window = "meter/window_min";
 static const char *mtr_csv    = "meter/csv";
 static const char *mtr_serial = "meter/serial";
 
@@ -107,6 +108,9 @@ Prefs prefsLoad(const QString &path)
     * 间隔同样显式带缺省值 —— 缺项时 toInt() 会给 0, 那是个非法间隔,
     * 会被 MeterLog 夹到下限, 于是"没记过"表现成 20ms 而不是 200ms */
    p.meter_interval_ms = s.value(QLatin1String(k::mtr_int), p.meter_interval_ms).toInt();
+   /* 窗口同理: 缺项给 0 -> MeterLog 夹到 1 分钟, 于是"没记过"表现成 1 分钟而不是 5 分钟。
+    * 手改坏的 ini (负数 / 一千万) 也都由它夹 —— 曲线不该用一个没验过的窗口 */
+   p.meter_window_min  = s.value(QLatin1String(k::mtr_window), p.meter_window_min).toInt();
    p.meter_csv         = s.value(QLatin1String(k::mtr_csv)).toString();
    p.meter_serial      = s.value(QLatin1String(k::mtr_serial)).toString();
 
@@ -202,6 +206,7 @@ void prefsSave(const QString &path, const Prefs &p)
    s.setValue(QLatin1String(k::shade_unit), shadeUnitToText(p.shade_unit));
 
    s.setValue(QLatin1String(k::mtr_int),    p.meter_interval_ms);
+   s.setValue(QLatin1String(k::mtr_window), p.meter_window_min);
    s.setValue(QLatin1String(k::mtr_csv),    p.meter_csv);
    s.setValue(QLatin1String(k::mtr_serial), p.meter_serial);
 

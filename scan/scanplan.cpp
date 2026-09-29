@@ -192,6 +192,17 @@ std::string validate(const Params &p)
       return "每点采样次数应在 1..100";
    if (p.meter_timeout_ms < 100 || p.meter_timeout_ms > 60000)
       return "取样源超时应在 100..60000 ms";
+   /* 边界用常量拼, 不再硬写数 —— 它必须与 MeterLog 那个夹取、与界面上那个旋钮的量程
+    * **同源**: prefsMergeParams 是"validate 一失败就整份 ini 都不听", 三处漂一格就会
+    * 出现"控件夹得住、这里卡得住"的假拒绝 */
+   if (p.meter_interval_ms < kMeterIntervalMinMs || p.meter_interval_ms > kMeterIntervalMaxMs)
+   {
+      char buf[200];
+      std::snprintf(buf, sizeof(buf),
+                    "连续读数间隔应在 %d..%d ms 之间。",
+                    kMeterIntervalMinMs, kMeterIntervalMaxMs);
+      return buf;
+   }
 
    if (p.speed_pul_s < VEL_MIN || p.speed_pul_s > VEL_MAX)
    {
@@ -220,8 +231,13 @@ int64_t estimatePerPointMs(const Params &p)
    /* 进近段要减速, 实际比 step/vel 长。按 30% 粗加一笔, 宁可高估 */
    double per = move_ms * 1.30 + (double)p.settle_ms + (double)p.dwell_ms;
 
-   /* 采样本身: 模拟源是 0, 真机未知, 按 50ms/次占个位 */
-   per += 50.0 * (double)std::max(1, p.samples_per_point);
+   /* 采样本身。**2026-09-29 起这个点的值不是背靠背连要 N 次了**: 它是"读取时间段里到齐的
+    * 连续采样的平均", 而连续采样按 meter_interval_ms 的节奏到齐 —— 于是一个采样最少要等
+    * 一个间隔, 再加上自己那一次往返 (meterlog 的 `m_due_ms = m_now_ms + m_interval` 是
+    * 间隔之后再排下一拍, 往返叠在里面; 这里那个 50 是那次往返的占位, 与"模拟源是 0,
+    * 真机未知"同一条口径)。**不这么改的话「预计全程」会少报好几倍。**
+    * 口径照旧是"宁可高估": 每点的第一笔采样其实平均只等半个间隔。 */
+   per += (double)(p.meter_interval_ms + 50) * (double)std::max(1, p.samples_per_point);
 
    if (per < 1.0)
       per = 1.0;

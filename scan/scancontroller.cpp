@@ -56,27 +56,10 @@ static ArrivalObs obsOf(const BusTelem &t, int i)
 ScanController::ScanController(BusView *bus, PowerMeter *meter, QObject *parent)
    : QObject(parent), m_bus(bus), m_meter(meter)
 {
-   connect(m_meter, &PowerMeter::readingReady,  this, &ScanController::onReadingReady);
-   connect(m_meter, &PowerMeter::readingFailed, this, &ScanController::onReadingFailed);
+   /* 没有 connect: 本类不再向功率计发请求, 收数走 feedMeterSample()
+    * (那条线由窗口把 MeterLog::sampled 接过来 —— 2026-09-29, 见头文件) */
 
    rebuildPlan();
-}
-
-void ScanController::setMeter(PowerMeter *meter)
-{
-   if (meter == nullptr || meter == m_meter)
-      return;
-
-   /* 旧的必须显式断开: 它还活着, 不 disconnect 的话它下次出数会直接喂进状态机 */
-   if (m_meter != nullptr)
-   {
-      disconnect(m_meter, &PowerMeter::readingReady,  this, &ScanController::onReadingReady);
-      disconnect(m_meter, &PowerMeter::readingFailed, this, &ScanController::onReadingFailed);
-   }
-
-   m_meter = meter;
-   connect(m_meter, &PowerMeter::readingReady,  this, &ScanController::onReadingReady);
-   connect(m_meter, &PowerMeter::readingFailed, this, &ScanController::onReadingFailed);
 }
 
 void ScanController::setParams(const Params &p)
@@ -231,8 +214,11 @@ void ScanController::enter(State s)
 void ScanController::stopMotion()
 {
    m_bus->postStop();
-   /* 作废未决读数: 这一点的回包到了也不要了 (重走这一点时会重新发请求) */
-   m_pending = false;
+   /* 丢掉手上那半份采样: 到齐的那两笔是**停之前**的位置上采的, 留着会与重走这一点之后的
+    * 数混成一个平均值 —— 而它在 CSV 里和别的行长得一模一样。
+    * 采集那边没有"我们的请求"要撤 (请求是 MeterLog 发的), 所以只清这一对计数器 */
+   m_nsamp = 0;
+   m_acc   = 0.0;
 }
 
 bool ScanController::armRun(QString *err)
@@ -249,6 +235,9 @@ bool ScanController::armRun(QString *err)
    if (t.homing)
       return fail(err, QStringLiteral("总线正在回零, 请等回零结束后再启动扫描。"));
 
+   /* 这一条留在控制器里 (没搬去界面): 源没开 = MeterLog 起不来 = 这条流上**一笔采样都不会
+    * 到**, 每个点都得空等到期限才收尾成 ok=false —— 那趟扫描能走完, 却是一份全失败的 CSV。
+    * 起点拦掉比走完再解释便宜得多, 文案照旧 */
    if (m_meter == nullptr || !m_meter->isOpen())
       return fail(err, QStringLiteral("功率计未打开, 扫描无法采集数据。"));
 
@@ -336,7 +325,6 @@ void ScanController::startPoint(int plan_index)
    m_want_ok[0] = m_want_ok[1] = false;
    m_nsamp    = 0;
    m_acc      = 0.0;
-   m_pending  = false;
    m_spread[0] = m_spread[1] = 0;
 
    m_bus->setTarget(0, pt.x_pul);
@@ -578,46 +566,40 @@ void ScanController::beginReading()
 {
    m_nsamp = 0;
    m_acc   = 0.0;
+
+   /* 这一个点的收尾期限。采样按连续读数那个「间隔」一笔笔到齐, N 笔至少要 N 个间隔,
+    * 再给一整笔的余量 (第一笔可能要等下一次排拍) —— 加上 meter_timeout_ms 那一段,
+    * 于是"一笔都没到齐"与"到齐了但源卡住"两种情况都等得起。
+    * 这个数是**算出来的**: 它跟着「间隔」走, 而「间隔」是界面上那个旋钮 (见 Params) */
+   m_read_budget_ms = (int64_t)m_p.meter_timeout_ms
+                    + (int64_t)std::max(1, m_p.samples_per_point) * (int64_t)m_p.meter_interval_ms;
+   m_deadline_ms = m_now_ms + m_read_budget_ms;
+
    enter(State::Reading);
-   sendReading();
 }
 
-void ScanController::sendReading()
+void ScanController::feedMeterSample(int64_t ms, double watts, bool ok)
 {
-   m_pending = true;
-   m_sent_ms = m_now_ms;
-   m_meter->requestReading();
-}
+   Q_UNUSED(ms);           /* 用 tick 那条单调钟, 见头文件 */
 
-void ScanController::onReadingReady(double watts)
-{
-   /* 状态不对就是迟到的回包 (暂停时丢的那个), 扔掉 */
-   if (m_st != State::Reading || !m_pending)
+   /* 不在读数期间到齐的采样 (移动/停留/暂停/收尾之后) 属于曲线上那条流, 不属于任何一个点。
+    * 这一道守卫是"上一个点的数混进下一个点"的唯一防线 —— 少了它, 停止/暂停之前手上那半份
+    * 会被算进重走的那一点, 而且不报错 */
+   if (m_st != State::Reading)
       return;
 
-   m_pending = false;
+   /* 没要回来的那一笔: 不算进平均, 也不当场判死 —— 期限到了自然收尾成 ok=false */
+   if (!ok)
+      return;
+
    m_acc += watts;
    m_nsamp++;
 
    if (m_nsamp < m_p.samples_per_point)
-   {
-      sendReading();
       return;
-   }
 
    m_acc /= (double)m_nsamp;
    finishPoint(true, std::string());
-}
-
-void ScanController::onReadingFailed(const QString &err)
-{
-   if (m_st != State::Reading || !m_pending)
-      return;
-
-   m_pending = false;
-
-   /* 一个点读不到不毁掉整轮: 记下来继续走, 回头可以单点重测 */
-   finishPoint(false, err.toStdString());
 }
 
 void ScanController::finishPoint(bool ok, const std::string &flags)
@@ -754,13 +736,15 @@ void ScanController::tick(int64_t now_ms)
       return;
 
    case State::Reading:
-      if (!m_pending)
-         return;                              /* 回包在事件队列里, 等它 */
-      if (m_now_ms - m_sent_ms <= m_p.meter_timeout_ms)
+      /* 手上"欠"的是采样笔数, 不是未决请求 —— 一笔都没到齐就一直等, 等到期限 */
+      if (m_now_ms < m_deadline_ms)
          return;
 
-      m_pending = false;
-      finishPoint(false, "功率计超时 " + std::to_string(m_p.meter_timeout_ms) + " ms");
+      /* 记下到了几笔: 0 笔 = 这条流根本没在跑 (源没开 / 被 hold 住), 那是最常见的一种;
+       * 报出来比只报一个时限有用。两处都不用逗号 (它要进 CSV 的 flags 列) */
+      finishPoint(false, "功率计超时 " + std::to_string(m_read_budget_ms) + " ms (到 "
+                         + std::to_string(m_nsamp) + "/"
+                         + std::to_string(std::max(1, m_p.samples_per_point)) + " 笔采样)");
       return;
 
    case State::Idle:

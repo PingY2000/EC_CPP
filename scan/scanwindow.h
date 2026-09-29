@@ -142,6 +142,8 @@ private:
    void onMtrBrowseCsv();
    void onMtrExportClicked();
    void onMtrIntervalChanged(int ms);
+   /* 「曲线时长」旋钮: 转一下就把新窗口推给 MeterLog (它自己夹值并当场裁一次) */
+   void onMtrWindowChanged(int min);
    /* "这几行是哪个仪器什么配置采的" -> MeterLog::setMeta (建文件那一刻写进 CSV 的头几行) */
    void pushMeterMeta();
 
@@ -480,6 +482,13 @@ private:
    QPushButton *m_btnMtrExport   = nullptr;
    QLineEdit   *m_edMtrCsv       = nullptr;
    QPushButton *m_btnMtrCsv      = nullptr;
+   /* 上面那四件 (路径框 / 「…」/ 「导出当前缓冲」/ 「开始记录」) 与它们那一行, 2026-09-29 起
+    * **藏在代码里** (§41.1): m_csvBox 装着 CSV 那一整行, 它与记录那个按钮各有一句
+    * setVisible(false)。**控件与槽一个都没删** —— 恢复显示 = 删掉那两句, 别处一行不用动 */
+   QWidget     *m_csvBox         = nullptr;
+   /* 「曲线时长」(分钟): 曲线与统计只留最近这一段, 更旧的从内存里真丢掉。
+    * 量程与夹值住在 MeterLog 里 (kMinWindowMinutes … kMaxWindowMinutes), 这里只照抄 */
+   QSpinBox    *m_sbMtrWindow    = nullptr;
    QLabel      *m_lMtrCount      = nullptr;   /* 状态那一行: **只在有事可说时才有字** ——
                                                * 卡住 / 跟随扫描中 / 已写入 N 行, 三件都没有
                                                * 时整行藏起来 (2026-09-28 §37.11)。原来开头的

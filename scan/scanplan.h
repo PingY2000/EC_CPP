@@ -35,6 +35,12 @@ struct Params
    /* >1 = 到点后连采几次取平均; 每点多 n 倍读数时间, 不在停留期内 */
    int      samples_per_point  = 1;
    int      meter_timeout_ms   = 2000;
+   /* 连续读数那一路的**采样间隔**。2026-09-29 起一个点的值就是"读取时间段里到齐的采样的
+    * 平均", 而采样是按这个间隔到齐的 —— 于是它既是"一个点要多久"的时间尺度 (见
+    * estimatePerPointMs 与 ScanController::beginReading 的读取预算), 也是扫描节奏本身。
+    * **界面那个「间隔」旋钮是它唯一的来源** (scanwindow 的 currentParams), 这里没有第二个
+    * 写点 —— 同一个数两份实现正是本文件开头 VEL_MIN/VEL_MAX 那段在防的坑。 */
+   int      meter_interval_ms  = 200;
 
    bool     serpentine    = true;         /* 蛇形(逐行往返); false = 每行同向 */
    bool     start_positive = true;        /* 第一行的 X 往 +X 还是 -X 走 */
@@ -45,6 +51,14 @@ struct Params
 /* 网格点数的硬上限, 也是一道资源闸: 建网格要 nx*ny 个 Point, 热力图是一张 nx*ny 的 QImage。
  * validate() 报的是它, rebuildPlan() 拦的也是它。 */
 constexpr long long kMaxPlanPoints = 200000;
+
+/* Params::meter_interval_ms 的量程。**与 MeterLog::kMinIntervalMs / kMaxIntervalMs 必须
+ * 逐字一致** (那一头夹的是连续读数真的用的间隔, 这一头夹的是同一件事的估计与预算)。
+ * 本文件刻意不依赖 Qt (见开头 VEL_MIN 那段), 所以只能照抄一份 —— 但这次**钉住了**:
+ * scan/selftest.cpp 里有一条 checkEq 比对它与 MeterLog 那两个常量 (VEL_MIN 那两个至今
+ * 只有一句注释, 是没钉的)。 */
+constexpr int kMeterIntervalMinMs = 20;
+constexpr int kMeterIntervalMaxMs = 60000;
 
 /* 参数体检。返回空串 = 通过, 否则是一句给操作员看的中文。不做自动修正。 */
 std::string validate(const Params &p);
