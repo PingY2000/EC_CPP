@@ -73,6 +73,14 @@ QString ScanController::paramsError() const
    return fromStd(validate(m_p));
 }
 
+void ScanController::setLimitLines(const limitguard::LimitAxis *ax)
+{
+   /* 整份换掉, 不是逐条改 —— 推过来的那一份永远比这里的新 (界面是主)。传 nullptr 就是
+    * "一条都没有", 与那时候的操作员意图 (刚回过零) 一致。 */
+   for (int i = 0; i < 2; i++)
+      m_lim[i] = (ax != nullptr) ? ax[i] : limitguard::LimitAxis();
+}
+
 void ScanController::rebuildPlan()
 {
    /* 几何没变就什么都别动: 网格还是那个网格, 已有结果还是对的 */
@@ -287,9 +295,20 @@ bool ScanController::armRun(QString *err)
     * 那个时间差 (量程是每次参数一变就重投的, 但投过去要等工作线程转一圈), 这个窗口很窄但
     * 真的存在: 刚把区域放大、立刻按开始, 最外圈的点就会被静默夹掉。 */
    int32_t far = 0;
+   /* 逐轴的 [最小, 最大] (脉冲)。与 far 同一趟算出来 —— 那道量程闸要的是"最远多少",
+    * 限位那道闸要的是"每一侧最远到哪"; 分两趟走容易有一趟忘了跟着改。 */
+   int32_t lo[2] = {INT32_MAX, INT32_MAX};
+   int32_t hi[2] = {INT32_MIN, INT32_MIN};
    for (size_t k = 0; k < m_order.size(); k++)
    {
       const Point &p = m_plan[(size_t)m_order[k]];
+      const int32_t xy[2] = {p.x_pul, p.y_pul};
+      for (int i = 0; i < 2; i++)
+      {
+         lo[i] = std::min(lo[i], xy[i]);
+         hi[i] = std::max(hi[i], xy[i]);
+      }
+
       far = std::max(far, std::abs(p.x_pul));
       far = std::max(far, std::abs(p.y_pul));
    }
@@ -300,6 +319,18 @@ bool ScanController::armRun(QString *err)
          "参数刚改过时量程要等工作线程转一圈才跟上, 此时启扫会撞上这一条; \n"
          "持续出现请把区域改小。")
          .arg(far).arg(t.range));
+
+   /* 限位记录那道闸 (2026-09-29, 见 scan/limitguard.h)。**排在量程之后**: 量程是既有的
+    * 判据, 两条都中时先报那一条, 不多说一句。
+    *
+    * 拦在**起点**而不是走到那一格才停: 走一半停会留下一张缺了一角的图, 而那个缺口还得
+    * 靠人看出来 —— 起扫前一句话说清楚便宜得多。理由的措辞在 limitguard.h 里 (那句要与
+    * 界面上的提示同源, 所以它是个纯函数, 自检钉得住)。 */
+   {
+      const std::string lw = limitguard::limitPlanWhy(m_lim, lo, hi);
+      if (!lw.empty())
+         return fail(err, QString::fromStdString(lw));
+   }
 
    m_run_p   = m_p;
    m_bad_wkc = 0;

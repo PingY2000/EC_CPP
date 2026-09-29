@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "busview.h"
+#include "limitguard.h"
 #include "powermeter.h"
 #include "scanarrive.h"
 #include "scanlog.h"
@@ -138,6 +139,13 @@ public slots:
    void setZeroEpoch(int epoch) { m_zero_epoch = epoch; }
    int  zeroEpoch() const { return m_zero_epoch; }
 
+   /* 限位记录 (2026-09-29)。**界面是主, 变一次推一次** —— 与 setZeroEpoch 同一条路
+    * (记录活在 ScanWindow 里, 这里只收一份用来判"这一趟的网格有没有越过线")。
+    * 只在 armRun 里用一次: 越了就**拦在起点**, 不是走到一半才停 —— 走一半停会留下
+    * 半张图, 而那个缺口还得靠人看出来。
+    * 数组是**两根轴**, 下标 0 = X / 1 = Y (与 armRun 那句"正好两根轴"同一条)。 */
+   void setLimitLines(const limitguard::LimitAxis *ax);   /* nullptr = 当作一条都没有 */
+
 signals:
    void stateChanged();
    void pointLogged(int ix, int iy, bool ok);
@@ -203,6 +211,11 @@ private:
    int     m_bad_wkc = 0;
    /* CSV 表头里记的零点世代; 续扫时对不上 = 中途重连过 */
    int     m_zero_epoch = -1;
+
+   /* 限位记录: 只由 setLimitLines 换, 只在 armRun 里读 (理由见上面那个 setter)。
+    * has_pos 全为 false 时 limitPlanWhy 一律给空串 —— 于是"没记过"这条路
+    * 与"这道闸不在"是同一个行为, 不需要另开一个开关。 */
+   limitguard::LimitAxis m_lim[2];
 };
 
 }   /* namespace scan */

@@ -746,6 +746,18 @@ void ScanWindow::panelSavePrefs(int pi)
       /* 过不了体检的参数不覆盖旧的 (规则在 scanprefs 里, 那里能被自检钉住) */
       prefsMergeParams(&pf, currentParams());
       pf.manual_speed = m_edManSpeed->value();
+      /* 限位记录不是这一框设的, 但「保存」是**先读回整份再写回整份** —— 不把它带上,
+       * 这一框一按就会把盘上那几条冲掉 (prefsSave 整份重写, 没写的键就没了)。
+       * 与"别的框里还没保存的改动不被顺手固化"不冲突: 这一份是界面手里的**当前值**,
+       * 不是某个框的草稿。 */
+      for (int i = 0; i < 2; i++)
+         for (int side = 0; side < 2; side++)
+         {
+            const limitguard::LimitSide &s = (side == 0) ? m_lim[i].pos : m_lim[i].neg;
+            pf.lim_have[i][side] = s.has_pos;
+            pf.lim_pos[i][side]  = s.pos;
+         }
+      pf.lim_epoch = m_limEpoch;
       break;
    case PI_HOME:
       pf.home_vel   = m_edHomeVel->value();
@@ -1198,6 +1210,7 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
     * 用的就是它。**必须在这里**: buildUi() 里已经跑完 loadSettings (别的项都灌进去了),
     * 而下面 m_thr->start() 是它唯一的同步点, 过了那一步就不能再碰那些成员了 (§39)。 */
    seedZeroFromPrefs();
+   seedLimitFromPrefs();      /* 同一族, 同一个窗口 (见它自己的注释) */
 
    m_ctl->setZeroEpoch(m_epoch);
    pushParams();
@@ -1261,8 +1274,40 @@ void ScanWindow::buildUi()
        * 画布已吞掉扫描中的点击, 这里再拦一道 */
       if (m_ctl->running())
          return;
-      m_thr->setTarget(0, x);
-      m_thr->setTarget(1, y);
+
+      /* 限位守卫: 记过线的那一侧不许再点过去 (2026-09-29, 见 limitguard.h)。
+       * 夹取只在**这一侧有记录或此刻压着**时才动目标, 所以没撞过的机器上这一句是恒等变换。
+       *
+       * ★ 用当前位置 (t.ax[i].pos) 而不是别的: 界**永远不比当前位置更靠里**, 于是一次点击
+       *   绝不会产生"往回走"这种没人点过的运动 —— 老 ini 里那条线落在当前位置内侧时,
+       *   界就是当前位置 (点那一侧不动, 但也不会把滑台往里推)。 */
+      const BusTelem t = m_thr->telemetry();
+      const int32_t  want[2] = {x, y};
+      int32_t        out[2]  = {x, y};
+
+      for (int i = 0; i < 2; i++)
+         out[i] = limitguard::limitClampManual(m_lim[i], t.ax[i].pos, want[i]);
+
+      /* 夹了就明说 —— 不说的话"点了没走到"会看起来像卡了 (与 §42 那三条同一个教训)。
+       * 两根轴可能各夹一次, 只说第一句被夹的 (横幅只有一个槽)。
+       * 方向词由"被夹低了多少"定: 目标是往正方向被压下来 = 正限位那一条挡的 —— 不另传参数,
+       * 一处算、两处用 (与 limitClampManual 里的判据是同一次比较)。 */
+      for (int i = 0; i < 2; i++)
+      {
+         if (out[i] == want[i])
+            continue;
+
+         hint(QStringLiteral("%1 轴%2限位已锁住, 目标已夹到 %3 mm。")
+                 .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"),
+                      (out[i] < want[i]) ? QStringLiteral("正") : QStringLiteral("负"),
+                      QString::number(unitOf(out[i], m_ctl->params().pulses_per_unit),
+                                      'f', 3)),
+              false);
+         break;
+      }
+
+      m_thr->setTarget(0, out[0]);
+      m_thr->setTarget(1, out[1]);
    });
    connect(m_canvas, &MapCanvas::cellPicked, this, [this](int, int) { refresh(); });
 
@@ -3038,6 +3083,172 @@ void ScanWindow::seedZeroFromPrefs()
    m_thr->setRememberedOrigin(pf.zero_origin, pf.zero_naxis, pf.zero_epoch);
 }
 
+/* 限位记录: scan.ini 里那几条 → m_lim[] + m_limEpoch。**紧跟 seedZeroFromPrefs** ——
+ * 画布与控制器此刻都已建出来, 这是 start() 之前最后一个能碰它们的窗口。
+ *
+ * 盘上那份已经过了两道判据 (scanprefs: 全有或全无 + 与零点同一代, 见 prefsLoad),
+ * 所以这里**一个判据都不加** —— 再加一道就会有两处各说各话的那天, 而这一份的口径
+ * 自检钉不住 (scanwindow.cpp 不在 SCAN_COMMON_SRC 里)。
+ *
+ * 盘上没有记录时 m_lim 保持缺省 (has_pos 全 false): 不夹、不画、不拦, 一切照旧 ——
+ * 于是"这一版之前的 ini"与"装完就没撞过限位"走同一条路, 不需要一个开关。 */
+void ScanWindow::seedLimitFromPrefs()
+{
+   const Prefs pf = prefsLoad(prefsPath());
+
+   m_limEpoch = pf.lim_epoch;
+
+   for (int i = 0; i < 2; i++)
+      for (int side = 0; side < 2; side++)
+      {
+         limitguard::LimitSide &s = (side == 0) ? m_lim[i].pos : m_lim[i].neg;
+         s.has_pos = pf.lim_have[i][side];
+         s.pos     = pf.lim_pos[i][side];
+      }
+
+   pushLimitLines();
+}
+
+/* m_lim[] 的两个收的人。画布那一份要拆成两个平行数组 (它不认识 LimitAxis, 也没必要认识),
+ * 控制器那一份整份过去 —— 它是"起扫前有没有越线"这一件事的全部输入。 */
+void ScanWindow::pushLimitLines()
+{
+   if (m_ctl != nullptr)
+      m_ctl->setLimitLines(m_lim);
+
+   if (m_canvas != nullptr)
+   {
+      int     dir[2] = {0, 0};
+      int32_t at[2]  = {0, 0};
+      for (int i = 0; i < 2; i++)
+      {
+         /* 一条线上限一个 —— 画布一轴一侧只有一条线, 而**正侧优先**: 两侧都记过时,
+          * 两条线各自的位置不可能出现在同一张 ±16 mm 的图上还都看得见, 与其画两条
+          * 互相盖住的线, 不如先把正侧那条画出来 (负侧那一条的位置在 HUD 那一行里)。 */
+         if (m_lim[i].pos.has_pos)
+         {
+            dir[i] = +1;
+            at[i]  = m_lim[i].pos.pos;
+         }
+         else if (m_lim[i].neg.has_pos)
+         {
+            dir[i] = -1;
+            at[i]  = m_lim[i].neg.pos;
+         }
+      }
+      m_canvas->setLimitZones(dir, at);
+   }
+}
+
+/* 限位守卫: 每拍一次。三件事 —— 世代作废 / 记线 / 撞到就停。
+ *
+ * 位置: 挂在 refreshAxisSignals **之后** (那条红横幅的上升沿与清理都在里面, 这里要用它
+ * 刚算完的 m_limBanner[] 才知道自己该不该补一句)。
+ *
+ * ★ 整套豁免的两趟: 「找限位」与「测量原点宽度」。那两条**故意往开关上开**, 由驱动器执行
+ *   (a.homing / a.spanning), 一行都不许动它们 —— 记线会把线钉在开关上, 发停会打断那一趟。
+ *   与 §10 那张表里「找限位期间不弹红横幅」是同一个豁免, 理由也同一条。 */
+void ScanWindow::updateLimitGuard(const BusTelem &t)
+{
+   /* ---- ① 零点世代变了: 整份作废 ----
+    * m_epoch 在 refresh() 开头刚同步过, 这里读的是同步之后的值 —— 回零 / 「设为区域中心」/
+    * 设软件零点都会让它 +1。位置上记的是**那一个坐标系**里的一个点, 换了代那个数就没有
+    * 意义了 (留着的唯一后果是拦下一次没人要求过的运动)。
+    * 世代是单调往前的哨兵, 所以 `!=` 与 `<` 在这里同义 —— 写 `!=` 是为了不假装它只增。 */
+   if (m_limEpoch != m_epoch)
+   {
+      for (int i = 0; i < 2; i++)
+      {
+         m_lim[i].pos.has_pos = false;
+         m_lim[i].neg.has_pos = false;
+      }
+      m_limEpoch = m_epoch;
+      pushLimitLines();
+   }
+
+   for (int i = 0; i < 2; i++)
+   {
+      const AxisTelem &a = t.ax[i];
+
+      /* 判据与状态机、与那三盏灯**完全同一个** —— 不一致就会出现"灯说不可信而线画着" */
+      const bool known = m_connected && a.valid && a.mirror_ok;
+      if (!known)
+         continue;      /* 不知道: latch 一个字节都不动 (见头文件那段) */
+
+      /* 每拍刷: 这两个是"此刻的现状", 存不住也不必存 */
+      m_lim[i].pos.known = m_lim[i].neg.known = true;
+      m_lim[i].pos.pressed = a.dig_pos;
+      m_lim[i].neg.pressed = a.dig_neg;
+
+      /* ---- 「这一侧到边了」----
+       * 判据是 (驱动器那位) 或 (物理开关) 任一为真, 而不是只看一位:
+       *   · §9 那张表里「不一致时以 bit11 为准」说的是**中止扫描**, 那由控制器管;
+       *   · 这里要的是"别再把滑台往那边推", 而物理开关比 bit11 更早知道 (一位是驱动器
+       *     滤波后置起来的), 所以这里取的是**并集** —— 宁可早一步停。 */
+      const bool in_lim = a.limit_active || a.dig_pos || a.dig_neg;
+      if (!in_lim)
+      {
+         m_limLatch[i] = false;   /* 松开了 -> 重新上膛 (下一次撞上还要说一遍) */
+         continue;
+      }
+      if (m_limLatch[i])
+         continue;                /* 还压着: 不重复报、不重复落盘 */
+      m_limLatch[i] = true;
+
+      /* 方向只有 60FDh 说得出 (值已含「上位机侧取反」)。正负同时为真 = 物理上不成立的
+       * 那个状态: **不猜、不记线** —— 记了就是把一侧的限位钉在另一侧的位置上, 那比不记
+       * 危险得多 (它会拦住一个本来能走的方向)。停照旧停 (in_lim 已经成立)。 */
+      const int side = (a.dig_known && a.dig_pos != a.dig_neg) ? (a.dig_pos ? +1 : -1) : 0;
+
+      /* ---- ② 记线 (除了那两趟豁免) ---- */
+      const bool exempt = a.homing || a.spanning;
+      if (side != 0 && a.dig_known && !exempt)
+      {
+         limitguard::LimitSide &s = (side > 0) ? m_lim[i].pos : m_lim[i].neg;
+
+         const bool fresh = !s.has_pos;
+         limitguard::limitNote(side, s, a.pos);
+
+         if (fresh)
+         {
+            /* 第一次撞上这一侧: **立刻落盘**。「永久记住」这四个字只有落盘才兑现 ——
+             * 程序被别的路 (任务管理器 / 断电 / 另一个实例) 收掉时, 关窗那一次写不会发生。 */
+            pushLimitLines();
+            saveSettings();
+         }
+
+         /* 证据行: 与"停在哪个坐标上"有关的事故只有 stdout 说得清, 而这一件事**只有这一处
+          * 知道** (界面字是给人看的, 这一行是给排查用的)。 */
+         std::printf("[scan] 轴%d %s限位触发: 显示坐标 %.6f mm (%d pul) 零点 %d pul 世代 %d"
+                     "  目标已冻结, 这一侧已记下\n",
+                     i, (side > 0) ? "正" : "负",
+                     (double)a.pos / ((m_ctl->params().pulses_per_unit > 0)
+                                         ? m_ctl->params().pulses_per_unit : 1.0),
+                     (int)a.pos, (int)t.origin[i], m_epoch);
+         std::fflush(stdout);
+      }
+
+      /* ---- ③ 停 ----
+       * **只在手动走的时候由界面停**: 扫描中那一路由控制器的自动中止管 (它带模态框, 说得出
+       * 原因是哪一位), 这里再发一次就是两个人抢着说话。回零里整个会话都在驱动器手上。
+       * postStop = 目标冻在当前位置 + **保持使能** (与 hmi 那个「停止」同义)。 */
+      if (!m_ctl->running() && !t.homing)
+         m_thr->postStop();
+
+      /* ---- ④ 要不要自己说一句 ----
+       * 那条红横幅 (6041h bit11 的上升沿) 已经在 refreshAxisSignals 里弹过了; 这里只在
+       * **它没有说话**时补一句。判据就是那个抬 bit11 的机器上真会出现的情形: 60FDh 说压着
+       * 而 bit11 没置起 (§9 那张表里那条"不一致")。少了这一句就是"滑台自己停了而屏幕上
+       * 一个字都没有" —— 那是最难查的一种。 */
+      const bool banner = (i == 0) ? m_limBanner[0].isEmpty() : m_limBanner[1].isEmpty();
+      if (banner && side != 0)
+         hint(QStringLiteral("%1 轴%2限位触发, 已停止; 这一侧已锁住。")
+                 .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"),
+                      side > 0 ? QStringLiteral("正") : QStringLiteral("负")),
+              true);
+   }
+}
+
 /* 记忆: 把当前参数写回去。「连接」时与关窗时各一次 —— 连接那一次记的是真连过的那张卡。
  *
  * 写的是**整份** (六块框全带上), 不是某一块: 这两次是"这一轮到此为止, 屏幕上这些值就是往后
@@ -3099,6 +3310,18 @@ void ScanWindow::saveSettings()
          pf.zero_epoch = zgen;
       }
    }
+
+   /* 限位记录。与上面零点那一段**同一条**: 只搬界面手里这一份, 不重新算、不重新判。
+    * 一份都没有时 prefsSave 一个键都不写 (那是"没记过"的表达, 见它自己那段) —— 于是
+    * "回过零之后关窗"会把盘上那几条清干净, 不需要另写一处删除。 */
+   for (int i = 0; i < 2; i++)
+      for (int side = 0; side < 2; side++)
+      {
+         const limitguard::LimitSide &s = (side == 0) ? m_lim[i].pos : m_lim[i].neg;
+         pf.lim_have[i][side] = s.has_pos;
+         pf.lim_pos[i][side]  = s.pos;
+      }
+   pf.lim_epoch = m_limEpoch;
 
    prefsSave(prefsPath(), pf);
    m_savedNic = pf.nic;
@@ -4330,6 +4553,11 @@ void ScanWindow::refresh()
       syncShadeAuto();
 
    refreshAxisSignals(t);
+
+   /* 限位守卫。**必须排在 refreshAxisSignals 之后** —— 它要用那条刚算完的 m_limBanner[]
+    * 才知道自己该不该补一句 (见 updateLimitGuard 里 ④ 那一段)。
+    * 排在 m_connected 更新之后 (上面 setConnected), 否则它读到的连接态是上一拍的。 */
+   updateLimitGuard(t);
 
    const bool can_move = m_connected && !running;
    /* 回零期间不给目标 / 不改坐标 / 不改状态: 总线线程正阻塞在 doHome 里, interpolate()

@@ -51,6 +51,7 @@ set(SCAN_COMMON_SRC
   busview.h
   editgate.h
   axisutil.h
+  limitguard.h
 )
 
 # ---------------------------------------------------------------- GUI 程序

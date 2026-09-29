@@ -48,6 +48,16 @@ static const char *mtr_serial = "meter/serial";
 static const char *zero_na = "zero/naxis";
 static const char *zero_ep = "zero/epoch";
 static QString originKey(int i) { return QStringLiteral("zero/origin_%1").arg(i + 1); }
+
+/* 限位记录那一族 (见 scanprefs.h)。逐轴逐侧一个键, 所以也由函数出 —— 序号同样从 1 起,
+ * 侧那一格写 **p / n** 而不是 0 / 1: 手翻 ini 的人看的是"正那侧 / 负那侧",
+ * 而 0 与 1 在这里正好是反的 (数组下标 0 = 正), 写成数字迟早有人按反。 */
+static const char *lim_epoch = "limit/epoch";
+static QString limitPosKey(int axis, int side)
+{
+   return QStringLiteral("limit/pos_%1%2").arg(axis + 1).arg(side == 0 ? QLatin1Char('p')
+                                                                      : QLatin1Char('n'));
+}
 }
 
 QString prefsPath()
@@ -139,6 +149,39 @@ Prefs prefsLoad(const QString &path)
       }
    }
 
+   /* 限位记录 (2026-09-29)。三个规矩:
+    *   ① 解析走 originFromText (不许 toInt —— 手改坏的字会变成"记在 0 点上");
+    *   ② **逐条独立**: 每一条自己说自己有没有 —— 缺项 / 读坏了那一条就是"没记过", 别的照旧。
+    *      **这里与上面那份零点值不是同一条规矩, 是刻意的**: 零点记的是一根轴只许有一个的
+    *      坐标, 缺一项就得整份丢 (缺的那项会按 0 进来, 而 0 是合法坐标, 那根轴会悄悄跑掉);
+    *      限位记录是**疏的** —— 只记撞过的那几侧, 而且"没有记录"本身就是它的空值 (不像 0),
+    *      所以缺一项的正确含义就是"这一侧没撞过", 没有第二种可能。
+    *   ③ 与那份零点**同一代**才算数 (lim_epoch 与 zero_epoch 不等 = 两半不是一批写的)。 */
+   {
+      p.lim_epoch = s.value(QLatin1String(k::lim_epoch), 0).toInt();
+
+      for (int i = 0; i < EM_MAX_AXES; i++)
+         for (int side = 0; side < 2; side++)
+         {
+            int32_t v = 0;
+            const bool ok = originFromText(s.value(k::limitPosKey(i, side)).toString(), &v);
+            p.lim_have[i][side] = ok;
+            p.lim_pos[i][side]  = ok ? v : 0;
+         }
+
+      /* 世代对不上: 整份当没记过。位置上记的是**那一个坐标系**里的一个点, 零点换了代就什么
+       * 都不是了 —— 留着的唯一后果是拦下一次没人要求过的运动。 */
+      if (p.lim_epoch != p.zero_epoch)
+      {
+         for (int i = 0; i < EM_MAX_AXES; i++)
+            for (int side = 0; side < 2; side++)
+            {
+               p.lim_have[i][side] = false;
+               p.lim_pos[i][side]  = 0;
+            }
+      }
+   }
+
    return p;
 }
 
@@ -219,6 +262,36 @@ void prefsSave(const QString &path, const Prefs &p)
       s.setValue(QLatin1String(k::zero_ep), p.zero_epoch);
       for (int i = 0; i < p.zero_naxis; i++)
          s.setValue(k::originKey(i), (int)p.zero_origin[i]);
+   }
+
+   /* 限位记录。**一条有记录才写一条, 没记录的那一条要 remove** ——
+    * 写一个 0 进去是把一条限位线**钉在坐标系原点上** (那条线会拦住往那一侧的每一次运动),
+    * 而"不写"在这种稀疏记录里还有第二种含义: 那些键上一次写下的值**会留在文件里**
+    * (QSettings 是读-改-写, 它不认识"整份重写"; 别的键也一样, 只是它们在界面上永远有值)。
+    * 于是"回过零, 线作废"这条路必须**删**掉那些键 —— 留着的话, 下一次真撞上线时新记录
+    * 只写它自己那一侧, 陈的那几侧会以**新一代的世代号**被读回来 (世代判据救不了它)。
+    *
+    * `limit/epoch` 只在真有记录时才写 (没有记录时连它一起删): 一个世代配一份空记录,
+    * 下次读回来就是"有世代、没位置" —— 那正是"没记过"想要的样子。 */
+   {
+      bool any = false;
+      for (int i = 0; i < EM_MAX_AXES && !any; i++)
+         for (int side = 0; side < 2 && !any; side++)
+            any = p.lim_have[i][side];
+
+      for (int i = 0; i < EM_MAX_AXES; i++)
+         for (int side = 0; side < 2; side++)
+         {
+            if (p.lim_have[i][side])
+               s.setValue(k::limitPosKey(i, side), (int)p.lim_pos[i][side]);
+            else
+               s.remove(k::limitPosKey(i, side));
+         }
+
+      if (any)
+         s.setValue(QLatin1String(k::lim_epoch), p.lim_epoch);
+      else
+         s.remove(QLatin1String(k::lim_epoch));
    }
 
    /* 显式 sync: 不靠析构时机保证写盘 */

@@ -18,6 +18,7 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QIODevice>
+#include <QSettings>          /* 限位记录那几个键的**字面量**要钉住, 所以直接读一次盘 */
 #include <QString>
 #include <QTemporaryDir>
 #include <QTimer>
@@ -31,6 +32,7 @@
 #include <vector>
 
 #include "editgate.h"
+#include "limitguard.h"
 #include "meterlog.h"
 #include "scanarrive.h"
 #include "scancontroller.h"
@@ -1475,6 +1477,42 @@ static void test_preflight()
       check(!r.startScan(QDir::tempPath() + "/pf6.csv", &err), "refused");
       check(err.contains(QStringLiteral("量程")), "the reason mentions the range", err.toStdString());
    }
+
+   /* 限位记录那道闸 (2026-09-29)。**拦在起点**: 走到那一格才停会留下一张缺了角的图,
+    * 而那个缺口还得靠人看出来。理由那句由 limitguard::limitPlanWhy 一处出 (它的措辞在
+    * test_limitguard 里逐条钉着), 这里只钉"这道闸真的接上了、且不误伤"。 */
+   caseBegin("preflight: 网格越过记下的限位线就拒绝, 线在网格外则放行");
+   {
+      Rig r;
+      r.ctrl.setParams(Rig::smallParams());   /* 2×2 单位 @ 50000 pul/单位 = 网格 ±50000 pul */
+      QString err;
+
+      /* 先证明这份网格真的到得了那儿 —— 否则下面两条是空验 */
+      checkEq(r.ctrl.totalPoints(), 25, "the grid is really built");
+
+      limitguard::LimitAxis ax[2];
+      ax[0].pos.known   = true;
+      ax[0].pos.has_pos = true;
+      ax[0].pos.pos     = 25000;              /* 网格要到 +50000, 线记在 +25000 */
+
+      r.ctrl.setLimitLines(ax);
+      check(!r.startScan(QDir::tempPath() + "/lm1.csv", &err), "越线 → refused");
+      check(err.contains(QStringLiteral("限位")), "the reason mentions the limit line", err.toStdString());
+      check(err.contains(QStringLiteral("请把区域改小")), "and says the way out", err.toStdString());
+
+      /* 线挪到网格之外: 同一个控制器上必须立刻放行 —— 这道闸是"看线在哪", 不是"看有没有线" */
+      ax[0].pos.pos = 200000;
+      r.ctrl.setLimitLines(ax);
+      check(r.startScan(QDir::tempPath() + "/lm2.csv", &err),
+            "线在网格外 → accepted (这道闸不许误伤)", err.toStdString());
+      r.ctrl.abort(QString());
+
+      /* 传 nullptr = 一条都没有 (回零之后界面上就是这个状态) */
+      r.ctrl.setLimitLines(nullptr);
+      check(r.startScan(QDir::tempPath() + "/lm3.csv", &err),
+            "一条记录都没有 → accepted", err.toStdString());
+      r.ctrl.abort(QString());
+   }
 }
 
 /* ------------------------------------------------- 点数上限 (一道资源闸) */
@@ -1547,6 +1585,159 @@ static void test_plancap()
       check(r.startScan(QDir::tempPath() + "/cap2.csv", &err), "and it scans again",
             err.toStdString());
       r.ctrl.abort(QString());
+   }
+}
+
+/* ------------------------------------------------- 限位守卫 (limitguard.h) */
+
+/* 撞到限位之后: 那一侧记一条线, 从此不许再点过去。三条判据全是纯函数, 所以这里能一条条钉
+ * —— 而界面那一半 (ScanWindow::updateLimitGuard / 画布那条线) **不在这里**(scanwindow.cpp
+ * 与 mapcanvas.cpp 都不进 SCAN_COMMON_SRC), 只能靠人在屏幕前看。
+ *
+ * **不许把"只许往外"与"绝不产生往里的运动"这两条删掉**: 前者防的是反复贴线试把线一寸寸
+ * 啃进来, 后者防的是"点了没反应"变成"滑台自己往里走"。两条都是安全事故不是体验问题。 */
+static void test_limitguard()
+{
+   auto has = [](const std::string &s, const char *w) {
+      return s.find(w) != std::string::npos;
+   };
+
+   caseBegin("limitguard: 没记过线也没压着 → 目标原样过去");
+   {
+      limitguard::LimitAxis a;      /* known / has_pos / pressed 全是缺省 false */
+      checkEq(limitguard::limitClampManual(a, 0, 12345), 12345, "恒等变换 (这才是没撞过的机器)");
+      checkEq(limitguard::limitClampManual(a, -7000, -1), -1, "负方向也一样");
+   }
+
+   caseBegin("limitguard: 记过线 → 那一侧夹到线上, 反方向照走");
+   {
+      limitguard::LimitAxis a;
+      a.pos.known   = true;
+      a.pos.has_pos = true;
+      a.pos.pos     = 1000;
+
+      checkEq(limitguard::limitClampManual(a, 0, 5000), 1000, "往正方向点过线 → 夹到线上");
+      checkEq(limitguard::limitClampManual(a, 0, 1000), 1000,
+              "正好点在线上的**不夹** (边界: 线本身是走得到的)");
+      checkEq(limitguard::limitClampManual(a, 0, 999), 999, "线里侧的点一点不动");
+      checkEq(limitguard::limitClampManual(a, 0, -3000), -3000, "反方向一律照走 (只能往回)");
+   }
+
+   caseBegin("limitguard: 开关此刻还压着 → 界就是当前位置 (一刻都不许再往外)");
+   {
+      limitguard::LimitAxis a;
+      a.pos.known   = true;
+      a.pos.has_pos = true;
+      a.pos.pos     = 900;      /* 记在 900 */
+      a.pos.pressed = true;     /* 但此刻停在 1000 上 */
+
+      checkEq(limitguard::limitClampManual(a, 1000, 1500), 1000,
+              "还压着时目标就是当前位置, 不是那条线");
+   }
+
+   caseBegin("limitguard: 位置已经在线外侧 → 夹到当前位置, 绝不产生往里的运动");
+   {
+      limitguard::LimitAxis a;
+      a.pos.known   = true;
+      a.pos.has_pos = true;
+      a.pos.pos     = 800;      /* 老 ini 那条线比现在的位置还靠里 */
+
+      checkEq(limitguard::limitClampManual(a, 1000, 1500), 1000,
+              "界 = 当前位置 (不是 800) —— 800 会把滑台往里拽一下, 而那没人点过");
+      checkEq(limitguard::limitClampManual(a, 1000, 900), 900, "往回点仍照走");
+   }
+
+   caseBegin("limitguard: 60FDh 读不到就不夹 (什么都不知道时只敢说'停')");
+   {
+      limitguard::LimitAxis a;
+      a.pos.has_pos = true;     /* 记过线 */
+      a.pos.pos     = 1000;
+      a.pos.known   = false;    /* 但这一拍读不到 60FDh */
+
+      checkEq(limitguard::limitClampManual(a, 0, 5000), 5000, "读不到就不夹 (不拿猜的判据拦运动)");
+   }
+
+   caseBegin("limitguard: 两侧各记一条 → 两个方向各自夹, 中间照走");
+   {
+      limitguard::LimitAxis a;
+      a.pos.known = true;  a.pos.has_pos = true;  a.pos.pos = 1000;
+      a.neg.known = true;  a.neg.has_pos = true;  a.neg.pos = -2000;
+
+      checkEq(limitguard::limitClampManual(a, 0, 9000), 1000, "正方向夹到正限位线");
+      checkEq(limitguard::limitClampManual(a, 0, -9000), -2000, "负方向夹到负限位线");
+      checkEq(limitguard::limitClampManual(a, 0, 500), 500, "两条线之间照走");
+   }
+
+   caseBegin("limitguard: 记账只许往外");
+   {
+      limitguard::LimitSide s;
+      limitguard::limitNote(+1, s, 700);
+      check(s.has_pos, "第一次记: 无条件写上");
+      checkEq(s.pos, 700, "记的就是当时那个位置");
+
+      limitguard::limitNote(+1, s, 500);
+      checkEq(s.pos, 700, "往里的一次**不许**把线挪进来 (否则反复贴线试会一寸寸啃进来)");
+      limitguard::limitNote(+1, s, 1200);
+      checkEq(s.pos, 1200, "往外的一次要更新");
+
+      limitguard::LimitSide n;
+      limitguard::limitNote(-1, n, -700);
+      limitguard::limitNote(-1, n, -500);
+      checkEq(n.pos, -700, "负侧的'往里'是往正方向 (方向是反的)");
+      limitguard::limitNote(-1, n, -900);
+      checkEq(n.pos, -900, "负侧往外 = 更负");
+
+      limitguard::LimitSide u;
+      limitguard::limitNote(0, u, 700);
+      check(!u.has_pos, "说不出是哪一侧时**一个字节都不记** (记了就是把一侧钉在另一侧的位置上)");
+   }
+
+   caseBegin("limitguard: 网格越线那一句 —— 只有越了才说, 只说第一条");
+   {
+      const int32_t lo[2] = {-50000, -50000};
+      const int32_t hi[2] = { 50000,  50000};
+
+      limitguard::LimitAxis none[2];
+      check(limitguard::limitPlanWhy(none, lo, hi).empty(), "一条线都没有 → 不报");
+
+      limitguard::LimitAxis x[2];
+      x[0].pos.known = true;  x[0].pos.has_pos = true;  x[0].pos.pos = 25000;
+      {
+         const std::string w = limitguard::limitPlanWhy(x, lo, hi);
+         check(!w.empty(), "网格要到 +50000 而线在 +25000 → 报");
+         check(has(w, "X 轴正限位"), "点明哪一根轴的哪一侧", w);
+         check(has(w, "25000"), "把线记在哪写出来", w);
+         check(has(w, "50000"), "把网格最远要到哪写出来", w);
+         check(has(w, "请把区域改小"), "说得出路 (现象 + 出路, 不写步骤)", w);
+      }
+
+      /* 正好到线上不算越过 —— 与 limitClampSide 那条边界同一条: 线本身是走得到的 */
+      x[0].pos.pos = 50000;
+      check(limitguard::limitPlanWhy(x, lo, hi).empty(), "正好压在线上的网格点不算越线");
+
+      /* 没记过的那一侧越了也不报: 报的判据是"记过没有", 不是"网格到哪" */
+      limitguard::LimitAxis un[2];
+      un[0].pos.known = true;  un[0].pos.pos = 25000;   /* has_pos 仍是 false */
+      check(limitguard::limitPlanWhy(un, lo, hi).empty(), "没记过线的一侧不报");
+
+      limitguard::LimitAxis y[2];
+      y[1].neg.known = true;  y[1].neg.has_pos = true;  y[1].neg.pos = -20000;
+      {
+         const int32_t l2[2] = {-50000, -40000};
+         const int32_t h2[2] = { 50000,  50000};
+         const std::string w = limitguard::limitPlanWhy(y, l2, h2);
+         check(has(w, "Y 轴负限位"), "负侧越线报的是负限位", w);
+      }
+
+      /* 两根轴都越了: 只报第一条 (这是提示不是清单), 且 X 排在 Y 前面 */
+      {
+         limitguard::LimitAxis both[2];
+         both[0].pos.known = true;  both[0].pos.has_pos = true;  both[0].pos.pos = 25000;
+         both[1].neg.known = true;  both[1].neg.has_pos = true;  both[1].neg.pos = -20000;
+         const int32_t l3[2] = {-50000, -40000};
+         const std::string w = limitguard::limitPlanWhy(both, l3, hi);
+         check(has(w, "X 轴正限位") && !has(w, "Y 轴"), "只报第一条 (X 在前)", w);
+      }
    }
 }
 
@@ -1661,6 +1852,125 @@ static void test_prefs()
       withr.range_pul = 725000;
       prefsMergeParams(&store, withr);
       checkEq(store.params.range_pul, 0, "range is dropped, not remembered");
+   }
+
+   /* 限位记录 (2026-09-29)。三个键名在这里**故意写死**: 它们是文件格式的一部分 (手改 ini
+    * 是这一族唯一的出路), 存与读两头都用同一个常量生成, 于是"改了个名"这种错自检抓不到 ——
+    * 只有把字面量钉在这里才抓得到。 */
+   caseBegin("prefs: 限位记录存进去再读回来 (逐轴逐侧 + 世代)");
+   {
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      Prefs p;
+      p.zero_naxis = 2;
+      p.zero_origin[0] = -1000;
+      p.zero_origin[1] =  2000;
+      p.zero_epoch = 3;
+      p.lim_have[0][0] = true;  p.lim_pos[0][0] = 130000;   /* X 正 */
+      p.lim_have[0][1] = true;  p.lim_pos[0][1] = -45000;   /* X 负 */
+      p.lim_have[1][0] = true;  p.lim_pos[1][0] = 0;        /* Y 正: **正好在 0 点上** */
+      p.lim_have[1][1] = true;  p.lim_pos[1][1] = -77000;   /* Y 负 */
+      p.lim_epoch = 3;                                      /* 与 zero_epoch 同一代 */
+      prefsSave(ini, p);
+
+      const Prefs b = prefsLoad(ini);
+      check(b.lim_have[0][0] && b.lim_pos[0][0] == 130000, "X 正限位记在 130000");
+      check(b.lim_have[0][1] && b.lim_pos[0][1] == -45000, "X 负限位记在 -45000 (负数是合法坐标)");
+      check(b.lim_have[1][1] && b.lim_pos[1][1] == -77000, "Y 负限位记在 -77000");
+      /* ★ 这一条是"有没有"必须由 lim_have 说的证据: 拿 0 当哨兵 (或者拿任何值当哨兵)
+       *   的实现会把它读成"没记过", 而那是一条**已经在用的**限位线 */
+      check(b.lim_have[1][0] && b.lim_pos[1][0] == 0,
+            "记在 0 点上的那一条照样读得回来 (0 是合法坐标, 不是'没记过')");
+
+      QSettings s(ini, QSettings::IniFormat);
+      check(s.contains(QStringLiteral("limit/pos_1p")),
+            "键名就是 limit/pos_1p (1 起编号 + p 正 / n 负)");
+      checkEq(s.value(QStringLiteral("limit/epoch")).toInt(), 3, "limit/epoch 也写下去了");
+   }
+
+   caseBegin("prefs: 限位记录与那份零点不是同一代 → 整份不采纳");
+   {
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      Prefs p;
+      p.zero_naxis = 2;
+      p.zero_epoch = 4;
+      p.lim_have[0][0] = true;  p.lim_pos[0][0] = 130000;
+      p.lim_have[0][1] = true;  p.lim_pos[0][1] = -45000;
+      p.lim_epoch = 3;                       /* 上一位操作员回过零之后的世代 */
+      prefsSave(ini, p);
+
+      const Prefs b = prefsLoad(ini);
+      check(!b.lim_have[0][0] && !b.lim_have[0][1],
+            "世代对不上时**一条都不采纳** (那些位置在新坐标系里是错的, 留着只会拦下一次"
+            "没人要求过的运动)");
+   }
+
+   caseBegin("prefs: 限位记录手改坏 / 缺项 → 当没记过, 不许变成'记在 0 点上'");
+   {
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      Prefs p;
+      p.zero_naxis = 2;
+      p.zero_origin[0] = -1000;
+      p.zero_origin[1] =  2000;
+      p.zero_epoch = 3;
+      p.lim_have[0][0] = true;  p.lim_pos[0][0] = 130000;
+      p.lim_have[0][1] = true;  p.lim_pos[0][1] = -45000;
+      p.lim_epoch = 3;
+      prefsSave(ini, p);
+
+      /* 手改成垃圾。**不能用 QVariant::toInt() 读** —— 它对 "abc" 给 0, 而 0 是合法坐标 */
+      {
+         QSettings s(ini, QSettings::IniFormat);
+         s.setValue(QStringLiteral("limit/pos_1p"), QStringLiteral("abc"));
+         s.sync();
+      }
+
+      const Prefs b = prefsLoad(ini);
+      check(!b.lim_have[0][0], "写着 abc 的那一条当没记过 (不许读成 0)");
+      /* 坏的那一条只作废它自己 —— **与那份零点值相反, 这是刻意的**: 这一族是疏的, 只记撞过
+       * 的那几侧, "没有记录"就是它的空值 (不像 0 那样是个合法的坐标), 所以缺项的正确含义
+       * 只有一种。把好的那一条也一起丢掉, 换来的只是少一道护栏, 什么也防不住 */
+      check(b.lim_have[0][1] && b.lim_pos[0][1] == -45000,
+            "坏的那一条只作废它自己, 好着的那一条照旧采纳");
+
+      /* 缺项同理: 一个键都不在的 ini (老版本) 读出来是"一条都没记过" */
+      Prefs none;
+      prefsSave(dir.filePath(QStringLiteral("clean.ini")), none);
+      const Prefs c = prefsLoad(dir.filePath(QStringLiteral("clean.ini")));
+      check(!c.lim_have[0][0] && !c.lim_have[0][1], "一个键都没有 → 一条都没记过");
+   }
+
+   caseBegin("prefs: 一条记录都没有时, 那 5 个键一个都不写");
+   {
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      /* 先写一份有的, 再写一份没有的 —— 验的是"清掉之后陈的键自己消失" (prefsSave 整份重写) */
+      Prefs p;
+      p.zero_naxis = 2;
+      p.zero_origin[0] = -1000;
+      p.zero_origin[1] =  2000;
+      p.zero_epoch = 3;
+      p.lim_have[0][0] = true;  p.lim_pos[0][0] = 130000;
+      p.lim_epoch = 3;
+      prefsSave(ini, p);
+
+      Prefs q = p;                            /* 回零了: 记录整份作废, 零点那份照旧 */
+      q.lim_have[0][0] = false;
+      q.lim_pos[0][0]  = 0;
+      q.lim_epoch      = 4;
+      q.zero_epoch     = 4;
+      prefsSave(ini, q);
+
+      QSettings s(ini, QSettings::IniFormat);
+      check(!s.contains(QStringLiteral("limit/pos_1p")) && !s.contains(QStringLiteral("limit/epoch")),
+            "清掉之后盘上不留一个 limit/ 的键 (写一个 0 进去 = 把一条线钉在坐标原点)");
+      checkEq(s.value(QStringLiteral("zero/epoch")).toInt(), 4, "而那份零点照旧写着");
    }
 }
 
@@ -5997,6 +6307,7 @@ int main(int argc, char **argv)
    test_retest();
    test_preflight();
    test_plancap();
+   test_limitguard();
    test_prefs();
    test_editgate();
    test_advprefs();

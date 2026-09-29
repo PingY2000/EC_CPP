@@ -79,6 +79,14 @@ public:
    /* 扫描中/跨区域时由窗口置位。**它只管手动定位那一条路** —— 查看是只读的, 不吞 */
    void setManualAllowed(bool on) { m_manual_ok = on; }
 
+   /* 限位区 (2026-09-29, 见 limitguard.h): 每根轴最多一条线, `dir` = 0 没这一侧 /
+    * +1 正限位 / -1 负限位, `pos_pul` 是那条线的位置 (**显示脉冲** —— 与遥测里那些位置
+    * 同一套, 画的时候才除脉冲当量, 与 drawMarkers 那三个标记同源)。数组各 2 个, 下标 0 = X。
+    *
+    * 只画**记下来的**那些: "此刻压着但还没记过"由 drawMarkers 那个红环说了 —— 两处画的是
+    * 两件事 (一条是"以后不许越过", 一个是"现在压着"), 合成一条线会让人以为线才刚出现。 */
+   void setLimitZones(const int *dir, const int32_t *pos_pul);
+
    /* 画布顶上那条**空带**(像素): 留给 ScanWindow 那条**浮在画布上**的横幅 (它不进布局,
     * 见 scanwindow.cpp 的 placeBanner)。画布不认识横幅, 但它知道自己顶上得空出这么高 ——
     * 不空的话横幅一出现就盖住 HUD 的头两行 (进度 / 状态)。
@@ -116,6 +124,7 @@ private:
    void  drawHeat(QPainter &p);
    void  drawPath(QPainter &p);
    void  drawRulers(QPainter &p);     /* X/Y 坐标标尺 (每 1 单位小刻度, 每 5 单位带数字) */
+   void  drawLimitZones(QPainter &p); /* 限位线 + 线外侧那片阴影 (见 setLimitZones) */
    void  drawMarkers(QPainter &p);
    void  drawScaleBar(QPainter &p);
    void  drawHud(QPainter &p);
@@ -141,6 +150,11 @@ private:
    int m_sel_ix = -1;
    int m_sel_iy = -1;
    bool m_manual_ok = true;
+
+   /* 限位线 (见 setLimitZones)。缺省 0 = 一条都没有 —— "没撞过限位"与"这一版之前的盘"
+    * 走的就是这条路, 不需要另加一个"要不要画"的开关 */
+   int     m_lim_dir[2] = {0, 0};
+   int32_t m_lim_pos[2] = {0, 0};
 
    /* 悬停读数 */
    bool     m_hover = false;

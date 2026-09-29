@@ -247,9 +247,18 @@ private:
     * 名字不叫 loadSettings 的一部分是刻意的 —— 它必须在 start() 之前跑完, 而 loadSettings
     * 是在 buildParamPanel() 里、和控件一起建的 (§39)。 */
    void seedZeroFromPrefs();
+   /* 限位记录: scan.ini 里那几条 → m_lim[] (主) + 世代接到 m_limEpoch 上。
+    * 与 seedZeroFromPrefs 一同在 start() 之前跑完, 理由相同 (§39)。 */
+   void seedLimitFromPrefs();
 
    void pushManualSpeed(const BusTelem &t, bool running);
    void refreshAxisSignals(const BusTelem &t);   /* 限位/使能/故障: 状态栏 + 参数栏, 一份遥测 */
+   /* 限位守卫 (2026-09-29, 见 limitguard.h): 记线 + 撞到就停。挂在 refreshAxisSignals 之后 ——
+    * 它要用那条红横幅刚算完的 m_limBanner[] 才知道"这一句说过了没有" */
+   void updateLimitGuard(const BusTelem &t);
+   /* 把 m_lim[] 推到两个收的人: 控制器 (起扫前那道闸) 与画布 (那条线与阴影)。
+    * **一处出、两处进** —— 少推一处就会出现"界面说锁住了而画布上还是白的" */
+   void pushLimitLines();
    void setSignalCell(LampGrid &g, int i, int s, bool known, bool on, Lamp lit);
    Params currentParams() const;
    void refresh();                    /* 30Hz: tick 状态机 + 刷遥测 + 刷按钮可用性 */
@@ -563,6 +572,18 @@ private:
     * 横幅, 而"弹过了没有"只能按轴存着, 否则 30Hz 每帧都弹 */
    int  m_faultCodeShown[2] = {HMI_FAULT_CODE_UNREAD, HMI_FAULT_CODE_UNREAD};
    bool m_limShown[2] = {false, false};   /* 限位横幅的上升沿防重入, 一根轴一个 */
+
+   /* ---- 限位记录 (2026-09-29): 撞到哪一侧就把当时的位置记下来, 从此那一侧不许再越过。
+    * **这里是唯一的一份** —— 落盘走 scanprefs, 控制器与画布由 pushLimitLines() 推过去。
+    *
+    * ★ 与 m_limShown 是**两件事, 不能合并**: m_limShown 在 !known 那一帧会被清掉
+    *   ("不知道了就重新上膛"), 拿它当 latch 会在丢一帧之后、滑台正往回撤的半路上
+    *   再发一次 postStop, 把那一次撤退冻住。m_limLatch 只在**信号真的松开**时清零。
+    * ★ m_lim[i].pos/neg.known 与 pressed 每拍从遥测刷 (存不住也不必存);
+    *   has_pos/pos 是记下来的, 只随零点世代作废。 */
+   limitguard::LimitAxis m_lim[2];
+   int  m_limEpoch = 0;                        /* 记下它们时的零点世代 */
+   bool m_limLatch[2] = {false, false};        /* "这一侧这一趟已经处理过", 松开才重新上膛 */
    /* 我们发出去的那条限位横幅原文。下降沿靠它认现在挂着的是不是我们自己那条: 是才清, 不是不能动 */
    QString m_limBanner[2];
    /* 「通讯」红横幅 (t.comm_bad)。**总线级, 不是一根轴一个** —— 帧不够是整条总线的事,

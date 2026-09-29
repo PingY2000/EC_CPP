@@ -229,6 +229,32 @@ void MapCanvas::setAutoFit(bool on)
    update();
 }
 
+void MapCanvas::setLimitZones(const int *dir, const int32_t *pos_pul)
+{
+   if (dir == nullptr || pos_pul == nullptr)
+      return;
+
+   bool chg = false;
+   for (int i = 0; i < 2; i++)
+   {
+      /* 方向按 0 / ±1 归一, 位置只在"这一侧真有线"时才比 —— dir 一翻, 那个位置本来就是
+       * 另一侧的数, 拿它比会多刷一帧 (无害, 但会让"值没变就不重画"这句话变得不真) */
+      const int     d = (dir[i] > 0) ? +1 : ((dir[i] < 0) ? -1 : 0);
+      const int32_t v = (d == 0) ? 0 : pos_pul[i];
+
+      if (d != m_lim_dir[i] || v != m_lim_pos[i])
+         chg = true;
+
+      m_lim_dir[i] = d;
+      m_lim_pos[i] = v;
+   }
+
+   /* 值没变就不重画: 这个 setter 每拍都可能被叫 (见 ScanWindow::pushLimitLines),
+    * 而画布本来就每帧重画一次, 不必再从这条路上多推一次 */
+   if (chg)
+      update();
+}
+
 void MapCanvas::applyAutoFit()
 {
    if (!m_auto)
@@ -420,6 +446,9 @@ void MapCanvas::paintEvent(QPaintEvent *)
    if (m_shade_hi > m_shade_lo)
       drawHeat(p);
    drawGrid(p);
+   /* 限位区在网格之上、路径与三个标记之下: 它是一层"底图上的约束", 不是一件要压住数据的
+    * 东西 —— 路径与位置点是操作员真正在追的, 必须盖在它上面 (§28.5 那条教训的另一面) */
+   drawLimitZones(p);
    drawPath(p);
    drawRulers(p);
    drawMarkers(p);
@@ -607,6 +636,105 @@ void MapCanvas::drawPath(QPainter &p)
    p.drawPath(m_path);
 
    p.restore();
+}
+
+/* 限位区: 一条线 + 线**外侧**那半块阴影。X 轴的是竖线 (左或右半边), Y 轴的是横线 (上或下)。
+ *
+ * 画的是"以后不许越过这里", 不是"此刻压着" —— 后者由 drawMarkers 那个红环说。两件事分开画
+ * 是刻意的: 合成一条会让人以为线是刚出现的, 而它其实一直在那儿。
+ *
+ * 线与阴影都**裁剪在画图区里** (§28.5 那条"白点画到标尺上"的教训): 画图区之外有标尺、
+ * 色标条与 HUD, 一块 36/255 的色斑渗出去就是"屏幕上有块脏东西"。 */
+void MapCanvas::drawLimitZones(QPainter &p)
+{
+   const double ppu = m_ctl->params().pulses_per_unit;
+   if (!(ppu > 0.0))
+      return;
+
+   const QRectF r    = plotRect();
+   const double half = viewHalfUnits();
+
+   for (int i = 0; i < 2; i++)
+   {
+      if (m_lim_dir[i] == 0)
+         continue;
+
+      const double u = (double)m_lim_pos[i] / ppu;
+      if (std::fabs(u) > half)
+         continue;      /* 线在视野之外: 它由 drawHud 那一行负责说 (一条都画不出来时更要说)。
+                         * 判据与 drawHud 里"位置在面板外"那一条**同一个** (`>` 而不是 `>=`):
+                         * 正好落在边框上的那一条是画得出来的, 说它在面板外就是说了假话 */
+
+      const bool pos_side = (m_lim_dir[i] > 0);
+
+      p.save();
+      p.setClipRect(r);
+
+      QPointF a, b;
+      QRectF  band;
+
+      if (i == 0)
+      {
+         const double x = pxOf(u, 0.0).x();
+         a    = QPointF(x, r.top());
+         b    = QPointF(x, r.bottom());
+         band = pos_side ? QRectF(x, r.top(), r.right() - x, r.height())
+                         : QRectF(r.left(), r.top(), x - r.left(), r.height());
+      }
+      else
+      {
+         const double y = pxOf(0.0, u).y();
+         a    = QPointF(r.left(), y);
+         b    = QPointF(r.right(), y);
+         band = pos_side ? QRectF(r.left(), r.top(), r.width(), y - r.top())
+                         : QRectF(r.left(), y, r.width(), r.bottom() - y);
+      }
+
+      /* alpha 36 是"看得见却不抢数据"那一档 (两条线 + 两块阴影同时出现时也不该盖住热力图
+       * 里那一档颜色 —— 屏幕前那条验收专门看这个) */
+      QColor fill = C_LIMIT;
+      fill.setAlpha(36);
+      p.fillRect(band, fill);
+
+      p.setPen(QPen(C_LIMIT, 1.5));
+      p.drawLine(a, b);
+
+      /* 标签: 贴阴影那一侧, 离画图区边 4px。带子窄于阈值时**翻到线的另一侧** ——
+       * 标签是这条线唯一说得清"是哪一侧"的东西, 挤在 20px 的带子里等于没有 */
+      QFont f = p.font();
+      f.setPointSizeF(8.0);
+      p.setFont(f);
+      p.setPen(C_LIMIT);
+
+      const QString lbl = QStringLiteral("%1 轴%2限位区")
+                             .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"),
+                                  pos_side ? QStringLiteral("正") : QStringLiteral("负"));
+
+      int            al = Qt::AlignVCenter;
+      QRectF         tr;
+
+      if (i == 0)
+      {
+         const double bandw = pos_side ? (r.right() - a.x()) : (a.x() - r.left());
+         const bool   right = pos_side != (bandw < 130.0);
+
+         tr = right ? QRectF(a.x() + 4.0, r.top() + 4.0, r.right() - a.x() - 8.0, 14.0)
+                    : QRectF(r.left() + 4.0, r.top() + 4.0, a.x() - r.left() - 8.0, 14.0);
+         al |= right ? Qt::AlignRight : Qt::AlignLeft;
+      }
+      else
+      {
+         const double bandh = pos_side ? (a.y() - r.top()) : (r.bottom() - a.y());
+         const bool   up    = pos_side != (bandh < 24.0);
+
+         tr = up ? QRectF(r.left() + 8.0, r.top() + 4.0, r.width() - 16.0, 14.0)
+                 : QRectF(r.left() + 8.0, r.bottom() - 18.0, r.width() - 16.0, 14.0);
+         al |= Qt::AlignLeft;
+      }
+
+      p.drawText(tr, al, lbl);
+      p.restore();
+   }
 }
 
 void MapCanvas::drawMarkers(QPainter &p)
@@ -865,7 +993,11 @@ void MapCanvas::drawHud(QPainter &p)
                  .arg(q.area_x_unit, 0, 'f', 2)
                  .arg(q.area_y_unit, 0, 'f', 2));
 
-   /* 第四行: 位置跑到面板外了。软量程可以比视野大(区域一超过 2×kCanvasHalfUnits 就是),
+   /* 第四行起: 那些"位置本身就在面板外"的话。三行标题占 0/1/2, 从这一行起每说一句往下挪
+    * 一行 —— 中间空一行比"少一句时留着个洞"要好。 */
+   int row = 3;
+
+   /* 第四行 (可能): 位置跑到面板外了。软量程可以比视野大(区域一超过 2×kCanvasHalfUnits 就是),
     * 而标记在 drawMarkers 里被裁剪贴在边框上 —— 不说一句的话, 操作员看到的是"我的点卡在
     * 边上不动了"。**留着不画比画到标尺上更糟**, 所以是"贴边 + 写出来"这两下一起做。 */
    if (m_bus != nullptr)
@@ -879,9 +1011,41 @@ void MapCanvas::drawHud(QPainter &p)
          if (std::fabs(px) > kCanvasHalfUnits || std::fabs(py) > kCanvasHalfUnits)
          {
             p.setPen(C_WANT);
-            p.drawText(QRect(x, (int)r.top() + 51, w, 15), Qt::AlignLeft | Qt::AlignVCenter,
+            p.drawText(QRect(x, (int)r.top() + 6 + row * 15, w, 15),
+                       Qt::AlignLeft | Qt::AlignVCenter,
                        QStringLiteral("位置在面板外 (%1, %2) mm, 白色标记已贴至边框")
                           .arg(px, 0, 'f', 2).arg(py, 0, 'f', 2));
+            row++;
+         }
+      }
+   }
+
+   /* 再一行 (可能): 记下的限位线跑出视野了。记录本身与视野无关 (它记的是脉冲, 面板只有
+    * ±kCanvasHalfUnits), 所以这条线可以一直在图外 —— 不说的话, 屏幕上就是"限位区不见了",
+    * 而"不见了"与"没锁住"看起来一模一样。
+    * 一条就说一句: 两根轴各一条线时, 最该看见的是**离得近的那一条**, 而两条都在图外时
+    * 报第一条 (理由与 limitPlanWhy 只报第一条同一条: 这是提示, 不是清单)。 */
+   {
+      const double ppu = q.pulses_per_unit;
+      if (ppu > 0.0)
+      {
+         for (int i = 0; i < 2; i++)
+         {
+            if (m_lim_dir[i] == 0)
+               continue;
+
+            const double u = (double)m_lim_pos[i] / ppu;
+            if (std::fabs(u) <= kCanvasHalfUnits)
+               continue;
+
+            p.setPen(C_LIMIT);
+            p.drawText(QRect(x, (int)r.top() + 6 + row * 15, w, 15),
+                       Qt::AlignLeft | Qt::AlignVCenter,
+                       QStringLiteral("%1 轴%2限位线在面板外 (%3 mm) —— 那一侧已锁住")
+                          .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"),
+                               (m_lim_dir[i] > 0) ? QStringLiteral("正") : QStringLiteral("负"))
+                          .arg(u, 0, 'f', 3));
+            break;
          }
       }
    }
