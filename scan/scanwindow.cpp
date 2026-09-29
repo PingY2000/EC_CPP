@@ -273,9 +273,21 @@ void ScanWindow::panelRevert(int pi)
    m_panelRevert = false;
 
    /* 色标那一对**在回灌途中是被让开的** (见 onShadeLoChanged): lo 先落地时 hi 还是旧值,
-    * 那一瞬的区间是反的。两个都退完了在这里补一次, 画布拿到的才是最后那对 */
+    * 那一瞬的区间是反的。两个都退完了在这里补一次, 画布拿到的才是最后那对。
+    *
+    * ★ **这一句是色标回灌唯一的画布下推点** (两条槽都被 m_panelRevert 挡住了), 而框里那两个数
+    * 是**显示值** —— 所以必须自己乘除数, 不然「取消」之后画布与框里的数会差 d 倍。
+    * 除数取的是**已经退回去之后**的那个单位 (单位那一项也在 items 里, 上面那个循环已经把它
+    * 退回去了): 单位与两个数是一起退的, 于是重算出来的原始值与基线逐字相同。 */
    if (pi == PI_SHADE && m_edShadeLo != nullptr && m_edShadeHi != nullptr)
-      m_canvas->setShadeRange(m_edShadeLo->value(), m_edShadeHi->value());
+   {
+      const double d = shadeUnitDivisor(shadeUnitMode());
+      m_canvas->setShadeRange(m_edShadeLo->value() * d, m_edShadeHi->value() * d);
+      /* 单位那一项也在 items 里, 所以它上面已经跟着退回去了 —— 而**它退的那一下是让开的**
+       * (onShadeUnitChanged 看 m_panelRevert), 画布还顶着换之前那个单位。这里补一次,
+       * 否则「取消」之后色标条上的数与两个框会差 d 倍 */
+      applyShadeUnitUi();
+   }
 }
 
 /* 全部参数控件 setEnabled 的**唯一写点**。由 refresh() 每拍调用。
@@ -703,17 +715,11 @@ void ScanWindow::refreshMeterReadout()
       m_curve->update();
    }
 
-   /* ---- 色标那两个数是什么单位 ----
-    * 色阶画的就是取样源的读数, 所以它的单位跟着源头走: 真机报 J 的时候那两个数是 J 而不是
-    * W, 而这一点在控件上原本一个字都没有 (标题写着"功率")。放在这儿是因为这一条每拍都跑 */
-   if (m_lShadeUnit != nullptr)
-   {
-      const QString u = (m_meter != nullptr) ? m_meter->unit() : QString();
-      /* 判不出来就说「单位不明」—— 与 powermeter::unitLabel() 同一句话, 不另造一个说法 */
-      m_lShadeUnit->setText(u.isEmpty()
-         ? QStringLiteral("单位不明 (随取样源)")
-         : QStringLiteral("单位: %1 (随取样源)").arg(u));
-   }
+   /* ---- 色标的单位 (2026-09-29 起由「单位」那一项定, 也可以仍随取样源) ----
+    * 放在这儿是因为这一条**每拍都跑**: 选「随取样源」时那个单位字跟着源变 (真机报 J 的时候
+    * 色标那几个数就是 J 而不是 W), 而这一点在控件上原本一个字都没有 (标题写着"功率")。
+    * 推到画布上的那两件 (单位字 + 除数) 与这一行只读字说的是同一件事, 一处算两处用。 */
+   applyShadeUnitUi();
 }
 
 /* 「保存」= 把**这一框**管的字段写进 ini。先读回上次那份, 只覆盖自己管的键 —— 每块框各存
@@ -744,6 +750,8 @@ void ScanWindow::panelSavePrefs(int pi)
       break;
    case PI_SHADE:
       pf.shade_auto = m_cbShadeAuto->isChecked();
+      /* 单位与自动跟随同型: 是个模式, 所以「保存」管它; 上下限那两个数照旧一个字节都不存 */
+      pf.shade_unit = shadeUnitMode();
       break;
    default:
       return;      /* 「功率计」那一框不在表里, 没有「保存」 */
@@ -2470,25 +2478,50 @@ QWidget *ScanWindow::buildShadePanel()
    QGroupBox *box = new QGroupBox(QStringLiteral("色标"), this);
    QFormLayout *f = new QFormLayout(box);
 
+   /* ---- 「单位」那一项, 以及它顺带定下的"缺省那对上下限" (2026-09-29) ----
+    * prefs 读在这里而不是 loadSettings() 里: 那一句在 buildParamPanel() 里跑, 而这一框在它
+    * **之前**建 (buildUi 顶上那段"建序"注释) —— 与功率计那一框同一条理由。
+    *
+    * 缺省那对上下限是"0 … 1 个**当前单位**": 单位缺省 mW, 于是它落地成 0 … 1 mW
+    * (原始值 0 … 0.001)。这个换算**只做这一次** —— 之后就一律是原始值, 换单位不再动它
+    * (换单位只改怎么写出来, 绝不改颜色; 见 scanwindow.h 里色标那一段的 ★) */
+   {
+      const Prefs pf = prefsLoad(prefsPath());
+
+      m_cbShadeUnit = new QComboBox(box);
+      for (int m = SHADE_UNIT_FOLLOW; m <= SHADE_UNIT_UV; m++)
+         m_cbShadeUnit->addItem(shadeUnitName(m));      /* 下标 == 模式号, 顺序不许动 */
+      m_cbShadeUnit->setCurrentIndex(pf.shade_unit);
+      m_cbShadeUnit->setToolTip(QStringLiteral(
+         "色标数字的单位。换它只改屏幕上的数字与单位字, 不改颜色。\n"
+         "选「随取样源」时用取样源自己报的单位。"));
+
+      m_canvas->setShadeRange(0.0, 1.0 * shadeUnitDivisor(pf.shade_unit));
+      connect(m_cbShadeUnit, &QComboBox::currentIndexChanged, this,
+              [this](int) { onShadeUnitChanged(); });
+   }
+
    const double lo = m_canvas->shadeLo();
    const double hi = m_canvas->shadeHi();
+   /* 控件里放的是**显示值**, 画布那份是原始值 (见 scanwindow.h 里的 ★) */
+   const double d  = shadeUnitDivisor(shadeUnitMode());
 
    /* 下限就是 0: 功率没有负的。**下限也钉在 0**, 于是"最小 >= 0"这条不用在槽里再判一次 ——
     * 敲 -5 会被控件自己夹成 0, valueChanged 拿到的一直是合法值 */
    const QString kShadeTip = QStringLiteral(
-      "色标上下限, 单位随取样源。\n"
+      "色标上下限, 单位由「单位」那一项定。\n"
       "任一端越过另一端时另一端随之移动, 跨度保持不变; 取值范围为非负数, 且最小 < 最大。");
 
    m_edShadeLo = new QDoubleSpinBox(box);
    m_edShadeLo->setRange(0.0, 1e12);
    m_edShadeLo->setDecimals(6);
-   m_edShadeLo->setValue(lo);
+   m_edShadeLo->setValue(lo / d);
    m_edShadeLo->setToolTip(kShadeTip);
 
    m_edShadeHi = new QDoubleSpinBox(box);
    m_edShadeHi->setRange(0.0, 1e12);
    m_edShadeHi->setDecimals(6);
-   m_edShadeHi->setValue(hi);
+   m_edShadeHi->setValue(hi / d);
    m_edShadeHi->setToolTip(kShadeTip);
 
    connect(m_edShadeLo, &QDoubleSpinBox::valueChanged, this, &ScanWindow::onShadeLoChanged);
@@ -2537,9 +2570,11 @@ QWidget *ScanWindow::buildShadePanel()
 
    f->addRow(QStringLiteral("最小"), m_edShadeLo);
    f->addRow(QStringLiteral("最大"), m_edShadeHi);
+   /* 单位那一行在"最小/最大"**下面**: 它管的就是上面那两个数写成什么 */
+   f->addRow(QStringLiteral("单位"), m_cbShadeUnit);
 
-   /* 单位一行。色阶画的是取样源的读数, 而"色标 (功率)"这个名字里就写着一个单位 —— 这一行
-    * 是真正算数的那个 (每拍由 refreshMeterReadout 跟着源改) */
+   /* 实际生效的那个单位 (只读)。上面那个下拉说的是"选了什么", 这一行说的是"现在算数的是什么"
+    * —— 两者在「随取样源」那一档不是一回事 (源报什么得问源), 每拍由 refreshMeterReadout 写 */
    m_lShadeUnit = new QLabel(box);
    m_lShadeUnit->setWordWrap(true);
    m_lShadeUnit->setTextFormat(Qt::PlainText);
@@ -2556,10 +2591,15 @@ QWidget *ScanWindow::buildShadePanel()
             QList<GateItem>{
                GateItem{ m_edShadeLo,   false, false },
                GateItem{ m_edShadeHi,   false, false },
+               GateItem{ m_cbShadeUnit, false, false },
                GateItem{ m_cbShadeAuto, false, false },
                /* 定标按钮在自动跟随时灰掉 (need_manual), 这个勾本身**不能灰**: 关掉它得按得动 */
                GateItem{ m_btnFit,      false, true },
             });
+
+   /* 把单位推到画布与那一行只读字上 (上面 create 时还没连信号, 也不会自己推)。
+    * 它同时把两个框按这个单位重写一遍 —— 与上面 setValue 那两行是同一件事, 幂等 */
+   applyShadeUnitUi();
    return box;
 }
 
@@ -2583,18 +2623,23 @@ void ScanWindow::onShadeLoChanged(double lo)
    if (m_panelRevert)
       return;
 
+   /* 这两个槽拿到的是**显示值**, 画布要的是**原始值** —— 乘那个除数 (见 scanwindow.h 的 ★)。
+    * 横幅上那个数是给人看的, 所以它保持显示值并**带上单位字** (换过的数不带单位就是骗人) */
+   const double d  = shadeUnitDivisor(shadeUnitMode());
+   const QString u = shadeUnitName(shadeUnitMode());
+
    double hi = m_edShadeHi->value();
    if (hi <= lo)
    {
-      const double span = m_canvas->shadeHi() - m_canvas->shadeLo();
+      const double span = (m_canvas->shadeHi() - m_canvas->shadeLo()) / d;
       hi = lo + ((span > 0.0) ? span : 1.0);
       QSignalBlocker b(m_edShadeHi);
       m_edShadeHi->setValue(hi);
-      hint(QStringLiteral("最小值超过最大值, 最大值已调整至 %1 (跨度不变)。")
-              .arg(QString::number(hi, 'g', 6)),
+      hint(QStringLiteral("最小值超过最大值, 最大值已调整至 %1 %2 (跨度不变)。")
+              .arg(QString::number(hi, 'g', 6), u),
            false);
    }
-   m_canvas->setShadeRange(lo, hi);
+   m_canvas->setShadeRange(lo * d, hi * d);
 }
 
 void ScanWindow::onShadeHiChanged(double hi)
@@ -2602,10 +2647,13 @@ void ScanWindow::onShadeHiChanged(double hi)
    if (m_panelRevert)      /* 同上: 回灌那一路自己把色阶重新推给画布 */
       return;
 
+   const double d  = shadeUnitDivisor(shadeUnitMode());
+   const QString u = shadeUnitName(shadeUnitMode());
+
    double lo = m_edShadeLo->value();
    if (hi <= lo)
    {
-      const double span = m_canvas->shadeHi() - m_canvas->shadeLo();
+      const double span = (m_canvas->shadeHi() - m_canvas->shadeLo()) / d;
       lo = hi - ((span > 0.0) ? span : 1.0);
       /* 下限非负, 0 就是地板。压到 0 还不够 (hi 自己也在 0 附近) 就只好掉头把 hi 抬回去:
        * 色阶可以很窄, 但**不能反过来**, 那是一条死规矩 */
@@ -2621,11 +2669,50 @@ void ScanWindow::onShadeHiChanged(double hi)
          QSignalBlocker b(m_edShadeHi);
          m_edShadeHi->setValue(hi);
       }
-      hint(QStringLiteral("最大值低于最小值, 最小值已调整至 %1 (跨度不变, 下限 0)。")
-              .arg(QString::number(lo, 'g', 6)),
+      hint(QStringLiteral("最大值低于最小值, 最小值已调整至 %1 %2 (跨度不变, 下限 0)。")
+              .arg(QString::number(lo, 'g', 6), u),
            false);
    }
-   m_canvas->setShadeRange(lo, hi);
+   m_canvas->setShadeRange(lo * d, hi * d);
+}
+
+int ScanWindow::shadeUnitMode() const
+{
+   /* 判据跟下拉的状态走, 不另记一份模式 —— 与 refreshEditability 里 need_manual 那条同一条
+    * 规矩 (两处各记一份, 迟早有一处忘) */
+   return (m_cbShadeUnit != nullptr) ? m_cbShadeUnit->currentIndex() : SHADE_UNIT_MW;
+}
+
+/* 把当前单位落到画布与那一行只读字上。
+ * **不碰上下限**: 换单位只改写出来的数字, 原始值一个字节都不动 —— 颜色因此一点不变。
+ * 两个框的改写不在这里 (这里是**每拍**跑的): 见 onShadeUnitChanged。 */
+void ScanWindow::applyShadeUnitUi()
+{
+   if (m_cbShadeUnit == nullptr)
+      return;
+
+   const int     m   = shadeUnitMode();
+   const QString src = (m_meter != nullptr) ? m_meter->unit() : QString();
+
+   /* 画布上那句标题要的是**单位字** (shadeUnitWord), 不是下面那行说明 —— 两者在
+    * 「随取样源」那一档说的不是一回事 */
+   if (m_canvas != nullptr)
+      m_canvas->setShadeUnit(shadeUnitWord(m, src), shadeUnitDivisor(m));
+
+   if (m_lShadeUnit != nullptr)
+      m_lShadeUnit->setText(shadeUnitLabel(m, src));
+}
+
+void ScanWindow::onShadeUnitChanged()
+{
+   if (m_panelRevert)      /* 回灌那一路走 panelRevert 的尾, 那里自己重推 (同 onShadeHiChanged) */
+      return;
+
+   applyShadeUnitUi();
+   /* 同一个原始值换一个写法: 两个框里放的是显示值, 所以必须跟着重写一遍。
+    * **只有这一处与 buildShadePanel 会写它们** —— 放在上面那个每拍都跑的函数里就是每拍
+    * 白写一次正在打字的控件 */
+   syncShadeEdits();
 }
 
 /* 自动跟随开着的时候, 两个输入框是**读数**而不是输入: 值由画布按数据算, 打字进去下一拍就被
@@ -2646,18 +2733,20 @@ void ScanWindow::syncShadeAuto()
 {
    const double lo = m_canvas->shadeLo();
    const double hi = m_canvas->shadeHi();
+   /* 画布那两个是**原始值**, 框里要放**显示值** —— 除那个除数 (见 scanwindow.h 的 ★) */
+   const double d  = shadeUnitDivisor(shadeUnitMode());
 
    /* 没变就一句话都不做: 本函数由 refresh() 每拍 (30Hz) 调用, 值一样时下面那两次 setValue
-    * 是空转 */
-   if (m_edShadeLo->value() == lo && m_edShadeHi->value() == hi)
+    * 是空转。比较也要在**显示值**这一层做 —— 拿原始值比就永远不等, 每拍白写两次 */
+   if (m_edShadeLo->value() == lo / d && m_edShadeHi->value() == hi / d)
       return;
 
    /* **必须屏蔽信号**: 不屏蔽的话先设 lo 会触发 valueChanged, 而它拿的是还没更新的
     * m_edShadeHi->value() —— 色阶会被一个陈值盖一下, 下一拍才纠正回来 (看着像闪)。 */
    {
       QSignalBlocker bl(m_edShadeLo), bh(m_edShadeHi);
-      m_edShadeLo->setValue(lo);
-      m_edShadeHi->setValue(hi);
+      m_edShadeLo->setValue(lo / d);
+      m_edShadeHi->setValue(hi / d);
    }
 }
 
@@ -2690,6 +2779,10 @@ void ScanWindow::applyDefaults()
    m_cbNpnWrite ->setChecked(pd.npn_write_drive);
    m_cbDiInvert ->setChecked(pd.npn_sw_invert);
    m_cbShadeAuto->setChecked(pd.shade_auto);   /* 色标自动跟随 ("恢复默认"也回到这一档) */
+   /* 色标单位同上 (它也是个模式)。**上下限那两个数刻意不在这里** —— 回到缺省单位只该改
+    * 写出来的数字, 不该把色阶搬走 (与"换单位不改颜色"是同一条)。setCurrentIndex 变动时
+    * 会触发 onShadeUnitChanged, 画布与两个框自己跟着重写 */
+   m_cbShadeUnit->setCurrentIndex(pd.shade_unit);
 
    /* 回零速度 / 回零超时 / 两个回零偏移都刻意不在这里: 「恢复默认」会把 applyDefaults 再跑
     * 一遍, 会把为试回零特意压小的速度、特意调长的超时、或者现场量出来的偏移抬回去。
@@ -2796,6 +2889,7 @@ void ScanWindow::saveSettings()
    pf.npn_write_drive = m_cbNpnWrite->isChecked();
    pf.npn_sw_invert   = m_cbDiInvert->isChecked();
    pf.shade_auto      = m_cbShadeAuto->isChecked();
+   pf.shade_unit      = shadeUnitMode();
 
    /* 功率计那几格也跟着落盘。取样源本身**不记** —— 理由见 scanprefs.h。
     *
@@ -2935,8 +3029,10 @@ void ScanWindow::syncShadeEdits()
     * 值本身不用经信号下推 —— 走到这儿的时候画布的色阶已经是这一对了 (按数据定标定的)。 */
    {
       QSignalBlocker bl(m_edShadeLo), bh(m_edShadeHi);
-      m_edShadeLo->setValue(m_canvas->shadeLo());
-      m_edShadeHi->setValue(m_canvas->shadeHi());
+      /* 画布那份是**原始值**, 框里放的是**显示值** —— 除那个除数 (见 scanwindow.h 的 ★) */
+      const double d = shadeUnitDivisor(shadeUnitMode());
+      m_edShadeLo->setValue(m_canvas->shadeLo() / d);
+      m_edShadeHi->setValue(m_canvas->shadeHi() / d);
    }
 }
 

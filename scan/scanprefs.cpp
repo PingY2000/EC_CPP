@@ -34,6 +34,7 @@ static const char *want_dig   = "adv/want_dig_in";
 static const char *npn_wr     = "adv/npn_write_drive";
 static const char *npn_sw     = "adv/npn_sw_invert";
 static const char *shade_auto = "shade/auto_fit";
+static const char *shade_unit = "shade/unit";
 /* 功率计那两个键。键名照旧只在这里定义 —— 用它的那边是 load 整个 Prefs、改字段、再 save
  * 回去, 不自己拼键名 (拼第二遍就会有一边改名一边忘的那天) */
 static const char *mtr_int    = "meter/interval_ms";
@@ -97,6 +98,10 @@ Prefs prefsLoad(const QString &path)
 
    /* 同样显式带缺省值: ini 里没这一项时要回落到"关", 而不是当成读过 */
    p.shade_auto = s.value(QLatin1String(k::shade_auto), p.shade_auto).toBool();
+
+   /* 色标单位: 缺项时 toString() 给空串, 而 shadeUnitFromText("") 就是缺省 (mW) ——
+    * 于是"没有这一项"与"写着个认不出来的字"走同一条路, 不用另写一处缺省 */
+   p.shade_unit = shadeUnitFromText(s.value(QLatin1String(k::shade_unit)).toString());
 
    /* 功率计那两项 (「独立窗口」已经不在了, 见 scanprefs.h 上面对这两项的说明)。
     * 间隔同样显式带缺省值 —— 缺项时 toInt() 会给 0, 那是个非法间隔,
@@ -192,6 +197,9 @@ void prefsSave(const QString &path, const Prefs &p)
    s.setValue(QLatin1String(k::npn_sw),    p.npn_sw_invert);
 
    s.setValue(QLatin1String(k::shade_auto), p.shade_auto);
+   /* 存 ASCII 记号 (follow / W / mW / uW), 不存屏幕上那个字: QSettings 把非 ASCII 转义成
+    * \xXXXX, 那个键就没法手改了 (见 powermeter.h 的 shadeUnitFromText) */
+   s.setValue(QLatin1String(k::shade_unit), shadeUnitToText(p.shade_unit));
 
    s.setValue(QLatin1String(k::mtr_int),    p.meter_interval_ms);
    s.setValue(QLatin1String(k::mtr_csv),    p.meter_csv);

@@ -1667,6 +1667,43 @@ static void test_advprefs()
       check(b.shade_auto, "shade_auto=true 存得住");
    }
 
+   /* 色标单位 (2026-09-29)。它与上面那条同型 —— 是个**模式**, 所以记。它同时决定缺省那对
+    * 上下限是什么 (界面上那对是"0 … 1 个当前单位"), 但上下限本身照旧一个字节都不存。 */
+   caseBegin("advprefs: 色标单位 —— 缺省 mW、缺项回落 mW、坏值回落 mW、四个都存得住");
+   {
+      const Prefs p;
+      checkEq(p.shade_unit, SHADE_UNIT_MW, "缺省 mW (那对缺省上下限就是 0 … 1 mW)");
+
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+      checkEq(prefsLoad(ini).shade_unit, SHADE_UNIT_MW, "文件压根不存在时也走同一份缺省");
+
+      /* 老 ini: 没有 shade/unit 这一项。QSettings 给的是空串, 而空串就是缺省 —— 不做迁移,
+       * 也不该让升级前那份 ini 把 mW 读成别的 */
+      QFile f(ini);
+      check(f.open(QIODevice::WriteOnly | QIODevice::Text), "手写一份只有老键的 ini");
+      f.write("[scan]\narea_x_unit=12.5\n");
+      f.close();
+      checkEq(prefsLoad(ini).shade_unit, SHADE_UNIT_MW, "缺 shade/unit 回落到 mW (老 ini 不迁移)");
+
+      for (int m = SHADE_UNIT_FOLLOW; m <= SHADE_UNIT_UV; m++)
+      {
+         Prefs q;
+         q.shade_unit = m;
+         prefsSave(ini, q);
+         checkEq(prefsLoad(ini).shade_unit, m, "四个模式各存得住");
+      }
+
+      /* 手改成垃圾 -> 缺省, **不是 FOLLOW**: 坏值按"全新 ini 的待遇"办 */
+      {
+         QFile g(ini);
+         check(g.open(QIODevice::WriteOnly | QIODevice::Text), "手写一份 shade/unit 坏掉的 ini");
+         g.write("[shade]\nunit=abc\n");
+         g.close();
+      }
+      checkEq(prefsLoad(ini).shade_unit, SHADE_UNIT_MW, "shade/unit=abc -> 缺省 mW");
+   }
+
    caseBegin("advprefs: 被手改坏的 ini 不许直接把速度拿去用");
    {
       checkEq(ecatcmd::home_vel_from_pref(-1), HMI_HOME_VEL_DEF,
@@ -4404,6 +4441,77 @@ static void test_meter_sources()
          /* -0.0 也是 0: 探头的零点漂移可能给出负零, 那一下不该写成 "-0.0000e+00" */
          check(formatReading(-0.0) == QStringLiteral("0"), "-0.0 也写成 0",
                formatReading(-0.0).toStdString());
+      }
+
+      /* ------------------------------------------------------------ 色标那一框的单位 */
+      caseBegin("meter: 色标单位 —— ini 记号 / 除数 / 屏幕字 / 那一行只读字");
+      {
+         /* ini 那个记号 -> 模式。**认不出来一律给缺省 mW** —— 坏值按"全新 ini 的待遇"办,
+          * 而且**不给 FOLLOW**: 那会让一个手改坏的字悄悄变成另一套显示 */
+         checkEq(shadeUnitFromText(QString()), SHADE_UNIT_MW, "空串 (键不在) -> 缺省 mW");
+         checkEq(shadeUnitFromText(QStringLiteral("abc")), SHADE_UNIT_MW, "认不出来的字 -> 缺省 mW");
+         checkEq(shadeUnitFromText(QStringLiteral(" MW ")), SHADE_UNIT_MW,
+                 "两头空白与大小写都不计较");
+         checkEq(shadeUnitFromText(QStringLiteral("follow")), SHADE_UNIT_FOLLOW, "follow");
+         checkEq(shadeUnitFromText(QStringLiteral("随取样源")), SHADE_UNIT_FOLLOW,
+                 "中文那一个也认");
+         checkEq(shadeUnitFromText(QStringLiteral("W")),  SHADE_UNIT_W,  "W");
+         checkEq(shadeUnitFromText(QStringLiteral("uW")), SHADE_UNIT_UV, "uW (ASCII 记号)");
+         checkEq(shadeUnitFromText(QStringLiteral("μW")), SHADE_UNIT_UV, "μW 也认 (手写友好)");
+
+         /* 模式 -> 记号: 存进 ini 的必须是**纯 ASCII** (QSettings 会把非 ASCII 转义成 \xXXXX,
+          * 那个键就没法手改了) */
+         check(shadeUnitToText(SHADE_UNIT_FOLLOW) == QStringLiteral("follow"), "FOLLOW 的记号",
+               shadeUnitToText(SHADE_UNIT_FOLLOW).toStdString());
+         check(shadeUnitToText(SHADE_UNIT_UV) == QStringLiteral("uW"),
+               "μW 存进 ini 时写成 ASCII 的 uW", shadeUnitToText(SHADE_UNIT_UV).toStdString());
+         for (int m = SHADE_UNIT_FOLLOW; m <= SHADE_UNIT_UV; m++)
+            checkEq(shadeUnitFromText(shadeUnitToText(m)), m, "记号与模式一一往返");
+
+         /* 除数。**它 <= 0 会把刻度写成 inf**, 所以越界一律按缺省算 —— 与上面那个 default
+          * 分支是同一条, 钉住它是为了两边不会各说各话 */
+         checkNear(shadeUnitDivisor(SHADE_UNIT_FOLLOW), 1.0, "随取样源: 一个数都不除");
+         checkNear(shadeUnitDivisor(SHADE_UNIT_W), 1.0, "W: 原样");
+         checkNear(shadeUnitDivisor(SHADE_UNIT_MW), 1e-3, "mW: 除 1e-3");
+         checkNear(shadeUnitDivisor(SHADE_UNIT_UV), 1e-6, "μW: 除 1e-6");
+         checkNear(shadeUnitDivisor(-1), shadeUnitDivisor(SHADE_UNIT_MW),
+                   "越界的模式号按缺省算 (写坏成 0 会把刻度写成 inf)");
+         checkNear(shadeUnitDivisor(99), shadeUnitDivisor(SHADE_UNIT_MW), "同上, 另一头也一样");
+
+         /* 屏幕上的字 / 画布那句标题要的那个字 —— **两者不是一回事** */
+         check(shadeUnitName(SHADE_UNIT_MW) == QStringLiteral("mW"), "屏幕上写 mW",
+               shadeUnitName(SHADE_UNIT_MW).toStdString());
+         check(shadeUnitName(SHADE_UNIT_UV) == QStringLiteral("μW"),
+               "屏幕上写 μW (不是 ini 里那个 uW)", shadeUnitName(SHADE_UNIT_UV).toStdString());
+         check(shadeUnitWord(SHADE_UNIT_FOLLOW, QStringLiteral("J")) == QStringLiteral("J"),
+               "随取样源: 画布那个字就是源自己报的",
+               shadeUnitWord(SHADE_UNIT_FOLLOW, QStringLiteral("J")).toStdString());
+         check(shadeUnitWord(SHADE_UNIT_FOLLOW, QString()) == QStringLiteral("单位不明"),
+               "源没报时画布那个字照旧说「单位不明」, 不许替它挑一个",
+               shadeUnitWord(SHADE_UNIT_FOLLOW, QString()).toStdString());
+         check(shadeUnitWord(SHADE_UNIT_MW, QStringLiteral("J")) == QStringLiteral("mW"),
+               "手选时画布那个字与源无关",
+               shadeUnitWord(SHADE_UNIT_MW, QStringLiteral("J")).toStdString());
+
+         /* 只读那一行。**前两档是 2026-09-29 之前那两句, 一个字都不许变** */
+         check(shadeUnitLabel(SHADE_UNIT_FOLLOW, QStringLiteral("W"))
+                  == QStringLiteral("单位: W (随取样源)"),
+               "随取样源 + 源报了单位 (原话)",
+               shadeUnitLabel(SHADE_UNIT_FOLLOW, QStringLiteral("W")).toStdString());
+         check(shadeUnitLabel(SHADE_UNIT_FOLLOW, QString())
+                  == QStringLiteral("单位不明 (随取样源)"),
+               "随取样源 + 源没报 (原话)",
+               shadeUnitLabel(SHADE_UNIT_FOLLOW, QString()).toStdString());
+         check(shadeUnitLabel(SHADE_UNIT_MW, QStringLiteral("W")) == QStringLiteral("单位: mW"),
+               "手选 + 源报 W: 不多说一句",
+               shadeUnitLabel(SHADE_UNIT_MW, QStringLiteral("W")).toStdString());
+         check(shadeUnitLabel(SHADE_UNIT_MW, QString()) == QStringLiteral("单位: mW"),
+               "手选 + 源没报: 也不多说",
+               shadeUnitLabel(SHADE_UNIT_MW, QString()).toStdString());
+         check(shadeUnitLabel(SHADE_UNIT_MW, QStringLiteral("J"))
+                  == QStringLiteral("单位: mW (取样源报 J)"),
+               "手选的前缀与源报的不是一回事时**点名说出来**",
+               shadeUnitLabel(SHADE_UNIT_MW, QStringLiteral("J")).toStdString());
       }
    }
 }

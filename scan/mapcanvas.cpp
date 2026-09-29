@@ -164,6 +164,20 @@ void MapCanvas::setShadeRange(double lo, double hi)
    update();
 }
 
+void MapCanvas::setShadeUnit(const QString &label, double divisor)
+{
+   const double d = (divisor > 0.0) ? divisor : 1.0;
+
+   /* 值没变就不动。**这条不能省**: 它每拍都被 refreshMeterReadout 调一次 (随取样源模式下
+    * 那个单位字跟着源变), 而这里是 update() —— 不挡的话窗口每拍都要重画一次整张热力图 */
+   if (m_shade_unit_label == label && m_shade_unit_div == d)
+      return;
+
+   m_shade_unit_label = label;
+   m_shade_unit_div   = d;
+   update();
+}
+
 bool MapCanvas::dataShadeRange(double *lo, double *hi) const
 {
    if (m_ctl == nullptr || lo == nullptr || hi == nullptr)
@@ -629,11 +643,14 @@ void MapCanvas::drawMarkers(QPainter &p)
       f.setPointSizeF(8.0);
       p.setFont(f);
 
-      /* 数值: 没采到也写出来 (写"未采集") —— 空着会跟"这里根本没选中"分不清 */
+      /* 数值: 没采到也写出来 (写"未采集") —— 空着会跟"这里根本没选中"分不清。
+       * 单位与色标条上那几个数**共用同一个除数** (setShadeUnit): 同一个画布上两个数说的是
+       * 同一个量, 用两个单位就是自相矛盾 */
       const bool has = m_ctl->cellHasValue(m_sel_ix, m_sel_iy);
       p.setPen(has ? C_TEXT : C_MUTED);
       p.drawText(QRectF(q.x() - 70, q.y() - h - 18, 140, 16), Qt::AlignCenter,
-                 has ? QStringLiteral("%1").arg(m_ctl->cellValue(m_sel_ix, m_sel_iy), 0, 'g', 6)
+                 has ? QStringLiteral("%1").arg(m_ctl->cellValue(m_sel_ix, m_sel_iy)
+                                                    / m_shade_unit_div, 0, 'g', 6)
                      : QStringLiteral("未采集"));
 
       /* 索引 + 坐标: 「重测选中点」按的是**索引**, 得让人看见自己选中的是第几格 */
@@ -796,17 +813,21 @@ void MapCanvas::drawScaleBar(QPainter &p)
       t = std::max(0.0, std::min(1.0, t));
       const int y = y0 + (int)std::lround((1.0 - t) * (double)h);
 
-      /* 端点写得显眼 (它们是锁定色阶的那两个数), 中间刻度淡一档, 免得抢了数据本身 */
+      /* 端点写得显眼 (它们是锁定色阶的那两个数), 中间刻度淡一档, 免得抢了数据本身。
+       * 数字按 setShadeUnit 给的那个除数换过 —— 底下那句标题写着单位, 两者一起才对得上 */
       p.setPen(end ? C_TEXT : C_MUTED);
       if (!end)
          p.drawLine(x0 + w + 1, y, x0 + w + 4, y);
       p.drawText(QRect(x0 + w + 5, y - 7, 62, 14), Qt::AlignLeft | Qt::AlignVCenter,
-                 QStringLiteral("%1").arg(marks[i], 0, 'g', 4));
+                 QStringLiteral("%1").arg(marks[i] / m_shade_unit_div, 0, 'g', 4));
    }
 
+   /* 单位字必须有: 上面那几个数是换过的 ("功率"两个字里没有单位, 而数已经除过了)。
+    * 宽度给到 88 —— 原来那 70 只够 "功率 (锁定)" 四个字加括号, 现在多了一个单位词。
+    * 再宽就越出右边那条留白 (kPadR) 被窗口切掉了。 */
    p.setPen(C_MUTED);
-   p.drawText(QRect(x0 - 20, y0 + h + 6, 70, 14), Qt::AlignLeft | Qt::AlignTop,
-              QStringLiteral("功率 (锁定)"));
+   p.drawText(QRect(x0 - 20, y0 + h + 6, 88, 14), Qt::AlignLeft | Qt::AlignTop,
+              QStringLiteral("功率 (%1, 锁定)").arg(m_shade_unit_label));
 }
 
 void MapCanvas::drawHud(QPainter &p)

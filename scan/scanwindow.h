@@ -258,6 +258,11 @@ private:
    void syncShadeEdits();
    void syncShadeAuto();                   /* 自动跟随: 画布的色阶 -> 两个输入框 (屏蔽信号) */
    void applyShadeAutoUi(bool on);         /* 自动跟随开着时两个框是"显示"不是"输入" */
+   /* 色标数字的单位 (SHADE_UNIT_*)。它**只改显示**: 原始上下限与颜色一个字都不动,
+    * 见 scanwindow.h 里色标那一段的 ★ */
+   int  shadeUnitMode() const;
+   void applyShadeUnitUi();                /* 把当前单位推到画布与那一行只读字上 */
+   void onShadeUnitChanged();
    /* 「最小」「最大」是一对: 改一个顶到另一个头上时把另一个推过去 (跨度保留), 见实现 */
    void onShadeLoChanged(double lo);
    void onShadeHiChanged(double hi);
@@ -383,14 +388,22 @@ private:
    QLabel      *m_lTime     = nullptr;
 
    /* ---- 色标 ----
-    * 这一框在可用性表里 (PI_SHADE): 里面有一个要记进 scan.ini 的模式 (「自动跟随」, 上下限
-    * 那两个数不记) 和一个只在手动定标时才该按的按钮 (「按数据定标」), 那两条判据得有个住处。
+    * 这一框在可用性表里 (PI_SHADE): 里面有两个要记进 scan.ini 的模式 (「自动跟随」与「单位」,
+    * 上下限那两个数不记) 和一个只在手动定标时才该按的按钮 (「按数据定标」), 那几条判据得有
+    * 个住处。
     *
     * 两个数是一对, 得一起保证 min < max, 规则是**推着走**: 改一个顶到另一个头上, 就把另一个
-    * 一起推过去并保留原来的跨度 (见 onShadeLoChanged / onShadeHiChanged)。 */
+    * 一起推过去并保留原来的跨度 (见 onShadeLoChanged / onShadeHiChanged)。
+    *
+    * ★ **那两个数在屏幕上是什么单位, 由「单位」那一项定** (2026-09-29): 控件里放的是**显示
+    *   值** (原始值 / shadeUnitDivisor), 画布里面那份是**原始值**。两边的换算只在下面这五处
+    *   做 (onShadeLo/HiChanged「×d」、syncShadeEdits「/d」、syncShadeAuto「/d」、
+    *   panelRevert 尾那一句「×d」、buildShadePanel 初值「/d」), **漏一处就是静默错一位数**。 */
    QDoubleSpinBox *m_edShadeLo   = nullptr;
    QDoubleSpinBox *m_edShadeHi   = nullptr;
-   /* 色标那两个数是什么单位 —— 跟着取样源走, 每拍由 refreshMeterReadout() 写 */
+   /* 「单位」四项 (随取样源 / W / mW / μW) —— **下标就是 SHADE_UNIT_***, 顺序不许动 */
+   QComboBox      *m_cbShadeUnit = nullptr;
+   /* 实际生效的是哪个单位 (只读)。随取样源模式下它跟着源每拍变, 由 refreshMeterReadout() 写 */
    QLabel         *m_lShadeUnit  = nullptr;
    QPushButton    *m_btnFit      = nullptr;
    QCheckBox      *m_cbShadeAuto = nullptr;

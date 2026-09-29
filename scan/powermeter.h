@@ -175,6 +175,43 @@ QString scaleFor(double max_abs, const QString &unit, double *divisor);
  * 单位空时数值**原样**格式化 (不乘不除) */
 QString powerText(double v, const QString &unit);
 
+/* ---- 色标那一框与色标条上的数字用哪个单位 (2026-09-29) ----
+ *
+ * 它**不是**上面那套自适应前缀: 那是"按数的大小自动挑一个", 这是一个**手选**的固定前缀。
+ * 两者共用 mW / μW 这两个字, 但各管各的 —— 大字读数 / 统计 / 曲线走 scalePower, 色标走这一套。
+ *
+ * FOLLOW 就是 2026-09-29 之前那条行为 (跟着取样源自己报的单位走); 留着它是因为源报 J /
+ * dBm / 判不出来时, 它是唯一一个不说谎的选项。其余三个是写死的前缀。
+ *
+ * **除数为准**: 屏幕上的数 = 原始值 / shadeUnitDivisor(mode)。原始值 (画布里面那份上下限、
+ * 颜色映射) 一个字节都不动 —— 换单位只改写出来的数字, 绝不改颜色。 */
+enum
+{
+   SHADE_UNIT_FOLLOW = 0,   /* 随取样源 */
+   SHADE_UNIT_W,
+   SHADE_UNIT_MW,           /* 缺省 (见 scanprefs.h 的 Prefs::shade_unit) */
+   SHADE_UNIT_UV
+};
+
+/* ini 里那个记号 <-> 模式。记号是**纯 ASCII** 的 "follow" / "W" / "mW" / "uW" (也认 "μW"),
+ * 而屏幕上的字走 shadeUnitName (μW 那一个在 ini 里写成 uW: QSettings 会把非 ASCII 转义成
+ * \xXXXX, 手改起来就没法看了)。
+ * **认不出来 (含空串) 一律给缺省的 mW** —— 手改坏了的 ini 与全新 ini 走同一条路。 */
+int     shadeUnitFromText(const QString &s);
+QString shadeUnitToText(int mode);
+QString shadeUnitName(int mode);        /* 屏幕上写着的那几个字 */
+
+/* 除数: FOLLOW / W -> 1, mW -> 1e-3, μW -> 1e-6。模式越界一律按缺省 (mW) 算 */
+double shadeUnitDivisor(int mode);
+
+/* 色标那一框下面那行只读字 ("单位: mW" / "单位: W (随取样源)" …), 四档见 .cpp */
+QString shadeUnitLabel(int mode, const QString &source_unit);
+
+/* 写在**色标条底下那句标题**里的那个单位字, 只有字 ("mW" / "J" / "单位不明") ——
+ * 它与上面那句不是一回事: 那边是"这一项选的是什么" (要交代随取样源), 这边是"这几个数
+ * 是按哪个字写出来的"。FOLLOW 时取的就是取样源自己报的那个字 */
+QString shadeUnitWord(int mode, const QString &source_unit);
+
 /* 一个数的显示格式 (量级从 nW 到 W 那一带, 不固定小数位):
  *   **v == 0 -> "0"**;  |v| >= 1e-3 -> 'g' 6 位有效数字;  更小 -> 'e' 4 位有效数字。
  * 零单独写掉: 它**没有量级**, 写 "0" 而不是 "0.0000e+00" —— 挡住光的时候屏幕上正是一片 0,

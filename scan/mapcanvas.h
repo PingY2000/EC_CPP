@@ -53,6 +53,13 @@ public:
    void setShadeRange(double lo, double hi);
    double shadeLo() const { return m_shade_lo; }
    double shadeHi() const { return m_shade_hi; }
+
+   /* 色标数字用哪个单位 (2026-09-29)。**只管显示**: 刻度上那几个数 / 底下那句标题 /
+    * 选中格那个数。颜色映射与 `m_shade_lo`、`m_shade_hi` 那两个原始值**一点都不碰** ——
+    * 换单位绝不改颜色, 只改把这些数写出来的方式。
+    * `divisor` 是**除数** (屏幕上的数 = 原始值 / divisor), 与 powermeter.h 那几句同一个约定;
+    * 它 <= 0 时一律按 1 算 (写坏了不该把刻度写成 inf)。 */
+   void setShadeUnit(const QString &label, double divisor);
    /* 按当前已采数据的最小/最大定标。**只在人按了按钮时调** */
    bool fitShadeToData();
 
@@ -125,6 +132,11 @@ private:
    double m_shade_lo = 0.0;
    double m_shade_hi = 1.0;
    bool   m_auto     = false;
+
+   /* 色标数字的单位 (见 setShadeUnit)。缺省 "W" 与除数 1 就是"照原始值写", 也是 2026-09-29
+    * 之前的那种写法; 窗口建色标那一框时立刻会把它换成 scan.ini 里选定的那一档 */
+   QString m_shade_unit_label = QStringLiteral("W");
+   double  m_shade_unit_div   = 1.0;
 
    int m_sel_ix = -1;
    int m_sel_iy = -1;
