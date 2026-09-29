@@ -45,6 +45,9 @@ class MeterCurve;
 /* 滚轮闸, 定义在 .cpp 里 */
 class WheelNeedsCtrl;
 
+/* spin box 上下箭头那道闸 (windows11 样式下输入框会盖住箭头), 定义在 .cpp 里 */
+class SpinArrowGate;
+
 class ScanWindow : public QMainWindow
 {
    Q_OBJECT
@@ -540,6 +543,9 @@ private:
    /* 滚轮闸 (类体在 .cpp 里): 挂在参数输入框及其子控件上的事件过滤器。
     * 用具体类而非 QObject*, 因为装闸时要调它的 guard() */
    WheelNeedsCtrl *m_wheelGuard = nullptr;
+
+   /* 上下箭头闸 (类体在 .cpp 里): 同上, 挂在每个 spin box 内部那个输入框上 */
+   SpinArrowGate  *m_spinArrows = nullptr;
 
    /* 上次用的网卡 (从 scan.ini 读回, 可能已不在机器上)。适配器清单异步到, 故先存着等 adaptersListed */
    QString        m_savedNic;

@@ -41,6 +41,8 @@
 #include <QSplitter>
 #include <QStringList>
 #include <QStatusBar>
+#include <QStyle>
+#include <QStyleOptionSpinBox>
 #include <QThread>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -977,6 +979,81 @@ private:
    QSet<QWidget *> m_guards;
 };
 
+/* ---------------------------------------------------------------- 上下箭头那道闸 */
+
+/* **windows11 样式 + 参数栏那份样式表**下, 每个 QSpinBox 内部那个 QLineEdit 都比样式给上下
+ * 按钮留的位置**宽 16 px**, 于是它把两个箭头盖住 —— 点箭头的那一击落在输入框上, 值一动不动。
+ * (2026-09-29 用一个探针在真窗口上量的: 一个 151x29 的框, 箭头画在 x=107…127, 输入框铺到
+ *  x=122; 往箭头中心真发一次按下+抬起, 值一动不动 (110 → 110)。全窗口每个 spin box 都是这样。)
+ *
+ * 成因是两套算法打架: 按钮的位置由 QStyleSheetStyle 摆 (它认样式表里那些 padding), 而输入框
+ * 那一格由 QWindows11Style 那套算。**与 QSpinBox 上挂了哪条规则无关** —— 只留一条
+ * `padding: 0` 也照样盖住 (试过), 所以改 qss 修不了; 唯一的 qss 修法是给每个框加
+ * `padding-right: 22px`, 那会把 151 撑成 167 (六个框一起变宽)。
+ *
+ * 这里在输入框每次被重排之后把它裁到箭头左边 —— **只动宽度**, 别的一个字节不动。
+ * 样式自己留够了位置时 (不挂样式表, 或换成 Fusion / windowsvista) 这一步是空操作。 */
+class SpinArrowGate : public QObject
+{
+public:
+   explicit SpinArrowGate(QObject *parent = nullptr) : QObject(parent) {}
+
+   /* 事件落在**输入框**上, 所以闸挂在它那儿: 父类摆完输入框才轮到我们 */
+   void guard(QAbstractSpinBox *s)
+   {
+      if (s == nullptr)
+         return;
+
+      if (QLineEdit *le = s->findChild<QLineEdit *>())
+      {
+         le->installEventFilter(this);
+         /* 装的时候先来一次。这一次多半是空操作 (版面还没跑起来, 两个矩形都是空的),
+          * 真正那一次在 show 之后 —— 那时 spin box 会先重排, 输入框的 Resize 就来了 */
+         clip(le);
+      }
+   }
+
+protected:
+   bool eventFilter(QObject *obj, QEvent *e) override
+   {
+      if (e->type() != QEvent::Resize)
+         return false;
+
+      clip(qobject_cast<QLineEdit *>(obj));
+      return false;
+   }
+
+private:
+   static void clip(QLineEdit *le)
+   {
+      if (le == nullptr)
+         return;
+
+      auto *s = qobject_cast<QAbstractSpinBox *>(le->parentWidget());
+      if (s == nullptr || s->buttonSymbols() == QAbstractSpinBox::NoButtons)
+         return;                   /* 没有按钮就无所谓盖不盖 (色标那两个只读时是 NoButtons) */
+
+      QStyleOptionSpinBox o;
+      o.initFrom(s);
+      o.buttonSymbols = s->buttonSymbols();
+      o.stepEnabled  = QAbstractSpinBox::StepUpEnabled | QAbstractSpinBox::StepDownEnabled;
+      o.frame        = true;
+      /* 判据用**画出来的那个矩形**, 不是"我以为按钮有多宽" —— 换样式、换字号都跟着走 */
+      const QRect up = s->style()->subControlRect(QStyle::CC_SpinBox, &o, QStyle::SC_SpinBoxUp, s);
+      if (up.isEmpty())
+         return;
+
+      QRect g = le->geometry();   /* 输入框的父就是 spin box, 两个矩形同一个坐标系 */
+      if (g.right() < up.left())
+         return;
+
+      /* **上面那一句就是递归的出口**: setGeometry 会再来一个 Resize, 那一趟已经不重叠了,
+       * 于是最多进两层。输入框不在任何布局里 (spin box 自己摆它), 所以这一改不会牵动版面 */
+      g.setRight(up.left() - 1);
+      le->setGeometry(g);
+   }
+};
+
 /* 网卡名 (\Device\NPF_{GUID}) 太长, 横幅里只说得出那截 GUID —— 那是唯一有信息量的部分 */
 static QString nicShort(const QString &n)
 {
@@ -1281,6 +1358,12 @@ void ScanWindow::buildUi()
       m_wheelGuard->guard(x);
    for (QComboBox *x : findChildren<QComboBox *>())
       m_wheelGuard->guard(x);
+
+   /* 上下箭头闸: 同上, 名单也是找出来的 —— 挂了样式表之后 windows11 样式会把输入框摆得比箭头
+    * 还宽 (类体那儿有实测数), 每一框都得过一遍, 漏一个就是那个框的箭头点不动 */
+   m_spinArrows = new SpinArrowGate(this);
+   for (QAbstractSpinBox *x : findChildren<QAbstractSpinBox *>())
+      m_spinArrows->guard(x);
 
    /* 参数栏一滚, 把滚动区里那个焦点清掉: 焦点留在一个已经滚出视线的框上时, 上下箭头与打字
     * 会改到一个看不见的框 —— 滚轮那条闸管不到键盘。只清滚动区里面那个 (顶栏那张网卡表
@@ -2143,17 +2226,25 @@ QWidget *ScanWindow::buildParamPanel()
    connect(m_cbDir,  &QComboBox::currentIndexChanged, this, &ScanWindow::pushParams);
    connect(m_cbMode, &QComboBox::currentIndexChanged, this, &ScanWindow::pushParams);
 
-   /* 可用性表。
-    * lock_running = true 的都是"这一趟怎么走 / 往哪写": 跑到一半改掉, 落进 CSV 的 (ix,iy)
-    * 就跟滑台实际站的地方对不上了 —— 那张表是按扫描开始时定的几何算出来的 */
+   /* 可用性表。锁住的有两族, 判据是同一句话: **亮着就得真的有用**。
+    *
+    * 1) 这一趟怎么走 / 往哪写: 跑到一半改掉, 落进 CSV 的 (ix,iy) 就跟滑台实际站的地方对不上
+    *    了 —— 那张表是按扫描开始时定的几何算出来的。
+    * 2) 运行中改了**不生效**的那两项: 扫描速度一轮只在下发那一刻设一次 (scancontroller.cpp
+    *    的 armRun 里那句"速度只在这里设一次"), 手动速度在扫描中根本不往外推
+    *    (pushManualSpeed 一进门就 return) —— 留着能改就是让人白改 (2026-09-29 用户报的
+    *    「正在扫描时依然有一部分扫描参数是亮的」)。
+    *
+    * 剩下的「单点停留 / 稳定窗口 / 每点采样」**不锁**: 控制器每个点读一次, 改完从下一个点起
+    * 算数 —— 那才是真的改得动。 */
    addPanel(PI_PARAM, box,
             QList<GateItem>{
                GateItem{ m_edAreaX,    true,  false },   /* 区域 X */
                GateItem{ m_edAreaY,    true,  false },   /* 区域 Y */
                GateItem{ m_edRes,      true,  false },   /* 分辨率 */
                GateItem{ m_edPpu,      true,  false },   /* 1 mm = N 脉冲 */
-               GateItem{ m_edSpeed,    false, false },   /* 扫描速度: 下一次 start 才下发 */
-               GateItem{ m_edManSpeed, false, false },   /* 手动速度: 手工对位用, 与这趟无关 */
+               GateItem{ m_edSpeed,    true,  false },   /* 扫描速度: 一轮只设一次 */
+               GateItem{ m_edManSpeed, true,  false },   /* 手动速度: 扫描中推不出去 */
                GateItem{ m_edDwell,    false, false },
                GateItem{ m_edSettle,   false, false },
                GateItem{ m_edSamples,  false, false },
@@ -2797,6 +2888,14 @@ void ScanWindow::applyShadeAutoUi(bool on)
 {
    m_edShadeLo->setReadOnly(on);
    m_edShadeHi->setReadOnly(on);
+   /* 只读的框**不再画上下箭头**: 箭头画着、点上没反应, 与"亮着却没用"是同一条骗人
+    * (2026-09-29 用户报的「上下按钮都没有用」里就有这两个)。只读就是读数, 读数该长成读数的
+    * 样子 —— 下面那句「开启时上方两个数为只读显示」才是实话。
+    * 关掉自动跟随时两个框又变回输入框, 箭头跟着回来 (那一趟会重排, 闸会再裁一次) */
+   const QAbstractSpinBox::ButtonSymbols bs =
+      on ? QAbstractSpinBox::NoButtons : QAbstractSpinBox::UpDownArrows;
+   m_edShadeLo->setButtonSymbols(bs);
+   m_edShadeHi->setButtonSymbols(bs);
    m_lblLocked->setVisible(!on);
    m_lblAuto->setVisible(on);
 
