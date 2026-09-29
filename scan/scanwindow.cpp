@@ -2526,9 +2526,20 @@ QWidget *ScanWindow::buildMeterPanel()
    sep->setFrameShadow(QFrame::Sunken);
    v->addWidget(sep);
 
-   /* 「间隔」/ 记录那一个按钮 / 「清空」**同一行** (§37.5 那次是两行: 间隔一行, 三个按钮一行;
-    * §37.10 开始与停止并成一个按钮之后, 这一行是 2 字标签 + 一个旋钮 + 4 字按钮 + 2 字按钮,
-    * 340 px 栏宽放得下 —— 落地时在屏幕上确认 (见 §37.7 第 19 条)) */
+   /* 「间隔」/「曲线时长」/「清空」**同一行** (2026-09-29 用户原话: "把功率计的曲线时长放到间隔
+    * 右边 清空按钮靠右放")。在这之前是两行: 「间隔」与「清空」一行 (§37.5 那次是间隔一行、三个
+    * 按钮一行; §37.10 开始与停止并成一个按钮之后这一行只剩这两件), 「曲线时长」自占一行、摆在
+    * 图表正下方。
+    *
+    * **这一行是挤的, 量过 (2026-09-29)**: 两个旋钮各要 131 / 117 px (它们的 sizePolicy 是
+    * `Minimum`, 布局按 sizeHint 给底 151 / 142, 而这两个数得装得下 `60000 ms` 与 `120 min`),
+    * 加两个标签与「清空」, 这一行最小要 439 px, 而这一框只有 374 px 可用 (栏宽 400 px 减去竖
+    * 滚动条与框的 9 px 内边距)。落地后两个旋钮各约 105 px: 间隔值到五位数 (`60000 ms`) 时末尾
+    * 那截会被截掉, 时长那一档 (`120 min`) 装得下。
+    * **这是逐项量过之后选的**: 保留上下箭头、接受挤, 不为了宽度去动控件。另两个做法量过但没取
+    * —— 把这两个旋钮的上下箭头去掉 (这一行只剩 282 px, 拖到最窄也不挤), 或给它们
+    * `setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed)` 把布局的底从 sizeHint 落到
+    * minimumSizeHint 上 (这一行 394 px)。 */
    QHBoxLayout *recRow = new QHBoxLayout;
    recRow->setSpacing(6);
    recRow->addWidget(new QLabel(QStringLiteral("间隔"), box));
@@ -2542,6 +2553,24 @@ QWidget *ScanWindow::buildMeterPanel()
       "实际间隔 = 本值 + 单次往返耗时; 同一时刻只允许一个未完成请求。"));
    connect(m_edMtrInterval, &QSpinBox::valueChanged, this, &ScanWindow::onMtrIntervalChanged);
    recRow->addWidget(m_edMtrInterval, 1);
+
+   /* ---- 曲线与统计看多长的一段 (2026-09-29) ----
+    * 2026-09-29 从图表正下方移到「间隔」右边 (用户原话: "把功率计的曲线时长放到间隔右边")。
+    * 量程 1…120 分钟, 缺省 5 —— 上界不再往上开: 缺省间隔下 120 分钟已经超过缓冲能装下的那一段
+    * (见 MeterLog::kCapacity 的注释), 多给一档"不限"也只是同一个结果, 却多一个要解释的状态。
+    *
+    * 单位写 `min` 而不是「分」: 仓库既有的时长写法就是这一套 (`200 ms` / `2 h 5 min`, 见 fmtDur),
+    * 与 `pul/s` / `nm` 同一个"英文符号 + 一个空格"的规矩 */
+   recRow->addWidget(new QLabel(QStringLiteral("曲线时长"), box));
+
+   m_sbMtrWindow = new QSpinBox(box);
+   m_sbMtrWindow->setRange(MeterLog::kMinWindowMinutes, MeterLog::kMaxWindowMinutes);
+   m_sbMtrWindow->setValue(MeterLog::kDefaultWindowMinutes);
+   m_sbMtrWindow->setSuffix(QStringLiteral(" min"));
+   m_sbMtrWindow->setToolTip(QStringLiteral(
+      "曲线与统计只保留最近这段时间; 更旧的从内存里丢掉。"));
+   connect(m_sbMtrWindow, &QSpinBox::valueChanged, this, &ScanWindow::onMtrWindowChanged);
+   recRow->addWidget(m_sbMtrWindow, 1);
 
    /* **开与关共用这一个按钮** (2026-09-28 用户原话: "开始记录和停止记录共用一个按钮"):
     * 字随状态换 (没写文件 = 「开始记录」, 写着了 = 「停止记录」), 于是"按下去会发生什么"永远
@@ -2561,9 +2590,11 @@ QWidget *ScanWindow::buildMeterPanel()
     * "看数": 曲线 / 统计 / 大字读数 / 间隔 / 清空。
     * 要恢复: 删掉这一句与下面 csvBox 的那一句 setVisible(false), 别处一行不用改。 */
    m_btnMtrRec->setVisible(false);
+   /* 伸展项摆在这里、「清空」排在它**后面** —— 这一行的空当就全落在左边, 按钮贴到最右端
+    * (2026-09-29 用户原话: "清空按钮靠右放")。在这之前伸展项在按钮**之后**, 于是按钮紧跟着
+    * 旋钮, 右侧反而留一大块空当。 */
+   recRow->addStretch(1);
 
-   /* 「清空」跟在记录那一个按钮后面 (原来它与「停止记录」同一行; 那两个并成一个之后,
-    * 这一行就是"记录与清空"这一组三件 —— 现在记录那一件藏了, 这一行是「间隔」+「清空」) */
    m_btnMtrClear = new QPushButton(QStringLiteral("清空"), box);
    /* 后半句 ("已写入 CSV 的数据不变") 是给一个**已经藏起来的入口**作注解 —— 屏幕上再没有
     * "会不会把文件也清了"这个顾虑, 一句说不清任何事的说明不写 (§37 那次删「未写入文件」
@@ -2571,7 +2602,6 @@ QWidget *ScanWindow::buildMeterPanel()
    m_btnMtrClear->setToolTip(QStringLiteral("仅清除曲线与统计。"));
    connect(m_btnMtrClear, &QPushButton::clicked, this, &ScanWindow::onMtrClearClicked);
    recRow->addWidget(m_btnMtrClear);
-   recRow->addStretch(1);
 
    v->addLayout(recRow);
 
@@ -2602,29 +2632,6 @@ QWidget *ScanWindow::buildMeterPanel()
    m_curve->setLog(m_mlog);
    m_curve->setPlaceholder(QStringLiteral("等待第一个读数…"));
    v->addWidget(m_curve);
-
-   /* ---- 曲线与统计看多长的一段 (2026-09-29) ----
-    * 摆在原来 CSV 那一行的位置上 (图表的正下方)。量程 1…120 分钟, 缺省 5 —— 上界不再往
-    * 上开: 缺省间隔下 120 分钟已经超过缓冲能装下的那一段 (见 MeterLog::kCapacity 的注释),
-    * 多给一档"不限"也只是同一个结果, 却多一个要解释的状态。
-    *
-    * 单位写 `min` 而不是「分」: 仓库既有的时长写法就是这一套 (`200 ms` / `2 h 5 min`,
-    * 见 fmtDur), 与 `pul/s` / `nm` 同一个"英文符号 + 一个空格"的规矩 */
-   QHBoxLayout *winRow = new QHBoxLayout;
-   winRow->setSpacing(6);
-   winRow->addWidget(new QLabel(QStringLiteral("曲线时长"), box));
-
-   m_sbMtrWindow = new QSpinBox(box);
-   m_sbMtrWindow->setRange(MeterLog::kMinWindowMinutes, MeterLog::kMaxWindowMinutes);
-   m_sbMtrWindow->setValue(MeterLog::kDefaultWindowMinutes);
-   m_sbMtrWindow->setSuffix(QStringLiteral(" min"));
-   m_sbMtrWindow->setToolTip(QStringLiteral(
-      "曲线与统计只保留最近这段时间; 更旧的从内存里丢掉。"));
-   connect(m_sbMtrWindow, &QSpinBox::valueChanged, this, &ScanWindow::onMtrWindowChanged);
-   winRow->addWidget(m_sbMtrWindow, 1);
-   winRow->addStretch(1);
-
-   v->addLayout(winRow);
 
    /* 输出文件那一行。与扫描那份 CSV 同一个目录 (scan_out), 一眼能看出是同一条产线的东西。
     *
