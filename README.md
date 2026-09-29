@@ -137,6 +137,12 @@ PATH="/c/msys64/ucrt64/bin:$PATH" ./bin/scan_selftest.exe
 # ... 2486 passed, 0 failed, 0 skipped
 ```
 
+> **那个数会在 2480 与 2486 之间摆** —— 它取决于**此刻插没插 Ophir 表头**。表头在的时候多跑
+> 一组 6 条 (`ophir: live reading through OphirMeter`, 那一组**必须真表头**才能跑: 没有设备时
+> 第二趟 `open()` 直接失败, 走不到那条路上), 表头不在就少 6 条 —— 而那 6 条**不算 skipped**,
+> 只是压根不跑。跑完看一眼输出里有没有那行 `a head is attached`。
+> **不插表头也照样 0 failed**, 少的只是那 6 条。
+
 它只链 `Qt6Core`, 所以上面那条 `windeployqt6` (照 `bin/hmi.exe` 跑) 搬来的 DLL 就够它用了。
 
 > **`scan` 运行时在 exe 旁边放两个文件, 两个都不入库** (`.gitignore` 里各占一条):

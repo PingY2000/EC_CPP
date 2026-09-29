@@ -6273,6 +6273,10 @@ gen 贴着 `INT32_MAX` 时那一次 `++` 是 **UB**, 溢出成负数之后"只�
 
 - 三个目标全量重建, **0 warning 0 error**;
 - `scan_selftest` **2486 passed / 0 failed / 0 skipped**(这一轮之前 2446, 净增 40);
+  > **那个绝对数会在 2480 与 2486 之间摆**: 插着 Ophir 表头时多跑一组 6 条
+  > (`ophir: live reading through OphirMeter`, 那一组必须真表头), 不在就少 6 条, 而那 6 条
+  > **不算 skipped** —— 只是不跑。**净增那 40 条与表头无关**, 两种情形下都成立。
+  > 这一节里那两个数都是在**表头插着**的那一次测的。
 - 改动的源文件都是 CRLF: `git diff --stat` 与 `git diff --ignore-cr-at-eol --stat` 逐字相同。
 
 新增的断言(全部只在 `powermeter.cpp` 那几个纯函数与 `scanprefs` 的 ini 往返上 ——
