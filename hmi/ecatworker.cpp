@@ -196,6 +196,38 @@ void EcatThread::postSpanWidth(unsigned mask, uint32_t vel_fast, int tmo_s, cons
  * 开关时行为逐字节不变。理由全在头文件里。 */
 void EcatThread::setKeepOrigin(bool on) { m_keep_origin = on; }
 
+/* ★ **必须在 start() 之前调** —— 它写的是"只有工作线程碰"的那几个成员 (m_origin[] /
+ * m_origin_kept / m_origin_naxis / m_origin_gen), 而 start() 是唯一的同步点, 所以这里不用锁。
+ * 完整理由与"为什么不在这里加判据"见头文件。只有 scan/ 调它。 */
+void EcatThread::setRememberedOrigin(const int32_t *origin, int naxis, int epoch)
+{
+   if (origin == nullptr || !ecatcmd::origin_naxis_usable(naxis))
+      return;
+
+   for (int i = 0; i < EM_MAX_AXES; i++)
+      m_origin[i] = (i < naxis) ? origin[i] : 0;
+
+   m_origin_kept      = true;
+   m_origin_naxis     = naxis;
+   m_origin_from_disk = true;
+
+   /* ★ **世代无条件种上, 与上面那份零点是否可用无关** —— 它是个计数器, 不是那份值的属性。
+    * 少了这一行就有一条静默的坏路: 盘上的世代是 3 而线程的 gen 从 0 起, 于是"盘上那份没
+    * 沿用上、重取了一个新零点"只让 gen 变成 1, 界面那侧 origin_epoch_sync(3, 1) 仍然得 3 ——
+    * 新零点顶着旧世代 3, 同一份 CSV 里那个 zero_epoch=3 于是对得上, **续扫不弹任何横幅**,
+    * 两份不同坐标系的点就这么拼在一张图上。种上之后重取就是 4 > 3, 该拦的拦得住。 */
+   m_origin_gen = ecatcmd::origin_epoch_from_pref(epoch);
+
+   /* 只进控制台, 不进状态栏 —— 连接那一次要说的事实已经有好几行 (每根轴一条),
+    * 状态栏只留得下一句结论 (那是 tryInitOrigin 那句"从 scan.ini 恢复")。 */
+   QString disp;
+   for (int i = 0; i < naxis; i++)
+      disp += (i ? QStringLiteral(", ") : QString()) + QString::number(origin[i]);
+   consoleNote(QStringLiteral("零点: 从 scan.ini 取回 %1 根轴 (%2), 世代 %3。"
+                              "连接时按量程核对, 过不了就重取。")
+                  .arg(naxis).arg(disp).arg(m_origin_gen));
+}
+
 /* 「停止」在回零期间走这一个 —— **全程序唯一一处 GUI 线程直呼 motor_api**。
  * 安全: em_request_stop() 只往一个 `static volatile sig_atomic_t` 里存 1, 不碰总线/网卡。
  *
@@ -2052,10 +2084,13 @@ void EcatThread::finishHoming()
             m_home_off[axis].eff = 0;
          /* 零点搬了 —— 世代 +1。**无条件**: 这一步在上面那几条失败路上也跑 (超时/bit3/bit13
           * 都是举着 bit4 返回的), 而无论成败, m_origin[] 确实换了一个值。
-          * 同时把"这份零点归本次运行所有"重新盖一次章: 回零之后任何时候断开重连, 沿用的都是它。 */
+          * 同时把"这一份才是最新的"重新盖一次章: 回零之后任何时候断开重连, 沿用的都是它,
+          * 而 scan 关窗时也是它被写回 scan.ini (界面只从电文里读, 不看零点从哪来)。 */
          m_origin_gen++;
          m_origin_kept  = true;
          m_origin_naxis = m_naxis;
+         /* 这一份是本次运行里回零得来的, 跟 scan.ini 那份没关系了 (见 m_origin_from_disk) */
+         m_origin_from_disk = false;
 
          /* ---- 4b. 读一次 6061h: 手册 §3.7 把「6061h 读回 6」当作 HM 的前提。
           * 收尾之后应当是 8 (CSP), 不是 8 就得在结论句里喊出来; 读失败 (-1) 也照实写。 */
@@ -2493,6 +2528,8 @@ void EcatThread::doZero(int axis)
    m_origin_gen++;
    m_origin_kept  = true;
    m_origin_naxis = m_naxis;
+   /* 同 finishHoming 那一行: 这一份是本次运行里设出来的, 不再是 scan.ini 那份 */
+   m_origin_from_disk = false;
 
    note(QStringLiteral("轴%1: 当前位置已设为 0 点, 物理目标未改变。").arg(axis));
 }
@@ -2594,8 +2631,20 @@ void EcatThread::tryInitOrigin()
       QString disp;
       for (int i = 0; i < m_naxis; i++)
          disp += (i ? QStringLiteral(", ") : QString()) + QString::number(d[i]);
-      note(QStringLiteral("沿用上次零点 (本次连接未重设, 界面中心仍对应上次那个物理位置)。"
-                          "滑台当前显示在 (%1) pul。").arg(disp));
+
+      /* 这一份是从 scan.ini 种进来的, 还是本次运行里沿用下来的 —— 两句要说的事不一样:
+       * 后者只要说"本次连接未重设", 前者还得交代它**跨过了程序重启**。
+       * ★ 只报一次: 取出来就清掉。报过之后它与内存里那份再没有区别, 再说"来自 scan.ini"
+       *   已经不准 (那句提示是操作员唯一的告知, 说不准等于没有)。
+       * 两句都**不长于**改造前那一句 (横幅那条带子按一行定高度, 折成两行会压住 HUD 第一行)。 */
+      const bool from_disk = m_origin_from_disk;
+      m_origin_from_disk = false;
+
+      note(from_disk
+              ? QStringLiteral("零点从 scan.ini 恢复 (程序重启未重设)。"
+                               "滑台当前显示在 (%1) pul。").arg(disp)
+              : QStringLiteral("沿用上次零点 (本次连接未重设, 界面中心仍对应上次那个物理位置)。"
+                               "滑台当前显示在 (%1) pul。").arg(disp));
       return;
    }
 
@@ -2614,6 +2663,9 @@ void EcatThread::tryInitOrigin()
    m_origin_kept  = true;
    m_origin_naxis = m_naxis;
    m_origin_gen++;          /* 零点真搬了 */
+   /* ★ 这一行不能漏: 种进来的那份**没沿用上**、这里是重取的 —— 之后断开重连会走沿用支,
+    * 而那份零点已经不是 scan.ini 里那份了, 屏幕上说"从 scan.ini 恢复"就是一句假话。 */
+   m_origin_from_disk = false;
 
    /* 重取这一支有两个成因, 文案必须分开 —— 它们说的是两件事:
     *   (a) 以前就没定过零点(或这不是 scan): 常规, 说清"界面正中 = 现在这里"就够了;
@@ -2732,6 +2784,12 @@ void EcatThread::publish(int wkc)
    /* 零点世代。从成员拷而不是从电文里攒: teardown() 会把 m_telem 清成默认值, 而这里是
     * 每圈重算的 —— 断开之后这个值仍然新鲜, 界面也就不会漏发下一代。 */
    t.origin_gen   = m_origin_gen;
+   /* 那份零点本身 (逐轴值 + 几根轴), 与 origin_gen **同一个来源、同一个理由**: 从成员拷,
+    * 不在电文里攒。界面拿它落盘 (scanwindow.cpp 的 saveSettings)。m_origin_kept 是那道闸:
+    * 没有一份可用的记录时发 0, 而不是发一串看着像坐标的 0。 */
+   t.origin_naxis = m_origin_kept ? m_origin_naxis : 0;
+   for (int i = 0; i < EM_MAX_AXES; i++)
+      t.origin[i] = m_origin[i];
    /* 界面靠它知道"现在生效的是哪一条判据"。**一次 load 成局部量**: 不能在循环里一轴
     * load 一次, 否则同一次 publish 里会一半轴按老值、一半按新值算。 */
    const bool di_invert = m_di_invert.load();
@@ -3024,6 +3082,14 @@ void EcatThread::teardown()
    {
       QMutexLocker lk(&m_mtx);
       m_telem = BusTelem();
+      /* ★ **把零点快照放回刚被清空的电文里。** 界面写 scan.ini 是在收尾**之后** ——
+       * scanwindow.cpp 的 closeEvent 先等线程退出再 saveSettings(), 那一刻它读到的就是
+       * m_telem。少了下面几行, 落盘时 origin_naxis 永远是 0, 表现是"本进程内一切正常,
+       * 重启后照旧显示 0", 而且看起来完全像是没生效。
+       * m_origin_naxis 而不是 m_naxis: 上面刚把 m_naxis 清成 0。 */
+      m_telem.origin_naxis = m_origin_kept ? m_origin_naxis : 0;
+      for (int i = 0; i < EM_MAX_AXES; i++)
+         m_telem.origin[i] = m_origin[i];
       m_note  = QStringLiteral("已断开");
       for (int i = 0; i < EM_MAX_AXES; i++)
          m_want[i] = 0;

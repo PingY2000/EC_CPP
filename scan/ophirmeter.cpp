@@ -200,8 +200,22 @@ struct OphirMeter::Private
    bool           open_ok   = false;
    QString        open_err;
 
-   QAtomicInt quit  {0};        /* 1 = 该收摊了 (close() 置上) */
+   /* ★ **open() 必须把它清回 0** —— 它是"给当前这一次会话"的信号, 不是一次性开关。
+    * 2026-09-29 前它只被 close() 置 1、从没被清过, 于是"第一次打开失败 (设备没插) →
+    * 后来插上 → 按「重试」"这条路永远是坏的: open() 把设备开起来了、报成功了、界面也写着
+    * 已连接, 而新线程一进 while (!quit) 就直接跳过整个取数循环, 收摊退场 —— 读数永远不来,
+    * 只能重启程序 (那是唯一能让 Private 重新构造、把 quit 变回 0 的路)。
+    * 「切换设备」同理 (它先 close() 再 open()) 也是坏的。 */
+   QAtomicInt quit  {0};        /* 1 = 该收摊了 (close() 置上, open() 清回 0) */
    QAtomicInt want  {0};        /* 1 = 有一个未决的读数请求 */
+
+   /* 上一次的线程没能在 5 秒内收掉 (close() 那条路, 见下)。**它还在跑**, 所以不能再起一个 ——
+    * 两个线程抢同一个表头。只碰 GUI 线程, 不用原子量 (同 m_open)。
+    * 它同时是"quit 能不能清 0"的闸: 漏掉的那个线程还站在 while (!quit) 上, 清了它就会被
+    * 复活, 于是 close() 那句"该收摊了"静默失效。
+    * ★ **记的是指针不是 bool**: 它一跑完就自己清空 (见 close()), 而析构要**看得见**它 ——
+    * 线程还活着而 p 被删掉, 就是 use-after-free (那条路今天也在, 只是没人走过)。 */
+   QThread *leaked = nullptr;
    qint64     want_ms = 0;      /* 那个请求是什么时候发的 */
    int        want_wl    = -1;  /* -1 = 没有待改的 */
    int        want_range = -1;
@@ -249,6 +263,18 @@ OphirMeter::~OphirMeter()
       std::fprintf(stderr,
                    "[ophirmeter] 采集线程 15 s 没收掉 (COM 调用卡在驱动里?), "
                    "故意泄漏它以免 use-after-free。请检查设备与 USB\n");
+      return;
+   }
+
+   /* close() 早先就漏掉过一个线程 (见 close()): 它还在跑, 而且 runSession 每一轮都要碰 p。
+    * p 是它的上下文 —— 删了就是 use-after-free, 所以**跟上面一样漏掉 p**, 只是没有线程指针
+    * 可等了。这一支在加「重试」那条路之前就在, 但没有任何状态能走到它。 */
+   if (p->leaked != nullptr)
+   {
+      p->leaked->disconnect();
+      std::fprintf(stderr,
+                   "[ophirmeter] 早先有一个采集线程没收掉, 析构时它还在 (COM 调用卡在驱动里?), "
+                   "故意泄漏状态以免 use-after-free。请检查设备与 USB\n");
       return;
    }
 
@@ -336,11 +362,14 @@ bool OphirMeter::open(QString *err)
    if (isOpen())
       return true;
 
-   if (p->thread)
+   if (p->thread || p->leaked != nullptr)
    {
-      /* 上一次没收干净就别再起一个: 两个线程抢同一个表头 */
+      /* 上一次没收干净就别再起一个: 两个线程抢同一个表头。
+       * `leaked` 那一支是 close() 没等到线程退出的情形 —— 指针已经清了, 线程还在。
+       * 这句是**拒绝理由**, 按界面规矩要点出现象与出路: 它自己会退, 所以出路是等
+       * (close() 那边挂着 finished -> 清标志, 退干净了下一按就能起) */
       if (err)
-         *err = QStringLiteral("上一次的采集线程尚未结束");
+         *err = QStringLiteral("上一次的采集线程尚未结束。请稍候。");
       return false;
    }
 
@@ -355,6 +384,11 @@ bool OphirMeter::open(QString *err)
       p->want_add_wl = -1;
       p->want_ms = 0;
    }
+
+   /* ★ **这两个标志都是"给当前这次会话"的, 起线程之前必须复位。** 漏掉 quit 的后果见
+    * Private 里那一段: 新线程报了"打开成功"就自己收摊, 界面上写着已连接而读数永远不来。
+    * want 是"有没有未决请求", 上一趟那个已经是给上一台设备说的。 */
+   p->quit.storeRelease(0);
    p->want.storeRelease(0);
 
    p->thread = QThread::create([this] { runSession(); });
@@ -415,8 +449,16 @@ void OphirMeter::close()
       return;
    }
 
-   /* 线程还在某个 COM 调用里出不来。不 terminate: COM 对象会带着内部锁死掉 */
+   /* 线程还在某个 COM 调用里出不来。不 terminate: COM 对象会带着内部锁死掉。
+    * ★ **记下来**: 指针已经清了, 但那个线程还在 while (!quit) 上蹲着 —— open() 靠这个标志
+    * 拒绝再起一个 (否则两个线程抢同一个表头), 也靠它保证不把 quit 清 0 把它复活。 */
+   p->leaked = t;
    QObject::connect(t, &QThread::finished, t, &QObject::deleteLater);
+   /* 它**后来**退出来了就把标志放开 —— 不加这一条的话, 一次卡住会让「重试」从此永远
+    * 报"上一次的采集线程尚未结束", 而那件事已经不成立了 (只有重启程序能好)。
+    * 收在 GUI 线程上: 这个指针是普通成员, 只许 GUI 线程碰。this 没了这条连接自动断掉,
+    * 不会去碰已经释放的 p (析构那条漏掉 p 的路上也同理)。 */
+   QObject::connect(t, &QThread::finished, this, [this] { p->leaked = nullptr; });
 }
 
 void OphirMeter::runSession()

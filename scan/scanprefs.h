@@ -1,16 +1,22 @@
 /*
  * scan/scanprefs.h —— 参数的记忆 (exe 旁边那个 scan.ini): 扫描参数 / 上次用的网卡 (Npcap 名) /
  * 手动速度 (pul/s) / 回零速度 / 回零超时 / **回零偏移 (逐轴一个)** / 「高级选项」三项 /
- * 色标是不是自动跟随。其余一概不记: CSV 路径
+ * 色标是不是自动跟随 / **软件零点 (逐轴一个 + 世代)**。其余一概不记: CSV 路径
  * 带时间戳, 色标**上下限**只属于当次显示, 功率计的波长/量程/模式是设备自己的状态 (打开时向设备读)。
  *
  * 「色标上下限不记」与「色标自动跟随要记」不矛盾: 前者是一个数, 套到下一趟的数据上就是错的;
  * 后者是一个**模式**, 记不住的话每次开程序都要重新勾一遍。
+ *
+ * 软件零点记进 ini 是 **2026-09-29 改的**, 从前刻意不记 (老理由是"它只是本次运行的东西")。
+ * 取舍、代价与那道代价为什么可以接受: docs/scan_sweep.md §39 与 §29.5 的补注。
  */
 #pragma once
 
+#include <cstdint>
+
 #include <QString>
 
+#include "ec_motor.h"     /* 只为 EM_MAX_AXES: 下面那个数组按它定长 */
 #include "scanplan.h"
 
 namespace scan {
@@ -52,6 +58,19 @@ struct Prefs
     * "台面上插着好几台时, 我用的总是这一台"是**操作习惯** —— 与网卡那一条同理。
     * 记的这一台若没插会**打开失败并明说**, 不悄悄退到第一台 (见 ophirmeter.cpp)。 ---- */
    QString meter_serial;
+
+   /* ---- 软件零点: 断开重连与**重启程序**之后仍要沿用的那个零点 (见 ecatworker.h 的
+    * setRememberedOrigin / tryInitOrigin)。
+    * 记的是工作线程手里那个 m_origin[] —— **6064h 那套原始坐标**, 不是显示坐标。
+    * ★ **"有没有"只能由 zero_naxis 说**: 零点值本身是一个任意 int32, 0 与负数都是合法坐标,
+    *   拿某个值当哨兵就会把它误判成"没记过" (与上面 home_off 那条同一个坑, 但那边的哨兵
+    *   至少只落在负数一侧, 这边连负数都是合法的, 所以只能另开一个字段)。
+    *   半份记录 (缺一项 / 轴数越界) 一律不采纳, 见 prefsLoad —— 缺的那项会按 0 进来。
+    * ★ zero_epoch 与那两个**独立**读: 它是一个计数器, 不是那份值的属性。一份零点值读坏了
+    *   不该让世代也跟着丢 —— 丢了之后落盘那道"只许往前"的闸会让零点再也写不回来。 */
+   int     zero_naxis = 0;                        /* 0 = 没记过; 否则 1..EM_MAX_AXES */
+   int32_t zero_origin[EM_MAX_AXES] = {0};
+   int     zero_epoch = 0;                        /* 0 = 第一代 (负数才是"没记过") */
 };
 
 /* ini 在 exe 旁边 (bin/scan.ini) */
@@ -66,5 +85,11 @@ void prefsSave(const QString &path, const Prefs &p);
 /* 把当前参数并进已读回来的记忆里。过不了 validate() 的当前参数不覆盖旧的;
  * 量程 (range_pul) 一律归零 —— 它由区域算出。 */
 void prefsMergeParams(Prefs *store, const Params &cur);
+
+/* ini 里那一串零点文本 -> 一个整数。**不许用 QVariant::toInt()**: 它对 "abc" 给 0, 而 0 是
+ * **合法**的坐标值 —— "读成了 0"与"本来就是 0" 必须分得开, 否则一份手改坏的 ini 会静默变成
+ * 一份看起来完全正常的零点 (滑台一根轴跑到 6064h 的 0 点上, 屏幕上一点异常都看不出来)。
+ * 只认整数字面量 (首尾空白允许), 别的都返回 false。 */
+bool originFromText(const QString &s, int32_t *out);
 
 }   /* namespace scan */

@@ -1734,6 +1734,126 @@ static void test_advprefs()
       checkEq(ecatcmd::home_off_from_pref(75000), 75000,      "正常值原样用");
       checkEq(ecatcmd::home_off_from_pref(999999999), HMI_HOME_OFF_MAX, "太大 → 夹到上限");
    }
+
+   /* ---- 软件零点 (2026-09-29) ------------------------------------
+    * 「零点跨程序重启」这一整套里**只有 ini 这一段测得到**: 种进工作线程、连接时那道
+    * origin_keep_ok 闸、世代 +1, 三样都住在 ecatworker.cpp 里, 而 scan_selftest 不编那个
+    * 文件 (见 CMakeLists)。所以下面钉的是"存进去的与读回来的是同一份", 以及**读不回来时
+    * 绝不许编一份出来**。 */
+   caseBegin("advprefs: 软件零点 —— 0 与负数都是**合法坐标**, 「有没有」只能由轴数说");
+   {
+      const Prefs p;
+      checkEq(p.zero_naxis, 0, "缺省: 没记过");
+      checkEq(p.zero_epoch, 0, "缺省: 第 0 代");
+
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      Prefs q;
+      q.zero_naxis    = 2;
+      q.zero_origin[0] = 0;        /* ★ 这一条是这一组的全部意义: 0 是坐标, 不是"没记过" */
+      q.zero_origin[1] = -75000;   /* ★ 负数也是坐标 (回零偏移 75000 的落点就读这个数) */
+      q.zero_epoch     = 4;
+      prefsSave(ini, q);
+
+      const Prefs b = prefsLoad(ini);
+      checkEq(b.zero_naxis, 2,         "轴数往返");
+      checkEq(b.zero_origin[0], 0,     "★ 存下的 0 读回来还是 0");
+      checkEq(b.zero_origin[1], -75000, "★ 负数原样往返");
+      checkEq(b.zero_epoch, 4,         "世代往返");
+
+      /* 从没记过 (文件不存在) 与"记过一份全 0 的"必须分得开 */
+      const Prefs fresh = prefsLoad(dir.filePath(QStringLiteral("scan2.ini")));
+      checkEq(fresh.zero_naxis, 0, "文件不存在 → 0 = 没记过 (什么都没有)");
+   }
+
+   /* ★ **这一条是"没连过就关窗"那条路的钉子**: 关窗时若手里没有一份可用的记录,
+    * zero_naxis 是 0, 而 prefsSave 那时**一个键都不许写** —— 写一个 0 进去就是擦掉一个
+    * 坐标系, 而那不该是关窗的副作用 (与"网卡清单还没到就别把记住的抹掉"同一条规矩)。 */
+   caseBegin("advprefs: 软件零点 —— 没有记录时落盘不许把盘上那份擦掉");
+   {
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      Prefs q;
+      q.zero_naxis     = 2;
+      q.zero_origin[0] = 111;
+      q.zero_origin[1] = -75000;
+      q.zero_epoch     = 7;
+      prefsSave(ini, q);
+
+      Prefs empty;                 /* zero_naxis 还是 0 —— 没连过、也没种过任何一份 */
+      prefsSave(ini, empty);
+
+      const Prefs c = prefsLoad(ini);
+      checkEq(c.zero_naxis, 2,          "盘上那份**没被擦掉** (轴数还在)");
+      checkEq(c.zero_origin[0], 111,    "值也还在");
+      checkEq(c.zero_origin[1], -75000, "负值也还在");
+      checkEq(c.zero_epoch, 7,          "世代也还在");
+   }
+
+   caseBegin("advprefs: 被手改坏的零点 —— 整份不采纳, 但世代照读");
+   {
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      /* 一项不是整数字面量: 半份记录比没有更危险 —— 缺的那项会按 0 进来, 而 0 是合法坐标,
+       * 于是一根轴悄悄跑到 6064h 的 0 点上, 屏幕上看不出任何异常 */
+      QFile f(ini);
+      check(f.open(QIODevice::WriteOnly | QIODevice::Text), "手写一份零点坏掉的 ini");
+      f.write("[zero]\nnaxis=2\nepoch=5\norigin_1=abc\norigin_2=-75000\n");
+      f.close();
+
+      const Prefs p = prefsLoad(ini);
+      checkEq(p.zero_naxis, 0, "一项不是整数字面量 → 整份都不采纳");
+      checkEq(p.zero_origin[0], 0, "  没有半份记录被读进来");
+      /* ★ 世代**独立**读: 它是计数器, 不是那份值的属性 —— 值读坏了不该让世代一起丢,
+       * 丢了之后落盘那道"只许往前"的闸会让零点再也写不回来 (§39.3) */
+      checkEq(p.zero_epoch, 5, "★ 但世代照读 (它与那份值分开判)");
+
+      /* 轴数越界: 少写一项也走同一条路 (上面那个循环一项为假就整份不采纳) */
+      QFile g(ini);
+      check(g.open(QIODevice::WriteOnly | QIODevice::Text), "再写一份轴数越界的");
+      g.write("[zero]\nnaxis=9\nepoch=1\norigin_1=0\n");
+      g.close();
+      const Prefs big = prefsLoad(ini);
+      checkEq(big.zero_naxis, 0, "轴数 9 > EM_MAX_AXES → 不采纳");
+      checkEq(big.zero_epoch, 1, "  世代照读");
+
+      QFile h(ini);
+      check(h.open(QIODevice::WriteOnly | QIODevice::Text), "再写一份轴数为负的");
+      h.write("[zero]\nnaxis=-1\nepoch=2\norigin_1=0\n");
+      h.close();
+      const Prefs neg = prefsLoad(ini);
+      checkEq(neg.zero_naxis, 0, "轴数 -1 → 不采纳");
+      checkEq(neg.zero_epoch, 2, "  世代照读");
+
+      /* 缺一项 (值写了两个轴数、却只有一项) 也是整份不采纳 —— 缺项时 value() 给空串 */
+      QFile i2(ini);
+      check(i2.open(QIODevice::WriteOnly | QIODevice::Text), "再写一份缺一项的");
+      i2.write("[zero]\nnaxis=2\nepoch=3\norigin_1=0\n");
+      i2.close();
+      const Prefs miss = prefsLoad(ini);
+      checkEq(miss.zero_naxis, 0, "缺 origin_2 → 整份不采纳");
+      checkEq(miss.zero_epoch, 3, "  世代照读");
+   }
+
+   caseBegin("advprefs: 老 ini (没有 zero/*) —— 不迁移, 也不编一份零点出来");
+   {
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      QFile f(ini);
+      check(f.open(QIODevice::WriteOnly | QIODevice::Text), "手写一份只有老键的 ini");
+      f.write("[scan]\narea_x_unit=12.5\n[ui]\nhome_off_x=75000\n");
+      f.close();
+
+      const Prefs p = prefsLoad(ini);
+      checkEq(p.zero_naxis, 0, "缺 zero/naxis → 0 = 没记过 (工作线程那边什么都不种)");
+      checkEq(p.zero_epoch, 0, "缺 zero/epoch → 0 = 第一代");
+      checkEq(p.zero_origin[0], 0, "值那一格也不编");
+      checkNear(p.params.area_x_unit, 12.5, "老键照旧读回来");
+   }
 }
 
 /* ------------------------------------------------- 故障复位 (6040h bit7 上升沿) */
@@ -3934,10 +4054,98 @@ static void test_origin()
    }
 
    /* 新电文的世代从 0 起 —— 窗口那侧的 m_epoch 也从 0 起, 两者必须同一个起点 */
-   caseBegin("origin: BusTelem 的世代初值");
+   caseBegin("origin: BusTelem 的世代与那份零点");
    {
       const BusTelem t;
       checkEq(t.origin_gen, 0, "BusTelem{}.origin_gen == 0");
+      /* 零点那两个字段: 默认必须说"没有一份可用的记录"。**它不是 m_origin_ready** ——
+       * 那个在断开与进 OP 时都被清掉, 而断开之后恰恰是这份零点最该还在的时候 (§39.2) */
+      checkEq(t.origin_naxis, 0, "BusTelem{}.origin_naxis == 0 (没有记录)");
+      checkEq(t.origin[0], 0, "  值那一格也是 0");
+   }
+
+   /* ---- 软件零点记进 ini (2026-09-29) ------------------------------------ */
+
+   /* ★ **这一条是「世代为什么要种进工作线程」的钉子** (走查见 docs/scan_sweep.md §39.5)。
+    * 顺下来是这样: 盘上世代 3 → 种下去 → 线程 gen = 3 → 连接时那份零点没沿用上、重取 →
+    * gen = 4 → 界面 origin_epoch_sync(3, 4) = 4 > 3 → 同一份 CSV 里那个 zero_epoch=3
+    * 对不上, 该弹的"零点世代对不上"弹得出来。
+    * ★ 少了"种下去"那一步, 线程的 gen 从 0 起, 重取只到 1 → sync(3, 1) = 3 → **一点变化都
+    * 没有**: 新零点顶着旧世代, 续扫一声不响地把点接到一份坐标系已经不对的 CSV 上。
+    * 这里能钉的只有这两个纯判据串起来的那一半 —— "种"与"重取"本身在 ecatworker.cpp 里,
+    * 那个文件不在自检里 (见 CMakeLists)。 */
+   caseBegin("origin: 种下盘上的世代之后, 一次重取必须越过它");
+   {
+      const int from_disk = ecatcmd::origin_epoch_from_pref(3);
+      checkEq(from_disk, 3, "盘上世代 3 → 种下去还是 3");
+
+      /* 沿用: m_origin[] 一个字节都不动, 世代也不该变 */
+      checkEq(ecatcmd::origin_epoch_sync(3, from_disk), 3, "沿用 → 守在 3, 不报世代变化");
+
+      /* 重取: 工作线程在种下去的那个数上 +1 */
+      const int retaken = from_disk + 1;
+      checkEq(retaken, 4, "重取 → 线程的 gen 到 4");
+      checkEq(ecatcmd::origin_epoch_sync(3, retaken), 4,
+              "★ 重取 → 界面跟到 4 (> 3) → 续扫那份 CSV 该被拦下");
+
+      /* 反面: 不种世代 (线程从 0 起) 那条路上, 重取只到 1 —— 界面守在 3, 一点变化都没有。
+       * 把它钉在这里, 免得有人把"种世代"那一步当成多余的 (§39.3 的坑 D) */
+      checkEq(ecatcmd::origin_epoch_sync(3, 1), 3,
+              "不种世代的那条路: 重取只到 1, 界面仍是 3 → 静默 (这正是要避免的)");
+   }
+
+   caseBegin("origin: scan.ini 里的世代 —— 只有负数算「没记过」");
+   {
+      checkEq(ecatcmd::origin_epoch_from_pref(-1), 0, "-1 = 没记过 → 0");
+      checkEq(ecatcmd::origin_epoch_from_pref(-2147483647 - 1), 0, "INT32_MIN → 当没记过");
+      /* ★ 0 是合法的第一代: 拿 `<= 0` 当"没记过"(与 home_vel/tmo 那样抄)会把一份存着第 0 代
+       * 的 ini 读成从没记过 —— 与 home_off_from_pref 那条是同一个坑 */
+      checkEq(ecatcmd::origin_epoch_from_pref(0), 0, "★ 0 原样用 (第一代也是记过)");
+      checkEq(ecatcmd::origin_epoch_from_pref(1), 1, "第 1 代原样");
+      checkEq(ecatcmd::origin_epoch_from_pref(999), 999, "正常值原样");
+      checkEq(ecatcmd::origin_epoch_from_pref(HMI_ORIGIN_EPOCH_MAX), HMI_ORIGIN_EPOCH_MAX,
+              "上限本身仍然接受");
+      checkEq(ecatcmd::origin_epoch_from_pref(HMI_ORIGIN_EPOCH_MAX + 1), 0,
+              "超上限 → 当没记过 (贴上界时 m_origin_gen++ 会**有符号溢出**, 那是 UB)");
+      checkEq(ecatcmd::origin_epoch_from_pref(2147483647), 0, "INT32_MAX → 当没记过");
+   }
+
+   caseBegin("origin: scan.ini 里记了几根轴");
+   {
+      check( ecatcmd::origin_naxis_usable(1),   "1 根 = 一份可用的记录");
+      check( ecatcmd::origin_naxis_usable(2),   "2 根 (本机两轴)");
+      check( ecatcmd::origin_naxis_usable(EM_MAX_AXES), "正好到上限");
+      check(!ecatcmd::origin_naxis_usable(0),   "0 = 没记过");
+      check(!ecatcmd::origin_naxis_usable(-1),  "负数");
+      check(!ecatcmd::origin_naxis_usable(EM_MAX_AXES + 1),
+            "越上限 → 整份不采纳 (照它写数组会越界)");
+   }
+
+   /* 「读回来的是不是一个数」。**不许用 QVariant::toInt()** —— 它对 "abc" 给 0, 而 0 是
+    * **合法**的坐标值: "读成了 0"与"本来就是 0" 必须分得开, 否则一份手改坏的 ini 会静默
+    * 变成一份看起来完全正常的零点。 */
+   caseBegin("origin: scan.ini 里那串零点文本");
+   {
+      int32_t v = 0;
+
+      check(originFromText(QStringLiteral("0"), &v), "单一个 0 是**有效**的一份零点");
+      checkEq(v, 0, "  读出来的就是 0");
+      check(originFromText(QStringLiteral("-75000"), &v) && v == -75000,
+            "负数也是合法坐标 (回零偏移 75000 的落点读这个数)");
+      check(originFromText(QStringLiteral("  75000  "), &v) && v == 75000, "首尾空白收下");
+      check(originFromText(QStringLiteral("+7"), &v) && v == 7, "正号也收");
+      check(originFromText(QStringLiteral("2147483647"), &v) && v == 2147483647, "INT32_MAX 收");
+      check(originFromText(QStringLiteral("-2147483648"), &v) && v == -2147483648, "INT32_MIN 收");
+
+      v = 999;
+      check(!originFromText(QString(), &v), "空串 → 假 (缺项走的就是这条路)");
+      checkEq(v, 999, "  而且**一个字节都没写进去**");
+      check(!originFromText(QStringLiteral("abc"), &v), "abc → 假");
+      check(!originFromText(QStringLiteral("7.5"), &v), "7.5 → 假 (不认小数)");
+      check(!originFromText(QStringLiteral("0x10"), &v), "0x10 → 假 (只认十进制)");
+      check(!originFromText(QStringLiteral("2147483648"), &v), "溢出 int32 → 假");
+      check(!originFromText(QStringLiteral("1"), nullptr), "out 传空 → 假 (什么都不写)");
+      checkEq(v, 999, "  走到这里那份值也没被动过");
    }
 }
 
@@ -4269,24 +4477,40 @@ static void test_ophir()
          OphirMeter meter;
          check(meter.kind().contains(QStringLiteral("Ophir")), "kind() names the device");
 
-         QString e;
-         check(meter.open(&e), "open() with a head attached", e.toStdString());
-         if (meter.isOpen())
-         {
+         /* 一趟完整的「打开 -> 要一次读数 -> 关上」。**要跑两趟** —— 第一趟跑得再好也照不出
+          * 下面这个 bug, 它只在第二趟上出现。
+          *
+          * ★ **2026-09-29 的「重试」缺陷就在这里**: close() 把 quit 置 1, 而 open() 早先不清它。
+          * 于是新线程报完"打开成功"、界面写着已连接, 一进 while (!quit) 就跳过整个取数循环
+          * 收摊退场 —— 读数永远不来, 只能重启程序 (唯一能让 quit 变回 0 的路)。
+          * 「切换设备」是同一条路 (它先 close() 再 open())。
+          * 这根钉子**必须插在真表头上**: 没有设备时第二趟 open() 是直接失败的, 走不到这条路上。 */
+         auto session = [&meter](int round) {
+            QString e;
+            check(meter.open(&e),
+                  round == 1 ? "open() with a head attached"
+                             : "open() after close() (重试 / 切换设备那条路)", e.toStdString());
+            if (!meter.isOpen())
+               return;
+
             const OphirInfo i = meter.info();
             check(i.valid, "info() is valid after open");
             check(!i.sensor_name.isEmpty() || !i.device_name.isEmpty(),
                   "info() names the head and the sensor", i.summary.toStdString());
 
             /* 异步请求 -> 事件循环里等它回来 (跨线程是排队投递的) */
-            double        got = -1.0;
-            QString       fail;
-            int           ready = 0, failed = 0;
-            QEventLoop    loop;
-            QObject::connect(&meter, &PowerMeter::readingReady, [&](double w) {
+            double     got = -1.0;
+            QString    fail;
+            int        ready = 0, failed = 0;
+            QEventLoop loop;
+            /* 两个 lambda 各挂一个**本趟的**上下文对象: 它一析构连接就断 (连着队列里还没送到的
+             * 那几个也一起作废)。不挂的话第一趟那两个会活到第二趟, 而它们捕获的 ready/got/loop
+             * 早就随栈没了 —— 第二趟的信号打上去就是悬垂引用 (症状是"第 2 趟: 2 ready")。 */
+            QObject scope;
+            QObject::connect(&meter, &PowerMeter::readingReady, &scope, [&](double w) {
                ready++; got = w; loop.quit();
             });
-            QObject::connect(&meter, &PowerMeter::readingFailed, [&](const QString &m) {
+            QObject::connect(&meter, &PowerMeter::readingFailed, &scope, [&](const QString &m) {
                failed++; fail = m; loop.quit();
             });
             QTimer::singleShot(5000, &loop, &QEventLoop::quit);
@@ -4294,15 +4518,19 @@ static void test_ophir()
             meter.requestReading();
             loop.exec();
 
-            char buf[160];
-            std::snprintf(buf, sizeof(buf), "%d ready, %d failed, %s", ready, failed,
-                          fail.isEmpty() ? "-" : fail.toUtf8().constData());
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), "第 %d 趟: %d ready, %d failed, %s", round, ready,
+                          failed, fail.isEmpty() ? "-" : fail.toUtf8().constData());
+            /* 「连接上了但读不到数」在这两条上现形: ready 是 0 (而 open() 刚报过成功) */
             check(ready == 1, "exactly one reading came back", buf);
             check(!std::isnan(got) && got >= -1e-12, "the reading is a plausible wattage", buf);
 
             meter.close();
             check(!meter.isOpen(), "close() leaves it closed");
-         }
+         };
+
+         session(1);
+         session(2);
       }
       return;
    }

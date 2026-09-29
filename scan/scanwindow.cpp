@@ -1092,6 +1092,11 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
    buildUi();
    applyCsvDefaultName();
 
+   /* 软件零点: 把 ini 里那份种进工作线程, 并把世代接到 m_epoch 上 —— 下一句 setZeroEpoch
+    * 用的就是它。**必须在这里**: buildUi() 里已经跑完 loadSettings (别的项都灌进去了),
+    * 而下面 m_thr->start() 是它唯一的同步点, 过了那一步就不能再碰那些成员了 (§39)。 */
+   seedZeroFromPrefs();
+
    m_ctl->setZeroEpoch(m_epoch);
    pushParams();
    syncShadeEdits();
@@ -1341,7 +1346,7 @@ QWidget *ScanWindow::buildTopBar()
 
    m_btnConn = new QPushButton(QStringLiteral("连接 (进 OP)"), w);
    m_btnConn->setToolTip(QStringLiteral("开始过程数据交换并进入 OP 状态, 电机不上电。\n"
-                                        "零点沿用本次运行中已确定的值, 断开重连不重设。"));
+                                        "零点沿用上次那份 (记在 scan.ini), 断开重连与重启程序都不重设。"));
    connect(m_btnConn, &QPushButton::clicked, this, &ScanWindow::onConnectClicked);
 
    /* 「重连总线」摆在「连接/断开」旁边, 不塞进菜单栏也不另开窗口 (仓库既有规矩:
@@ -1372,7 +1377,7 @@ QWidget *ScanWindow::buildTopBar()
 
    m_btnZero = new QPushButton(QStringLiteral("设为区域中心"), w);
    m_btnZero->setToolTip(QStringLiteral("将当前位置设为显示坐标 0, 即扫描区域中心。\n"
-                                        "本次运行内断开重连后仍然有效。"));
+                                        "断开重连与重启程序后仍沿用。"));
    connect(m_btnZero, &QPushButton::clicked, this, &ScanWindow::onZeroHereClicked);
 
    QHBoxLayout *bar = new QHBoxLayout(w);
@@ -2742,6 +2747,30 @@ void ScanWindow::loadSettings()
    m_savedNic = pf.nic;
 }
 
+/* 软件零点: 把 scan.ini 里那份交给工作线程。**构造期调一次, 在 m_thr->start() 之前** ——
+ * 它写的是"只有工作线程碰"的那几个成员, start() 是唯一的同步点 (完整理由见 ecatworker.h
+ * 的 setRememberedOrigin)。调用点就在 setZeroEpoch 那一句上面, 所以世代在这里定下来。
+ *
+ * 三件事分开做, 顺序不能换:
+ *   ① **世代先接上** —— 它是**计数器**, 与那份零点值可不可用无关。一份手改坏了的 ini
+ *      (origin 写着 "abc" 而 epoch 写着 5) 如果连世代也不接, 线程的 gen 每次从 0 起,
+ *      重取一个零点只到 1, 而落盘那道"只许往前"的闸要求 >= 5 —— 零点从此再也存不进去。
+ *   ② 没有一份可用的记录就到此为止 (zero_naxis == 0 或越界): 工作线程那边什么都不种,
+ *      第一次连接走它自己的重取支「零点取自连接时的位置」—— 与改造前逐字相同。 */
+void ScanWindow::seedZeroFromPrefs()
+{
+   const Prefs pf = prefsLoad(prefsPath());
+
+   m_epoch = pf.zero_epoch;                            /* ① 计数器, 独立于那份值 */
+
+   if (!ecatcmd::origin_naxis_usable(pf.zero_naxis))    /* ② 没记过 (或手改坏了) */
+      return;
+
+   /* ③ 有记录才种。**这里一个判据都不加** —— 位置与量程此刻都不知道, 能不能沿用交给
+    * 连接那一刻的 tryInitOrigin / ecatcmd::origin_keep_ok。 */
+   m_thr->setRememberedOrigin(pf.zero_origin, pf.zero_naxis, pf.zero_epoch);
+}
+
 /* 记忆: 把当前参数写回去。「连接」时与关窗时各一次 —— 连接那一次记的是真连过的那张卡。
  *
  * 写的是**整份** (六块框全带上), 不是某一块: 这两次是"这一轮到此为止, 屏幕上这些值就是往后
@@ -2778,6 +2807,28 @@ void ScanWindow::saveSettings()
     * 认的是序列号 (进 ini 的也是它) */
    if (m_cbMtrDev != nullptr && !m_cbMtrDev->currentData().toString().isEmpty())
       pf.meter_serial = m_cbMtrDev->currentData().toString();
+
+   /* 软件零点。**从遥测读**, 不从界面读 —— 它由工作线程持有, 界面从来不改它。
+    * ★ 关窗这一趟读得到它, 靠的是 teardown() 把那份快照放回了被清空的电文 (ecatworker.cpp):
+    *   那一行删掉, 这里读到的永远是 0, 表现成"本进程内一切正常, 重启后照旧显示 0"。
+    * 世代那一条是**单调闸**: 盘上的比手上的新, 说明有另一个实例搬过零点, 覆盖它就是把这套
+    * 显示坐标倒回去 —— 而倒回去之后盘上那份零点会被接到一个已经不属于它的坐标系统上。
+    * 没连过就关窗时读到的是种子那份, 写回去与盘上逐字节相同 (幂等); 若那份本来就没采纳,
+    * 这里是 0, 而 prefsSave 那边 zero_naxis == 0 时**一个键都不写**。 */
+   {
+      const BusTelem t = m_thr->telemetry();
+      const int      zgen = ecatcmd::origin_epoch_sync(m_epoch, t.origin_gen);
+
+      /* 用 origin_naxis_usable 而不是 > 0: 它同时把上界也管住, 而 prefsSave 是照着
+       * zero_naxis 逐个写 zero_origin[0..n-1] 的 —— 一个越界的轴数会读越界 */
+      if (ecatcmd::origin_naxis_usable(t.origin_naxis) && zgen >= pf.zero_epoch)
+      {
+         pf.zero_naxis = t.origin_naxis;
+         for (int i = 0; i < t.origin_naxis; i++)
+            pf.zero_origin[i] = t.origin[i];
+         pf.zero_epoch = zgen;
+      }
+   }
 
    prefsSave(prefsPath(), pf);
    m_savedNic = pf.nic;
@@ -3120,7 +3171,7 @@ void ScanWindow::onZeroHereClicked()
    m_thr->postZeroHere(0);
    m_thr->postZeroHere(1);
 
-   hint(QStringLiteral("当前位置已设为显示坐标 0 (区域中心), 断开重连后仍沿用。"), false);
+   hint(QStringLiteral("当前位置已设为显示坐标 0 (区域中心), 断开重连与重启程序后仍沿用。"), false);
    m_canvas->update();
 }
 

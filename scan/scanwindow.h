@@ -238,6 +238,10 @@ private:
    /* 记忆 (exe 旁边的 scan.ini)。loadSettings 必须在 applyDefaults 之后调, 反了会被缺省值盖掉 */
    void loadSettings();
    void saveSettings();
+   /* 软件零点: scan.ini 里那份 → 工作线程 (在 start() 之前) + 世代接到 m_epoch 上。
+    * 名字不叫 loadSettings 的一部分是刻意的 —— 它必须在 start() 之前跑完, 而 loadSettings
+    * 是在 buildParamPanel() 里、和控件一起建的 (§39)。 */
+   void seedZeroFromPrefs();
 
    void pushManualSpeed(const BusTelem &t, bool running);
    void refreshAxisSignals(const BusTelem &t);   /* 限位/使能/故障: 状态栏 + 参数栏, 一份遥测 */

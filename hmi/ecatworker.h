@@ -223,6 +223,15 @@ struct BusTelem
     * 它在 m_origin[] 旁边而不是只在电文里 —— teardown() 会把整份电文清成默认值,
     * 清掉了界面就会漏发下一代, 而漏发那一侧正是危险的。 */
    int      origin_gen = 0;
+
+   /* 零点**逐轴的值** (6064h 那套原始坐标下的 m_origin[]) 与它记了几根轴。与 origin_gen
+    * 合起来才是一份可用的记录: gen 说"这是第几代显示坐标", origin_naxis 说"这份值全不全"。
+    * ★ **它不是 m_origin_ready** —— 后者在 teardown() 与进 OP 时都被清掉, 而断开之后恰恰是
+    *   这份零点最该还在的时候; 也**不是 naxis** (teardown() 把那个清成 0)。
+    * 只有 scan/ 读它 (关窗时落盘, 见 scanwindow.cpp 的 saveSettings); hmi 不读, 行为不变。 */
+   int32_t  origin[EM_MAX_AXES] = {0};
+   int      origin_naxis = 0;    /* 0 = 没有一份可用的零点记录 */
+
    QString  note;                /* 最后一条给操作员看的话 */
 
    /* 「上位机侧取反」当前是否真的生效。**总线级**: 接线方式是整台机器的性质。
@@ -802,6 +811,30 @@ inline bool origin_keep_ok(int32_t pos, int32_t origin, int32_t range)
 inline int origin_epoch_sync(int ui_epoch, int worker_gen)
 {
    return (worker_gen > ui_epoch) ? worker_gen : ui_epoch;
+}
+
+/* 从 scan.ini 读回来的零点世代。★ **只有负数算"没记过"**, 0 是合法的第一代 —— 与
+ * home_off_from_pref() 同一条规矩 (拿 <= 0 当"没记过"会把一份存着第 0 代的 ini 读成从没记过,
+ * 而后果比那边更绕: 世代在落盘时有一道"只许往前"的闸, 倒回去之后就再也写不回来)。
+ *
+ * 超上限一律当没记过。上限不是为了"太大了没意义", 是为了**避免有符号溢出**:
+ * m_origin_gen++ 发生在写 m_origin[] 的那三处, gen 贴着上限时那一次 ++ 是 UB, 溢出成负数
+ * 之后 origin_epoch_sync() 就拦不住倒退了 —— 而拦倒退正是它唯一的职责。 */
+#define HMI_ORIGIN_EPOCH_MAX 1000000000
+inline int origin_epoch_from_pref(int v)
+{
+   if (v < 0 || v > HMI_ORIGIN_EPOCH_MAX)
+      return 0;
+   return v;
+}
+
+/* scan.ini 里那份零点记了几根轴。0 = 没记过 —— 那是**"有没有"唯一的说法**: 零点值本身是一个
+ * 任意 int32 (0 与负数都是合法坐标), 拿某个值当哨兵就会把它们误判成"没记过"。
+ * 越界一律不采纳: 半份记录比没有更危险 —— 缺的那一项按 0 读进来, 而 0 是合法坐标,
+ * 于是一根轴悄悄跑到 6064h 的 0 点上, 屏幕上一点异常都看不出来。 */
+inline bool origin_naxis_usable(int n)
+{
+   return n >= 1 && n <= EM_MAX_AXES;
 }
 
 /* 回零之前那道闸: nullptr = 可以发起, 否则是一句给操作员看的话。
@@ -2376,6 +2409,18 @@ public:
     * 沿用还有一道硬条件 (见 ecatcmd::origin_keep_ok): 滑台必须仍在当前量程内。 */
    void setKeepOrigin(bool on);
 
+   /* 把一份**记在 scan.ini 里**的零点交给工作线程, 第一次连接时当作"上次那份零点"来试。
+    * 走的就是 setKeepOrigin 那条沿用路 —— 还是那道 origin_keep_ok 量程闸, 过了才用。
+    * 与 setKeepOrigin 是**两件事**: 那个是"允许沿用", 这个是"沿用的内容从哪儿来";
+    * 不记进 ini 时(比如 hmi)只调前者, 本函数从头到尾没被调过。
+    *
+    * ★ **必须在 start() 之前调** —— 它写的是"只有工作线程碰"的那几个成员
+    *   (m_origin[] / m_origin_kept / m_origin_naxis / m_origin_gen), start() 是唯一的同步点。
+    * ★ 这里**一个判据都不加**: 位置与量程此刻都不知道, 能不能用交给 tryInitOrigin()。
+    *   唯一被挡掉的是轴数越界 (见 ecatcmd::origin_naxis_usable)。
+    * ★ epoch 是**独立**读的, 与那份零点是否可用无关 —— 它是个计数器, 不是那份值的属性。 */
+   void setRememberedOrigin(const int32_t *origin, int naxis, int epoch);
+
    /* 「停止」在回零期间用这一个 —— **立即**让 em_home 的轮询看见 (≤ 它的 2ms 轮询周期)。
     * 全程序唯一一处 GUI 线程直呼 motor_api; 队列救不了正在找原点的轴 (回零阻塞着
     * 工作线程, 一条 CMD_STOP 要等它自己退出来才轮到)。 */
@@ -2573,6 +2618,11 @@ private:
    bool       m_origin_kept  = false;   /* m_origin[] 里那份零点还在不在 */
    int        m_origin_naxis = 0;       /* 存下那份零点时总线报了几根轴 */
    int        m_origin_gen   = 0;       /* 见 BusTelem::origin_gen */
+   /* m_origin[] 里那份是**从 scan.ini 种进来的**(见 setRememberedOrigin), 不是本次运行里
+    * 回零/设零得到的。只管结论句那一句"从哪儿来的": 沿用支报过一次就清掉, 因为报过之后
+    * 它与内存里那份再没有区别, 再说"来自 scan.ini"已经不准; 三处写 m_origin[] 的地方
+    * (回零收尾 / 设零 / 重取支) 也各清一次。 */
+   bool       m_origin_from_disk = false;
 
    int32_t    m_origin[EM_MAX_AXES] = {0};
    int32_t    m_tgt   [EM_MAX_AXES] = {0};
