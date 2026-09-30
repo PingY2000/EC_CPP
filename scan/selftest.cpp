@@ -2161,7 +2161,10 @@ static void test_plancap()
  * 与 mapcanvas.cpp 都不进 SCAN_COMMON_SRC), 只能靠人在屏幕前看。
  *
  * **不许把"只许往外"与"绝不产生往里的运动"这两条删掉**: 前者防的是反复贴线试把线一寸寸
- * 啃进来, 后者防的是"点了没反应"变成"滑台自己往里走"。两条都是安全事故不是体验问题。 */
+ * 啃进来, 后者防的是"点了没反应"变成"滑台自己往里走"。两条都是安全事故不是体验问题。
+ *
+ * **例外**: 画布上那两处限位**文字**"什么时候才写"这一条 (2026-09-30) 就住在这里, 由最后那一组
+ * 钉着 —— 它本来要写在 mapcanvas.cpp 里, 而那个文件一个断言也够不着。 */
 static void test_limitguard()
 {
    auto has = [](const std::string &s, const char *w) {
@@ -2304,6 +2307,25 @@ static void test_limitguard()
          const std::string w = limitguard::limitPlanWhy(both, l3, hi);
          check(has(w, "X 轴正限位") && !has(w, "Y 轴"), "只报第一条 (X 在前)", w);
       }
+   }
+
+   /* 2026-09-30: 画布上那两处限位**文字**离得远就不写。判据搬进 limitguard.h 就是为了这一
+    * 组断言 —— 它本来住在 mapcanvas.cpp 里, 而那个文件不进 SCAN_COMMON_SRC, 屏幕前才能看。
+    * **两条不许删**: 「2 mm 之外一个字不写」(那是用户这一轮要的) 与「位置不知道就不写」
+    * (少了它, 断线之后屏幕上会照旧写着一句拿陈值算出来的"接近")。 */
+   caseBegin("limitguard: 限位那两句字只在离得够近时才写");
+   {
+      check(limitguard::limitTextNear(0.0, 0.0, true), "正压在这条线上: 写");
+      check(limitguard::limitTextNear(1.999, 0.0, true), "差不到 2 mm: 写");
+      check(limitguard::limitTextNear(0.0, -1.999, true), "线在负侧也一样 (比的是差的绝对值)");
+      check(limitguard::limitTextNear(2.0, 0.0, true), "正好 2 mm: 还写 (上限本身算在内)");
+      check(!limitguard::limitTextNear(2.001, 0.0, true), "过了 2 mm: 一个字都不写");
+      check(!limitguard::limitTextNear(-30.0, 12.0, true), "隔着几十毫米: 不写");
+      check(!limitguard::limitTextNear(0.0, 0.0, false),
+            "位置不知道 (没连接 / 没帧) → 不写: 说不出滑台在哪, 就说不出一句'接近'");
+      check(!limitguard::limitTextNear(1.0, 0.0, false),
+            "**看着像接近也压不过 known**: 位置是陈的那会儿, 1 mm 这个数本身就不作数");
+      checkNear(limitguard::kLimitTextNearUnit, 2.0, "阈值就是用户说的那 2 mm");
    }
 }
 

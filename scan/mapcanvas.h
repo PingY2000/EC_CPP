@@ -125,6 +125,10 @@ private:
    void  drawPath(QPainter &p);
    void  drawRulers(QPainter &p);     /* X/Y 坐标标尺 (每 1 单位小刻度, 每 5 单位带数字) */
    void  drawLimitZones(QPainter &p); /* 限位线 + 线外侧那片阴影 (见 setLimitZones) */
+   /* 滑台此刻离这一轴的限位线够不够近 —— 限位那两处**文字**共用的判据 (2026-09-30)。
+    * 判据本身在 limitguard::limitTextNear (纯逻辑, 自检钉得住), 这里只把位置换算成显示单位
+    * 并把"位置可不可信"那一份判断合上 —— 不知道位置时它给 false, 也就是一个字都不写 */
+   bool  limitNearAxis(int axis, double line_unit) const;
    void  drawMarkers(QPainter &p);
    void  drawScaleBar(QPainter &p);
    void  drawHud(QPainter &p);

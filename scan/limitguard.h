@@ -10,12 +10,16 @@
  * 记录本身 (每根轴每一侧一个位置 + 零点世代) 在 ScanWindow 里, 落盘在 scanprefs 里;
  * 这个文件只有判据与算术, 所以自检钉得住 (scanwindow.cpp 不在 SCAN_COMMON_SRC 里)。
  *
+ * 还有一条**只管显示**的 (2026-09-30, `limitTextNear`): 画布上那两处限位**文字**离得远就
+ * 不写。它不夹任何东西、不发任何话, 只是"什么时候值得写" —— 但它同样住在这里, 同样为了自检。
+ *
  * **不叫「软限位」**: 软限位是驱动器的 607Dh, 本程序一个字节都不写它
  * (docs/scan_sweep.md §10 那张「全程不写」的表)。这是**上位机侧**的一道护栏。
  */
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -94,6 +98,28 @@ inline int32_t limitClampManual(const LimitAxis &a, int32_t cur, int32_t want)
    want = limitClampSide(+1, a.pos, cur, want);
    want = limitClampSide(-1, a.neg, cur, want);
    return want;
+}
+
+/* ---- 「离得够近才写那两句字」 (2026-09-30) ----
+ *
+ * 画布上有两处跟着限位线走的**文字**: 贴着线那个「X 轴正限位区」标签, 与左上角 HUD 那行
+ * 「…限位线在面板外 (… mm) —— 那一侧已锁住」。两处都只在**滑台离那条线 `kLimitTextNearUnit`
+ * 以内**时才写 —— 隔得远的时候它们只是噪声 (用户原话: 「只要在接近限位的时候提示就好
+ * 距离超过 2mm 时候不要有文字提示」)。
+ *
+ * **线与线外那片阴影照旧画**: 那是"以后不许越过"的界, 它存不存在与滑台在哪无关
+ * (与 drawLimitZones 顶上那段"画的是界, 不是此刻压着"同一个理由)。
+ *
+ * 单位是**显示单位 (mm)**: 与画布、与界面同一套坐标, 判据不碰脉冲 —— 换算在调用方做,
+ * 这一步只有减法、绝对值与一个比较 (所以自检钉得住: mapcanvas.cpp 不在 SCAN_COMMON_SRC 里)。
+ *
+ * `known` = 位置可信。**不知道位置时一律 false**: 说不出滑台此刻在哪, 就说不出一句"接近"
+ * —— 那一句要是照旧写出来, 它说的是上一次断线前的位置。 */
+inline constexpr double kLimitTextNearUnit = 2.0;
+
+inline bool limitTextNear(double pos_unit, double line_unit, bool known)
+{
+   return known && std::fabs(pos_unit - line_unit) <= kLimitTextNearUnit;
 }
 
 /* 网格逐轴的 [lo, hi] (显示脉冲) 有没有越过记下的线。越了就写出那一句拒绝理由, 没有就给

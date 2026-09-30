@@ -1,6 +1,7 @@
 #include "mapcanvas.h"
 
 #include "axisutil.h"
+#include "limitguard.h"    /* limitTextNear: 限位那两处文字"离得够近才写"的判据 */
 #include "scancontroller.h"
 #include "scanplan.h"      /* kCanvasHalfUnits: 画布半宽, 也是软量程的下限 */
 
@@ -638,10 +639,37 @@ void MapCanvas::drawPath(QPainter &p)
    p.restore();
 }
 
+/* 滑台此刻离这一轴的限位线够不够近 (见 limitguard::limitTextNear)。
+ * 位置换算成**显示单位**再比 —— 画布上的一切都是单位, 判据不碰脉冲。
+ *
+ * `known` 用的是 ScanWindow::updateLimitGuard 那道闸的**同一个算式** (连着 / 这一轴在映射里
+ * / **此刻**还有完整帧 —— 那边头一项写作 `m_connected`, 是同一个量的窗口侧副本):
+ * 少了最后一条, `pos` 就是上一次断线前的陈值, 拿它算出来的"离得够近"是一句过时的话
+ * —— 而这句话会写在屏幕上, 没有任何东西能让人看出它是陈的。 */
+bool MapCanvas::limitNearAxis(int axis, double line_unit) const
+{
+   if (m_bus == nullptr || m_ctl == nullptr || axis < 0 || axis > 1)
+      return false;
+
+   const double ppu = m_ctl->params().pulses_per_unit;
+   if (!(ppu > 0.0))
+      return false;
+
+   const BusTelem t   = m_bus->telemetry();
+   const AxisTelem &a = t.ax[axis];
+
+   const bool known = t.connected && a.valid && a.mirror_ok;
+   return limitguard::limitTextNear((double)a.pos / ppu, line_unit, known);
+}
+
 /* 限位区: 一条线 + 线**外侧**那半块阴影。X 轴的是竖线 (左或右半边), Y 轴的是横线 (上或下)。
  *
  * 画的是"以后不许越过这里", 不是"此刻压着" —— 后者由 drawMarkers 那个红环说。两件事分开画
  * 是刻意的: 合成一条会让人以为线是刚出现的, 而它其实一直在那儿。
+ *
+ * **线与阴影与距离无关, 那个「…限位区」标签才有** (2026-09-30): 线是"这一侧以后不许越过"的
+ * 界, 它在那儿就是在那儿; 而标签是**一句提示**, 滑台离得远的时候它只是噪声 (用户原话:
+ * 「只要在接近限位的时候提示就好 距离超过 2mm 时候不要有文字提示」)。判据见 limitguard.h。
  *
  * 线与阴影都**裁剪在画图区里** (§28.5 那条"白点画到标尺上"的教训): 画图区之外有标尺、
  * 色标条与 HUD, 一块 36/255 的色斑渗出去就是"屏幕上有块脏东西"。 */
@@ -666,6 +694,10 @@ void MapCanvas::drawLimitZones(QPainter &p)
                          * 正好落在边框上的那一条是画得出来的, 说它在面板外就是说了假话 */
 
       const bool pos_side = (m_lim_dir[i] > 0);
+
+      /* 这一轴的滑台离这条线够近吗 —— 只有"够近"才写下面那个「…限位区」标签。
+       * **线与阴影不看这个** (见函数顶上那段): 判据在 limitguard::limitTextNear */
+      const bool near = limitNearAxis(i, u);
 
       p.save();
       p.setClipRect(r);
@@ -700,39 +732,44 @@ void MapCanvas::drawLimitZones(QPainter &p)
       p.drawLine(a, b);
 
       /* 标签: 贴阴影那一侧, 离画图区边 4px。带子窄于阈值时**翻到线的另一侧** ——
-       * 标签是这条线唯一说得清"是哪一侧"的东西, 挤在 20px 的带子里等于没有 */
-      QFont f = p.font();
-      f.setPointSizeF(8.0);
-      p.setFont(f);
-      p.setPen(C_LIMIT);
-
-      const QString lbl = QStringLiteral("%1 轴%2限位区")
-                             .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"),
-                                  pos_side ? QStringLiteral("正") : QStringLiteral("负"));
-
-      int            al = Qt::AlignVCenter;
-      QRectF         tr;
-
-      if (i == 0)
+       * 标签是这条线唯一说得清"是哪一侧"的东西, 挤在 20px 的带子里等于没有。
+       * `near` 为假时整段跳过 (连 lbl 都不拼) —— 隔得远, 这一句只是噪声 */
+      if (near)
       {
-         const double bandw = pos_side ? (r.right() - a.x()) : (a.x() - r.left());
-         const bool   right = pos_side != (bandw < 130.0);
+         QFont f = p.font();
+         f.setPointSizeF(8.0);
+         p.setFont(f);
+         p.setPen(C_LIMIT);
 
-         tr = right ? QRectF(a.x() + 4.0, r.top() + 4.0, r.right() - a.x() - 8.0, 14.0)
-                    : QRectF(r.left() + 4.0, r.top() + 4.0, a.x() - r.left() - 8.0, 14.0);
-         al |= right ? Qt::AlignRight : Qt::AlignLeft;
+         const QString lbl = QStringLiteral("%1 轴%2限位区")
+                                .arg(i == 0 ? QStringLiteral("X") : QStringLiteral("Y"),
+                                     pos_side ? QStringLiteral("正") : QStringLiteral("负"));
+
+         int    al = Qt::AlignVCenter;
+         QRectF tr;
+
+         if (i == 0)
+         {
+            const double bandw = pos_side ? (r.right() - a.x()) : (a.x() - r.left());
+            const bool   right = pos_side != (bandw < 130.0);
+
+            tr = right ? QRectF(a.x() + 4.0, r.top() + 4.0, r.right() - a.x() - 8.0, 14.0)
+                       : QRectF(r.left() + 4.0, r.top() + 4.0, a.x() - r.left() - 8.0, 14.0);
+            al |= right ? Qt::AlignRight : Qt::AlignLeft;
+         }
+         else
+         {
+            const double bandh = pos_side ? (a.y() - r.top()) : (r.bottom() - a.y());
+            const bool   up    = pos_side != (bandh < 24.0);
+
+            tr = up ? QRectF(r.left() + 8.0, r.top() + 4.0, r.width() - 16.0, 14.0)
+                    : QRectF(r.left() + 8.0, r.bottom() - 18.0, r.width() - 16.0, 14.0);
+            al |= Qt::AlignLeft;
+         }
+
+         p.drawText(tr, al, lbl);
       }
-      else
-      {
-         const double bandh = pos_side ? (a.y() - r.top()) : (r.bottom() - a.y());
-         const bool   up    = pos_side != (bandh < 24.0);
 
-         tr = up ? QRectF(r.left() + 8.0, r.top() + 4.0, r.width() - 16.0, 14.0)
-                 : QRectF(r.left() + 8.0, r.bottom() - 18.0, r.width() - 16.0, 14.0);
-         al |= Qt::AlignLeft;
-      }
-
-      p.drawText(tr, al, lbl);
       p.restore();
    }
 }
@@ -1024,7 +1061,12 @@ void MapCanvas::drawHud(QPainter &p)
     * ±kCanvasHalfUnits), 所以这条线可以一直在图外 —— 不说的话, 屏幕上就是"限位区不见了",
     * 而"不见了"与"没锁住"看起来一模一样。
     * 一条就说一句: 两根轴各一条线时, 最该看见的是**离得近的那一条**, 而两条都在图外时
-    * 报第一条 (理由与 limitPlanWhy 只报第一条同一条: 这是提示, 不是清单)。 */
+    * 报第一条 (理由与 limitPlanWhy 只报第一条同一条: 这是提示, 不是清单)。
+    *
+    * **图外还不够, 得够近才写** (2026-09-30, 判据见 limitguard.h): 这一行是"快压上去了"
+    * 的提示, 而滑台在几十毫米之外时它只是一句噪声 —— 用户原话「只要在接近限位的时候提示
+    * 就好 距离超过 2mm 时候不要有文字提示」。位置不知道 (没连接 / 没帧) 时一个字都不写:
+    * 说不出滑台在哪, 就说不出一句"接近"。 */
    {
       const double ppu = q.pulses_per_unit;
       if (ppu > 0.0)
@@ -1036,6 +1078,9 @@ void MapCanvas::drawHud(QPainter &p)
 
             const double u = (double)m_lim_pos[i] / ppu;
             if (std::fabs(u) <= kCanvasHalfUnits)
+               continue;
+
+            if (!limitNearAxis(i, u))
                continue;
 
             p.setPen(C_LIMIT);
