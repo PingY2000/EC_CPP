@@ -557,16 +557,17 @@ bool ScanController::loadResume(const QString &csv_path, bool accept_zero_epoch_
     * **连接不算搬零点**了 (2026-09-22 起 scan 跨重连沿用零点), 所以那句报错里不再提连接。 */
    if (csv_epoch >= 0 && csv_epoch != m_zero_epoch && !accept_zero_epoch_change)
    {
+      /* 一句「现象 + 出路」, 五行压成一行 (2026-09-30, §49.11)。
+       *
+       * 从前这里是**五段** —— 它落到屏幕上就是一条五行的红横幅, 压在画布顶上, 把刚打开
+       * 的那半场数据整个盖住。而中间那三段是**成因**(回零与「设为区域中心」会搬零点、同一个
+       * 坐标可能指向别处), 按 §26.3 那套本来就该住在 docs/scan_messages.md §8.2 里, 不在
+       * 屏幕上。出路也只剩一条, 就是操作员下一步真会按的那个键 (按「继续」之前先看一眼滑台
+       * 在不在原处)。 */
       return fail(why != nullptr ? why : err,
-         QStringLiteral(
-            "该 CSV 采于另一次零点 (文件为第 %1 次, 当前为第 %2 次)。\n\n"
-            "回零与「设为区域中心」都会搬动零点 (重新连接不会), 同一个坐标\n"
-            "可能已指向另一个物理位置, 继续采会把两份数据拼在同一张图上。\n\n"
-            "确认滑台当前位置与上次零点确立时是同一个物理位置 (同一机械靠块 /\n"
-            "对位标记) 后, 再选「继续」。\n\n"
-            "文件: %3 (开始于 %4)")
-            .arg(csv_epoch).arg(m_zero_epoch)
-            .arg(csv_path, fromStd(started_iso)));
+         QStringLiteral("该 CSV 采于另一次零点 (第 %1 次 → 第 %2 次)。"
+                        "请确认滑台还在上次确立零点时的位置, 再按「继续」。")
+            .arg(csv_epoch).arg(m_zero_epoch));
    }
 
    /* 只补没采过的点 (2026-09-30: **空也照装**)。

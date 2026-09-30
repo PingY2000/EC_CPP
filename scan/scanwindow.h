@@ -269,7 +269,12 @@ private:
    Params currentParams() const;
    void refresh();                    /* 30Hz: tick 状态机 + 刷遥测 + 刷按钮可用性 */
    void setConnected(bool on);
-   void hint(const QString &s, bool fault);
+   /* 横幅就这一个槽。`ms` 是这一句的**自灭时间** (毫秒):
+    *   ms == 0  —— 老规矩: 故障常驻, 其余 8 秒;
+    *   ms  > 0  —— 这一句自己说了算 (「打开 CSV」那条路用 5000, 见 §49.11)。
+    * 故障常驻那条理由 ("无人值守的一趟扫下来, 一闪而过的提示等于没提示") 说的是跑起来之后
+    * **自动发生**的故障; 而给 ms 的那几句全是操作员刚点完按钮的回音, 他人就在屏幕前。 */
+   void hint(const QString &s, bool fault, int ms = 0);
    /* 把横幅摆到画布顶上那一层 (它不在布局里, 所以位置与折行高度都得自己算) */
    void placeBanner();
    void showFault(const QString &why);   /* 自动中止: 红色横幅 + 模态 (无人值守时不会错过) */

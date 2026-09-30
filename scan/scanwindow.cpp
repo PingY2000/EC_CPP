@@ -65,8 +65,29 @@ static const char *kBannerInfo =
  * 横幅**在那条带子里**再缩进多少, 两个数合起来才是"HUD 不会被压住"。 */
 static const int kBannerInset = 6;
 
+/* 「打开 CSV」那一族横幅的自灭时间 (2026-09-30, §49.11)。5 秒, 而且是**故障也灭**。
+ *
+ * 别的红横幅不自动消失, 理由是"无人值守的一趟扫下来, 一闪而过的提示等于没提示"; 这一族
+ * 恰好相反 —— 它们全都是操作员刚点完「打开 CSV」的回音, 人就坐在屏幕前, 而这条横幅压在
+ * 画布顶上, 赖着不走只会挡住刚打开的那半场数据。 */
+static const int kBannerOpenMs = 5000;
+
 /* 默认 CSV 目录, 相对当前工作目录 (从仓库根敲 ./bin/scan.exe 时就落在 scan_out/) */
 static const char *kOutDir = "scan_out";
+
+/* 横幅里报路径一律只留文件名 (2026-09-30, §49.11)。
+ *
+ * 横幅浮在画布顶上, 宽度就是画布的宽度, 一行大约放得下 40 个汉字。而一条
+ * `C:\Users\...\EC_CPP\scan_out\scan_20260930_120000.csv` 自己就有 60 多个字符 ——
+ * 带上它, 整条横幅非折成两行不可, 而画布顶上只留了一条 40px 的带子 (MapCanvas::
+ * kBannerBand), 折出来的第二行就直接压住网格了。
+ *
+ * 目录并没有丢: 参数栏那个「CSV 输出」框一直写着数据落到哪个目录, 选择文件对话框也是从
+ * 那儿开的; 文件名里那串时间戳才是"这是哪一份"的唯一凭据。 */
+static QString shortPath(const QString &p)
+{
+   return QDir::toNativeSeparators(QFileInfo(p).fileName());
+}
 
 /* 读数的显示格式 (量级从 nW 到 W 那一带, 不固定小数位) 已经搬到 powermeter.cpp 的
  * formatReading(): 「最近读数」与「统计」那四个数共用它, 而单位换算 (powerText / scaleFor)
@@ -239,9 +260,7 @@ void ScanWindow::reloadStyle()
    QTimer::singleShot(0, this, [this] { placePanelBars(); });
 
    /* 说一句做了什么: 这个键不弹窗、也没有菜单项, 不给回话就分不出"读到了"和"没反应" */
-   hint(QStringLiteral("已重新载入界面样式: %1")
-           .arg(QDir::toNativeSeparators(stylePath())),
-        false);
+   hint(QStringLiteral("已重新载入界面样式: %1。").arg(shortPath(stylePath())), false);
 }
 
 void ScanWindow::panelCapture(int pi)
@@ -893,12 +912,16 @@ void ScanWindow::onDiInvertToggled(bool on)
 
    if (!t.ax[0].dig_known)
    {
-      hint(QStringLiteral("读不到 60FDh, 取反后无可用判据, 扫描无法启动。请勾选「让 60FDh 进 TxPDO」并重新连接, 或关闭上位机侧取反。"), true);
+      /* 出路只留一条 (2026-09-30): 关掉取反是"把操作员刚做的事退回去", 而他要的是判别据 */
+      hint(QStringLiteral("读不到 60FDh, 取反后扫描无法启动。"
+                          "请勾选「将 60FDh 加入 TxPDO」并重新连接。"), true);
       return;
    }
 
    const AxisTelem &a = t.ax[0];
-   hint(QStringLiteral("上位机侧取反已开启 (轴0 反相后: 正限位 %1 / 负限位 %2)。仅作用于本程序, 驱动器 bit11 与限位保护不受影响。").arg(a.dig_pos ? QStringLiteral("触发") : QStringLiteral("未触发"), a.dig_neg ? QStringLiteral("触发") : QStringLiteral("未触发")), false);
+   hint(QStringLiteral("上位机侧取反已开启 (轴0: 正限位 %1, 负限位 %2), 驱动器不受影响。")
+           .arg(a.dig_pos ? QStringLiteral("触发") : QStringLiteral("未触发"),
+                a.dig_neg ? QStringLiteral("触发") : QStringLiteral("未触发")), false);
 }
 
 /* ---------------------------------------------------------------- 信号灯 */
@@ -1212,16 +1235,15 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
 
               /* 上次那张卡不在了 (换了机器 / USB 网卡没插)。必须说出来, 否则人以为程序记错了 */
               if (cur.isEmpty())
-                 hint(QStringLiteral("网卡 %1 不在当前列表中。请重新选择网卡。"
-                                     "(记录在 scan.ini 中)").arg(nicShort(want)),
+                 hint(QStringLiteral("网卡 %1 不在当前列表中。请重新选择网卡。").arg(nicShort(want)),
                       false);
            });
 
    connect(m_ctl, &ScanController::autoAborted, this, &ScanWindow::showFault);
    connect(m_ctl, &ScanController::runFinished,  this, [this](bool complete) {
       if (complete)
-         hint(QStringLiteral("扫描完成: %1 点, 数据写入 %2。")
-                 .arg(m_ctl->totalPoints()).arg(m_ctl->csvPath()), false);
+         hint(QStringLiteral("扫描完成: %1 点, 已写入 %2。")
+                 .arg(m_ctl->totalPoints()).arg(shortPath(m_ctl->csvPath())), false);
       else if (m_ctl->state() != ScanController::State::Aborted)
          hint(QStringLiteral("扫描已结束 (未完成)"), false);
       refresh();
@@ -3432,12 +3454,9 @@ void ScanWindow::onRestoreDefaults()
 
    applyDefaults();     /* 每一 setValue 都会经 pushParams 重算一遍, 幂等 */
 
-   const Params d;
-   hint(QStringLiteral("扫描参数已恢复为缺省值 (区域 %1 × %2 mm, 分辨率 %3 mm, "
-                       "1 mm = %4 pul, 速度 %5 pul/s)。CSV 输出路径未变。")
-           .arg(d.area_x_unit, 0, 'f', 0).arg(d.area_y_unit, 0, 'f', 0)
-           .arg(d.res_unit, 0, 'f', 3).arg(d.pulses_per_unit, 0, 'f', 0)
-           .arg(d.speed_pul_s), false);
+   /* 那几个数一个都不用念 (2026-09-30): 它们就在旁边的参数栏里, 而且这一下已经把那一栏
+    * 刷成缺省值了 —— 横幅只说"做了什么" */
+   hint(QStringLiteral("扫描参数已恢复为缺省值。"), false);
    refresh();
 }
 
@@ -4023,8 +4042,7 @@ void ScanWindow::onMtrRecordToggled()
       return;
    }
 
-   hint(QStringLiteral("开始记录: 数据写入 %1。")
-           .arg(QDir::toNativeSeparators(m_mlog->recordPath())), false);
+   hint(QStringLiteral("开始记录: 写入 %1。").arg(shortPath(m_mlog->recordPath())), false);
    refresh();
 }
 
@@ -4133,8 +4151,7 @@ void ScanWindow::onMtrExportClicked()
    }
 
    hint(QStringLiteral("已导出 %1 个点至 %2。")
-           .arg(m_mlog->count())
-           .arg(QDir::toNativeSeparators(f)), false);
+           .arg(m_mlog->count()).arg(shortPath(f)), false);
 }
 
 /* ---------------------------------------------------------------- 扫描 */
@@ -4161,8 +4178,9 @@ void ScanWindow::onStartClicked()
    }
 
    /* 不弹确认框 —— 这一趟的范围在按之前就全在眼前了 (参数栏填的数、扫描栏那两行、
-    * 旁边的「开不了」红字)。这里只留一句"出发了": 区域、点数、时长、数据写到哪 */
-   const Params p = currentParams();
+    * 旁边的「开不了」红字)。这里只留一句"出发了": 点数、时长、写到哪个文件。
+    * **区域 / 分辨率 / 速度一个都不念** (2026-09-30, §49.11): 参数栏就在旁边, 而横幅压在
+    * 画布顶上, 每多念一项就多折一行。 */
 
    /* 2026-09-29 §41.3: 这里原来有一句 setHold(true) —— "扫描起来就让连续读数让位"。
     * **它撤掉了**: 不是让位, 从今往后扫描就是**消费这条流**。扫描期间连续读数照旧采 (曲线
@@ -4182,16 +4200,11 @@ void ScanWindow::onStartClicked()
     * 真机更不能这么做: 那次 close/open 要收线程 → 枚举 USB → 开设备 → 读探头 → 重新开流,
     * 几百毫秒起步, 而且会白冻一次界面 */
 
-   /* 出发那一句必须在 m_ctl->start 之后: 它念的是控制器真建出来的网格 (gridNx/totalPoints) */
-   hint(QStringLiteral("扫描开始: 区域 %1 × %2 mm (±%3), 共 %4 × %5 = %6 点, "
-                       "预计全程 %7; 取样源 %8, 数据写入 %9。")
-           .arg(p.area_x_unit, 0, 'f', 3).arg(p.area_y_unit, 0, 'f', 3)
-           .arg(p.area_x_unit / 2.0, 0, 'f', 3)
-           .arg(m_ctl->gridNx()).arg(m_ctl->gridNy())
+   /* 出发那一句必须在 m_ctl->start 之后: 它念的是控制器真建出来的网格 (totalPoints) */
+   hint(QStringLiteral("扫描开始: %1 点, 预计 %2, 写入 %3。")
            .arg(m_ctl->totalPoints())
            .arg(fmtDur(m_ctl->estimateTotalMs()))
-           .arg(m_meter->kind())
-           .arg(QDir::toNativeSeparators(path)), false);
+           .arg(shortPath(path)), false);
 
    m_bannerTimer->stop();    /* 这一句别自己消失: 它说清的是"现在在跑什么" */
    refresh();
@@ -4235,7 +4248,7 @@ void ScanWindow::onOpenCsvClicked()
       if (!readCsvText(f, &text, &rerr))
       {
          m_edCsv->setText(old_path);
-         hint(QStringLiteral("无法打开: ") + rerr, true);
+         hint(QStringLiteral("无法打开: ") + rerr, true, kBannerOpenMs);
          return;
       }
    }
@@ -4245,7 +4258,7 @@ void ScanWindow::onOpenCsvClicked()
    if (!aerr.empty())
    {
       m_edCsv->setText(old_path);
-      hint(QString::fromStdString(aerr), true);
+      hint(QString::fromStdString(aerr), true, kBannerOpenMs);
       return;
    }
 
@@ -4324,8 +4337,7 @@ void ScanWindow::onOpenCsvClicked()
    if (m_ctl->loadResume(f, false, &err, &why))
    {
       m_banner->setVisible(false);
-      hint(QStringLiteral("已打开: %1%2。")
-              .arg(aligned, QDir::toNativeSeparators(f)), false);
+      hint(QStringLiteral("已打开: %1%2。").arg(aligned, shortPath(f)), false, kBannerOpenMs);
       refresh();
       return;
    }
@@ -4333,10 +4345,10 @@ void ScanWindow::onOpenCsvClicked()
    if (!err.isEmpty())
    {
       if (undoOpen(changed))
-         hint(QStringLiteral("无法打开: ") + err, true);
+         hint(QStringLiteral("无法打开: ") + err, true, kBannerOpenMs);
       else
          hint(QStringLiteral("无法打开: ") + err
-              + QStringLiteral("\n上一份也装不回来了, 请重新打开。"), true);
+              + QStringLiteral("\n上一份也装不回来了, 请重新打开。"), true, kBannerOpenMs);
       return;
    }
 
@@ -4352,15 +4364,20 @@ void ScanWindow::onOpenCsvClicked()
    {
       const QString msg = err.isEmpty() ? why : err;
       if (undoOpen(changed))
-         hint(QStringLiteral("仍然无法打开: ") + msg, true);
+         hint(QStringLiteral("仍然无法打开: ") + msg, true, kBannerOpenMs);
       else
          hint(QStringLiteral("仍然无法打开: ") + msg
-              + QStringLiteral("\n上一份也装不回来了, 请重新打开。"), true);
+              + QStringLiteral("\n上一份也装不回来了, 请重新打开。"), true, kBannerOpenMs);
       return;
    }
 
-   hint(QStringLiteral("已打开: %1%2\n%3")
-           .arg(aligned, QDir::toNativeSeparators(f), mismatch), true);
+   /* 世代差异单独说, 不与"打开成功"拼成一条 (2026-09-30, §49.11)。
+    *
+    * 上一版是 `已打开: %1%2\n%3` —— 两件事硬拼, 而 %3 那句控制器文案本身就有五行, 于是屏幕
+    * 上是一条六行的红横幅, 把刚打开的那半场数据整个盖住。"打开了哪一份"由状态行
+    * (「已打开 CSV (未启动)」/「…(此文件已采完)」) 与参数栏那个输出路径框说, 这一句只说
+    * 该知道的那件事。 */
+   hint(mismatch, true, kBannerOpenMs);
    refresh();
 }
 
@@ -4428,8 +4445,7 @@ void ScanWindow::onAbortClicked()
    }
 
    m_ctl->abort(QStringLiteral("操作员中止"));
-   hint(QStringLiteral("已中止。已采数据位于 %1。")
-           .arg(QDir::toNativeSeparators(m_ctl->csvPath())), false);
+   hint(QStringLiteral("已中止。已采数据位于 %1。").arg(shortPath(m_ctl->csvPath())), false);
    refresh();
 }
 
@@ -5179,7 +5195,7 @@ void ScanWindow::setConnected(bool on)
    m_btnConn->setText(on ? QStringLiteral("断开") : QStringLiteral("连接 (进 OP)"));
 }
 
-void ScanWindow::hint(const QString &s, bool fault)
+void ScanWindow::hint(const QString &s, bool fault, int ms)
 {
    m_banner->setText(s);
    m_banner->setStyleSheet(fault ? kBannerFault : kBannerWarn);
@@ -5188,8 +5204,12 @@ void ScanWindow::hint(const QString &s, bool fault)
     * 从隐藏的状态回来的, 不抬一次会被后建的分隔条盖住) */
    placeBanner();
 
-   /* 故障不自动消失: 无人值守的一趟扫下来, 一闪而过的提示等于没提示 */
-   if (!fault)
+   /* 故障不自动消失: 无人值守的一趟扫下来, 一闪而过的提示等于没提示。
+    * 传了 ms 的那几句是例外 —— 它们是操作员刚点完某个按钮的回音, 人就在屏幕前
+    * (「打开 CSV」那一族, 2026-09-30, §49.11) */
+   if (ms > 0)
+      m_bannerTimer->start(ms);
+   else if (!fault)
       m_bannerTimer->start(8000);
    else
       m_bannerTimer->stop();
