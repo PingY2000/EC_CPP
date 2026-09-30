@@ -8,14 +8,22 @@
 
 namespace scan {
 
-static int64_t wallMs()
+/* `# started=` 与每一行的 `time_local` 共用的**同一个**格式串 (2026-09-30)。
+ * 两处必须逐字相同: 一个是"这趟几点开始的", 另一个是"这一点几点采的", 格式不一样就得对表。
+ * 都是 QDateTime::currentDateTime() 来的**本机本地时间、不带时区后缀**。 */
+static QString isoFmt()
 {
-   return QDateTime::currentMSecsSinceEpoch();
+   return QStringLiteral("yyyy-MM-ddTHH:mm:ss");
+}
+
+static QString isoOf(const QDateTime &t)
+{
+   return t.toString(isoFmt());
 }
 
 static QString isoNow()
 {
-   return QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-ddTHH:mm:ss"));
+   return isoOf(QDateTime::currentDateTime());
 }
 
 static bool fail(QString *err, const QString &msg)
@@ -152,6 +160,52 @@ void ScanController::clearResults()
    m_watts.assign(m_watts.size(), 0.0);
 }
 
+/* 把"当前这一轮"整个收掉。两个调用方: abortInternal 的装载那一支与 newFile()。
+ * 不碰状态 (enter(Idle) 由调用方来), 也不碰 m_plan / m_nx / m_ny —— 网格尺寸要留着,
+ * clearResults() 那一份注释说了为什么。 */
+void ScanController::resetRunState()
+{
+   m_log.close();
+   m_order.clear();
+
+   /* 这三行是"让不可能变成不可能", 不是顺手 (2026-09-30): pendingPoints() 是
+    * m_order.size() - m_ord_i, m_order 空了而 m_ord_i 不是 0 就是**负数** —— 而从这一轮起
+    * 它成了「继续」与「重测选中点」两个按钮的判据 (见 scanwindow.cpp 的 refresh)。
+    * 装载那一支从前没重置它们, 当时没事 (loadResume 刚清零过), 但那靠的是调用顺序。 */
+   m_ord_i      = 0;
+   m_run_ms     = -1;
+   m_load_epoch = -1;
+
+   m_cur       = -1;
+   m_is_retest = false;
+
+   clearResults();
+
+   /* 当前那份文件已经不再是要写的目标了 —— 窗口那个路径框得换名, 否则下一次「开始扫描」
+    * 会把它截断 (见 takeStaleCsvName) */
+   m_stale_csv_name = true;
+}
+
+bool ScanController::newFile(QString *err)
+{
+   if (running())
+      return fail(err, QStringLiteral("扫描进行中, 请先「中止」。"));
+
+   /* **不复用 abortInternal**: 它的第三个分支 (中止一轮) 刻意不关文件 —— 那是为了让中止之后
+    * 还能单点重测; 而"新建"要的恰恰是把那份文件放掉, 否则新建之后重测还能往上一份文件追加。
+    * 装载 / Done / Aborted / Idle 四种来路在这里走的是**同一条**。 */
+   resetRunState();
+   enter(State::Idle);
+   return true;
+}
+
+bool ScanController::takeStaleCsvName()
+{
+   const bool v = m_stale_csv_name;
+   m_stale_csv_name = false;
+   return v;
+}
+
 const Point *ScanController::currentPoint() const
 {
    if (m_cur < 0 || (size_t)m_cur >= m_plan.size())
@@ -177,7 +231,12 @@ QString ScanController::stateText() const
    switch (m_st)
    {
    case State::Idle:     return QStringLiteral("空闲, 参数可改");
-   case State::Loaded:   return QStringLiteral("已装载续扫数据 (未启动)");
+   /* 两支 (2026-09-30): 待补的点在不在, 决定操作员此刻能做的是"继续补点"还是"重测单点" ——
+    * 而这两件事在屏幕上是两个不同的按钮。字数上限 ~15 (这一句同时进画布 HUD, 那个框单行
+    * 不换行直接裁, 而画布能被拖窄), 所以只说最要紧的那半句 */
+   case State::Loaded:   return m_order.empty()
+                                ? QStringLiteral("已打开 CSV (此文件已采完)")
+                                : QStringLiteral("已打开 CSV (未启动)");
    case State::Moving:   return settlingNow() ? QStringLiteral("到位中 (已进稳定窗口)")
                                               : QStringLiteral("移动中");
    case State::Dwelling: return QStringLiteral("停留 (等待机械余振衰减)");
@@ -408,10 +467,12 @@ bool ScanController::start(const QString &csv_path, QString *err)
    if (running())
       return fail(err, QStringLiteral("扫描进行中, 请先「中止」。"));
 
-   /* 装载态下"新建一轮"没有意义 —— 一份续扫正等着补点, 而这一按会把它的上半场与待补集合
-    * 一起丢掉。界面那边「开始扫描」是灰的, 这一句是照 armRun 那个体例留的第二道 */
+   /* 打开态下"新建一轮"没有意义 —— 一份打开的文件正等着补点或重测, 而这一按会把它的
+    * 上半场与待补集合一起丢掉。界面那边「开始扫描」是灰的, 这一句是照 armRun 那个体例
+    * 留的第二道。出路写「中止」而不写「新建 CSV」: 两个都能出去, 而「中止」在任何状态下
+    * 都在 (「新建 CSV」是这一轮新加的, 不指望读这句话的人已经知道它) */
    if (loaded())
-      return fail(err, QStringLiteral("已装载一份续扫, 请先「中止」。"));
+      return fail(err, QStringLiteral("已打开一份 CSV, 请先「中止」。"));
 
    QString pe = paramsError();
    if (!pe.isEmpty())
@@ -446,7 +507,7 @@ bool ScanController::start(const QString &csv_path, QString *err)
    return true;
 }
 
-/* 续扫第一步: 把那份 CSV 读进来 (2026-09-29 与"开跑"拆开)。
+/* 「打开 CSV」第一步: 把那份 CSV 读进来 (2026-09-29 与"开跑"拆开)。
  *
  * 今天打开的路径只到这里为止 —— 上半场画在画布上、要补的点算好、句柄按追加开着, 而滑台
  * **一步没走**。开始走是 beginLoadedRun() 的事, 由操作员按「继续」触发。
@@ -454,14 +515,14 @@ bool ScanController::start(const QString &csv_path, QString *err)
  * 装载态**不可重入** (上面那句守卫): 它的后半段是破坏性的 (清 m_order / 覆写 m_done /
  * 关旧句柄), 而其中关旧句柄与开新句柄之间没有退路 —— 新的没开成, 旧的就回不来了, 留下一个
  * "状态写着装载态、m_order 空、句柄关着"的撕裂态, 之后按「继续」永远失败。与其在失败路径上
- * 补一堆回滚, 不如让这条路不可达 (界面那边「打开 CSV 续扫」在装载态也是灰的)。 */
+ * 补一堆回滚, 不如让这条路不可达 (界面那边「打开 CSV」在装载态也是灰的)。 */
 bool ScanController::loadResume(const QString &csv_path, bool accept_zero_epoch_change,
                                 QString *err, QString *why)
 {
    if (running())
       return fail(err, QStringLiteral("扫描进行中, 请先「中止」。"));
    if (loaded())
-      return fail(err, QStringLiteral("已装载一份续扫, 请先「中止」。"));
+      return fail(err, QStringLiteral("已打开一份 CSV, 请先「中止」。"));
 
    if (why != nullptr) why->clear();
 
@@ -496,7 +557,7 @@ bool ScanController::loadResume(const QString &csv_path, bool accept_zero_epoch_
          QStringLiteral(
             "该 CSV 采于另一次零点 (文件为第 %1 次, 当前为第 %2 次)。\n\n"
             "回零与「设为区域中心」都会搬动零点 (重新连接不会), 同一个坐标\n"
-            "可能已指向另一个物理位置, 续扫会把两份数据拼在同一张图上。\n\n"
+            "可能已指向另一个物理位置, 继续采会把两份数据拼在同一张图上。\n\n"
             "确认滑台当前位置与上次零点确立时是同一个物理位置 (同一机械靠块 /\n"
             "对位标记) 后, 再选「继续」。\n\n"
             "文件: %3 (开始于 %4)")
@@ -504,18 +565,21 @@ bool ScanController::loadResume(const QString &csv_path, bool accept_zero_epoch_
             .arg(csv_path, fromStd(started_iso)));
    }
 
-   /* 只补没采过的点 */
+   /* 只补没采过的点 (2026-09-30: **空也照装**)。
+    *
+    * 从前 m_order 为空这里就 fail 了, 于是"打开一份已经采完的 CSV"只有一个红横幅。而用户要的
+    * 是**打开来看 / 拿来重测单点** —— 那是两份不同的用途, 采完的文件完全配得上一个能用的
+    * "打开"。所以这里不再拒, 后面照旧往下走: m_done 由 mask 铺满、csvLoadGrid 把值填上,
+    * 于是画布上是一整张图, 而 pendingPoints() == 0。
+    *
+    * 它的代价落在两处判据上, 都在下面各自的地方: beginLoadedRun() 空 order 拒绝 (那份文案
+    * 从前住在这里), retest() 反过来**只在有待补的点时才拒**。 */
    m_order.clear();
    for (size_t i = 0; i < m_plan.size() && i < mask.size(); i++)
    {
       if (!mask[i])
          m_order.push_back((int)i);
    }
-
-   if (m_order.empty())
-      return fail(why != nullptr ? why : err,
-                  QStringLiteral("该 CSV 中的点已全部采完, 没有要补的点。"
-                                 "要重来一轮请另建文件。"));
 
    /* 已有进度连数值一起装进结果网格, 续扫一开始图上就有上半场 */
    for (size_t i = 0; i < mask.size() && i < m_done.size(); i++)
@@ -543,7 +607,7 @@ bool ScanController::loadResume(const QString &csv_path, bool accept_zero_epoch_
    return true;
 }
 
-/* 续扫第二步: 操作员按了「继续」。
+/* 「打开 CSV」第二步: 操作员按了「继续」。
  *
  * 开工之前把**装载那一刻的两条前提**重查一遍。这两件事都能在"装载好、还没按继续"那段
  * 时间里变掉, 而 m_order 里那些 (ix, iy) 绑的就是它们:
@@ -555,14 +619,21 @@ bool ScanController::loadResume(const QString &csv_path, bool accept_zero_epoch_
 bool ScanController::beginLoadedRun(QString *err)
 {
    if (m_st != State::Loaded)
-      return fail(err, QStringLiteral("还没装载续扫数据, 请先打开一份 CSV。"));
+      return fail(err, QStringLiteral("还没打开一份 CSV, 请先「打开 CSV」。"));
+
+   /* **排在 sameGeom 与 armRun 前面** (2026-09-30): armRun 里同样有一句空 order 的拒绝,
+    * 但它排在"未连接总线 / 不在 OP / 正在回零 / 功率计未打开"**之后** —— 打开一份采完的文件
+    * 又恰好掉过线时, 屏幕上先看到的会是「未连接总线」, 一句与现象毫不相干的话。 */
+   if (m_order.empty())
+      return fail(err, QStringLiteral(
+         "这份 CSV 的点已全部采完, 没有要补的点。请改用「重测选中点」。"));
 
    if (!sameGeom(m_run_p, m_p))
-      return fail(err, QStringLiteral("装载时的几何已被改过, 请「中止」后重新打开这份 CSV。"));
+      return fail(err, QStringLiteral("打开时那份几何已被改过, 请「中止」后重新打开这份 CSV。"));
 
    if (m_zero_epoch != m_load_epoch)
       return fail(err,
-         QStringLiteral("装载之后零点被搬动过 (第 %1 次 → 第 %2 次)。"
+         QStringLiteral("打开之后零点被搬动过 (第 %1 次 → 第 %2 次)。"
                         "请「中止」后重新打开这份 CSV。")
             .arg(m_load_epoch).arg(m_zero_epoch));
 
@@ -574,16 +645,21 @@ bool ScanController::retest(int ix, int iy, QString *err)
    if (running())
       return fail(err, QStringLiteral("扫描进行中, 单点重测需等扫描停止。"));
 
-   /* 装载态下重测会把 m_order 换成那一个点 —— "要补哪些点"当场没了, 一声不响。
-    * 而这里**特别容易漏**: 下面那句 !m_log.isOpen() 在装载态恰好**不成立** (续扫句柄
-    * 正开着), 所以它不是这道闸。界面那边「重测选中点」是灰的 */
-   if (loaded())
-      return fail(err, QStringLiteral("已装载一份续扫, 请先「中止」。"));
+   /* 打开一份 CSV 之后重测会把 m_order 换成那一个点 —— **"要补哪些点"当场没了, 一声不响**。
+    * 而这里**特别容易漏**: 下面那句 !m_log.isOpen() 在装载态恰好**不成立** (追加句柄正开着),
+    * 所以它不是这道闸。界面那边「重测选中点」是灰的。
+    *
+    * 判据是**有没有待补的点**, 不是"在不在装载态" (2026-09-30): 采完的文件里 m_order 本来就
+    * 是空的, 没有集合可顶 —— 而那正是"打开一份旧数据、挑几格重测"这条用途 (用户原话:
+    * 「扫完了可以重扫单点并把数据加在最后」)。界面那一侧的判据是同一个算式。 */
+   if (loaded() && pendingPoints() > 0)
+      return fail(err, QStringLiteral("已打开一份 CSV, 还有 %1 个点待补, 请先「继续」或「中止」。")
+                            .arg(pendingPoints()));
 
    if (!m_log.isOpen())
       return fail(err, QStringLiteral(
          "当前没有进行中的一轮, 单点重测需要已打开的 CSV 文件, 无文件可追加。\n"
-         "请先「开始」或「续扫」。"));
+         "请先「开始扫描」或「打开 CSV」。"));
 
    if (!sameGeom(m_run_p, m_p))
       return fail(err, QStringLiteral(
@@ -650,17 +726,15 @@ void ScanController::abort(const QString &why)
 
 void ScanController::abortInternal(const QString &why, bool automatic)
 {
-   /* 装载态 = **放弃这次装载**, 不是"中止一轮" (2026-09-29)。一个点都没跑过, 所以:
-    * 关掉追加句柄、丢掉要补的点、把结果数组清干净 (否则「中止装载 → 开始扫描」之后,
+   /* 装载态 = **放弃这次打开**, 不是"中止一轮" (2026-09-29)。一个点都没跑过, 所以:
+    * 关掉追加句柄、丢掉要补的点、把结果数组清干净 (否则「放弃打开 → 开始扫描」之后,
     * 图上这一轮还没测过的格子画的是那份被放弃文件里的值 —— rebuildPlan 几何没变就提前
-    * return, start() 只重排 m_order, 那三个数组谁都不会替它清), 回到"未装载"。
-    * **不发 runFinished**: 那一路的槽会弹「扫描已结束 (未完成)」, 而这里没有"结束"可言。 */
+    * return, start() 只重排 m_order, 那三个数组谁都不会替它清), 回到 Idle。
+    * **不发 runFinished**: 那一路的槽会弹「扫描已结束 (未完成)」, 而这里没有"结束"可言。
+    * 2026-09-30 起这一段搬进 resetRunState() (与 newFile() 共用), 做的还是这几件事。 */
    if (m_st == State::Loaded)
    {
-      m_log.close();
-      m_order.clear();
-      m_cur = -1;
-      clearResults();
+      resetRunState();
       enter(State::Idle);
       return;
    }
@@ -676,7 +750,10 @@ void ScanController::abortInternal(const QString &why, bool automatic)
    m_cur = -1;
    enter(State::Aborted);
 
-   /* 不关文件: 中止之后常要单点重测, 而重测就是往这个文件里追加 (每行都已 flush) */
+   /* 不关文件: 中止之后常要单点重测, 而重测就是往这个文件里追加 (每行都已 flush)。
+    * 「重测」走的是 m_log 手上那个句柄, 与路径框写着什么无关 —— 所以下面那件事安全。 */
+   m_stale_csv_name = true;   /* 见 takeStaleCsvName() */
+
    if (automatic && !why.isEmpty())
       emit autoAborted(why);
    emit runFinished(false);
@@ -745,7 +822,11 @@ void ScanController::finishPoint(bool ok, const std::string &flags)
    r.pos_y_pul    = t.ax[1].pos;
    r.spread_x_pul = m_spread[0];
    r.spread_y_pul = m_spread[1];
-   r.unix_ms      = wallMs();
+   /* 两个时间字段从**同一个** QDateTime 来 (2026-09-30): 分两次 currentDateTime() 会跨秒 ——
+    * unix_ms 落在 …:29.998 而 time_local 落在 …:30, 于是那一行自己跟自己对不上 */
+   const QDateTime now = QDateTime::currentDateTime();
+   r.unix_ms      = now.toMSecsSinceEpoch();
+   r.time_local   = isoOf(now).toStdString();
    r.elapsed_ms   = (m_run_ms >= 0) ? (m_now_ms - m_run_ms) : 0;
 
    if (!m_log.isOpen() || !m_log.append(r))
@@ -786,6 +867,19 @@ void ScanController::advance()
 
    /* 走完了 (整轮或单点重测)。文件不关: 重测要往同一个文件追加 */
    m_is_retest = false;
+
+   /* 点列清掉 (2026-09-30)。单点重测走完之后 m_order 是 {k} 而 m_ord_i 是 0 (重测那一路
+    * 跳过上面那句 m_ord_i++), 于是 pendingPoints() 报 **1** —— 画布左上角那行「N / M 点,
+    * 剩 K」是无条件读它的, 每次重测之后都会多出一句"剩 1 个点"。而这一轮起它还成了
+    * 「继续」与「重测」两个按钮的判据, 留着一个假的数会给下一个人假的线索。
+    * start() 与 retest() 都会重填 m_order, 所以清掉安全。 */
+   m_order.clear();
+   m_ord_i = 0;
+
+   /* 本轮那份文件不再是"要写的目标"了 —— 窗口那个路径框得换成新的时间戳名, 否则再按
+    * 「开始扫描」会把它截断 (见 takeStaleCsvName) */
+   m_stale_csv_name = true;
+
    enter(State::Done);
    emit runFinished(true);
 }

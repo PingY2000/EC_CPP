@@ -356,6 +356,14 @@ void ScanWindow::refreshEditability()
    if (m_btnOpen != nullptr)
       m_btnOpen->setEnabled(!running && !loaded && m_connected);
 
+   /* 「新建 CSV」的判据**只有 !running** (2026-09-30, §49.3) —— 与「中止」同族, 与「打开」
+    * 那条刻意不同: 它不发任何总线帧, 也不依赖"装载完之后能不能干活"。反过来, 在**装载态 +
+    * 断线**这个组合下它是除「中止」之外唯一能退出来的口子: 那时「打开」是灰的、一份采完的
+    * 文件上「继续」也是灰的、几何那几项与参数框的 [取消] 全按不动 —— 不留这一个口子, 屏幕上
+    * 就像卡死了。 */
+   if (m_btnNew != nullptr)
+      m_btnNew->setEnabled(!running);
+
    /* 「功率计」那一整块框。它不在上面那张表里, 判据全在 refreshMeterPanel() 里 —— 从这一处
     * 转过去, 于是"可用性只有一处写"这条规矩在这一块上也成立 */
    refreshMeterPanel();
@@ -2361,8 +2369,16 @@ QWidget *ScanWindow::buildScanPanel()
 
    connect(m_btnRetest, &QPushButton::clicked, this, &ScanWindow::onRetestClicked);
 
-   m_btnOpen = new QPushButton(QStringLiteral("打开 CSV 续扫"), box);
-   m_btnOpen->setToolTip(QStringLiteral("读回已有数据, 仅补采未完成的点, 继续追加同一文件。"));
+   /* 两个入口, 屏幕上永远看得出此刻在哪种模式 (2026-09-30, docs/scan_sweep.md §49)。
+    * 从前只有一个「打开 CSV 续扫」, 它把选文件 / 对齐参数 / 读回数据三件事捆在一起,
+    * 于是分不清"我要新开一份"和"我要看/接着那一份" */
+   m_btnNew = new QPushButton(QStringLiteral("新建 CSV"), box);
+   m_btnNew->setToolTip(QStringLiteral("清掉当前这份, 输出路径换成当前时刻的新名字。"));
+   connect(m_btnNew, &QPushButton::clicked, this, &ScanWindow::onNewCsvClicked);
+
+   m_btnOpen = new QPushButton(QStringLiteral("打开 CSV"), box);
+   m_btnOpen->setToolTip(QStringLiteral("读回已有数据并画到画布上, 参数对齐到这份文件。"
+                                        "未采完的可继续补点, 采完的可重测单点。"));
    connect(m_btnOpen, &QPushButton::clicked, this, &ScanWindow::onOpenCsvClicked);
 
    /* ---- 输出路径那一行 (2026-09-30 从「扫描参数」搬来的) ----
@@ -2371,10 +2387,12 @@ QWidget *ScanWindow::buildScanPanel()
     * 与控件摆在哪一框无关 (理由见 buildParamPanel 里那一段)。所以这里的控件**一个 setEnabled
     * 都不许写**: 参数控件的可用性只有 refreshEditability() 一处写点。
     *
-    * 摆在「打开 CSV 续扫」下面: 这两件说的是同一份文件 (它决定"往哪写", 那个决定"接着哪份写")。
-    * 路径框那一份说明在占位字上, 不另加标签 (搬之前它也是这么摆的) */
+    * 摆在两个入口下面: 这三件说的是同一份文件 (那两个决定"新建还是接着哪份", 它决定"往哪写")。
+    * 路径框那一份说明在占位字上, 不另加标签 (搬之前它也是这么摆的)。
+    * 占位字必须是**小写** yyyyMMdd_HHmmss: 那是 applyCsvDefaultName() 真的生成的格式
+    * (Qt 里大写的 MM 是**月**, 换成大写这张脸就与真实文件名对不上了) */
    m_edCsv = new QLineEdit(box);
-   m_edCsv->setPlaceholderText(QStringLiteral("scan_out/scan_YYYYmmdd_HHMMSS.csv"));
+   m_edCsv->setPlaceholderText(QStringLiteral("scan_out/scan_yyyyMMdd_HHmmss.csv"));
    m_btnCsv = new QPushButton(QStringLiteral("…"), box);
    /* **不设固定宽** (2026-09-30): 原先这里是 setFixedWidth(28), 而样式表给 QPushButton 的
     * 内边距是 5px 12px、边框 1px —— 28 宽留给字的只剩 **2 px**, 那个「…」被剪成**一个点**
@@ -2399,6 +2417,7 @@ QWidget *ScanWindow::buildScanPanel()
    QHBoxLayout *r2 = new QHBoxLayout;
    r2->setContentsMargins(0, 0, 0, 0);
    r2->addWidget(m_btnRetest, 1);
+   r2->addWidget(m_btnNew, 1);
    r2->addWidget(m_btnOpen, 1);
 
    QHBoxLayout *r3 = new QHBoxLayout;
@@ -4183,13 +4202,16 @@ void ScanWindow::onOpenCsvClicked()
                             ? QDir::current().filePath(QString::fromLatin1(kOutDir))
                             : m_last_dir;
 
+   /* 「未完成」三个字去掉了 (2026-09-30, §49.3): 采完的 CSV 现在也打得开 —— 打开来看、
+    * 挑几格重测是它与"补点"并列的第二条用途 */
    const QString f = QFileDialog::getOpenFileName(
-      this, QStringLiteral("打开未完成的扫描 CSV"), start,
+      this, QStringLiteral("打开扫描 CSV"), start,
       QStringLiteral("CSV (*.csv);;所有文件 (*)"));
    if (f.isEmpty())
       return;
 
    m_last_dir = QFileInfo(f).absolutePath();
+   const QString old_path = m_edCsv->text();   /* 退回时与那四个几何控件同进退, 见下面 restore */
    m_edCsv->setText(QDir::toNativeSeparators(f));
 
    /* ---- 先把参数栏对齐到这份 CSV 的几何 (2026-09-29, docs/scan_sweep.md §44) -------------
@@ -4208,7 +4230,8 @@ void ScanWindow::onOpenCsvClicked()
       QString rerr;
       if (!readCsvText(f, &text, &rerr))
       {
-         hint(QStringLiteral("无法接续: ") + rerr, true);
+         m_edCsv->setText(old_path);
+         hint(QStringLiteral("无法打开: ") + rerr, true);
          return;
       }
    }
@@ -4217,6 +4240,7 @@ void ScanWindow::onOpenCsvClicked()
    const std::string aerr = csvAlignParams(text, cand, &cand);
    if (!aerr.empty())
    {
+      m_edCsv->setText(old_path);
       hint(QString::fromStdString(aerr), true);
       return;
    }
@@ -4234,28 +4258,36 @@ void ScanWindow::onOpenCsvClicked()
       m_edPpu  ->setValue(cand.pulses_per_unit);
    }
 
-   /* 退回去的那一手: 续扫最终没成时把四个控件退回原样 (也就退回了控制器与量程)。
-    * 「要么整件事成了, 要么屏幕回到按之前那样」—— 点已采完 / 限位闸拦下 / 写不进文件
-    * 都跟参数无关, 让面板留着一份"为这趟改过而结果没跑"的几何只会让人看不懂。
-    * (退回之后「● 未保存」那个标记也跟着回到按之前的样子 —— 基线比对是幂等的) */
-   auto restore = [this, old]()
+   /* 退回去的那一手: 打开最终没成时把四个控件退回原样 (也就退回了控制器与量程)。
+    * 「要么整件事成了, 要么屏幕回到按之前那样」—— 限位闸拦下 / 写不进文件都跟参数无关,
+    * 让面板留着一份"为这趟改过而结果没跑"的几何只会让人看不懂。
+    * (退回之后「● 未保存」那个标记也跟着回到按之前的样子 —— 基线比对是幂等的)
+    *
+    * **路径框一起退** (2026-09-30, §49.5): 它是 beginNew 的 Truncate 目标 (scanlog.cpp:32),
+    * 打开失败却把它留在那份"没打开成"的文件上, 再按「开始扫描」就是静默清空一份**别人写的**
+    * 文件 —— 而屏幕上唯一能看出来的是这句 8 秒自灭的横幅。从前它退四个几何控件、不退路径,
+    * 这个不对称本身就是错的 */
+   auto restore = [this, old, old_path]()
    {
       m_edAreaX->setValue(old[0]);
       m_edAreaY->setValue(old[1]);
       m_edRes  ->setValue(old[2]);
       m_edPpu  ->setValue(old[3]);
+      m_edCsv  ->setText(old_path);
    };
 
    /* 只有真变了才说这一句 —— 横幅就一个槽, 那四个数就在旁边的参数栏里 (横幅 1 句 / 40 字) */
    const QString aligned = changed ? QStringLiteral("已按 CSV 对齐扫描参数, ") : QString();
 
-   /* 读入而已, **不开跑** (2026-09-29): 装载好的上半场已经在画布上, 要补的点也算好了,
-    * 滑台一步没走 —— 开始补点是操作员按「继续」的事 (见 onResumeRunClicked) */
+   /* 读入而已, **不开跑** (2026-09-29): 上半场已经在画布上, 要补的点也算好了,
+    * 滑台一步没走 —— 开始补点是操作员按「继续」的事 (见 onResumeRunClicked)。
+    * **采完的文件也装得进来** (2026-09-30): 那时 pendingPoints() == 0、「继续」是灰的,
+    * 能做的是「重测选中点」 */
    QString err, why;
    if (m_ctl->loadResume(f, false, &err, &why))
    {
       m_banner->setVisible(false);
-      hint(QStringLiteral("续扫: %1已读入 %2。")
+      hint(QStringLiteral("已打开: %1%2。")
               .arg(aligned, QDir::toNativeSeparators(f)), false);
       refresh();
       return;
@@ -4265,7 +4297,9 @@ void ScanWindow::onOpenCsvClicked()
    {
       if (changed)
          restore();
-      hint(QStringLiteral("无法接续: ") + err, true);
+      else
+         m_edCsv->setText(old_path);
+      hint(QStringLiteral("无法打开: ") + err, true);
       return;
    }
 
@@ -4281,12 +4315,37 @@ void ScanWindow::onOpenCsvClicked()
    {
       if (changed)
          restore();
-      hint(QStringLiteral("仍然无法接续: ") + (err.isEmpty() ? why : err), true);
+      else
+         m_edCsv->setText(old_path);
+      hint(QStringLiteral("仍然无法打开: ") + (err.isEmpty() ? why : err), true);
       return;
    }
 
-   hint(QStringLiteral("续扫: %1%2\n%3")
+   hint(QStringLiteral("已打开: %1%2\n%3")
            .arg(aligned, QDir::toNativeSeparators(f), mismatch), true);
+   refresh();
+}
+
+/* 「新建 CSV」: 回到"新建"模式 (2026-09-30, docs/scan_sweep.md §49.3)。
+ *
+ * 屏幕上它做三件事 —— 画布清空 / 几何解锁 ("打开态下间距大小改不动"这条解药就是它) /
+ * 输出路径换成当前时刻的新时间戳名。前两件在这里, 第三件不在这里: 路径由 refresh() 里那个
+ * 一次性标志 (takeStaleCsvName) 换, 四条来路 (新建 / 跑完 / 中止 / 放弃打开) 走同一条。
+ *
+ * 拒绝只有一种: 运行中。那句 err 由控制器给, 这里原样端上去 —— 界面上这个按钮那时候也
+ * 是灰的, 这一道是"两处判据同一个算式"里靠后的那一道。 */
+void ScanWindow::onNewCsvClicked()
+{
+   QString err;
+   if (!m_ctl->newFile(&err))
+   {
+      hint(err, true);
+      refresh();
+      return;
+   }
+
+   m_banner->setVisible(false);   /* 上一轮那句红横幅说的是另一份文件, 跟着一起收掉 */
+   hint(QStringLiteral("已新建一份 CSV。"), false);
    refresh();
 }
 
@@ -4299,17 +4358,17 @@ void ScanWindow::onPauseClicked()
 
 void ScanWindow::onResumeRunClicked()
 {
-   /* 两个来源 (2026-09-29): 装载态 = 开始补点 (要报错), 暂停态 = 接着跑完当前点 (void) */
+   /* 两个来源 (2026-09-29): 打开态 = 开始补点 (要报错), 暂停态 = 接着跑完当前点 (void) */
    if (m_ctl->loaded())
    {
       QString err;
       if (!m_ctl->beginLoadedRun(&err))
       {
-         hint(err, true);      /* 留在装载态: 接好线 / 换一份再按一次就行 */
+         hint(err, true);      /* 留在打开态: 接好线 / 换一份再按一次就行 */
          refresh();
          return;
       }
-      hint(QStringLiteral("续扫: 开始补 %1 点。").arg(m_ctl->pendingPoints()), false);
+      hint(QStringLiteral("开始补 %1 点。").arg(m_ctl->pendingPoints()), false);
    }
    else
    {
@@ -4320,12 +4379,12 @@ void ScanWindow::onResumeRunClicked()
 
 void ScanWindow::onAbortClicked()
 {
-   /* 装载态那一支是"放弃这次装载": 一个点都没跑过, 所以那句话不能说"已采数据位于…"
+   /* 打开态那一支是"放弃这次打开": 一个点都没跑过, 所以那句话不能说"已采数据位于…"
     * (那份文件是**别人**采的, 这一趟一个字没写)。画布也一起清 —— 见 abortInternal */
    if (m_ctl->loaded())
    {
-      m_ctl->abort(QStringLiteral("操作员放弃装载"));
-      hint(QStringLiteral("已放弃这次装载。"), false);
+      m_ctl->abort(QStringLiteral("操作员放弃打开"));
+      hint(QStringLiteral("已放弃这次打开。"), false);
       refresh();
       return;
    }
@@ -4627,6 +4686,23 @@ void ScanWindow::refresh()
       }
    }
 
+   /* 路径框里那个名字已经作废了 -> 换成当前时刻的新时间戳名 (2026-09-30, §49.5)。
+    *
+    * 四条来路 (新建 CSV / 跑完一轮 / 中止 / 放弃打开) 在控制器里各置一次那个一次性标志,
+    * **这里是唯一的消费点** —— 一处写点, 于是"什么时候该换名"这件事只有一个答案。
+    *
+    * 为什么非换不可: 路径框是 beginNew 的 Truncate 目标 (scanlog.cpp:32), 而上面那四条路
+    * 之后它写的还是**上一份**文件 —— 那时按「开始扫描」就是静默清空一份已经在盘上的数据,
+    * 屏幕上只多出一句 8 秒自灭的横幅。换了名之后「开始扫描」永远写新文件。
+    *
+    * 放在 tick 之后: 上面第一句已经让状态机走了一格, 这一拍该发生的跳变都已经发生 (跑完
+    * 一轮就是在 tick 里走的), 于是屏幕上不会闪一帧旧名字。 */
+   if (m_ctl->takeStaleCsvName())
+   {
+      m_edCsv->clear();
+      applyCsvDefaultName();
+   }
+
    /* 按钮形态只看遥测, 不看"点过哪个按钮" —— 后者会与线程的真实状态错开。
     * in_op = 正在发帧 (真连上了), busy = 正在连接或正在收尾; 两者任一为真就是占着总线 */
    const bool onair = t.in_op || t.busy;
@@ -4906,19 +4982,28 @@ void ScanWindow::refresh()
 
    const ScanController::State st = m_ctl->state();
    m_btnPause->setEnabled(running && st != ScanController::State::Paused);
-   /* 「继续」有两个来源 (2026-09-29): 暂停之后接着跑, 或者装载之后开始补点。
-    * 两条路都叫"继续", 差别在那半句状态行上 (「已暂停…」/「已装载续扫数据 (未启动)」)。
+   /* 「继续」有两个来源 (2026-09-29): 暂停之后接着跑, 或者打开一份 CSV 之后开始补点。
+    * 两条路都叫"继续", 差别在那半句状态行上 (「已暂停…」/「已打开 CSV (未启动)」)。
     * **两个来源都要连接** (2026-09-30): 它按下去就**发新动作** (接着走点), 没总线走不动。
-    * 暂停着掉线那一路本来也很快就自己结束 (running() 为真时 tick() 的健康检查照样在跑) */
-   m_btnResume->setEnabled((st == ScanController::State::Paused || loaded) && m_connected);
+    * 暂停着掉线那一路本来也很快就自己结束 (running() 为真时 tick() 的健康检查照样在跑)。
+    *
+    * 打开态那一路还多一条**待补点数 > 0** (2026-09-30): 一份已经采完的 CSV 装得进来
+    * (那时它在屏幕上是"一张完整的图"), 而它没有任何要补的点 —— 按钮亮着按下去只会换来
+    * 一句拒绝。判据与控制器 beginLoadedRun() 那道闸是同一个算式 */
+   m_btnResume->setEnabled(m_connected
+                           && (st == ScanController::State::Paused
+                               || (loaded && m_ctl->pendingPoints() > 0)));
    /* 「中止」**刻意不判连接** (2026-09-30): 它是"退出去"的那一个 —— 装载态下总线断了, 人得
-    * 能按它放弃这次装载、把几何解锁; 判上连接就成了"断了线就卡在装载态里出不来"。
+    * 能按它放弃这次打开、把几何解锁; 判上连接就成了"断了线就卡在装载态里出不来"。
     * 它不向上面的「开始扫描 / 继续 / 重测选中点」看齐, 是因为那三个要**发新动作**,
     * 而这个只收尾 (收尾最坏也只是写不出去, 工作线程那边本来就拦得住) */
-   m_btnAbort->setEnabled(running || loaded);   /* 装载态 = 放弃这次装载 */
-   /* 「重测选中点」装载态下不放开: 它会把"要补哪些点"换成那一个点。
-    * **没连接也不放开** (2026-09-30): 它走 armRun 重走一点, 没有总线一步也走不了 */
-   m_btnRetest->setEnabled(!running && !loaded && m_connected && m_canvas->selectedIx() >= 0);
+   m_btnAbort->setEnabled(running || loaded);   /* 装载态 = 放弃这次打开 */
+   /* 「重测选中点」的判据从"装载态一律不许"改成**有待补的点才不许** (2026-09-30, §49.4):
+    * 不许的理由是"它会把要补哪些点换成那一个点", 而一份采完的 CSV 没有待补集合可顶 ——
+    * 那正是"打开一份旧数据、挑几格重测"这条用途 (用户原话: 「扫完了可以重扫单点并把数据加在
+    * 最后」)。**没连接仍然不放开**: 它走 armRun 重走一点, 没有总线一步也走不了 */
+   m_btnRetest->setEnabled(!running && m_connected && m_canvas->selectedIx() >= 0
+                           && (!loaded || m_ctl->pendingPoints() == 0));
 
    /* ---- 进度 ---- */
    if (running || st == ScanController::State::Paused)

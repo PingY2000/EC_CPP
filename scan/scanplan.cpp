@@ -246,8 +246,15 @@ int64_t estimatePerPointMs(const Params &p)
 
 std::string csvColumnHeader()
 {
+   /* `time_local` 是 2026-09-30 加在人看得懂那一头的一列 (用户原话: 「在记录每个点的时候
+    * 记录记录的时间」) —— unix_ms 与 elapsed_ms 都在, 但读文件的人要的是"这一点几点几分
+    * 采的"。
+    *
+    * **只许追加在末尾**: csvLoadGrid 是**按列名找** ix/iy/watts/ok 的, 那套"找不到就退回
+    * 默认下标 1/2/7/8"的兜底只在**没有列名行**的老文件上才用到 —— 末尾多一列, 它连一个字
+    * 都不用改; csvParseForResume 更只看前三个字段。改这一行的时候别动前面任何一列的位置。 */
    return "index,ix,iy,x_unit,y_unit,x_pul,y_pul,watts,ok,flags,"
-          "pos_x_pul,pos_y_pul,spread_x_pul,spread_y_pul,unix_ms,elapsed_ms";
+          "pos_x_pul,pos_y_pul,spread_x_pul,spread_y_pul,unix_ms,elapsed_ms,time_local";
 }
 
 std::string csvMetaLines(const Params &p, const std::string &started_iso, int zero_epoch)
@@ -280,6 +287,9 @@ std::string csvMetaLines(const Params &p, const std::string &started_iso, int ze
 
 std::string csvRowLine(const Row &r)
 {
+   /* buf 的余量按最坏情况量过: flags 最长那条中文串在 UTF-8 下约 60 字节, 其余 15 个字段
+    * 合起来约 180 字节, 再加 time_local 的 19 —— 整行不到 260, 512 有近两倍余量。
+    * **加列的时候顺手看一眼这里** (这是最容易忘的一处)。 */
    char buf[512];
 
    /* 数值用 C locale, 不用 QLocale: 某些区域设置会把小数点变成逗号 */
@@ -290,12 +300,13 @@ std::string csvRowLine(const Row &r)
       watts[0] = '\0';          /* 采不到就留空: 0 是一个合法的读数 */
 
    std::snprintf(buf, sizeof(buf),
-                 "%d,%d,%d,%.9g,%.9g,%d,%d,%s,%d,%s,%d,%d,%d,%d,%lld,%lld\n",
+                 "%d,%d,%d,%.9g,%.9g,%d,%d,%s,%d,%s,%d,%d,%d,%d,%lld,%lld,%s\n",
                  r.index, r.pt.ix, r.pt.iy,
                  r.pt.x_unit, r.pt.y_unit, r.pt.x_pul, r.pt.y_pul,
                  watts, r.ok ? 1 : 0, r.flags.c_str(),
                  r.pos_x_pul, r.pos_y_pul, r.spread_x_pul, r.spread_y_pul,
-                 (long long)r.unix_ms, (long long)r.elapsed_ms);
+                 (long long)r.unix_ms, (long long)r.elapsed_ms,
+                 r.time_local.c_str());
 
    return std::string(buf);
 }

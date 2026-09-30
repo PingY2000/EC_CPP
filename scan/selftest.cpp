@@ -764,6 +764,114 @@ static void test_csv()
    outside += "0,99,0,0,0,0,0,1,1,,0,0,0,0,0,0\n";       /* ix 超出 55 */
    check(!csvParseForResume(outside, p, nullptr, nullptr, nullptr, nullptr).empty(),
          "an out-of-grid index rejected");
+
+   /* ---- 2026-09-30 (§49.6): 每行末尾多一列人能看的时间 ----
+    *
+    * 加列这件事**只有一个兼容性风险点**: 老文件里没有这一列。所以下面的判据要拿一份
+    * **手写的、16 列的老格式文本**去跑, 而且那份文本是写死的 —— 不许从新代码生成
+    * (生成出来的东西当然跟新代码一致, 那就不叫兼容性判据了)。 */
+   caseBegin("csv: 每行多一个 time_local 列, 读回一个字不变");
+   {
+      /* 表头只许往**末尾**追加 —— csvLoadGrid 按列名找列, 找不到才退回默认下标 1/2/7/8,
+       * 而那一套默认值是给"没有列名行的老文件"用的。插在中间就是静默错位 */
+      const std::string head = csvColumnHeader();
+      check(head.size() > 10 && head.compare(head.size() - 10, 10, "time_local") == 0,
+            "time_local 是最后一列", head);
+
+      /* 列数: 表头与数据行必须一样 —— 差一列 Excel 打开就是歪的 */
+      Row a;
+      a.pt = plan[0];
+      a.ok = true;
+      a.watts = 2.0;
+      a.time_local = "2026-09-30T14:25:30";
+      Row b = a;
+      b.time_local.clear();          /* 老文件那一格是空的 */
+
+      const std::string la = csvRowLine(a);
+      const std::string lb = csvRowLine(b);
+      auto commas = [](const std::string &s) {
+         int n = 0;
+         for (char c : s)
+            if (c == ',') n++;
+         return n;
+      };
+      checkEq(commas(la), commas(lb), "有没有时间, 逗号个数一样 (列数没变)");
+      int hc = 0;
+      for (char c : head)
+         if (c == ',') hc++;
+      checkEq(commas(la), hc, "数据行与表头的列数一致");
+      check(la.size() > lb.size(), "带上时间那一行更长 (多出来的就是那一列)",
+            la);
+      check(lb.find("2026-09-30") == std::string::npos, "空那一格不许凭空编一个时间", lb);
+
+      /* 同一份点列, 一份带时间一份不带: 两个读函数**逐项相同** */
+      std::string with_t = csvMetaLines(p, "2026-09-30T10:00:00", 1) + head + "\n";
+      std::string no_t   = with_t;
+      for (int i = 0; i < 6; i++)
+      {
+         Row r;
+         r.index = i;
+         r.pt    = plan[(size_t)i];
+         r.watts = 1.0 + (double)i;
+         r.ok    = true;
+         with_t += csvRowLine(r);
+         r.time_local.clear();
+         no_t += csvRowLine(r);
+      }
+
+      std::vector<char>   h1, h2;
+      std::vector<double> w1, w2;
+      csvLoadGrid(with_t, p, &h1, &w1);
+      csvLoadGrid(no_t,   p, &h2, &w2);
+      checkEq((long long)h1.size(), (long long)h2.size(), "两个网格一样大");
+      int diffs = 0;
+      for (size_t i = 0; i < h1.size() && i < h2.size(); i++)
+         if (h1[i] != h2[i] || w1[i] != w2[i])
+            diffs++;
+      checkEq(diffs, 0, "带时间与不带时间读回来逐项相同");
+
+      std::vector<char> m1, m2;
+      int mi1 = 0, mi2 = 0;
+      const std::string d1 = csvParseForResume(with_t, p, &m1, &mi1, nullptr, nullptr);
+      const std::string d2b = csvParseForResume(no_t,   p, &m2, &mi2, nullptr, nullptr);
+      check(d1.empty() && d2b.empty(), "两份都能续", d1 + " | " + d2b);
+      checkEq(mi1, mi2, "max_index 相同");
+      checkEq((long long)m1.size(), (long long)m2.size(), "mask 一样大");
+      check(m1 == m2, "mask 逐项相同");
+
+      /* **老格式 (16 列, 连列名都没有 time_local)**: 这一条是这次加列唯一的风险点。
+       * 字符串是写死的, 一个字节都不从新代码生成 */
+      caseBegin("csv: 一份手写的老格式文件 (16 列) 照旧读得回来");
+      const std::string old_file =
+         "# area_x_unit=27\n"
+         "# area_y_unit=27\n"
+         "# res_unit=0.5\n"
+         "# pulses_per_unit=50000\n"
+         "# started=2026-09-17T10:00:00\n"
+         "# zero_epoch=1\n"
+         "index,ix,iy,x_unit,y_unit,x_pul,y_pul,watts,ok,flags,"
+         "pos_x_pul,pos_y_pul,spread_x_pul,spread_y_pul,unix_ms,elapsed_ms\n"
+         "0,0,0,-13.5,-13.5,-675000,-675000,1.5,1,,0,0,0,0,1000,0\n"
+         "1,1,0,-13,-13.5,-650000,-675000,2.5,1,,0,0,0,0,1100,100\n";
+
+      std::vector<char>   mo;
+      std::vector<double> wo;
+      csvLoadGrid(old_file, p, &mo, &wo);
+      checkEq(mo[0], 1, "老文件第 0 格有值");
+      checkNear(wo[0], 1.5, "老文件第 0 格的值");
+      checkNear(wo[1], 2.5, "老文件第 1 格的值 (列下标没被新列顶歪)");
+      checkEq(mo[2], 0, "老文件第 2 格是空的");
+
+      std::vector<char> mo2;
+      int mio = -1;
+      std::string isoo;
+      int epo = -1;
+      const std::string d3 = csvParseForResume(old_file, p, &mo2, &mio, &isoo, &epo);
+      check(d3.empty(), "老文件照旧续得上", d3);
+      checkEq(mio, 1, "max_index = 1");
+      checkEq(epo, 1, "zero_epoch 读得回来");
+      check(isoo == "2026-09-17T10:00:00", "started 读得回来");
+   }
 }
 
 /* 续扫前把面板对齐到 CSV 的几何 (2026-09-29, docs/scan_sweep.md §44)。
@@ -1155,7 +1263,7 @@ static void test_resumeload()
       r.ctrl.abort(QStringLiteral("收尾"));
    }
 
-   caseBegin("resumeload: 装载失败不留痕 (四种拒绝都排在动状态之前)");
+   caseBegin("resumeload: 拒绝都排在动状态之前 (采完的文件 2026-09-30 起不再拒绝)");
    {
       Rig r;
       const Params p = Rig::smallParams();
@@ -1166,20 +1274,30 @@ static void test_resumeload()
 
       QString err;
 
-      /* (a) 点已经采完 */
+      /* (a) 点已经采完 —— **装得进来** (2026-09-30, §49.4)。
+       *
+       * 这一组在 2026-09-29 钉的是反过来的那句话 (「采完的文件装不进来」), 这一轮判据反了:
+       * 打开一份旧数据、挑几格重测是「打开 CSV」与"补点"并列的第二条用途 (用户原话:
+       * 「扫完了可以重扫单点并把数据加在最后」)。**"不留痕"这个意思换一条判据承着** ——
+       * 它本来要防的是"拒绝之后在控制器里留下半截状态", 现在的判据是"装进来之后画布上就是
+       * 那 25 格"。
+       *
+       * **用一套自己的 Rig** (下面 (b) 还要拿干净的 r 去拒绝): 装载是"进得去"的, 装在同一个
+       * 控制器上会让 (b) 撞上"已打开一份 CSV, 请先「中止」"而不是它要量的那句几何差异。 */
       {
          const QString full = dir.filePath("full.csv");
-         Rig rf;
-         rf.ctrl.setParams(p);
-         rf.ctrl.rebuildPlan();
-         rf.meter.setValue(3.0);
-         check(rf.startScan(full, &err), "先跑完一整轮", err.toStdString());
-         check(rf.runToIdle(), "跑完");
+         Rig ra;
+         ra.ctrl.setParams(p);
+         ra.ctrl.rebuildPlan();
+         ra.meter.setValue(3.0);
+         check(ra.startScan(full, &err), "先跑完一整轮", err.toStdString());
+         check(ra.runToIdle(), "跑完");
 
          err.clear();
-         check(!r.loadOnlyScan(full, &err), "采完的文件装不进来");
-         check(err.contains(QStringLiteral("已全部采完")), "那句话说了原因", err.toStdString());
-         check(r.ctrl.state() != ScanController::State::Loaded, "没进装载态");
+         check(ra.loadOnlyScan(full, &err), "采完的文件装得进来", err.toStdString());
+         check(ra.ctrl.state() == ScanController::State::Loaded, "进了装载态");
+         checkEq(ra.ctrl.pendingPoints(), 0, "一个待补的点都没有");
+         checkEq(countDoneCells(ra.ctrl), 25, "画布上是那份文件里的一整张图");
       }
 
       /* (b) 几何对不上 (手写一份别的分辨率的 CSV, 不走界面那次对齐) */
@@ -1272,8 +1390,13 @@ static void test_resumeload()
       checkEq(r.ctrl.pendingPoints(), pend, "要补的点没被动过");
 
       /* 这一句**特别容易漏**: retest 下面那句 !m_log.isOpen() 在装载态恰好不成立
-       * (续扫句柄正开着), 所以它不是这道闸 —— 放开的话 m_order 会被换成那一个点,
-       * "要补哪些点"当场没了, 一声不响 */
+       * (追加句柄正开着), 所以它不是这道闸 —— 放开的话 m_order 会被换成那一个点,
+       * "要补哪些点"当场没了, 一声不响。
+       *
+       * 判据 2026-09-30 改成**"有待补的点"才拒** (§49.4): 这一组装的是一份 3/25 的文件,
+       * pendingPoints() == 25-3 > 0, 所以结论一个字不变 —— 变的只是理由。判据从"在不在
+       * 装载态"挪到"那个集合里还有没有东西", 因为采完的文件里 m_order 本来就是空的,
+       * 没有集合可顶 (那正是"打开旧数据挑几格重测"这条用途) */
       err.clear();
       check(!r.retestAt(0, 0, &err), "装载态下 retest 被拒");
       check(err.contains(QStringLiteral("中止")), "那句话也说了出路", err.toStdString());
@@ -1303,6 +1426,294 @@ static void test_resumeload()
 
       check(r.runToIdle(), "跑完");
       checkEq(r.ctrl.completedPoints(), 25, "补齐 25 格");
+   }
+
+   /* ================================================================
+    * 2026-09-30 (§49): 「打开一份采完的 CSV」+ 「新建 CSV」那两条路
+    * ================================================================ */
+
+   caseBegin("resumeload: 采完的文件也能打开 (待补点数为 0)");
+   {
+      const Params p = Rig::smallParams();
+
+      /* 先跑一份**完整**的: 用一个临时 Rig 写完就丢掉 —— 主角是下面那个"打开它"的控制器 */
+      const QString full = dir.filePath("complete.csv");
+      {
+         Rig w;
+         w.ctrl.setParams(p);
+         w.ctrl.rebuildPlan();
+         w.meter.setValue(3.0);
+         QString err;
+         check(w.startScan(full, &err), "先跑完一整轮", err.toStdString());
+         check(w.runToIdle(), "跑完");
+         checkEq(w.ctrl.completedPoints(), 25, "文件里是 25 个点");
+      }
+
+      Rig r;
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      QString err, why;
+      check(r.loadOnlyScan(full, &err, &why), "采完的文件装得进来", (err + " | " + why).toStdString());
+      check(r.ctrl.state() == ScanController::State::Loaded, "状态是 Loaded");
+      checkEq(r.ctrl.pendingPoints(), 0, "一个待补的点都没有");
+      checkEq(r.ctrl.completedPoints(), 25, "已采点数 = 25 (整份都读回来了)");
+      checkEq(countDoneCells(r.ctrl), 25, "画布上是完整一张图");
+      checkEq(r.bus.nspeed, 0, "装载这一路一次速度都没设过 (armRun 没被走到)");
+      checkEq(r.bus.ntarget, 0, "一个目标都没下发");
+
+      /* 拨 50 拍, 一个字节都不该动 —— 与"打开一份没采完的"同一条 (上面那一组钉的) */
+      for (int k = 0; k < 50; k++)
+         r.stepOnce();
+      check(r.ctrl.state() == ScanController::State::Loaded, "拨 50 拍之后还在装载态");
+      checkEq(r.bus.ntarget, 0, "拨 50 拍之后还是一个目标都没下发");
+
+      /* ---- 按「继续」被拒, **而且留在装载态** ---- */
+      caseBegin("resumeload: 采完的文件按「继续」被拒, 且留在装载态");
+      err.clear();
+      check(!r.beginLoadedRun(&err), "没有要补的点 → 拒");
+      check(err.contains(QStringLiteral("已全部采完")), "那句话点名了现象", err.toStdString());
+      check(err.contains(QStringLiteral("重测选中点")), "而且给了唯一的出路", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Loaded, "留在装载态 (接好线 / 换一份再按一次就行)");
+      checkEq(r.bus.ntarget, 0, "拒了就是一步没走");
+
+      /* 这一句必须是**这道闸**给的, 不是 armRun 里那句「网格中没有要扫的点。」
+       * —— 那一条排在"未连接 / 不在 OP / 正在回零 / 功率计未打开"**之后**, 掉过线时
+       * 屏幕上先看到的就是一句与现象毫不相干的话 */
+      check(!err.contains(QStringLiteral("网格中没有要扫的点")),
+            "走的是 beginLoadedRun 那道闸, 不是 armRun 那句兜底", err.toStdString());
+
+      /* ---- 单点重测: 这才是这份文件能做的事 ---- */
+      caseBegin("resumeload: 采完的文件可以单点重测 (值换成新的, 格数不变)");
+      const int done_before = countDoneCells(r.ctrl);
+      checkEq(done_before, 25, "重测之前是满的");
+      r.meter.setValue(7.0);          /* 换一个值, 才看得出"这一格被重测了" */
+
+      err.clear();
+      check(r.retestAt(0, 0, &err), "有待补点才拒, 采完的反而放行", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Moving, "当场就走 (armRun 那一路)");
+      check(r.runToIdle(), "走完这一个点");
+      checkNear(r.ctrl.cellValue(0, 0), 7.0, "那一格的值换成了重测的这一次");
+      checkEq(countDoneCells(r.ctrl), done_before, "格数不变 (重测是覆盖, 不是多一个点)");
+      check(r.ctrl.state() == ScanController::State::Done, "单点重测走完 = 本轮结束");
+      checkEq(r.ctrl.pendingPoints(), 0, "待补点数归零 (点列收掉了, 见 advance())");
+
+      r.ctrl.abort(QStringLiteral("收尾"));
+   }
+
+   caseBegin("resumeload: 有待补的点时单点重测仍被拒 (与采完的那份正相反)");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      const QString csv = dir.filePath("pending_retest.csv");
+      checkEq(makePartialCsv(csv, p, 3), 3, "只采了 3 个点的文件");
+
+      QString err, why;
+      check(r.loadOnlyScan(csv, &err, &why), "装载", err.toStdString());
+      const int pend = r.ctrl.pendingPoints();
+      checkEq(pend, 22, "3/25 → 22 个待补");
+
+      err.clear();
+      check(!r.retestAt(0, 0, &err), "有待补的点 → 拒 (顶掉那个集合就一声不响了)");
+      check(err.contains(QStringLiteral("中止")), "那句话说了出路", err.toStdString());
+      check(err.contains(QStringLiteral("22")), "而且把待补点数报出来", err.toStdString());
+      checkEq(r.ctrl.pendingPoints(), pend, "要补的点集合没被动过");
+      check(r.ctrl.state() == ScanController::State::Loaded, "还在装载态");
+
+      r.ctrl.abort(QStringLiteral("收尾"));
+   }
+
+   caseBegin("newfile: 新建清掉上一轮的结果与句柄");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      QString err;
+      check(r.startScan(dir.filePath("tobediscarded.csv"), &err), "先跑一轮", err.toStdString());
+      check(r.runToIdle(), "跑完");
+      checkEq(countDoneCells(r.ctrl), 25, "跑完之后画布是满的");
+
+      err.clear();
+      check(r.ctrl.newFile(&err), "新建", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Idle, "回到 Idle");
+      check(!r.ctrl.running(), "也没在跑");
+      check(!r.ctrl.loaded(), "也不是装载态");
+      checkEq(countDoneCells(r.ctrl), 0, "画布清空了");
+      checkEq(r.ctrl.completedPoints(), 0, "已采点数归零");
+      checkEq(r.ctrl.pendingPoints(), 0, "待补点数归零");
+
+      /* 句柄真的关了 —— 单点重测那条路的判据就是 !m_log.isOpen()
+       * (csvPath() 不能当证据: ScanLog::close() 刻意不清 m_path) */
+      err.clear();
+      check(!r.retestAt(0, 0, &err), "新建之后单点重测也拒 (没有可追加的文件)");
+      check(err.contains(QStringLiteral("无文件可追加")), "而且拒的理由就是这一条",
+            err.toStdString());
+   }
+
+   caseBegin("newfile: 装载态新建 = 放弃这次打开 (画布与句柄一起收掉)");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      const QString csv = dir.filePath("discard_by_new.csv");
+      checkEq(makePartialCsv(csv, p, 3), 3, "只采了 3 个点的文件");
+
+      QString err, why;
+      check(r.loadOnlyScan(csv, &err, &why), "装载", err.toStdString());
+      checkEq(countDoneCells(r.ctrl), 3, "画布上有上半场");
+
+      err.clear();
+      check(r.ctrl.newFile(&err), "装载态下新建也成", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Idle, "回到 Idle (几何随之解锁)");
+      checkEq(countDoneCells(r.ctrl), 0, "那半张图也清掉了");
+
+      /* 那三个结果数组从文件里读进来之后**谁都不会替它清** (rebuildPlan 几何没变就提前
+       * return, start 只重排 m_order) —— 不清的话 "新建 → 开始扫描" 之后图上画的是那份
+       * 被放弃文件的值。上面的 countDoneCells 是这一条的直接证据 */
+
+      /* 用户答复里明说的那条出路: 新建之后能按「开始扫描」 */
+      err.clear();
+      check(r.startScan(dir.filePath("after_new.csv"), &err), "新建之后能起一轮",
+            err.toStdString());
+      check(r.runToIdle(), "跑完");
+      checkEq(r.ctrl.completedPoints(), 25, "新文件名下是干净的 25 格");
+   }
+
+   caseBegin("newfile: 运行中新建被拒");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      QString err;
+      check(r.startScan(dir.filePath("running_new.csv"), &err), "起一轮", err.toStdString());
+      check(r.ctrl.running(), "正在跑");
+
+      err.clear();
+      check(!r.ctrl.newFile(&err), "运行中 → 拒");
+      check(err.contains(QStringLiteral("中止")), "那句话说了出路", err.toStdString());
+      check(r.ctrl.running(), "拒了就是还在跑");
+      check(r.ctrl.state() == ScanController::State::Moving, "状态没被动过");
+
+      r.ctrl.abort(QStringLiteral("收尾"));
+   }
+
+   caseBegin("newfile: 路径框作废标志恰好置一次 (跑完 / 放弃打开 置, 打开成功不置)");
+   {
+      const Params p = Rig::smallParams();
+
+      const QString full = dir.filePath("stale_full.csv");
+
+      Rig r;
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      /* (1) 跑完一轮 → 置一次, 取走即清。**这一轮得由 r 自己跑** —— 拿另一个控制器跑完
+       *     再来问 r 的标志, 量的是"新建过的那个控制器" (它当然没置) */
+      QString err;
+      check(r.startScan(full, &err), "先跑完一整轮", err.toStdString());
+      check(r.runToIdle(), "跑完");
+      check(r.ctrl.takeStaleCsvName(), "跑完一轮之后标志置着");
+      check(!r.ctrl.takeStaleCsvName(), "取一次就清了 (名字只该换一次)");
+
+      /* (2) 打开成功那一步**不置** —— 那之后要写的正是刚打开的那份文件,
+       *     换名就等于把"接着往下补"变成"另起一份", 两半数据分家 */
+      QString why;
+      check(r.loadOnlyScan(full, &err, &why), "打开一份采完的", err.toStdString());
+      check(!r.ctrl.takeStaleCsvName(), "打开成功不置 (这份文件就是接下来要写的)");
+
+      /* (3) 放弃打开 → 置一次 (那份文件已经不再是要写的目标了) */
+      r.ctrl.abort(QStringLiteral("操作员放弃打开"));
+      check(r.ctrl.state() == ScanController::State::Idle, "放弃打开回 Idle");
+      check(r.ctrl.takeStaleCsvName(), "放弃打开之后也置");
+      check(!r.ctrl.takeStaleCsvName(), "同样只置一次");
+
+      /* (4) 中止一轮也置 —— 中止那份文件还在盘上(句柄都还开着, 重测要用),
+       *     而它已经不是"下一次「开始扫描」要写的文件"了。不置的话那一次就是 Truncate,
+       *     静默清空刚中止下来的半份数据 ("已采数据保留在 CSV 中"这句话就成假的) */
+      Rig r2;
+      r2.ctrl.setParams(p);
+      r2.ctrl.rebuildPlan();
+      r2.meter.setValue(3.0);
+      r2.ctrl.setZeroEpoch(0);
+      QString e2;
+      check(r2.startScan(dir.filePath("aborted_stale.csv"), &e2), "起一轮", e2.toStdString());
+      /* 起一轮那一步**不置** (armRun 不碰这个标志) —— 先取干净, 下面量的是"中止"那一下 */
+      while (r2.ctrl.takeStaleCsvName())
+         ;
+      r2.ctrl.abort(QStringLiteral("操作员中止"));
+      check(r2.ctrl.state() == ScanController::State::Aborted, "中止了");
+      check(r2.ctrl.takeStaleCsvName(), "中止一轮也置");
+   }
+
+   caseBegin("csv: 真跑一轮写出来的 time_local 与 # started= 同格式");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      const QString csv = dir.filePath("timed.csv");
+      QString err;
+      check(r.startScan(csv, &err), "起一轮", err.toStdString());
+      check(r.runToIdle(), "跑完");
+
+      QFile f(csv);
+      check(f.open(QIODevice::ReadOnly | QIODevice::Text), "读回那份 CSV", csv.toStdString());
+      const QStringList lines = QString::fromUtf8(f.readAll())
+                                   .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+      f.close();
+
+      QString started, last_row;
+      for (const QString &l0 : lines)
+      {
+         const QString l = l0.trimmed();
+         if (l.startsWith(QStringLiteral("# started=")))
+            started = l.mid(10);
+         else if (!l.startsWith(QLatin1Char('#')) && !l.startsWith(QStringLiteral("index,")))
+            last_row = l;
+      }
+
+      /* 表头那一份 (起点) 与最后一行那一列 (每个点各一份) 必须是**同一种写法** ——
+       * 两处一旦不同源, 屏幕上/表格里没人看得出来 */
+      check(started.size() == 19, "started 是 19 个字符", started.toStdString());
+      check(!last_row.isEmpty(), "有数据行");
+
+      const QStringList flds = last_row.split(QLatin1Char(','));
+      check(flds.size() >= 17, "最后一行至少 17 个字段", last_row.toStdString());
+      const QString t = flds.last();
+      checkEq(t.size(), 19, "time_local 是 19 个字符");
+      check(t[10] == QLatin1Char('T'), "第 11 位是 T (日期与时间之间)", t.toStdString());
+      check(t[4] == QLatin1Char('-') && t[7] == QLatin1Char('-'), "4 / 7 位是 -", t.toStdString());
+      check(t[13] == QLatin1Char(':') && t[16] == QLatin1Char(':'),
+            "13 / 16 位是 :", t.toStdString());
+      check(t.left(10) == started.left(10), "日期那一段与 started 同一天",
+            (t + " vs " + started).toStdString());
+      /* 本机本地时间、**不带时区后缀** —— 与 # started= 同一个性质 (不能当 UTC 用) */
+      check(!t.contains(QLatin1Char('Z')) && !t.contains(QLatin1Char('+')),
+            "不带时区后缀", t.toStdString());
    }
 }
 

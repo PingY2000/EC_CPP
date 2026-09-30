@@ -73,7 +73,7 @@ public:
 
    State state() const { return m_st; }
    bool  running() const;              /* Moving/Dwelling/Reading/Paused */
-   bool  loaded() const { return m_st == State::Loaded; }   /* 装载好等着按「继续」 */
+   bool  loaded() const { return m_st == State::Loaded; }   /* 打开一份 CSV, 停着等操作员 */
    QString stateText() const;          /* 状态栏那一行中文 */
 
    /* 正在走的点在 m_plan 里的下标; 不在跑时 -1 */
@@ -104,12 +104,23 @@ public:
    /* 开始新一轮: 新建 CSV (父目录自动建)。过不了 Preflight 就返回 false 并说明 */
    bool start(const QString &csv_path, QString *err);
 
+   /* 回到"新建"模式 (2026-09-30, docs/scan_sweep.md §49): 关掉当前那份文件的写出句柄、
+    * 丢掉点列与三个结果数组、回 Idle —— 于是参数栏解锁、画布清空, 下一次 start() 写一个
+    * **新文件**。运行中拒绝 (界面那边「新建 CSV」也是灰的, 这一句是第二道)。
+    *
+    * 与 abort() 的区别不是"做多做少", 是**对谁**: abortInternal 的第三个分支 (中止一轮)
+    * **刻意不关文件** —— 中止之后常要单点重测, 而重测就是往同一个文件追加; 而"新建"恰恰
+    * 要把那份文件放掉。 */
+   bool newFile(QString *err);
+
    /* 断点续扫, 拆成两步 (2026-09-29: 打开 CSV 之后**不直接开跑**, 先把数据读进来)。
     *
     * loadResume: 读一个已有 CSV, 校验几何一致 → 只补没采过的点 → 继续追加同一个文件,
     * 然后**停在 State::Loaded** —— 上半场已经画在画布上、要补的点已经算好、句柄开着,
     * 而滑台一步没走。zero_epoch 不一致时 (中间重连过、零点可能变过) 返回 false,
     * why 里要求操作员确认 (照旧)。
+    * **采完的文件也装得进来** (2026-09-30): 那时 m_order 为空、pendingPoints() == 0, 能做的是
+    * 单点重测而不是补点 —— 见 retest() 与 beginLoadedRun() 那两道判据。
     *
     * beginLoadedRun: 操作员按下「继续」才开始走。开工前把**装载那一刻的两条前提重查一遍**
     * (几何还是那一份吗 / 零点世代还是那一个吗) —— 这两件事都能在"装载好、还没按继续"那段
@@ -118,6 +129,22 @@ public:
    bool loadResume(const QString &csv_path, bool accept_zero_epoch_change,
                    QString *err, QString *why);
    bool beginLoadedRun(QString *err);
+
+   /* 「输出路径框里那个名字已经作废了」的一次性标志 (2026-09-30, docs/scan_sweep.md §49.5)。
+    *
+    * 一轮结束 / 中止 / 放弃打开 / 新建 之后,**当前那份文件已经不再是要写的目标**, 而窗口那个
+    * 路径框还写着它的路径 —— 按「开始扫描」就是 beginNew 的 Truncate, 静默清空一份(可能是
+    * 别人的)文件。所以这几条路各置一次这个标志, 由窗口在 refresh() 里取走换成新的时间戳名。
+    *
+    * 置起的地方一共四处, 一处一句 m_stale_csv_name = true:
+    *   advance() (整轮 / 单点重测跑完) / abortInternal 的"中止一轮"那一支 / resetRunState()
+    *   (它管"放弃打开"与 newFile() 两条)。
+    * **唯独"打开成功"那一步不置** —— 那一步之后要写的正是刚打开的那份文件, 换名就等于
+    * 把"接着往下补"变成"另起一份", 两半数据分家。自检钉的就是这三条。
+    *
+    * 放在控制器里而不是让窗口比状态跳变: 它进得了 SCAN_COMMON_SRC, 自检钉得住。取走即清 ——
+    * 名字只该换一次, 而 applyCsvDefaultName() 每次调用都会取一个新时刻。 */
+   bool takeStaleCsvName();
 
    /* 单点重测: 走回 (ix,iy) 再采一次, 追加一行 flags=retest。
     * 要求已经有一轮在跑 (否则没有文件可追加), 且几何参数没被改过 */
@@ -177,8 +204,13 @@ private:
    void stopMotion();                   /* postStop + 丢掉未决读数 */
    void abortInternal(const QString &why, bool automatic);
    /* 三个结果数组归零, **网格尺寸保持原样** (cellDone 是按 m_nx 索引进来的, 不能 clear)。
-    * 只有"放弃装载"那一条路要它 —— 见 abortInternal 里装载态那一支 */
+    * 只有"放弃装载"与"新建"那两条路要它 */
    void clearResults();
+
+   /* 把"当前这一轮"整个收掉: 关句柄 / 清点列 / 清结果网格 / 置那个路径框作废标志。
+    * 两个调用方: abortInternal 的装载那一支 ("放弃这次打开") 与 newFile()。
+    * **它不碰状态** —— enter(State::Idle) 由调用方自己来。 */
+   void resetRunState();
 
    /* 每 tick 的安全检查。返回空串 = 健康; 非空 = 原因 (调用方据此自动中止) */
    QString healthProblem(const BusTelem &t);
@@ -214,6 +246,7 @@ private:
    std::vector<double> m_watts;  /* 该格最后一次的功率 */
 
    ScanLog m_log;
+   bool    m_stale_csv_name = false;   /* 见 takeStaleCsvName() */
 
    int64_t m_now_ms      = 0;    /* 最近一次 tick 的单调钟 */
    int64_t m_state_ms    = -1;   /* 进入当前状态的时刻 */

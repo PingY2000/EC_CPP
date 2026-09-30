@@ -114,7 +114,8 @@ private:
    void onCenterAllClicked();
    void onZeroHereClicked();          /* 「设为区域中心」 */
    void onBrowseCsv();
-   void onOpenCsvClicked();           /* 断点续扫 */
+   void onNewCsvClicked();            /* 新建 CSV: 回到"新建"模式 (§49) */
+   void onOpenCsvClicked();           /* 打开 CSV: 读回一份已有数据并停住 */
    void onStartClicked();
    void onPauseClicked();
    void onResumeRunClicked();
@@ -403,6 +404,12 @@ private:
    QPushButton *m_btnResume = nullptr;
    QPushButton *m_btnAbort  = nullptr;
    QPushButton *m_btnRetest = nullptr;
+   /* 「新建 CSV」= 回到"新建"模式 (2026-09-30, docs/scan_sweep.md §49): 清掉当前那份、几何解锁、
+    * 输出路径换成当前时刻的新时间戳名。**它的可用性判据只有 !running**, 不判 m_connected ——
+    * 与「中止」同族: 它不发任何总线帧, 而且"装载态 + 断线"这个组合下它是除「中止」之外唯一
+    * 能退出来的口子 (那时「打开」是灰的、采完的文件上「继续」也是灰的、几何锁与参数框的
+    * [取消] 全按不动) */
+   QPushButton *m_btnNew    = nullptr;
    QPushButton *m_btnOpen   = nullptr;
    QLabel      *m_lProg     = nullptr;
    QLabel      *m_lTime     = nullptr;

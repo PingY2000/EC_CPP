@@ -138,6 +138,14 @@ struct Row
    int32_t  spread_y_pul = 0;
    int64_t  unix_ms  = 0;
    int64_t  elapsed_ms = 0;       /* 自本轮扫描开始 */
+   /* 人能看的那一列 (2026-09-30): `yyyy-MM-ddTHH:mm:ss`, 与表头 `# started=` 同一个格式,
+    * **本机本地时间、不带时区后缀** (所以它不能当 UTC 用 —— 与 `# started=` 同一个性质)。
+    *
+    * 它**由调用方填**, 不在这里从 unix_ms 推: 本文件是纯 C++ (不含 Qt), 推本地时间得走
+    * localtime_r, 而那与 controllers 那边 isoNow() 用的 QDateTime 不是同一套规则 —— 两边
+    * 一旦对不上, 这一列与 `# started=` 会**差着时区而没人看得出来**。同一个来源才安全。
+    * 空串照写 (那一格是个空字段), 列数保持齐整。 */
+   std::string time_local;
 };
 
 std::string csvRowLine(const Row &r);
