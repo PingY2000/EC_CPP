@@ -1530,6 +1530,95 @@ static void test_resumeload()
       r.ctrl.abort(QStringLiteral("收尾"));
    }
 
+   /* 「打开态下再打开一份」= 换一份 (2026-09-30, docs/scan_sweep.md §49.9)。
+    *
+    * 用户原话是「打开 csv 的时候不要只有一个中止按钮」: 从前进这一条路直接是一句
+    * `if (loaded()) return fail(...)`, 于是"想看看/接着另一份"只剩「中止」—— 而「中止」在
+    * 屏幕上说的是"把这一轮的扫描停下", 用它来"换一份"是两件事。 */
+   caseBegin("resumeload: 打开态下再打开一份 = 换一份 (画面整张重铺, 不留上一份的格子)");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      /* 两份文件采的是**同一张网格的前若干个点**, 但采的数量不同 (3 与 7)。
+       * 这样"格数"本身就是判据: 整份覆写的结论是 7, 而"把新的贴上去"会得到 7 也一样 ——
+       * 所以下面还反过来再换回 3 的那一份, 靠第二次的 3 把"只加不减"钉死。 */
+      const QString a = dir.filePath("swap_a.csv");
+      const QString b = dir.filePath("swap_b.csv");
+      checkEq(makePartialCsv(a, p, 3), 3, "A 采了 3 个点");
+      checkEq(makePartialCsv(b, p, 7), 7, "B 采了 7 个点");
+
+      QString err, why;
+      check(r.loadOnlyScan(a, &err, &why), "先打开 A", err.toStdString());
+      checkEq(countDoneCells(r.ctrl), 3, "画布上是 A 的 3 格");
+      checkEq(r.ctrl.pendingPoints(), 22, "A 有 22 个待补");
+
+      /* 换一份: 打开态下 loadResume 照收 —— 这一句就是本轮新开的那条路 */
+      err.clear(); why.clear();
+      check(r.loadOnlyScan(b, &err, &why), "打开态下直接打开 B (不用先「中止」)", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Loaded, "还是在打开态");
+      checkEq(countDoneCells(r.ctrl), 7, "画布换成 B 的 7 格");
+      checkEq(r.ctrl.pendingPoints(), 18, "待补点数跟着换成 B 的");
+
+      /* 再换回去: 3 < 7, 所以这一条把"只贴不减"排掉 */
+      err.clear(); why.clear();
+      check(r.loadOnlyScan(a, &err, &why), "再换回 A", err.toStdString());
+      checkEq(countDoneCells(r.ctrl), 3, "B 多出来的那 4 格变回未采 (整份重铺, 不是叠加)");
+      checkEq(r.ctrl.pendingPoints(), 22, "待补点数回到 22");
+
+      r.ctrl.abort(QStringLiteral("收尾"));
+   }
+
+   caseBegin("resumeload: 换一份没换成 → 手里那一份一个字节都没动");
+   {
+      Rig r;
+      const Params p = Rig::smallParams();
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+      r.ctrl.setZeroEpoch(0);
+
+      const QString a = dir.filePath("keep_a.csv");
+      checkEq(makePartialCsv(a, p, 3), 3, "A 采了 3 个点");
+
+      QString err, why;
+      check(r.loadOnlyScan(a, &err, &why), "先打开 A", err.toStdString());
+
+      /* 手写一份几何不同的 (不走界面那次对齐 —— 它就是用来当场被拒的) */
+      Params other = p;
+      other.res_unit = 0.25;
+      std::string text = csvMetaLines(other, "2026-09-17T10:00:00", 0);
+      text += csvColumnHeader();
+      text += "\n";
+      const QString bad = dir.filePath("swap_bad.csv");
+      check(writeTextFile(bad, QString::fromStdString(text)), "写一份几何不同的 CSV");
+
+      /* 不传 why (与上面那组 (b) 同一个理由): 几何差异那句走的是"why 非空就写 why"那条路,
+       * 传了 why 它就不在 err 里, 而这一句要钉的是"指名道姓" */
+      err.clear();
+      check(!r.loadOnlyScan(bad, &err), "几何不同 → 换不成");
+      check(err.contains(QStringLiteral("分辨率")), "那句话照旧指名道姓", err.toStdString());
+
+      check(r.ctrl.state() == ScanController::State::Loaded, "还留在打开态");
+      checkEq(countDoneCells(r.ctrl), 3, "画布上还是 A 的那 3 格");
+      checkEq(r.ctrl.pendingPoints(), 22, "要补的点还是 A 那一份");
+
+      /* 句柄也还是 A 的 —— 换失败时控制器把旧的**装了回去** (csvPath() 读的就是 m_log 手上
+       * 那个句柄)。这一句钉的是那条回滚: 少了它, 屏幕上"看着没变"而下一行会写进一份
+       * 根本没打开成的文件里 */
+      check(r.ctrl.csvPath() == a, "写出句柄还是 A");
+
+      err.clear();
+      check(r.beginLoadedRun(&err), "A 照旧能接着补", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Moving, "走起来了");
+
+      r.ctrl.abort(QStringLiteral("收尾"));
+   }
+
    caseBegin("newfile: 新建清掉上一轮的结果与句柄");
    {
       Rig r;

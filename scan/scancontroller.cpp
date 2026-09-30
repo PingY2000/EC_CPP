@@ -512,17 +512,21 @@ bool ScanController::start(const QString &csv_path, QString *err)
  * 今天打开的路径只到这里为止 —— 上半场画在画布上、要补的点算好、句柄按追加开着, 而滑台
  * **一步没走**。开始走是 beginLoadedRun() 的事, 由操作员按「继续」触发。
  *
- * 装载态**不可重入** (上面那句守卫): 它的后半段是破坏性的 (清 m_order / 覆写 m_done /
- * 关旧句柄), 而其中关旧句柄与开新句柄之间没有退路 —— 新的没开成, 旧的就回不来了, 留下一个
- * "状态写着装载态、m_order 空、句柄关着"的撕裂态, 之后按「继续」永远失败。与其在失败路径上
- * 补一堆回滚, 不如让这条路不可达 (界面那边「打开 CSV」在装载态也是灰的)。 */
+ * **可重入 (2026-09-30, §49.9)**: 打开态下再打开一份 = **换一份** —— 界面那边「打开 CSV」
+ * 在打开态是亮的, 用户原话是"打开 csv 的时候不要只有一个中止按钮"。这条路从前是不通的
+ * (一句 `if (loaded()) return fail(...)`), 理由是它的后半段**破坏性**: 清 m_order / 覆写
+ * m_done / 关旧句柄开新句柄, 而新旧句柄之间没有退路 —— 新的没开成, 旧的就回不来, 留下一个
+ * "状态写着装载态、数据没了、句柄关着"的撕裂态。把这条路堵掉是最省事的做法, 代价是"想换
+ * 一份"只剩「中止」这一条路。
+ *
+ * 现在它通, 靠的是**把顺序反过来**: 凡是可能失败的都排在前面 (读文件 / 解析 / 世代比对),
+ * 换句柄是唯一不可逆的一步, 于是给它配一条回滚 (关掉新开的、把旧的装回去 —— 重开一次是
+ * 幂等的); 换成功之后剩下的**全是内存里的赋值**, 一步都失败不了。 */
 bool ScanController::loadResume(const QString &csv_path, bool accept_zero_epoch_change,
                                 QString *err, QString *why)
 {
    if (running())
       return fail(err, QStringLiteral("扫描进行中, 请先「中止」。"));
-   if (loaded())
-      return fail(err, QStringLiteral("已打开一份 CSV, 请先「中止」。"));
 
    if (why != nullptr) why->clear();
 
@@ -574,6 +578,33 @@ bool ScanController::loadResume(const QString &csv_path, bool accept_zero_epoch_
     *
     * 它的代价落在两处判据上, 都在下面各自的地方: beginLoadedRun() 空 order 拒绝 (那份文案
     * 从前住在这里), retest() 反过来**只在有待补的点时才拒**。 */
+
+   /* ---- 到这儿为止一个字节都没动。下面是**唯一不可逆的一步**: 换写出句柄 ---------
+    *
+    * ScanLog 只有一个句柄 (换一份就是换它), 而它一失败就没有回头路 —— 所以先把旧的那份
+    * 记下来, 新句柄没开成就把旧的**装回去**。重开一次是幂等的: 那半行残行早被 trimTail
+    * 切过, 而每一次 append 都写满行。于是"换一份"没换成就等于什么都没发生 —— 屏幕上还是
+    * 原来那一份, 画布上还是它那半场图。 */
+   const QString old_path = m_log.path();
+   const bool    old_open = m_log.isOpen();
+
+   if (!m_log.beginAppend(csv_path, err))
+   {
+      QString back_err;
+      if (old_open && !old_path.isEmpty())
+         m_log.beginAppend(old_path, &back_err);
+      return false;
+   }
+
+   /* ---- 句柄已经换好了, 下面全是内存里的赋值, 一步都失败不了 ------------------- */
+
+   /* 已有进度连数值一起装进结果网格, 续扫一开始图上就有上半场。
+    * 装进两个临时数组再换进来: csvLoadGrid 本来就是"整份覆写" (它先 assign 再填), 用临时
+    * 数组只是让"哪一段会失败、哪一段不会"在代码上看得见。 */
+   std::vector<char>   have;
+   std::vector<double> watts;
+   csvLoadGrid(text, m_p, &have, &watts);
+
    m_order.clear();
    for (size_t i = 0; i < m_plan.size() && i < mask.size(); i++)
    {
@@ -581,14 +612,14 @@ bool ScanController::loadResume(const QString &csv_path, bool accept_zero_epoch_
          m_order.push_back((int)i);
    }
 
-   /* 已有进度连数值一起装进结果网格, 续扫一开始图上就有上半场 */
+   /* m_done **整份重铺**, 不是"把采过的格子贴上去" (2026-09-30): 打开态下换一份时, 新文件里
+    * 没有的格子必须**变回未采** —— 留着上一份的值就是把两份数据的图拼在一起。mask 与 m_done
+    * 同尺寸 (都是 nx*ny), 所以逐格赋值就是整份覆写。 */
+   m_done.assign(m_done.size(), 0);
    for (size_t i = 0; i < mask.size() && i < m_done.size(); i++)
       m_done[i] = mask[i];
-   csvLoadGrid(text, m_p, &m_have, &m_watts);
-
-   m_log.close();
-   if (!m_log.beginAppend(csv_path, err))
-      return false;
+   m_have  = std::move(have);
+   m_watts = std::move(watts);
 
    m_is_retest = false;
    m_cur       = -1;

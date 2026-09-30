@@ -344,17 +344,20 @@ void ScanWindow::refreshEditability()
    }
 
    /* 不是参数、但也只能在运行外按的动作按钮 (原先是跟着那张"扫描中锁住"的表走的)。
-    * **装载态下也灰**: "再打开一份"的后半段是破坏性的 (清点表 / 覆写画布 / 关旧句柄排在开新
-    * 句柄之前), 新句柄没开成就会留下一个撕裂的装载态。要换一份先「中止」—— 与几何那几项
-    * 同一条规矩。
     *
-    * **没连接也灰** (2026-09-30): 读一份 CSV 本身一个总线帧都不发, 但装载完之后能做的事只有
+    * **打开态下也亮** (2026-09-30, §49.9): 按它就是**换一份** —— 用户原话是"打开 csv 的时候
+    * 不要只有一个中止按钮", 也就是说"想看看/接着另一份"不该先按「中止」放弃手里这一份。
+    * 从前它在这里是灰的, 理由是"再打开一份"的后半段破坏性、新句柄没开成会留下撕裂的装载态
+    * —— 那件事现在由控制器那边解决 (loadResume 失败时一个字节都不动, 见它的注释),
+    * 这里是那条判据的另一半。
+    *
+    * **没连接仍然灰** (2026-09-30): 读一份 CSV 本身一个总线帧都不发, 但装载完之后能做的事只有
     * 按「继续」补点, 而那一条要总线 —— 不连就按下它, 屏幕上只会多出一张谁也动不了的半场图。
     * 判据与「开始扫描」那一条同一个 (用户原话: 「续扫csv等按钮 在没有连接的时候也是亮的
     * 不合理 应该等按这个按钮合理的时候才亮起」)。**「中止」不在此列**: 它是"退出去"的那一个,
     * 断了线正得靠它退出装载态 (见 refresh() 里那一行) */
    if (m_btnOpen != nullptr)
-      m_btnOpen->setEnabled(!running && !loaded && m_connected);
+      m_btnOpen->setEnabled(!running && m_connected);
 
    /* 「新建 CSV」的判据**只有 !running** (2026-09-30, §49.3) —— 与「中止」同族, 与「打开」
     * 那条刻意不同: 它不发任何总线帧, 也不依赖"装载完之后能不能干活"。反过来, 在**装载态 +
@@ -2378,7 +2381,8 @@ QWidget *ScanWindow::buildScanPanel()
 
    m_btnOpen = new QPushButton(QStringLiteral("打开 CSV"), box);
    m_btnOpen->setToolTip(QStringLiteral("读回已有数据并画到画布上, 参数对齐到这份文件。"
-                                        "未采完的可继续补点, 采完的可重测单点。"));
+                                        "未采完的可继续补点, 采完的可重测单点。"
+                                        "手里已有一份时, 按它会换成新选的这一份。"));
    connect(m_btnOpen, &QPushButton::clicked, this, &ScanWindow::onOpenCsvClicked);
 
    /* ---- 输出路径那一行 (2026-09-30 从「扫描参数」搬来的) ----
@@ -4276,6 +4280,39 @@ void ScanWindow::onOpenCsvClicked()
       m_edCsv  ->setText(old_path);
    };
 
+   /* 打开态下按「打开 CSV」= **换一份** (2026-09-30, §49.9)。失败时的退法比"未打开"那条路
+    * 多一步, 而且非有不可:
+    *   上面那句对齐 (把四个几何控件推到新文件那套值上) 走的是控件自己的 valueChanged,
+    *   控制器那边收到 setParams 之后 rebuildPlan() 一看几何变了就把**点列与三个结果数组
+    *   一起清掉** (那是它的本分)。所以手里这一份在"对齐"那一步就已经被清空了 ——
+    *   只把四个控件退回去, 变不回来。要**把那份文件重新装一遍**。
+    * 用 accept_zero_epoch_change=true: 那份文件的世代差操作员当初打开它时已经确认过一次,
+    * 没有理由再问第二遍。装不回来 (刚被别的程序动过 / 删了) 就退回"未打开" —— 那也比一个
+    * "写着已打开、画布空着、句柄关着"的撕裂态强。
+    * 没碰过几何 (changed 为假) 时控制器那边一个字节都没动, 不用装。 */
+   const bool    was_loaded = m_ctl->loaded();
+   const QString held_path  = m_ctl->csvPath();   /* 打开态下它就是 m_log 手上那个文件 */
+
+   /* 返回 true = 手里那一份还在 (要么本来就没有, 要么装回来了) */
+   auto undoOpen = [&](bool was_changed) -> bool
+   {
+      if (was_changed)
+         restore();
+      else
+         m_edCsv->setText(old_path);
+
+      if (!was_loaded || !was_changed)
+         return true;
+
+      QString e, w;
+      if (!held_path.isEmpty() && m_ctl->loadResume(held_path, true, &e, &w))
+         return true;
+
+      QString e2;
+      m_ctl->newFile(&e2);
+      return false;
+   };
+
    /* 只有真变了才说这一句 —— 横幅就一个槽, 那四个数就在旁边的参数栏里 (横幅 1 句 / 40 字) */
    const QString aligned = changed ? QStringLiteral("已按 CSV 对齐扫描参数, ") : QString();
 
@@ -4295,11 +4332,11 @@ void ScanWindow::onOpenCsvClicked()
 
    if (!err.isEmpty())
    {
-      if (changed)
-         restore();
+      if (undoOpen(changed))
+         hint(QStringLiteral("无法打开: ") + err, true);
       else
-         m_edCsv->setText(old_path);
-      hint(QStringLiteral("无法打开: ") + err, true);
+         hint(QStringLiteral("无法打开: ") + err
+              + QStringLiteral("\n上一份也装不回来了, 请重新打开。"), true);
       return;
    }
 
@@ -4313,11 +4350,12 @@ void ScanWindow::onOpenCsvClicked()
    why.clear();
    if (!m_ctl->loadResume(f, true, &err, &why))
    {
-      if (changed)
-         restore();
+      const QString msg = err.isEmpty() ? why : err;
+      if (undoOpen(changed))
+         hint(QStringLiteral("仍然无法打开: ") + msg, true);
       else
-         m_edCsv->setText(old_path);
-      hint(QStringLiteral("仍然无法打开: ") + (err.isEmpty() ? why : err), true);
+         hint(QStringLiteral("仍然无法打开: ") + msg
+              + QStringLiteral("\n上一份也装不回来了, 请重新打开。"), true);
       return;
    }
 
