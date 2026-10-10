@@ -22,7 +22,7 @@ static const char *speed      = "scan/speed_pul_s";
 static const char *dwell      = "scan/dwell_ms";
 static const char *settle     = "scan/settle_ms";
 static const char *samples    = "scan/samples_per_point";
-static const char *serp       = "scan/serpentine";
+static const char *mode       = "scan/mode";
 static const char *start_pos  = "scan/start_positive";
 static const char *nic        = "bus/nic";
 static const char *manspeed   = "ui/manual_speed";
@@ -85,7 +85,12 @@ Prefs prefsLoad(const QString &path)
    p.params.samples_per_point =
       s.value(QLatin1String(k::samples), p.params.samples_per_point).toInt();
 
-   p.params.serpentine     = s.value(QLatin1String(k::serp),      p.params.serpentine).toBool();
+   /* 扫描方式 (2026-10-11 从 `scan/serpentine` 那个 bool 改成这个数, 见 ScanMode)。
+    * 走 modeFromIndex 而不是直接强转: 手改坏的 ini 里可能是一个越界的数, 越界一律回落缺省
+    * (「逐行往返」), 不让界面拿到一个说不出的模式。**老 ini 里的 serp 不再读** —— 与 §40
+    * 那条"缺项就是缺项的待遇, 不做迁移"同一套。 */
+   p.params.mode = modeFromIndex(
+      s.value(QLatin1String(k::mode), (int)p.params.mode).toInt());
    p.params.start_positive = s.value(QLatin1String(k::start_pos), p.params.start_positive).toBool();
 
    /* 量程从不记忆: 它由区域算出 (autoRangePul)。现在是 max(区域推出来的, 画布半宽推出来的),
@@ -229,7 +234,7 @@ void prefsSave(const QString &path, const Prefs &p)
    s.setValue(QLatin1String(k::settle),    p.params.settle_ms);
    s.setValue(QLatin1String(k::samples),   p.params.samples_per_point);
 
-   s.setValue(QLatin1String(k::serp),      p.params.serpentine);
+   s.setValue(QLatin1String(k::mode),      (int)p.params.mode);
    s.setValue(QLatin1String(k::start_pos), p.params.start_positive);
 
    s.setValue(QLatin1String(k::nic),       p.nic);

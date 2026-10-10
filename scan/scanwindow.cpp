@@ -338,6 +338,10 @@ void ScanWindow::refreshEditability()
           * 判据跟勾选框的状态走而不是"模式", 所以它跟着勾一起变, 不用另外记一份 */
          if (ok && it.need_manual)
             ok = (m_cbShadeAuto == nullptr) || !m_cbShadeAuto->isChecked();
+         /* 「起始方向」在随机那两种走法下是多余的 (每步都是随机跳)。判据读**控件自己**
+          * 当前选中的那一项, 与 need_manual 那条同一个体例: 它跟着模式一起变, 不另记状态 */
+         if (ok && it.need_row_mode)
+            ok = !modeRandom(modeFromIndex(m_cbMode != nullptr ? m_cbMode->currentIndex() : 0));
          it.w->setEnabled(ok);
       }
 
@@ -2210,9 +2214,15 @@ QWidget *ScanWindow::buildParamPanel()
    m_cbDir->addItem(QStringLiteral("X 正向 (+X)"));
    m_cbDir->addItem(QStringLiteral("X 负向 (-X)"));
 
+   /* 走法那几项**从 modeText() 循环建**, 文案不在界面里另抄一份 (2026-10-11 加的那两种
+    * 随机扫描就在那儿)。顺序即 ScanMode 的数值, currentParams() 靠下标取值 */
    m_cbMode = new QComboBox(box);
-   m_cbMode->addItem(QStringLiteral("逐行往返"));
-   m_cbMode->addItem(QStringLiteral("每行同向") );
+   for (int i = 0; i < kScanModeCount; i++)
+      m_cbMode->addItem(QString::fromUtf8(modeText((ScanMode)i)));
+   /* 四个项的名字自己说了怎么走, 所以 tooltip 只讲名字说不出来的那一件: 「随机 (可重复)」
+    * 不会自己结束 —— 不说的话, 屏幕上那个「全程: 不限」与停不下来的进度看着像是出了岔子。
+    * 30 字, 在「普通 tooltip 2 行 / 60 字」之内 (§26.2) */
+   m_cbMode->setToolTip(QStringLiteral("随机 (可重复) 的池子始终是整片网格, 一轮不会自己结束。"));
 
    /* 输出路径那一行 (m_edCsv + m_btnCsv) **不在这里建** (2026-09-30): 那一行整个搬进
     * 「扫描控制」了, 归 buildScanPanel() 建 (用户原话: 「扫描参数的csv栏并入扫描控制中」;
@@ -2357,7 +2367,8 @@ QWidget *ScanWindow::buildParamPanel()
                GateItem{ m_edDwell,    false, false },
                GateItem{ m_edSettle,   false, false },
                GateItem{ m_edSamples,  false, false },
-               GateItem{ m_cbDir,      true,  false, true },   /* 起始方向: 改的是轨迹 */
+               /* 起始方向: 改的是轨迹 (末一个 true = 只在按行走的那两种走法下可用, 随机时灰) */
+               GateItem{ m_cbDir,      true,  false, true,  true },
                GateItem{ m_cbMode,     true,  false, true },   /* 扫描方式: 同上 */
                /* 输出路径与它那个「…」: 句柄已经按装载那条开着。**控件 2026-09-30 起摆在
                 * 「扫描控制」那一框里**, 而这两条留在这张表不动 —— 表里收的是指针 (见上面) */
@@ -3096,7 +3107,7 @@ void ScanWindow::applyDefaults()
    m_edSettle->setValue(d.settle_ms);
    m_edSamples->setValue(d.samples_per_point);
    m_cbDir  ->setCurrentIndex(d.start_positive ? 0 : 1);
-   m_cbMode ->setCurrentIndex(d.serpentine ? 0 : 1);
+   m_cbMode ->setCurrentIndex((int)d.mode);
 
    /* 手动速度不在 Params 里 (与扫描几何无关), 缺省就是 HMI_VEL_DEF */
    m_edManSpeed->setValue(HMI_VEL_DEF);
@@ -3135,7 +3146,7 @@ void ScanWindow::loadSettings()
    m_edSettle->setValue(pf.params.settle_ms);
    m_edSamples->setValue(pf.params.samples_per_point);
    m_cbDir   ->setCurrentIndex(pf.params.start_positive ? 0 : 1);
-   m_cbMode  ->setCurrentIndex(pf.params.serpentine ? 0 : 1);
+   m_cbMode  ->setCurrentIndex((int)pf.params.mode);
 
    /* 手动速度: **-1 = ini 里没这一项** (或是个旧 ini), 那就留在 applyDefaults 填的缺省上 */
    if (pf.manual_speed > 0)
@@ -3473,7 +3484,7 @@ Params ScanWindow::currentParams() const
    p.settle_ms   = m_edSettle->value();
    p.samples_per_point = m_edSamples->value();
 
-   p.serpentine     = (m_cbMode->currentIndex() == 0);
+   p.mode           = modeFromIndex(m_cbMode->currentIndex());
    p.start_positive = (m_cbDir->currentIndex() == 0);
 
    /* 连续读数的间隔 (2026-09-29 §41.3): 扫描不再自己发请求, 一个点的 N 笔采样要等这条流喂,
@@ -3518,8 +3529,15 @@ void ScanWindow::pushParams()
                           .arg(nx).arg(ny).arg(total)
                           .arg(p.area_x_unit / 2.0, 0, 'f', 3));
 
-   /* 预估是线性的, 实际一定更长 (每次移动的进近段都要减速), 这一句必须写出来 */
-   m_lEst->setText(QStringLiteral("每点 ≈ %1 ms   全程 ≈ %2\n(线性估计, 实际用时更长)").arg(estimatePerPointMs(p)).arg(fmtDur(m_ctl->estimateTotalMs())));
+   /* 预估是线性的, 实际一定更长 (每次移动的进近段都要减速), 这一句必须写出来。
+    * 「随机 (可重复)」那一轮不会自己结束, 所以它这一行**不报全程的钟点**: 报出来的数
+    * 只是"一轮"的长短, 写成一个确切的终点是假话 (用户定的写法: 只说「全程: 不限」)。 */
+   if (modeEndless(p.mode))     /* 读**选中的**模式, 不读控制器的: 没开扫时它还是上一轮的值 */
+      m_lEst->setText(QStringLiteral("每点 ≈ %1 ms   全程: 不限\n(线性估计, 实际用时更长)")
+                         .arg(estimatePerPointMs(p)));
+   else
+      m_lEst->setText(QStringLiteral("每点 ≈ %1 ms   全程 ≈ %2\n(线性估计, 实际用时更长)")
+                         .arg(estimatePerPointMs(p)).arg(fmtDur(m_ctl->estimateTotalMs())));
 
    /* 两条否决: 参数本身不合法 / 几何超出量程 (超出的部分会被静默夹掉) */
    QString bad = m_ctl->paramsError();
@@ -4200,11 +4218,17 @@ void ScanWindow::onStartClicked()
     * 真机更不能这么做: 那次 close/open 要收线程 → 枚举 USB → 开设备 → 读探头 → 重新开流,
     * 几百毫秒起步, 而且会白冻一次界面 */
 
-   /* 出发那一句必须在 m_ctl->start 之后: 它念的是控制器真建出来的网格 (totalPoints) */
-   hint(QStringLiteral("扫描开始: %1 点, 预计 %2, 写入 %3。")
-           .arg(m_ctl->totalPoints())
-           .arg(fmtDur(m_ctl->estimateTotalMs()))
-           .arg(shortPath(path)), false);
+   /* 出发那一句必须在 m_ctl->start 之后: 它念的是控制器真建出来的网格 (totalPoints)。
+    * 「随机 (可重复)」那一轮没有终点, 所以不念"预计多久" —— 念了就是一句假话 */
+   if (m_ctl->endless())
+      hint(QStringLiteral("扫描开始: %1 点 (可重复), 写入 %2。")
+              .arg(m_ctl->totalPoints())
+              .arg(shortPath(path)), false);
+   else
+      hint(QStringLiteral("扫描开始: %1 点, 预计 %2, 写入 %3。")
+              .arg(m_ctl->totalPoints())
+              .arg(fmtDur(m_ctl->estimateTotalMs()))
+              .arg(shortPath(path)), false);
 
    m_bannerTimer->stop();    /* 这一句别自己消失: 它说清的是"现在在跑什么" */
    refresh();
@@ -5062,26 +5086,39 @@ void ScanWindow::refresh()
    /* ---- 进度 ---- */
    if (running || st == ScanController::State::Paused)
    {
-      m_lProg->setText(QStringLiteral("%1 / %2 点   剩 %3   第 %4/%5 个")
-                          .arg(m_ctl->completedPoints())
-                          .arg(m_ctl->totalPoints())
-                          .arg(m_ctl->pendingPoints())
-                          .arg(m_ctl->index() >= 0 ? m_ctl->index() + 1 : 0)
-                          .arg(m_ctl->totalPoints()));
-
       QString extra;
       if (m_ctl->settlingNow())
          extra = QStringLiteral("  (等待稳定 %1 ms)").arg(m_ctl->stateMs());
 
-      m_lTime->setText(QStringLiteral("已用 %1   预计剩余 %2%3")
-                          .arg(fmtDur(m_ctl->elapsedMs()))
-                          .arg(fmtDur(m_ctl->state() == ScanController::State::Paused
-                                         ? -1
-                                         : (int64_t)((double)m_ctl->estimateTotalMs()
-                                                     * m_ctl->pendingPoints()
-                                                     / (m_ctl->totalPoints() > 0
-                                                           ? m_ctl->totalPoints() : 1))))
-                          .arg(extra));
+      /* 「随机 (可重复)」那一支**不报「剩 / 第 i/j 个」**: 它的池子一轮一轮地整份重来,
+       * pendingPoints() 会从 0 猛地跳回满格, 报在屏幕上就是一句假话。已采格数是准的
+       * (热力图上那几个数就从它来), 照报。 */
+      if (m_ctl->endless())
+      {
+         m_lProg->setText(QStringLiteral("%1 / %2 点 (可重复, 不设终点)")
+                             .arg(m_ctl->completedPoints())
+                             .arg(m_ctl->totalPoints()));
+         m_lTime->setText(QStringLiteral("已用 %1%2").arg(fmtDur(m_ctl->elapsedMs())).arg(extra));
+      }
+      else
+      {
+         m_lProg->setText(QStringLiteral("%1 / %2 点   剩 %3   第 %4/%5 个")
+                             .arg(m_ctl->completedPoints())
+                             .arg(m_ctl->totalPoints())
+                             .arg(m_ctl->pendingPoints())
+                             .arg(m_ctl->index() >= 0 ? m_ctl->index() + 1 : 0)
+                             .arg(m_ctl->totalPoints()));
+
+         m_lTime->setText(QStringLiteral("已用 %1   预计剩余 %2%3")
+                             .arg(fmtDur(m_ctl->elapsedMs()))
+                             .arg(fmtDur(m_ctl->state() == ScanController::State::Paused
+                                            ? -1
+                                            : (int64_t)((double)m_ctl->estimateTotalMs()
+                                                        * m_ctl->pendingPoints()
+                                                        / (m_ctl->totalPoints() > 0
+                                                              ? m_ctl->totalPoints() : 1))))
+                             .arg(extra));
+      }
    }
    else
    {

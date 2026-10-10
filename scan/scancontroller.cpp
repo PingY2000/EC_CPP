@@ -1,6 +1,7 @@
 #include "scancontroller.h"
 
 #include <QDateTime>
+#include <QRandomGenerator>
 
 #include <algorithm>
 #include <cmath>
@@ -89,11 +90,46 @@ void ScanController::setLimitLines(const limitguard::LimitAxis *ax)
       m_lim[i] = (ax != nullptr) ? ax[i] : limitguard::LimitAxis();
 }
 
+/* 开扫前把点列按**这次的走法**重排一次 (2026-10-11)。start() 与 loadResume() 各调一次。
+ *
+ * rebuildPlan() 只在**几何**变了时重建点列, 走法变了它只重排不重建 (见它开头那一支) ——
+ * 于是到这里手里那份点列是"按这种走法"的基准顺序, 但**不是随机的那个顺序**: 随机那两种
+ * 每轮得现洗一遍, 而且**每次开扫换一个新种子** (同一片区域连着跑两轮, 顺序本来就该不一样,
+ * 这正是用户要的"每次随机一个点")。
+ *
+ * 洗的是 m_plan 本身, 不动 m_nx/m_ny 与三个结果数组: 热力图按 (ix, iy) 索引, 与顺序无关,
+ * 而"上一轮图上还留着格子"是既有的、与本轮无关的行为 (§45 末尾那条), 这里不顺手改它。
+ * 按行的两种一个字都不做 —— 它们的顺序是算出来的, 洗它没有意义。 */
+void ScanController::prepareRunPlan()
+{
+   if (!modeRandom(m_p.mode) || m_plan.empty())
+      return;
+
+   m_seed   = QRandomGenerator::global()->generate();
+   m_plan   = buildPlan(m_p);
+   shufflePlan(&m_plan, m_seed++);      /* ++ : 第一遍循环里再洗时用的是另一个子种子 */
+   m_plan_p = m_p;
+}
+
 void ScanController::rebuildPlan()
 {
    /* 几何没变就什么都别动: 网格还是那个网格, 已有结果还是对的 */
    if (m_nx > 0 && !m_plan.empty() && sameGeom(m_p, m_plan_p))
+   {
+      /* 但**走法**变了要把点列重排一次 (2026-10-11)。几何不变就整段跳过的话, 屏幕上写着
+       * 「逐行往返」而点列还是上一轮随机那个顺序 —— 画布上那条预览折线当场就露馅。
+       * 重排**只换顺序**: 网格尺寸与三个结果数组一个都不动, 于是"上一轮跑完了图上还留着
+       * 上一轮的格子"这条既有行为原样保留 (它有自己的账, 见 docs/scan_sweep.md §45)。
+       *
+       * 「起始方向」不在这里比 —— 它也是"走法"的一部分, 但它改了之后要不要重排是 §45 末尾
+       * 那条既有取舍, 本轮不顺手改 (本轮的账: 只有 mode)。 */
+      if (m_p.mode != m_plan_p.mode)
+      {
+         m_plan   = buildPlan(m_p);
+         m_plan_p = m_p;
+      }
       return;
+   }
 
    const int nx = axisCount(m_p.area_x_unit, m_p.res_unit);
    const int ny = axisCount(m_p.area_y_unit, m_p.res_unit);
@@ -124,6 +160,8 @@ void ScanController::rebuildPlan()
    m_watts.assign(n, 0.0);
 }
 
+/* 一轮 (m_plan 一个来回) 的估计。**「随机 (可重复)」下它仍然只是"一轮"**: 那一轮不会
+ * 自己结束, 所以界面那一行写的是「全程: 不限」, 不拿它当整轮耗时用 (scanwindow.cpp)。 */
 int64_t ScanController::estimateTotalMs() const
 {
    return (int64_t)m_plan.size() * estimatePerPointMs(m_p);
@@ -178,6 +216,7 @@ void ScanController::resetRunState()
 
    m_cur       = -1;
    m_is_retest = false;
+   m_endless   = false;      /* 这一轮收掉了, endless() 不许对着一轮过去的事点头 (见 advance) */
 
    clearResults();
 
@@ -482,6 +521,11 @@ bool ScanController::start(const QString &csv_path, QString *err)
    if (m_plan.empty())
       return fail(err, QStringLiteral("网格为空。"));
 
+   /* 按这次的走法重排一次点列 (见 prepareRunPlan)。新一轮没有任何格子采过, 所以 m_order
+    * 一律是整片网格 —— 「随机 (可重复)」那个"永远整片"的池子在这里也就自动成立了 */
+   prepareRunPlan();
+   m_endless = modeEndless(m_p.mode);
+
    m_log.close();
 
    m_order.resize(m_plan.size());
@@ -606,11 +650,33 @@ bool ScanController::loadResume(const QString &csv_path, bool accept_zero_epoch_
    std::vector<double> watts;
    csvLoadGrid(text, m_p, &have, &watts);
 
+   /* 走法在这里也重排一次: 补点该按这次选的走法走 (随机那两种还会洗一遍) */
+   prepareRunPlan();
+   m_endless = modeEndless(m_p.mode);
+
    m_order.clear();
-   for (size_t i = 0; i < m_plan.size() && i < mask.size(); i++)
+   if (m_endless)
    {
-      if (!mask[i])
-         m_order.push_back((int)i);
+      /* 「随机 (可重复)」的池子**永远是整片网格** —— 不管扫没扫过都进池子, 所以这里刻意
+       * 不按 mask 过滤 (那是别的走法的"只补没采过的点")。残留数据照旧画在图上, 由上面的
+       * m_done 重铺决定。 */
+      m_order.resize(m_plan.size());
+      std::iota(m_order.begin(), m_order.end(), 0);
+   }
+   else
+   {
+      /* **点列下标不是网格下标** (2026-10-11 修): mask 是按网格 `iy*m_nx+ix` 排的, 而 m_plan
+       * 的下标是"走的第几个点" —— 蛇形在行内是反的 (row1 的第一个点是 ix=54), 随机那两种更
+       * 是一整个置换。以前这里直接拿 `mask[i]` 配 `m_plan[i]`, 只在"整行整行地采过"时才恰好
+       * 对得上 (行内是一个集合内的对折); 文件停在一行中间时它就会**重采已经采过的格、漏掉
+       * 没采过的格**。走 (ix, iy) 换算一下才是那一格真正的下标。 */
+      for (size_t i = 0; i < m_plan.size(); i++)
+      {
+         const Point &q = m_plan[i];
+         const size_t cell = (size_t)q.iy * (size_t)m_nx + (size_t)q.ix;
+         if (cell < mask.size() && !mask[cell])
+            m_order.push_back((int)i);
+      }
    }
 
    /* m_done **整份重铺**, 不是"把采过的格子贴上去" (2026-09-30): 打开态下换一份时, 新文件里
@@ -890,6 +956,7 @@ void ScanController::advance()
    if (!m_is_retest)
    {
       m_ord_i++;
+
       if (m_ord_i < m_order.size())
       {
          startPoint(m_order[m_ord_i]);
@@ -897,8 +964,29 @@ void ScanController::advance()
       }
    }
 
+   /* 「随机 (可重复)」: 这一遍点列走完**不判 Done**, 把点列重洗一遍接着走 —— 这一轮永远
+    * 到不了头, 只有「暂停」「中止」能停 (用户要的"不管扫没扫过都进随机池子, 不停歇地扫")。
+    * 洗的是 m_plan 本身, 而 m_order 是它的下标全集, 于是新顺序自动覆盖整片网格。此刻
+    * m_cur 还是 -1 (函数第一行), 不在任何点上, 换顺序不会让谁指错格子。
+    *
+    * **它必须住在这儿, 不能搬到上面那句 `m_ord_i++` 之后**: 那样就成了"每走完一个点就重洗、
+    * 再从 m_order[0] 起步", 也就是**每次独立抽一个点** —— 那不是用户选的 (他要的是"洗一遍
+    * 走一遍, 走完再洗"), 而且集齐整片网格要多花近四倍的点 (25 格 ≈ 95 次抽取)。
+    * 自检里"走完第一遍恰好 25 个点"那一条钉的就是这个位置。
+    *
+    * `!m_is_retest` 不能省: 单点重测走完也落到这儿, 而它是**一个点**, 不该把整轮重开。
+    * (重测之前可能刚跑过一轮可重复, 那时 m_endless 还是 true。) */
+   if (m_endless && !m_is_retest)
+   {
+      shufflePlan(&m_plan, m_seed++);
+      m_ord_i = 0;
+      startPoint(m_order[0]);
+      return;
+   }
+
    /* 走完了 (整轮或单点重测)。文件不关: 重测要往同一个文件追加 */
    m_is_retest = false;
+   m_endless   = false;      /* 这一轮已经收掉, endless() 不许对着一轮过去的事点头 */
 
    /* 点列清掉 (2026-09-30)。单点重测走完之后 m_order 是 {k} 而 m_ord_i 是 0 (重测那一路
     * 跳过上面那句 m_ord_i++), 于是 pendingPoints() 报 **1** —— 画布左上角那行「N / M 点,

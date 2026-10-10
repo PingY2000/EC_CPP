@@ -5,8 +5,38 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 
 namespace scan {
+
+const char *modeText(ScanMode m)
+{
+   switch (m)
+   {
+   case ScanMode::Serpentine:   return "逐行往返";
+   case ScanMode::SameDir:      return "每行同向";
+   case ScanMode::RandomOnce:   return "随机 (不重复)";
+   case ScanMode::RandomRepeat: return "随机 (可重复)";
+   }
+   return "逐行往返";      /* 到不了: 上面四支盖满了 enum。兜底只为 -Wreturn-type */
+}
+
+ScanMode modeFromIndex(int i)
+{
+   if (i < 0 || i >= kScanModeCount)
+      return ScanMode::Serpentine;
+   return (ScanMode)i;
+}
+
+bool modeRandom(ScanMode m)
+{
+   return m == ScanMode::RandomOnce || m == ScanMode::RandomRepeat;
+}
+
+bool modeEndless(ScanMode m)
+{
+   return m == ScanMode::RandomRepeat;
+}
 
 /* 同 hmi/ecatworker.h 的 HMI_VEL_MIN / HMI_VEL_MAX, 照抄一份以保持本文件不依赖 Qt。
  * 两边必须一致: EcatThread::setSpeed 会夹速度, 而估算是照原值算的。 */
@@ -69,9 +99,10 @@ std::vector<Point> buildPlan(const Params &p)
 
    for (int iy = 0; iy < ny; iy++)
    {
-      /* 蛇形: 奇数行反向。不蛇形就是每行都从头走。 */
+      /* 蛇形: 奇数行反向。别的走法都是每行从头走 —— 随机那两种在这里出的只是**基准网格**,
+       * 顺序随即便被 shufflePlan 洗掉, 所以走哪一套都无所谓, 用"每行同向"这套省一个分支。 */
       bool fwd = true;
-      if (p.serpentine)
+      if (p.mode == ScanMode::Serpentine)
          fwd = ((iy % 2) == 0);
       if (!p.start_positive)
          fwd = !fwd;
@@ -92,6 +123,14 @@ std::vector<Point> buildPlan(const Params &p)
    }
 
    return out;
+}
+
+void shufflePlan(std::vector<Point> *pts, uint32_t seed)
+{
+   if (pts == nullptr || pts->size() < 2)
+      return;
+   std::mt19937 rng(seed);
+   std::shuffle(pts->begin(), pts->end(), rng);
 }
 
 int32_t autoRangePul(const Params &p)
@@ -222,10 +261,23 @@ std::string validate(const Params &p)
 
 int64_t estimatePerPointMs(const Params &p)
 {
-   double step_pul = p.res_unit * p.pulses_per_unit;
    uint32_t vel = clampVel(p.speed_pul_s ? p.speed_pul_s : 1);
 
-   /* 蛇形里每一步都只动一根轴、都走一个 res —— 所以"移动"这一项是常数 */
+   /* "移动"这一项走多少距离, 看走法。
+    *
+    * 一行一行走的那两种: 每一步都只动一根轴、都走一个 res —— 是常数 (见 §4 那段"蛇形里
+    * 每一步只动一根轴")。
+    *
+    * 随机那两种: 每一步都是**两个随机点之间的一跳**, 不再是 res。取区域里两个均匀随机点的
+    * 平均距离 —— 边长 S 的正方形上那个数是 0.5214·S (闭式解), 长方形上没有这么简洁的式子,
+    * 就照正方形那个系数取 max(区域X, 区域Y)。**拉长的区域上这一项偏大**, 那是故意的:
+    * 本函数的口径一直是"宁可高估", 而随机那一跳还常常是两轴同时走的斜线 (进近减速比单轴
+    * 走更久), 偏大方向正好。 */
+   double step_unit = p.res_unit;
+   if (modeRandom(p.mode))
+      step_unit = 0.5214 * std::max(p.area_x_unit, p.area_y_unit);
+
+   double step_pul = step_unit * p.pulses_per_unit;
    double move_ms = step_pul / (double)vel * 1000.0;
 
    /* 进近段要减速, 实际比 step/vel 长。按 30% 粗加一笔, 宁可高估 */
@@ -268,11 +320,14 @@ std::string csvMetaLines(const Params &p, const std::string &started_iso, int ze
    s += " pulses_per_unit=" + std::to_string(p.pulses_per_unit);
    s += "\n";
 
+   /* `mode=%d` 是 2026-10-11 从 `serp=%d` 改的 (0..3, 见 ScanMode)。**没有任何代码解析它**
+    * —— 续扫只比四项几何 (csvParseForResume), 所以这不是格式破坏, 只是这一栏记得更全:
+    * 一行一行走和随机走, 出来的数据不是一回事, 读文件的人该看得出来 (docs/scan_sweep.md §8)。 */
    std::snprintf(buf, sizeof(buf),
-                 "# speed_pul_s=%u dwell_ms=%d settle_ms=%d samples=%d serp=%d start_pos=%d\n",
+                 "# speed_pul_s=%u dwell_ms=%d settle_ms=%d samples=%d mode=%d start_pos=%d\n",
                  (unsigned)(p.speed_pul_s ? p.speed_pul_s : 0),
                  p.dwell_ms, p.settle_ms, p.samples_per_point,
-                 p.serpentine ? 1 : 0, p.start_positive ? 1 : 0);
+                 (int)p.mode, p.start_positive ? 1 : 0);
    s += buf;
 
    std::snprintf(buf, sizeof(buf),

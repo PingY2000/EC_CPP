@@ -74,6 +74,9 @@ public:
    State state() const { return m_st; }
    bool  running() const;              /* Moving/Dwelling/Reading/Paused */
    bool  loaded() const { return m_st == State::Loaded; }   /* 打开一份 CSV, 停着等操作员 */
+   /* 本轮是「随机 (可重复)」: 永远到不了 Done, 只有「暂停」「中止」能停。
+    * 界面拿它决定进度那几行怎么写 (pendingPoints 在那一支里会一轮一轮往回跳, 报出来是假话) */
+   bool  endless() const { return m_endless; }
    QString stateText() const;          /* 状态栏那一行中文 */
 
    /* 正在走的点在 m_plan 里的下标; 不在跑时 -1 */
@@ -201,6 +204,7 @@ signals:
 
 private:
    bool armRun(QString *err);           /* Preflight + 进第一个点 */
+   void prepareRunPlan();               /* 开扫前按这次的走法重排点列 (随机那两种还会洗牌) */
    void startPoint(int plan_index);
    void beginReading();
    void finishPoint(bool ok, const std::string &flags);
@@ -233,6 +237,13 @@ private:
 
    State   m_st = State::Idle;
    bool    m_is_retest = false;  /* 本轮是单点重测: 走完这一个点就 Done */
+   /* 本轮是「随机 (可重复)」(见 modeEndless)。m_order 走完不判 Done, 而是把点列重洗一遍
+    * 接着走 —— 于是这一轮只有 pause()/abort() 能结束。start()/loadResume() 里连同 m_order
+    * 的构造一起定下来, advance() 里用它 (那是它唯一的分支点)。 */
+   bool    m_endless   = false;
+   /* 洗点列用的种子。**每轮换一个** (start/loadResume 里从 QRandomGenerator 取),
+    * 每次洗牌自增 —— 于是同一轮里每洗一遍都是另一个顺序, 而自检能靠一个固定值钉住结果 */
+   uint32_t m_seed = 0;
    std::vector<int>   m_order;   /* m_plan 的下标序列 (续扫时已滤掉采过的) */
    size_t  m_ord_i = 0;
    int     m_cur   = -1;         /* m_plan 下标; -1 = 不在点上 */

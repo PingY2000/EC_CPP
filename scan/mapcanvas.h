@@ -170,6 +170,9 @@ private:
    QImage              m_img;
    QPainterPath        m_path;
    int                 m_c_nx = -1, m_c_ny = -1, m_c_pts = -1;
+   /* 缓存里那条折线是照**哪一种走法**的点列画的 (2026-10-11)。换走法会让控制器重排点列,
+    * 而 nx/ny/点数一个都不变 —— 不比这一项, 换回「逐行往返」时画的还是上一轮随机那条乱线 */
+   int                 m_c_mode = -1;
    bool                m_geo_done = false;
 };
 

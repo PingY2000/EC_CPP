@@ -22,6 +22,33 @@ struct Point
    int32_t y_pul  = 0;
 };
 
+/* 走法 (2026-10-11)。**这是"这一趟怎么走"的唯一定义处** —— 界面那个「扫描方式」下拉、
+ * 点列的排法、预览画不画、一轮会不会自己结束, 全从这里推。
+ *
+ * 前两种是按行走的**几何式**走法 (每步只动一根轴, 时间是常数); 后两种是随机抽点,
+ * 每一步都是一个随机跳, 所以时间估算那一项另算 (见 estimatePerPointMs)。
+ * 数值即界面下拉的下标, 也是 ini 与 CSV 表头里记的那个数 —— **别改这几个数**。 */
+enum class ScanMode
+{
+   Serpentine   = 0,   /* 逐行往返 (蛇形, 缺省) */
+   SameDir      = 1,   /* 每行同向 */
+   RandomOnce   = 2,   /* 随机 (不重复): 整片网格洗成一个随机顺序走一遍, 走完即止 */
+   RandomRepeat = 3,   /* 随机 (可重复): 走完一遍再洗一遍接着走, 永远不结束 */
+};
+
+/* 四个下拉项文案的**唯一来源** (界面循环建项, 自检钉着这几个字) */
+constexpr int kScanModeCount = 4;
+const char *modeText(ScanMode m);
+
+/* 下标 (界面下拉 / ini 里那个数) → 模式。越界一律回落 Serpentine, 不做别的解释 */
+ScanMode modeFromIndex(int i);
+
+/* 两种随机共用的一条: 开扫时要重排点列, 画布上不画预览折线 */
+bool modeRandom(ScanMode m);
+
+/* 只有「随机 (可重复)」为真: 这一轮永远到不了 Done, 只有暂停 / 中止能停 */
+bool modeEndless(ScanMode m);
+
 struct Params
 {
    double area_x_unit = 27.0;
@@ -42,8 +69,8 @@ struct Params
     * 写点 —— 同一个数两份实现正是本文件开头 VEL_MIN/VEL_MAX 那段在防的坑。 */
    int      meter_interval_ms  = 200;
 
-   bool     serpentine    = true;         /* 蛇形(逐行往返); false = 每行同向 */
-   bool     start_positive = true;        /* 第一行的 X 往 +X 还是 -X 走 */
+   ScanMode mode          = ScanMode::Serpentine;   /* 这一趟怎么走 (见上面那个 enum) */
+   bool     start_positive = true;        /* 第一行的 X 往 +X 还是 -X 走; 只对前两种走法有意义 */
 
    int32_t  range_pul = 0;                /* 0 = 按区域自动算, 见 autoRangePul() */
 };
@@ -78,8 +105,15 @@ int  axisCount(double area_unit, double res_unit);
 /* 一根轴上的坐标, 居中: span = (n-1)*res 可能略小于 area, 于是网格落在区域内 */
 std::vector<double> axisCoords(double area_unit, double res_unit);
 
-/* 完整点列, 已经按扫描顺序排好。 */
+/* 完整点列, 已经按扫描顺序排好。随机那两种在这里出的是**基准网格** (每行同向那个顺序),
+ * 真正的随机顺序由调用方再洗一次 —— 见 shufflePlan() 与 ScanController::start()。 */
 std::vector<Point> buildPlan(const Params &p);
+
+/* 把点列洗成随机顺序 (随机那两种走法用)。
+ *
+ * seed **由调用方给**而不是在这里现抽: 自检要能钉住"同一个 seed 给出同一份点列",
+ * 而界面每次开扫给一个新的。行模式不调用它 —— 它们的顺序是算出来的, 不是抽出来的。 */
+void shufflePlan(std::vector<Point> *pts, uint32_t seed);
 
 /* 单位 <-> 脉冲。用 llround, 不做截断 —— 截断会让 27/2*50000 少一个脉冲。 */
 int32_t pulseOf(double unit, double pulses_per_unit);
@@ -117,7 +151,8 @@ bool fitsRange(const Params &p, std::string *why);
  * 点列就不是同一个地方了; 速度/停留/采样次数不影响几何。 */
 bool sameGeom(const Params &a, const Params &b);
 
-/* 按参数估一个每点耗时 (ms), 用于开始之前报出总时长。线性估计, 实际一定更长。 */
+/* 按参数估一个每点耗时 (ms), 用于开始之前报出总时长。线性估计, 实际一定更长。
+ * 随机那两种走法每一步是一个随机跳, "移动"那一项按**平均跳距**估, 不按分辨率 (见 .cpp)。 */
 int64_t estimatePerPointMs(const Params &p);
 
 /* CSV 表头与行格式。表头两行 `#` 注释带全部参数, 续扫靠它做兼容性判定; 列名一律 ASCII,

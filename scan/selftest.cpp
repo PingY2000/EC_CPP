@@ -663,6 +663,267 @@ static void test_grid()
          "「间隔」不写进 CSV 表头 (格式一个字节没动)");
 }
 
+/* ---------------------------------------------------------------- 随机那两种走法 */
+
+/* 「随机 (不重复)」与「随机 (可重复)」都是"每次随机一个点, 然后扫它", 区别在**池子**:
+ *   不重复 = 只在还没扫过的点里抽 (等价于把整片网格洗成一个随机顺序走一遍, 走完即止);
+ *   可重复 = 不管扫没扫过都进池子, 走完一遍再洗一遍接着走, **永远不结束**。
+ *
+ * 四个下拉项的文案与两个真值表钉在这儿 —— 它们同时是 scan.ini 与 CSV 表头里那个数
+ * 说出来的东西 (与仓库里钉 6041h bit3 / 轴X / 0xFF02 那些是同一个理由)。 */
+static void test_randommode()
+{
+   caseBegin("random: 四个走法的文案与两条真值表");
+   {
+      /* 文案是**逐字**钉的: 下拉项、ini 里那个数、CSV 表头里的 mode= 指的都是它 */
+      check(std::string(modeText(ScanMode::Serpentine)) == "逐行往返",
+            "modeText(0) = 逐行往返", modeText(ScanMode::Serpentine));
+      check(std::string(modeText(ScanMode::SameDir)) == "每行同向",
+            "modeText(1) = 每行同向", modeText(ScanMode::SameDir));
+      check(std::string(modeText(ScanMode::RandomOnce)) == "随机 (不重复)",
+            "modeText(2) = 随机 (不重复)", modeText(ScanMode::RandomOnce));
+      check(std::string(modeText(ScanMode::RandomRepeat)) == "随机 (可重复)",
+            "modeText(3) = 随机 (可重复)", modeText(ScanMode::RandomRepeat));
+      checkEq(kScanModeCount, 4, "下拉一共四项");
+
+      check(!modeRandom(ScanMode::Serpentine) && !modeRandom(ScanMode::SameDir),
+            "行那两种不是随机的");
+      check(modeRandom(ScanMode::RandomOnce) && modeRandom(ScanMode::RandomRepeat),
+            "随机那两种是随机的 (预览不画 / 开扫要洗牌, 都认这一条)");
+
+      check(!modeEndless(ScanMode::Serpentine) && !modeEndless(ScanMode::SameDir)
+               && !modeEndless(ScanMode::RandomOnce),
+            "只有「可重复」到不了 Done");
+      check(modeEndless(ScanMode::RandomRepeat), "「可重复」到不了 Done");
+
+      /* 下标是一张来回票 (界面拿到的是 currentIndex, 存盘写的是 (int)mode) */
+      bool rt = true;
+      for (int i = 0; i < kScanModeCount; i++)
+         rt = rt && ((int)modeFromIndex(i) == i);
+      check(rt, "modeFromIndex 与 enum 的数值同号");
+      check(modeFromIndex(-1) == ScanMode::Serpentine && modeFromIndex(4) == ScanMode::Serpentine,
+            "越界的下标回落「逐行往返」(手改坏的 ini 走这一条)");
+   }
+
+   caseBegin("random: 洗出来的点列 = 整片网格, 不重不漏");
+   {
+      Params p;
+      p.mode = ScanMode::RandomOnce;
+
+      const std::vector<Point> base = buildPlan(p);
+      checkEq((long long)base.size(), 3025, "点数还是 3025 (随机不改几何)");
+
+      /* 同一个 seed 必须给出同一份点列 —— 这是"自检钉得住"的前提, 也是出问题时能复现的前提 */
+      std::vector<Point> a = base, b = base;
+      shufflePlan(&a, 12345u);
+      shufflePlan(&b, 12345u);
+      bool same = (a.size() == b.size());
+      for (size_t i = 0; same && i < a.size(); i++)
+         same = (a[i].ix == b[i].ix && a[i].iy == b[i].iy);
+      check(same, "同一个 seed → 同一份点列");
+
+      std::vector<Point> c = base;
+      shufflePlan(&c, 999u);
+      size_t diff = 0;
+      for (size_t i = 0; i < a.size(); i++)
+         if (a[i].ix != c[i].ix || a[i].iy != c[i].iy)
+            diff++;
+      char dbuf[96];
+      std::snprintf(dbuf, sizeof(dbuf), "3025 个位置里有 %llu 个不一样", (unsigned long long)diff);
+      check(diff > 2500, "另一个 seed → 另一个顺序", dbuf);
+
+      /* 不重不漏 —— 这才叫"每个点扫一次"。热力图那三个数组按 (ix, iy) 索引, 顺序怎样都不影响,
+       * 所以这条钉的是**遍历本身**, 不是画面 */
+      std::vector<int> seen((size_t)55 * 55, 0);
+      for (const Point &q : a)
+         seen[(size_t)q.iy * 55 + (size_t)q.ix]++;
+      size_t dup = 0, miss = 0;
+      for (int v : seen)
+      {
+         if (v > 1)
+            dup++;
+         if (v == 0)
+            miss++;
+      }
+      checkEq((long long)dup, 0, "洗过之后一个点都没重复");
+      checkEq((long long)miss, 0, "洗过之后一个点都没漏");
+   }
+
+   caseBegin("random: 洗一个点 / 洗空表 = 空动作 (不越界)");
+   {
+      std::vector<Point> one(1);
+      one[0].ix = 3;
+      one[0].iy = 7;
+      shufflePlan(&one, 1u);
+      checkEq((long long)one.size(), 1, "一个点洗完还是一个点");
+      check(one[0].ix == 3 && one[0].iy == 7, "而且动都没动");
+
+      std::vector<Point> none;
+      shufflePlan(&none, 2u);
+      checkEq((long long)none.size(), 0, "空表洗完还是空");
+
+      shufflePlan(nullptr, 3u);      /* 真调了不该崩 (这条只证明它没崩) */
+      check(true, "nullptr 是空动作");
+   }
+
+   caseBegin("random: 每点估计按平均跳距算, 不按分辨率");
+   {
+      /* 一行一行走时每一步只动一根轴、只走一个 res; 随机那一跳是区域里两个随机点的距离。
+       * 正方形上那个平均距离 = 0.5214·S (闭式解), 长方形照正方形那个系数取 max(区域X, 区域Y)。
+       * 缺省那份参数逐字算一遍:
+       *   平均跳距 0.5214 × 27 = 14.0778 mm → × 50000 = 703890 pul
+       *   移动 703890 / 20000 × 1000 = 35194.5 ms, 进近段按 30% 粗加成 45752.85
+       *   稳定 100 + 停留 200                                    → 46052.85
+       *   采样一次: 间隔 200 + 往返 50                            → 46302.85
+       *   (int64_t) 截断                                        → 46302
+       * 这一条钉的是"随机那一项**不再**按 res 算" —— 按 res 算出来是 2175, 少报二十倍 */
+      Params r;
+      r.mode = ScanMode::RandomOnce;
+      checkEq(estimatePerPointMs(r), 46302, "「不重复」每点 46302 ms");
+
+      Params s;
+      s.mode = ScanMode::RandomRepeat;
+      checkEq(estimatePerPointMs(s), 46302, "「可重复」同一个数 (几何一样, 快慢无关)");
+
+      check(estimatePerPointMs(r) > estimatePerPointMs(Params()) * 10,
+            "比按行走的每点 (2175) 大一个量级 —— 随机那一跳是全区域宽");
+   }
+
+   caseBegin("random: CSV 表头把走法记下来 (mode=0/2/3)");
+   {
+      /* 老那栏 `serp=` 换成了 `mode=`。**没有任何代码解析它** (续扫只比四项几何), 所以这不是
+       * 格式破坏, 只是"一行一行走"和"随机走"出来的数据不是一回事, 读文件的人该看得出来 */
+      Params a;
+      a.mode = ScanMode::RandomOnce;
+      const std::string m2 = csvMetaLines(a, "2026-10-11T00:00:00", 0);
+      check(m2.find("mode=2") != std::string::npos, "「不重复」写 mode=2", m2);
+      check(m2.find("serp=") == std::string::npos, "老那栏 serp= 没了");
+
+      Params b;
+      b.mode = ScanMode::RandomRepeat;
+      check(csvMetaLines(b, "2026-10-11T00:00:00", 0).find("mode=3") != std::string::npos,
+            "「可重复」写 mode=3");
+
+      check(csvMetaLines(Params(), "2026-10-11T00:00:00", 0).find("mode=0") != std::string::npos,
+            "缺省 (逐行往返) 写 mode=0");
+   }
+
+   /* 控制器那一条, 用现成的 FakeBus 台架 (25 点的小网格: 2 单位 @ 0.5)*/
+   caseBegin("random: 「不重复」恰好 N 个点收尾, 状态落到 Done");
+   {
+      Rig r;
+      Params p = Rig::smallParams();
+      p.mode = ScanMode::RandomOnce;
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+
+      QTemporaryDir dir;
+      check(dir.isValid(), "temp dir");
+      QString err;
+      check(r.startScan(dir.filePath(QStringLiteral("once.csv")), &err),
+            "开扫", err.toStdString());
+      check(!r.ctrl.endless(), "「不重复」不是不设终点的那种");
+
+      /* 每一步下发的目标都得是网格里那 25 个点之一 —— 洗牌不许把点洗丢或洗出格子外 */
+      bool in_grid = true;
+      int  seen_pts = 0;
+      while (r.ctrl.state() != ScanController::State::Done && r.now < 1000 + 120000)
+      {
+         r.stepOnce();
+         const Point *q = r.ctrl.currentPoint();
+         if (q != nullptr)
+         {
+            seen_pts++;
+            if (q->ix < 0 || q->ix >= 5 || q->iy < 0 || q->iy >= 5)
+               in_grid = false;
+         }
+      }
+      check(r.ctrl.state() == ScanController::State::Done, "走完就是 Done");
+      check(in_grid, "每一步的目标都在网格里");
+      check(seen_pts > 0, "确实走过点");
+      checkEq(r.ctrl.completedPoints(), 25, "25 个格子全采到");
+      checkEq(r.ctrl.pendingPoints(), 0, "待补点数归零");
+
+      r.ctrl.abort(QStringLiteral("收尾"));
+   }
+
+   caseBegin("random: 「可重复」走完一轮接着走, 永远到不了 Done");
+   {
+      Rig r;
+      Params p = Rig::smallParams();
+      p.mode = ScanMode::RandomRepeat;
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(3.0);
+
+      QTemporaryDir dir;
+      check(dir.isValid(), "temp dir");
+      QString err;
+      check(r.startScan(dir.filePath(QStringLiteral("repeat.csv")), &err),
+            "开扫", err.toStdString());
+      check(r.ctrl.endless(), "控制器知道这一轮不设终点");
+
+      /* 数**一共走完过几个点** (用它钉"洗一遍走一遍", 见下面那条断言)。
+       * 状态机每收一个点喊一次这个信号, 与 completedPoints() 那种"格子有没有数"是两回事 */
+      int logged = 0;
+      QObject::connect(&r.ctrl, &ScanController::pointLogged,
+                       [&logged](int, int, bool) { logged++; });
+
+      /* **不复用 runToIdle** —— 它认 Done, 而这一条的断言恰恰是"永远等不到 Done", 用它就得
+       * 先给一个超时, 那就分不清"没到"和"断错了"。
+       *
+       * 拍数**跟着一轮的长度走**, 不写死: 一轮要多久是小网格 + 假总线的速度定的, 写死一个数
+       * 就是在猜它 (与机器快慢无关 —— 这里的钟是手拨的)。于是拨到"采满一轮之后又跑了一轮多"
+       * 为止, 上限 30000 拍只是防跑飞 */
+      bool in_grid     = true;
+      int  ticks       = 0;
+      int  t_full      = -1;    /* 第一次采满 25 格是在第几拍上 */
+      int  pts_at_full = -1;    /* 那一刻一共走完过几个点 */
+      while (ticks < 30000)
+      {
+         r.stepOnce();
+         ticks++;
+         if (t_full < 0 && r.ctrl.completedPoints() >= 25)
+         {
+            t_full      = ticks;
+            pts_at_full = logged;
+         }
+         const Point *q = r.ctrl.currentPoint();
+         if (q != nullptr && (q->ix < 0 || q->ix >= 5 || q->iy < 0 || q->iy >= 5))
+            in_grid = false;
+         if (r.ctrl.state() == ScanController::State::Done)
+            break;
+         if (t_full > 0 && ticks > t_full * 2)
+            break;
+      }
+      check(t_full > 0, "走满一轮确实发生过 (25 格都采到了)");
+      check(r.ctrl.state() != ScanController::State::Done, "拨到底还是没 Done");
+      check(r.ctrl.running(), "还在跑 (只有「暂停」「中止」能停)");
+      check(in_grid, "每一步的目标都在网格里");
+
+      /* **"洗一遍走一遍"钉的就是这一条**。反例实测过一次 (2026-10-11): 把重洗那一段搬到
+       * `m_ord_i++` 之后 = 每收一个点就重洗、再从 m_order[0] 起步, 于是退化成"每次独立抽一个
+       * 点" —— 那种实现下采满 25 格已经走了 95 个点上下, 而**"永远到不了 Done"那几条照样是绿
+       * 的**, 只有这一条会红。集齐 25 格的独立抽取约需 25·H(25) ≈ 95 次; 洗一遍走一遍恰好 25 */
+      checkEq(pts_at_full, 25, "走完第一遍恰好 25 个点 (每点每轮只到一次)");
+
+      /* 这一条才是"不停歇"的正面证据: 采满一整轮之后又跑了**不止一轮**的时间, 而它还在走 ——
+       * 说明池子没有把已采的点滤掉 (滤掉的话采满那一刻就收尾了) */
+      char ebuf[128];
+      std::snprintf(ebuf, sizeof(ebuf), "一轮 %d 拍 / %d 个点, 之后又跑了 %d 拍",
+                    t_full, pts_at_full, ticks - t_full);
+      check(t_full > 0 && ticks > t_full * 2, "采满一轮之后又跑了一轮多, 仍在跑", ebuf);
+
+      /* 格子数停在 25 上: 重复采到已采的点是覆盖, 不是多一个点 (与单点重测同一条) */
+      checkEq(r.ctrl.completedPoints(), 25, "25 个格子都在, 一个没多");
+      check(logged > 25, "而走完的点数早就超过 25 了 (第二遍起是在重采)", ebuf);
+
+      r.ctrl.abort(QStringLiteral("收尾"));
+      check(r.ctrl.state() == ScanController::State::Aborted, "中止才停得下来");
+   }
+}
+
 static void test_csv()
 {
    caseBegin("csv: meta + rows round trip");
@@ -894,7 +1155,7 @@ static void test_csvalign()
    cur.dwell_ms          = 50;
    cur.settle_ms         = 20;
    cur.samples_per_point = 3;
-   cur.serpentine        = false;
+   cur.mode              = ScanMode::SameDir;
    cur.start_positive    = false;
    cur.meter_interval_ms = 500;
    cur.range_pul         = autoRangePul(cur);
@@ -912,7 +1173,7 @@ static void test_csvalign()
    checkEq(out.dwell_ms, 50, "停留不许被动");
    checkEq(out.settle_ms, 20, "稳定不许被动");
    checkEq(out.samples_per_point, 3, "采样次数不许被动");
-   check(!out.serpentine, "蛇形不许被动");
+   check(out.mode == ScanMode::SameDir, "扫描方式不许被动");
    check(!out.start_positive, "起始方向不许被动");
    checkEq(out.meter_interval_ms, 500, "功率计间隔不许被动");
    /* 量程是"由区域算出来的"(autoRangePul), 所以它**要**跟着变 —— 这是"别的字段一个都不动"
@@ -927,7 +1188,7 @@ static void test_csvalign()
    check(same.speed_pul_s == csv_p.speed_pul_s && same.dwell_ms == csv_p.dwell_ms
             && same.settle_ms == csv_p.settle_ms
             && same.samples_per_point == csv_p.samples_per_point
-            && same.serpentine == csv_p.serpentine
+            && same.mode == csv_p.mode
             && same.start_positive == csv_p.start_positive
             && same.meter_interval_ms == csv_p.meter_interval_ms,
          "而且整份逐项等于原来那一份");
@@ -1803,6 +2064,105 @@ static void test_resumeload()
       /* 本机本地时间、**不带时区后缀** —— 与 # started= 同一个性质 (不能当 UTC 用) */
       check(!t.contains(QLatin1Char('Z')) && !t.contains(QLatin1Char('+')),
             "不带时区后缀", t.toStdString());
+   }
+
+   /* 2026-10-11: 补点必须按**网格下标**去比 mask, 不能拿点列下标当网格下标。
+   *
+   * 这一段是那个既有 bug 唯一的一处证据 —— 上面那一族用例**一条都抓不到它**: 它们手上的
+   * 文件是"从头采到第 3 个点"的, 而蛇形里"采过的点在点列开头"与"在网格里就是那几格"
+   * 碰巧是一回事 (行内是对折, 一行采满时 mask[i] 与 mask[cell] 逐点相同)。于是要**手写
+   * 一份"采过的点散在中间"的 CSV** 才照得出来: 3 个点分别取在点列的第 6/13/21 位
+   * (6 号是 row1 的第二个点 = 第 8 格, 下标与格号**不相等**, 这就是破那个巧合的地方)。
+   *
+   * 判据不数"待补几个" (两种写法算出来都是 22 —— 补集的大小一样, 错的只是**哪几个**),
+   * 而是逐格看值: 文件里采过的那三格**不许被重采**, 没采过的 22 格**一格都不许漏**。 */
+   caseBegin("resumeload: 采过的点散在中间时, 补的就是「没采过的那些」 (按下标配 mask 会重采 + 漏采)");
+   {
+      const Params p = Rig::smallParams();
+      const std::vector<Point> plan = buildPlan(p);
+
+      const int    pick[3] = {6, 13, 21};
+      const double val[3]  = {11.0, 22.0, 33.0};
+
+      bool idx_ne_cell = false;
+      for (int k = 0; k < 3; k++)
+         if (pick[k] != plan[pick[k]].iy * 5 + plan[pick[k]].ix)
+            idx_ne_cell = true;
+      check(idx_ne_cell, "挑的点里有点列下标 ≠ 网格下标 (否则这一条钉不住任何东西)");
+
+      std::string text = csvMetaLines(p, "2026-10-11T10:00:00", 0);
+      text += csvColumnHeader();
+      text += "\n";
+      for (int k = 0; k < 3; k++)
+      {
+         Row row;
+         row.index = pick[k];
+         row.pt    = plan[pick[k]];
+         row.watts = val[k];
+         row.ok    = true;
+         text += csvRowLine(row);
+      }
+
+      QTemporaryDir dir;
+      check(dir.isValid(), "temp dir");
+      const QString csv = dir.filePath(QStringLiteral("scattered.csv"));
+      check(writeTextFile(csv, QString::fromStdString(text)), "写一份采过的点散在中间的 CSV");
+
+      Rig r;
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(9.0);
+      r.ctrl.setZeroEpoch(0);
+
+      QString err, why;
+      check(r.loadOnlyScan(csv, &err, &why), "装载", (err + " | " + why).toStdString());
+      checkEq(r.ctrl.pendingPoints(), 22, "3/25 → 22 个待补");
+
+      check(r.beginLoadedRun(&err), "按「继续」", err.toStdString());
+      check(r.runToIdle(), "补完这一轮");
+
+      /* 采过的那三格一格都不许被重采 —— 值还是文件里那个数 */
+      bool kept = true;
+      std::string kept_why;
+      for (int k = 0; k < 3; k++)
+      {
+         const double got = r.ctrl.cellValue(plan[pick[k]].ix, plan[pick[k]].iy);
+         if (std::fabs(got - val[k]) > 1e-9)
+         {
+            kept = false;
+            char b[96];
+            std::snprintf(b, sizeof(b), "格 %d,%d = %.1f, 应为 %.1f",
+                          plan[pick[k]].ix, plan[pick[k]].iy, got, val[k]);
+            kept_why = b;
+         }
+      }
+      check(kept, "文件里采过的那三格没被重采", kept_why);
+
+      /* 剩下 22 格**逐格**看: 只要不是那三格, 值就必须是这次采的 9.0。
+       * **不能只数"有几格是 9.0"** —— 两种写法都恰好扫了 22 个点, 数出来一模一样; 差的是
+       * **哪 22 个** (漏了一格、同时多扫了一格, 数目是抵消的) */
+      int missed = 0;
+      int first_missed = -1;
+      for (const Point &q : plan)
+      {
+         bool is_file_cell = false;
+         for (int k = 0; k < 3; k++)
+            if (q.ix == plan[pick[k]].ix && q.iy == plan[pick[k]].iy)
+               is_file_cell = true;
+         if (is_file_cell)
+            continue;
+         if (std::fabs(r.ctrl.cellValue(q.ix, q.iy) - 9.0) > 1e-9)
+         {
+            missed++;
+            if (first_missed < 0)
+               first_missed = q.iy * 5 + q.ix;
+         }
+      }
+      char mbuf[128];
+      std::snprintf(mbuf, sizeof(mbuf), "%d 格没拿到这次的值 (第一格 = %d)", missed, first_missed);
+      check(missed == 0, "除那三格之外, 22 格全都拿到了这次采的值", mbuf);
+
+      r.ctrl.abort(QStringLiteral("收尾"));
    }
 }
 
@@ -2846,7 +3206,7 @@ static void test_prefs()
       checkNear(none.params.res_unit, 0.5, "default res");
       checkEq((long long)none.params.speed_pul_s, 20000, "default speed");
       checkEq(none.params.samples_per_point, 1, "default samples");
-      check(none.params.serpentine, "default serpentine");
+      check(none.params.mode == ScanMode::Serpentine, "default mode = 逐行往返");
       checkEq(none.manual_speed, -1, "manual speed unset");
       check(none.nic.isEmpty(), "no nic yet");
       checkEq(none.params.range_pul, 0, "range is never remembered");
@@ -2866,7 +3226,7 @@ static void test_prefs()
       p.params.dwell_ms         = 150;
       p.params.settle_ms        = 80;
       p.params.samples_per_point = 4;
-      p.params.serpentine       = false;
+      p.params.mode             = ScanMode::RandomRepeat;   /* 非缺省, 也非"另一个 bool" */
       p.params.start_positive   = false;
       /* 功率计那一族: 间隔与**曲线时长窗**都是"这台机器怎么看数", 与网卡名同一类 */
       p.meter_interval_ms = 1234;
@@ -2885,13 +3245,52 @@ static void test_prefs()
       checkEq(b.params.dwell_ms, 150, "dwell");
       checkEq(b.params.settle_ms, 80, "settle");
       checkEq(b.params.samples_per_point, 4, "samples");
-      check(!b.params.serpentine, "serpentine=false survives");
+      check(b.params.mode == ScanMode::RandomRepeat, "mode 存进去读回来还是它");
       check(!b.params.start_positive, "start_positive=false survives");
       checkEq(b.manual_speed, 12345, "manual speed");
       checkEq(b.meter_interval_ms, 1234, "功率计间隔");
       checkEq(b.meter_window_min, 37, "曲线时长窗 (分钟)");
       check(b.nic == p.nic, "the Npcap device path survives INI escaping",
             b.nic.toStdString());
+   }
+
+   caseBegin("prefs: 「扫描方式」缺项给缺省, 手改越界夹回来");
+   {
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+
+      /* 老 ini 里那个 `serp` 键 (bool) **不再读了** —— 键名从 scan/serpentine 换成 scan/mode
+       * 的代价, docs/scan_sweep.md §50。缺项就是缺项的待遇, 不做迁移: 老用户手上那个
+       * 「每行同向」会被忘掉一次, 回到缺省「逐行往返」。这一条钉的就是"没有迁移代码" */
+      {
+         QSettings s(ini, QSettings::IniFormat);
+         s.setValue(QStringLiteral("scan/serpentine"), false);
+         s.sync();
+      }
+      check(prefsLoad(ini).params.mode == ScanMode::Serpentine, "老键 serp 不当数, 回缺省");
+
+      /* 手改成一个越界的数: 走 modeFromIndex 夹回缺省。**不许直接强转** —— 界面拿到的
+       * 是"四个下拉项里的第几个", 越界的下标会让 setCurrentIndex 拿到 -1, 下拉变空白 */
+      {
+         QSettings s(ini, QSettings::IniFormat);
+         s.setValue(QStringLiteral("scan/mode"), 99);
+         s.sync();
+      }
+      check(prefsLoad(ini).params.mode == ScanMode::Serpentine, "99 → 回落缺省");
+
+      {
+         QSettings s(ini, QSettings::IniFormat);
+         s.setValue(QStringLiteral("scan/mode"), -3);
+         s.sync();
+      }
+      check(prefsLoad(ini).params.mode == ScanMode::Serpentine, "-3 → 回落缺省");
+
+      {
+         QSettings s(ini, QSettings::IniFormat);
+         s.setValue(QStringLiteral("scan/mode"), (int)ScanMode::RandomRepeat);
+         s.sync();
+      }
+      check(prefsLoad(ini).params.mode == ScanMode::RandomRepeat, "3 照读 = 随机 (可重复)");
    }
 
    caseBegin("prefs: 曲线时长窗缺项 / 手改坏 —— 都落到 MeterLog 的缺省与量程上");
@@ -7388,6 +7787,7 @@ int main(int argc, char **argv)
    std::printf("scan selftest -- no hardware, no GUI, hand-driven clock\n\n");
 
    test_grid();
+   test_randommode();
    test_csv();
    test_csvalign();
    test_resumeload();

@@ -395,6 +395,11 @@ void MapCanvas::rebuildPath()
    if (m_ctl == nullptr || m_ctl->totalPoints() <= 0)
       return;
 
+   /* 随机那两种走法不画预览 (见 drawPath)。这里也一并别建: 一个 20 万点的网格上连这条
+    * 折线是白费力气, 而建出来的东西一次都不会被画 */
+   if (modeRandom(m_ctl->params().mode))
+      return;
+
    const Point *p0 = m_ctl->pointAt(0);
    if (p0 == nullptr)
       return;
@@ -428,11 +433,13 @@ void MapCanvas::paintEvent(QPaintEvent *)
    /* 路径只在几何变时才重建 —— 它跟数据无关 */
    if (!m_geo_done
        || m_c_nx != m_ctl->gridNx() || m_c_ny != m_ctl->gridNy()
-       || m_c_pts != m_ctl->totalPoints())
+       || m_c_pts != m_ctl->totalPoints()
+       || m_c_mode != (int)m_ctl->params().mode)
    {
       m_c_nx = m_ctl->gridNx();
       m_c_ny = m_ctl->gridNy();
       m_c_pts = m_ctl->totalPoints();
+      m_c_mode = (int)m_ctl->params().mode;
       m_geo_done = true;
       rebuildPath();
    }
@@ -613,6 +620,12 @@ void MapCanvas::drawRulers(QPainter &p)
 void MapCanvas::drawPath(QPainter &p)
 {
    if (m_path.isEmpty() || m_ctl->totalPoints() < 2)
+      return;
+
+   /* 随机那两种走法**不画预览折线** (2026-10-11): 每一步是一个随机跳, 连出来的线横七竖八
+    * 穿过整片区域, 把底下那张热力图糊成一片灰 —— 而预览线的作用本来是"告诉你待会儿怎么走",
+    * 那条路本来就无从预告。判据读控制器里那一份 (它在 setParams 时就更新了, 与序无关) */
+   if (modeRandom(m_ctl->params().mode))
       return;
 
    const QRectF r = plotRect();
