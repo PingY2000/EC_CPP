@@ -469,7 +469,7 @@ void ScanWindow::refreshMeterPanel()
       m_btnMtrRetry->setEnabled(!m_mtrOpening);
    }
 
-   /* 真机那一块 (波长/量程/模式 + 设备信息)。设备没开就没有选项表可填 */
+   /* 真机那一块 (波长/量程/模式/Filter + 设备信息)。设备没开就没有选项表可填 */
    if (m_devBox != nullptr)
       m_devBox->setVisible(open && isOphir);
 
@@ -484,11 +484,11 @@ void ScanWindow::refreshMeterPanel()
    if (m_cbMtrDev != nullptr)
       m_cbMtrDev->setEnabled(m_cbMtrDev->count() > 0 && !m_mtrOpening && !running && !loaded);
 
-   /* 真机那三项: 设备开着才可改, 扫描中不给改 (那三项会重开流), 空选项表也不放开
-    * (探头没有这一项, 放开就是个假控件)。
+   /* 真机那几项: 设备开着才可改, 扫描中不给改 (那几项会重开流), 空选项表也不放开
+    * (探头没有这一项, 放开就是个假控件 —— Filter 在光电二极管之外的探头上就是这一种)。
     * 原来这里判的是 `!rec`, 意思是"别在采着的时候改配置" —— 采集常开之后那个意思由 cfgBusy
     * 承担 (它由工作线程的 infoChanged / configFailed 关掉) */
-   for (QComboBox *cb : { m_cbWl, m_cbRange, m_cbMeasMode })
+   for (QComboBox *cb : { m_cbWl, m_cbRange, m_cbMeasMode, m_cbFilter })
       if (cb != nullptr)
          cb->setEnabled(open && isOphir && cb->count() > 0 && !running && !loaded && !cfgBusy);
 
@@ -1194,6 +1194,9 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
 
    /* 信息是工作线程攒好之后发过来的 (跨线程 → 自动排队, 落回 GUI 线程执行) */
    connect(m_ophir, &OphirMeter::infoChanged, this, &ScanWindow::onMeterInfoChanged);
+   /* 设备自己拨了滤片 (0x040001)。**这条连接与上面两条不是一回事**: 它不是"我们发出去的
+    * 那次改写走完了", 所以那个槽只重填 Filter 那一格, 不碰 m_cfgBusy (见 scanwindow.h) */
+   connect(m_ophir, &OphirMeter::filterChanged, this, &ScanWindow::onMtrFilterChanged);
    connect(m_ophir, &OphirMeter::configFailed, this,
            [this](const QString &e) {
               m_cfgBusy = false;   /* 配置这条路走完了 (失败也是走完), 采集可以回来 */
@@ -2579,8 +2582,8 @@ QWidget *ScanWindow::buildMeterPanel()
    v->addWidget(m_btnMtrRetry);
 
    /* ---------------- 真机那一块 ----------------
-    * 选项表由设备给, 一个都不写死 (探头不同, 能选的波长与量程就不同)。三行连着小标签一起
-    * 收进 m_devBox, 真机没打开时整块 setVisible(false) —— 露不露归 refreshMeterPanel() */
+    * 选项表由设备给, 一个都不写死 (探头不同, 能选的波长与量程就不同)。这几行连着小标签
+    * 一起收进 m_devBox, 真机没打开时整块 setVisible(false) —— 露不露归 refreshMeterPanel() */
 
    m_devBox = new QWidget(box);
    {
@@ -2597,6 +2600,12 @@ QWidget *ScanWindow::buildMeterPanel()
       addDevRow(QStringLiteral("波长"), &m_cbWl);
       addDevRow(QStringLiteral("量程"), &m_cbRange);
       addDevRow(QStringLiteral("模式"), &m_cbMeasMode);
+      /* 滤片状态 (滤片在光路里 / 不在光路里, 手册 §3.6.4.4)。**标签就写 Filter** ——
+       * 选项字是设备原话, 而本机 PD300R 报的就是光秃秃的 `OUT` / `IN` (实测, 见自检那条
+       * `INFO … filter:` 行): 左边那一列不写两个字, 一个裸 `IN` 摆在界面上没人猜得出
+       * 是什么。与上面三行同一套: 选项由设备给、改一次走 停流→改→重开流、不记进 ini。
+       * 探头没有这一项时 (光电二极管之外) 这一格是空表 + 灰的, 由 refreshMeterPanel 判 */
+      addDevRow(QStringLiteral("Filter"), &m_cbFilter);
 
       /* 「添加波长」—— 设备给的那几档之外的值。它是**写设备**的动作, 所以与上面三个下拉框
        * 一样归 m_devBox (真机开着才露) , 可不可按另算 (见 refreshMeterPanel)
@@ -3950,7 +3959,38 @@ void ScanWindow::onMeterInfoChanged()
    fill(m_cbWl,       i.wavelengths, i.wl_index);
    fill(m_cbRange,    i.ranges,      i.range_index);
    fill(m_cbMeasMode, i.modes,       i.mode_index);
+   fill(m_cbFilter,   i.filters,     i.filter_index);
 
+   m_meterCfgQuiet = false;
+}
+
+/* 设备自己报了滤片状态变化 (工作线程重读 GetFilter 之后发)。**只重填 Filter 那一格** ——
+ * 这是它与 onMeterInfoChanged 的全部区别: 别的事项 (设备下拉、波长/量程/模式、m_cfgBusy)
+ * 一个都不许动。理由见 ophirmeter.h 的 filterChanged: 这个信号不是"改配置结束"的回话。
+ *
+ * 与 onMeterInfoChanged 一样挡着信号填 (不挡的话每次 addItem 都会被当成操作员改配置,
+ * 于是往设备回写一次 —— 而这一次正是设备刚告诉我们的那个状态, 白跑一趟停流重开)。 */
+void ScanWindow::onMtrFilterChanged()
+{
+   if (m_cbFilter == nullptr || m_ophir == nullptr)
+      return;
+
+   const OphirInfo i = m_ophir->info();
+
+   /* 先比再填 (与 onMeterInfoChanged 里重建设备下拉那份写法同一条): 选项表与选中项都没变
+    * 就一个字节都不动 —— 每来一次都把框 clear 掉, 会跟操作员正在点的那一下抢 */
+   QStringList have;
+   for (int k = 0; k < m_cbFilter->count(); k++)
+      have << m_cbFilter->itemText(k);
+
+   if (have == i.filters && m_cbFilter->currentIndex() == i.filter_index)
+      return;
+
+   m_meterCfgQuiet = true;
+   m_cbFilter->clear();
+   m_cbFilter->addItems(i.filters);
+   if (i.filter_index >= 0 && i.filter_index < m_cbFilter->count())
+      m_cbFilter->setCurrentIndex(i.filter_index);
    m_meterCfgQuiet = false;
 }
 
@@ -3978,6 +4018,7 @@ void ScanWindow::onMeterCfgChanged()
    m_ophir->setWavelengthIndex(m_cbWl->currentIndex());
    m_ophir->setRangeIndex(m_cbRange->currentIndex());
    m_ophir->setModeIndex(m_cbMeasMode->currentIndex());
+   m_ophir->setFilterIndex(m_cbFilter->currentIndex());
 }
 
 /* 操作员在下拉里换了**另一台表头**。与上面那一条的区别是"换的是哪一台仪器"而不是"改它的

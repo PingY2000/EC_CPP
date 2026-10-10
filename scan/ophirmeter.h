@@ -39,9 +39,14 @@ struct OphirInfo
    QStringList wavelengths;  /* 下拉框的选项, 原样来自设备 */
    QStringList ranges;
    QStringList modes;
-   int wl_index    = -1;     /* -1 = 这个探头没有这一项 (手册 Common Parameters) */
-   int range_index = -1;
-   int mode_index  = -1;
+   /* 滤片状态 (滤片在光路里 / 不在光路里)。**只对光电二极管探头适用** —— 别的探头这一项
+    * 要么选项表为空 (那时 index 恒为 0), 要么 GetFilter 直接回 "Not Applicable", 两种都当
+    * "没有这一项" (index 留 -1, 界面那一格空着且不放开) */
+   QStringList filters;
+   int wl_index     = -1;    /* -1 = 这个探头没有这一项 (手册 Common Parameters) */
+   int range_index  = -1;
+   int mode_index   = -1;
+   int filter_index = -1;
 
    /* 这一次 ScanUSB 看到的**所有**表头序列号 (Ophir COM 只给序列号, 型号要打开之后才知道)。
     * **打开成功与否都发布** —— 多设备时"这台打不开, 换一台再试"这条路全靠它 */
@@ -69,6 +74,13 @@ const int k_wl_max_nm = 1100;
  * 认不出来就返回空, **不猜** —— 空的意思是"我不知道", 界面照原样写「单位不明」。
  * 见 docs/scan_sweep.md §25。 */
 QString unitFromDeviceInfo(const QString &sensor_type, const QString &mode_name);
+
+/* 这个非零 status 是通知 (手册 "informational notification" 那一列), 不是错误 —— 收到它
+ * 不许把那一笔读数判成不可用 (工作线程靠它决定发 readingFailed 还是静静等下一个新数)。
+ * **0x040001 (滤片状态变化) 也在这张表里**, 而且是唯一一个还要另作处置的 (重读 GetFilter)。
+ * 0x200000 (过热告警) **不在**这张表里 —— 那个要停下来。
+ * 与 unitFromDeviceInfo 同一个理由摆在头文件里: 自检要直接钉这几条判据。 */
+bool isNotificationStatus(int status);
 
 /* 「设备」下拉里那一项怎么写 (纯函数, 只拼字):
  *   PD300R (s/n: 3216298) · Juno (s/n: 754170)
@@ -118,6 +130,7 @@ public:
    void setWavelengthIndex(int idx);
    void setRangeIndex(int idx);
    void setModeIndex(int idx);
+   void setFilterIndex(int idx);
 
    /*
     * 往设备里**加**一个波长并选中它 (异步, 范围 k_wl_min_nm ~ k_wl_max_nm)。
@@ -138,6 +151,15 @@ public:
 signals:
    void infoChanged();
    void configFailed(const QString &err);
+
+   /* 设备**自己**报了滤片状态变化 (GetData status 0x040001), 工作线程重读 GetFilter 之后发。
+    *
+    * ★ **它不是 infoChanged**, 别拿它当"改配置这一段结束了"的回话: 那个含义只有 infoChanged /
+    * configFailed 两个信号有 (界面靠它们清 m_cfgBusy, 见 scanwindow.cpp 里那两处)。
+    * 0x040001 是操作员用手拨了一下滤片, 与"我们发出去的那次改写"无关 —— 复用 infoChanged 会
+    * 在一次改写还在飞的时候把 m_cfgBusy 提前清掉, 界面提前放开那几行下拉框与采集 (那正是
+    * m_cfgBusy 存在的理由)。所以单开一条: 界面收到它只重填 Filter 那一格。 */
+   void filterChanged();
 
 private:
    void runSession();          /* 工作线程的主体 —— 所有 COM 都在这里面 */

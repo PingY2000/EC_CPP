@@ -1892,6 +1892,23 @@ static void test_meter_meta()
       check(k_wl_min_nm < k_wl_max_nm, "下限严格小于上限");
    }
 
+   caseBegin("meter: 滤片状态变化那个码 —— 通知, 不是错误");
+   {
+      /* 0x040001 是**唯一**一个要另作处置的通知: 设备自己拨了滤片, 工作线程收到它就重读一次
+       * GetFilter 并发 filterChanged (界面那一格跟着走)。码与话都钉在这儿 ——
+       * 改那个码或改那句话, 自检先红。纯函数, 不碰设备 (test_ophir 那条腿才需要真表头) */
+      check(OphirCom::statusText(0x040001) == QStringLiteral("滤片状态变化"),
+            "0x040001 的原文", OphirCom::statusText(0x040001).toStdString());
+
+      /* ★ 这一条才是要害: 它在 isNotificationStatus 那张表里, 所以工作线程收到滤片状态变化时
+       * **不会**把它判成一笔不可用的读数 (判错的话操作员每拨一下滤片就挨一条红横幅)。
+       * 下面那一对是同一条判据的反面 —— 过热告警要停下来, 不许混进这张表 */
+      check(isNotificationStatus(0x040001), "0x040001 是通知");
+      check(!isNotificationStatus(0x000001), "过量程不是通知 (要报错)");
+      check(!isNotificationStatus(0x200000), "过热告警不是通知 (要停下来)");
+      check(!isNotificationStatus(0), "0 也不在这张表里 —— 它由更早的那条 st == 0 分支接走");
+   }
+
    caseBegin("meter: 两份 CSV 的 meta 行 —— 谁采的 / 什么单位 / 什么配置");
    {
       QTemporaryDir dir;
@@ -1909,7 +1926,8 @@ static void test_meter_meta()
       QStringList extra = meterMetaLines(nullptr);
       extra << QStringLiteral("meter_source=ophir")
             << QStringLiteral("meter_unit=J")
-            << QStringLiteral("meter_mode=Energy");
+            << QStringLiteral("meter_mode=Energy")
+            << QStringLiteral("meter_filter=OUT");   /* 设备原话就是光秃秃的 OUT / IN */
 
       check(log.beginNew(path, p, QStringLiteral("2026-09-17T10:00:00"), 3, extra, &err),
             "beginNew with extra meta", err.toStdString());
@@ -1921,6 +1939,10 @@ static void test_meter_meta()
 
       check(text.contains(QStringLiteral("# meter_unit=J\n")), "单位那一行在文件里");
       check(text.contains(QStringLiteral("# meter_source=ophir\n")), "来源那一行在文件里");
+      /* 滤片档位也是"这份数据怎么来的"的一部分 (滤片在光路里会衰减) ——
+       * 键名钉在这儿: 界面上那一行叫 Filter, 文件里那一行叫 meter_filter */
+      check(text.contains(QStringLiteral("# meter_filter=OUT\n")),
+            "滤片那一行在文件里");
 
       /* 位置: 夹在几何那几行与列表头之间 —— 头几行永远是"这份文件是怎么来的" */
       const int at_meta = text.indexOf(QStringLiteral("# meter_source="));
@@ -6202,6 +6224,16 @@ static void test_ophir()
             check(i.valid, "info() is valid after open");
             check(!i.sensor_name.isEmpty() || !i.device_name.isEmpty(),
                   "info() names the head and the sensor", i.summary.toStdString());
+
+            /* 滤片那一项**只报不断言**: 有的探头装可调滤片 (光电二极管), 有的一格都没有,
+             * 两种都对 —— 下断言会把"这台探头没有这一项"判成失败。打出来是给跑自检的人看的:
+             * 它一眼能看出手上这台到底有没有这一项 (有的话界面第四行就会亮起来)。
+             * 与上面 `ScanUSB found N device(s)` 那两行同一个用途 */
+            const QString flt = i.filters.isEmpty()
+                                   ? QStringLiteral("这台探头没有可调滤片 (界面那一格空着且不放开)")
+                                   : i.filters.join(QStringLiteral(" / "));
+            std::printf("  INFO [%s] filter: %s (index %d)\n", g_case,
+                        flt.toUtf8().constData(), i.filter_index);
 
             /* 异步请求 -> 事件循环里等它回来 (跨线程是排队投递的) */
             double     got = -1.0;

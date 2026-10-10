@@ -44,23 +44,6 @@ long long nowMs()
    return QDateTime::currentMSecsSinceEpoch();
 }
 
-/* 有些非零 status 是通知不是错误 (手册 GetData Status Codes 的 "When and Where" 列标成
- * "informational notification")。注意 0x200000 (过热告警) 不在其列, 那个要停下来。 */
-bool isNotificationStatus(int status)
-{
-   switch (status)
-   {
-   case 0x040001:   /* 滤片状态变化 */
-   case 0x050000:   /* 脉冲频率 */
-   case 0x100000:   /* 温度 */
-   case 0x300000:   /* 脉宽 */
-   case 0x400000:   /* PfP 能量 */
-      return true;
-   default:
-      return false;
-   }
-}
-
 QString buildSummary(const OphirInfo &i)
 {
    QStringList parts;
@@ -85,6 +68,15 @@ QString buildSummary(const OphirInfo &i)
       parts << QStringLiteral("量程 ") + i.ranges.at(i.range_index);
    if (i.mode_index >= 0 && i.mode_index < i.modes.size())
       parts << i.modes.at(i.mode_index);
+   /* 滤片档位也写出来: 它决定这一列数的量级 (滤片在光路里会衰减), 是"这份数据怎么来的"
+    * 的一部分。探头没有这一项时 (index = -1) 一个字都不写 —— 与上面三项同一条判据。
+    *
+    * **要带标签**, 与「量程」同一个道理: 本机那只 PD300R 报回来的选项就是光秃秃的
+    * `OUT` / `IN` (2026-10-10 实测, 见 selftest 那条 `INFO … filter:` 行), 一个字搁在这一串里
+    * 读不出是指什么 —— 而 "IN" 尤其含糊。标签用界面那一格的同一个词 (Filter),
+    * 于是屏幕上两处说的是同一件事 */
+   if (i.filter_index >= 0 && i.filter_index < i.filters.size())
+      parts << QStringLiteral("Filter ") + i.filters.at(i.filter_index);
 
    /* 读数单位 (由模式名 / 探头类型判出来的那个)。状态行是操作员一眼看得见的地方, 所以
     * 它也要写出来 —— 而判不出来就照原样写「单位不明」, **不替它填一个 W**。
@@ -138,6 +130,26 @@ QString unitFromDeviceInfo(const QString &sensor_type, const QString &mode_name)
       return QStringLiteral("W");
 
    return QString();      /* 认不出来。**不猜**, 见 ophirmeter.h 的说明 */
+}
+
+/* 有些非零 status 是通知不是错误 (手册 GetData Status Codes 的 "When and Where" 列标成
+ * "informational notification")。注意 0x200000 (过热告警) 不在其列, 那个要停下来。
+ *
+ * **放在匿名空间外面**: 与下面 unitFromDeviceInfo 同一条理由 —— 它是判据, 自检要直接钉
+ * (0x040001 在不在这一列, 决定"操作员拨一下滤片"是安静地刷新界面还是弹一条红横幅)。 */
+bool isNotificationStatus(int status)
+{
+   switch (status)
+   {
+   case 0x040001:   /* 滤片状态变化 —— 唯一一个还要另作处置的: 见 runSession 里那面 flt_reload */
+   case 0x050000:   /* 脉冲频率 */
+   case 0x100000:   /* 温度 */
+   case 0x300000:   /* 脉宽 */
+   case 0x400000:   /* PfP 能量 */
+      return true;
+   default:
+      return false;
+   }
 }
 
 /* 见 ophirmeter.h: 「探头 (s/n: …) · 表头 (s/n: …)」。纯拼字, 不碰设备 —— 所以自检能直接测
@@ -220,6 +232,7 @@ struct OphirMeter::Private
    int        want_wl    = -1;  /* -1 = 没有待改的 */
    int        want_range = -1;
    int        want_mode  = -1;
+   int        want_filter = -1;
    int        want_add_wl = -1;  /* 要加进设备的那个波长 (nm); -1 = 没有 */
    QString    want_serial;       /* 想打开哪一台; 空 = 枚举到的第一台 */
 
@@ -326,6 +339,10 @@ QStringList OphirMeter::configLines() const
       add(QStringLiteral("meter_range"), i.ranges.at(i.range_index));
    if (i.mode_index >= 0 && i.mode_index < i.modes.size())
       add(QStringLiteral("meter_mode"), i.modes.at(i.mode_index));
+   /* 滤片档位: 同一份数据换个量级 (滤片在光路里会衰减), 回头复核时它是判据的一部分。
+    * 设备给的字原样进文件, 与上面三项同一个写法 */
+   if (i.filter_index >= 0 && i.filter_index < i.filters.size())
+      add(QStringLiteral("meter_filter"), i.filters.at(i.filter_index));
 
    add(QStringLiteral("meter_driver"), i.driver_version);
    return out;
@@ -641,9 +658,12 @@ void OphirMeter::runSession()
     * 表头序列号用**枚举到的那个** pick, 不用 dinfo.serial —— 那一项是用 pick 认的 */
    p->dev_labels.insert(pick, deviceLabel(dinfo.name, pick, sinfo.name, sinfo.serial));
 
-   /* ---- 读当前的波长 / 量程 / 测量模式 ----
-    * 只读不改 (手册: 不要拿型号自行推断规格)。这三项对某些探头不适用, 那时 index = -1、
-    * options 为空 —— 那是正常的, 不是错。设备给的下标是 COM 的 LONG, 先收进 long。 */
+   /* ---- 读当前的波长 / 量程 / 测量模式 / 滤片 ----
+    * 只读不改 (手册: 不要拿型号自行推断规格)。这几项对某些探头不适用, 那时 index = -1、
+    * options 为空 —— 那是正常的, 不是错。设备给的下标是 COM 的 LONG, 先收进 long。
+    *
+    * 滤片 (手册 §3.6.4.4) 只对光电二极管探头适用, 别的探头多半回 "Not Applicable" 而
+    * 整个 Get 失败 —— 与上面三项一样. 失败就留 -1, 不当错。 */
    auto readOptions = [&]() {
       QString e2;
       long idx = -1;
@@ -651,7 +671,8 @@ void OphirMeter::runSession()
       info.wavelengths.clear();
       info.ranges.clear();
       info.modes.clear();
-      info.wl_index = info.range_index = info.mode_index = -1;
+      info.filters.clear();
+      info.wl_index = info.range_index = info.mode_index = info.filter_index = -1;
 
       if (com.getWavelengths(h, k_channel, &idx, &info.wavelengths, &e2))
          info.wl_index = (int)idx;
@@ -659,6 +680,8 @@ void OphirMeter::runSession()
          info.range_index = (int)idx;
       if (com.getMeasurementMode(h, k_channel, &idx, &info.modes, &e2))
          info.mode_index = (int)idx;
+      if (com.getFilter(h, k_channel, &idx, &info.filters, &e2))
+         info.filter_index = (int)idx;
 
       /* 单位**在这儿判**, 因为它随模式走: Power 那一档报的是 W, 切到 Energy 同一份数组
        * 就是 J 了。判不出来留空 (= 不明), 界面照原样写「单位不明」 */
@@ -711,17 +734,25 @@ void OphirMeter::runSession()
     * 加 N 次, 看着正常其实是假的 */
    double watermark = -1.0;
 
+   /* 设备自己报了滤片状态变化 (status 0x040001), 下一轮开头重读一次 GetFilter。
+    * **循环内局部量**: 它只由这一条线程读写, 不跨线程, 所以不进 Private 也不用锁。
+    * 置位而不当场重读, 是为了把同一批里来的好几次 0x040001 折成一次 (取数那一趟只看最新的
+    * 那一项, 见下面 best 那段) —— 也免得在读数那条路上插一次 COM 往返 */
+   bool flt_reload = false;
+
    while (!p->quit.loadAcquire())
    {
-      int wl = -1, rg = -1, md = -1, addwl = -1;
+      int wl = -1, rg = -1, md = -1, addwl = -1, flt = -1;
       {
          QMutexLocker<QMutex> lk(&p->mx);
          wl = p->want_wl; rg = p->want_range; md = p->want_mode; addwl = p->want_add_wl;
+         flt = p->want_filter;
          p->want_wl = p->want_range = p->want_mode = -1;
          p->want_add_wl = -1;
+         p->want_filter = -1;
       }
 
-      if (wl >= 0 || rg >= 0 || md >= 0 || addwl >= 0)
+      if (wl >= 0 || rg >= 0 || md >= 0 || addwl >= 0 || flt >= 0)
       {
          /* 手册: "Configuration methods cannot be called while a channel is streaming" */
          QString e2;
@@ -777,6 +808,7 @@ void OphirMeter::runSession()
          if (ok && wl >= 0) ok = com.setWavelength(h, k_channel, wl, &e2);
          if (ok && rg >= 0) ok = com.setRange(h, k_channel, rg, &e2);
          if (ok && md >= 0) ok = com.setMeasurementMode(h, k_channel, md, &e2);
+         if (ok && flt >= 0) ok = com.setFilter(h, k_channel, flt, &e2);
 
          if (ok)
             ok = com.startStream(h, k_channel, &e2);
@@ -786,16 +818,20 @@ void OphirMeter::runSession()
             /* 新流 = 新时间戳, 水位线作废 */
             watermark = -1.0;
             readOptions();                 /* 设备可能把值夹到它接受的范围内 */
+            /* 这一趟的 readOptions() 已经把滤片重读过了, 那个待办作废 */
+            flt_reload = false;
 
             {
                QMutexLocker<QMutex> lk(&p->info_mx);
                const QString summary = buildSummary(info);
-               p->info.wavelengths = info.wavelengths;
-               p->info.ranges      = info.ranges;
-               p->info.modes       = info.modes;
-               p->info.wl_index    = info.wl_index;
-               p->info.range_index = info.range_index;
-               p->info.mode_index  = info.mode_index;
+               p->info.wavelengths  = info.wavelengths;
+               p->info.ranges       = info.ranges;
+               p->info.modes        = info.modes;
+               p->info.filters      = info.filters;
+               p->info.wl_index     = info.wl_index;
+               p->info.range_index  = info.range_index;
+               p->info.mode_index   = info.mode_index;
+               p->info.filter_index = info.filter_index;
                /* 单位跟着模式走: 上面那一句可能刚把它改了 (W <-> J) */
                p->info.unit        = info.unit;
                p->info.summary     = summary;
@@ -810,6 +846,41 @@ void OphirMeter::runSession()
                emit configFailed(QStringLiteral("%1; 重新启动数据流也失败: %2").arg(e2, e3));
             else
                emit configFailed(e2);
+         }
+      }
+      else if (flt_reload)
+      {
+         /* 设备自己报了滤片状态变化 (0x040001)。**只读滤片这一项**, 不走 readOptions():
+          * 那一趟会先把波长/量程/模式清成 -1 再读四项, 一次瞬时 COM 失败就会把三行无关的
+          * 界面清空 —— 而 0x040001 只说明滤片变了, 别的项没有任何理由动。
+          *
+          * 只读不改, 所以**不用停流** (手册那条禁令只针对 Set/Configure 那一族; 同一个
+          * 道理: 上面配置成功后那一句 readOptions() 也是在 streaming 时调的)。
+          * Get 失败就什么都不做 —— 一个通知不该把屏幕上的档位抹掉。 */
+         flt_reload = false;
+
+         long        idx = -1;
+         QStringList opts;
+         QString     e3;
+         if (com.getFilter(h, k_channel, &idx, &opts, &e3))
+         {
+            /* 值真的变了才发信号。操作员拨一下滤片是低频动作, 这段比的是防"设备连着吐
+             * 一串 0x040001"时每拍一次的信号风暴 */
+            if (opts != info.filters || (int)idx != info.filter_index)
+            {
+               info.filters      = opts;
+               info.filter_index = (int)idx;
+
+               {
+                  QMutexLocker<QMutex> lk(&p->info_mx);
+                  p->info.filters      = info.filters;
+                  p->info.filter_index = info.filter_index;
+                  /* 摘要里写着滤片档位 (buildSummary), 所以它也得跟着重算 */
+                  p->info.summary      = buildSummary(p->info);
+               }
+
+               emit filterChanged();
+            }
          }
       }
 
@@ -850,7 +921,13 @@ void OphirMeter::runSession()
                }
                else if (isNotificationStatus(st))
                {
-                  /* 通知类: 水位线已推过去, 等下一个真正的新数; 故意不清标志 */
+                  /* 通知类: 水位线已推过去, 等下一个真正的新数; 故意不清标志。
+                   *
+                   * **只有一个通知要另作处置**: 0x040001 滤片状态变化 —— 那说明设备自己
+                   * 的滤片档位变了 (操作员用手拨的), 屏幕上的那一格得跟着走。置个待办,
+                   * 下一轮开头重读 (这里不插 COM 往返: 读数那条路正等着新数) */
+                  if (st == 0x040001)
+                     flt_reload = true;
                }
                else
                {
@@ -925,6 +1002,14 @@ void OphirMeter::setModeIndex(int idx)
       return;
    QMutexLocker<QMutex> lk(&p->mx);
    p->want_mode = idx;
+}
+
+void OphirMeter::setFilterIndex(int idx)
+{
+   if (!isOpen())
+      return;
+   QMutexLocker<QMutex> lk(&p->mx);
+   p->want_filter = idx;
 }
 
 }   /* namespace scan */

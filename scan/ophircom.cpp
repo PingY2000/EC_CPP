@@ -905,6 +905,18 @@ bool OphirCom::setMeasurementMode(long h, long ch, long index, QString *err)
    return d->setIndex("SetMeasurementMode", h, ch, index, err);
 }
 
+bool OphirCom::getFilter(long h, long ch, long *index, QStringList *options, QString *err)
+{
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
+   return d->getOptionList("GetFilter", h, ch, index, options, err);
+}
+
+bool OphirCom::setFilter(long h, long ch, long index, QString *err)
+{
+   if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
+   return d->setIndex("SetFilter", h, ch, index, err);
+}
+
 bool OphirCom::configureStreamMode(long h, long ch, long mode, long n_value, QString *err)
 {
    if (!isCreated()) { if (err) *err = QStringLiteral("COM 对象尚未创建"); return false; }
