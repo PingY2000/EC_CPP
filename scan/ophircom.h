@@ -74,6 +74,12 @@ public:
                            QString *err);
    bool setMeasurementMode(long h_device, long channel, long index, QString *err);
 
+   /* 滤片状态 (手册 §3.6.4.4 / §3.6.4.16)。**只对光电二极管探头适用**: 没装可调滤片的探头
+    * 这条要么 options 为空 (那时 index 恒为 0), 要么直接回 0x80040403 "Not Applicable in
+    * this Sensor" —— 两种都不是错, 调用方当成"这一项不存在" */
+   bool getFilter(long h_device, long channel, long *index, QStringList *options, QString *err);
+   bool setFilter(long h_device, long channel, long index, QString *err);
+
    /* ---- 测量 ----
     * 手册 Data Streams: StartStream 会丢掉之前攒下的数据; 之后设备持续把数据推给 COM
     * 对象, 由 GetData 取走 (取走的就从缓冲里没了)。

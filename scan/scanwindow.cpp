@@ -12,6 +12,7 @@
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QDoubleSpinBox>
@@ -72,8 +73,40 @@ static const int kBannerInset = 6;
  * 画布顶上, 赖着不走只会挡住刚打开的那半场数据。 */
 static const int kBannerOpenMs = 5000;
 
-/* 默认 CSV 目录, 相对当前工作目录 (从仓库根敲 ./bin/scan.exe 时就落在 scan_out/) */
+/* 默认 CSV 目录的名字 —— **exe 旁边**那个 scan_out, 与 scan.ini / scan.qss 同一个目录。
+ *
+ * **2026-10-08 起不再是"相对当前工作目录"**。这条是打包发出去之后才显形的: 工作目录跟着
+ * **启动方式**走, 不跟着程序走 —— 双击是 exe 所在目录, 快捷方式看「起始位置」, 而
+ * **以管理员身份运行**时 Windows 给的是 C:\Windows\System32 (开 Npcap 网卡常要管理员)。
+ * 于是同一份程序在不同机器上会把数据静默落到三个不同的地方, 而屏幕上只有路径框那一行字
+ * 是线索。scanprefs.cpp 的 prefsPath 与 scanstyle.cpp 的 stylePath 从一开始取的就是
+ * applicationDirPath (那儿写着"从哪儿双击启动都找得到"), CSV 这一族漏了同一条规矩。
+ *
+ * **目录由 outDirPath() 保证存在** (见下面的 ensureOutDir), 于是路径框里显示的那个目录
+ * 去资源管理器里一定找得到。从前它要到按下「开始扫描」、走到 ScanLog::beginNew 才被建
+ * 出来 (那是全仓库唯一一处 mkpath), 于是"打开程序, 照框里那行字去看"看到的是空的 ——
+ * 打包现场报的就是这个现象。 */
 static const char *kOutDir = "scan_out";
+
+/* 默认输出目录 (绝对路径)。**只算路径, 不建目录** —— 建目录是 ensureOutDir 的事,
+ * 而它只在"这个目录里马上要落一个文件"的两处被叫 (两个 apply*DefaultName)。
+ * 两个"文件对话框从哪儿开"的调用点不该顺手在盘上建东西。 */
+static QString outDirPath()
+{
+   return QDir(QCoreApplication::applicationDirPath()).filePath(QString::fromLatin1(kOutDir));
+}
+
+/* 把默认输出目录建出来 (已经有了就是个空动作)。
+ *
+ * 失败**不在这里报**: 这一处只负责"让人看得见它", 真正写不下去的时候
+ * ScanLog::beginNew 自己会报一句「新建目录失败: <路径>」, 而那才是该出红横幅的地方 ——
+ * 在这里再报一次只会让同一件事出两句文案。 */
+static void ensureOutDir()
+{
+   const QString d = outDirPath();
+   if (!QDir(d).exists())
+      QDir().mkpath(d);
+}
 
 /* 横幅里报路径一律只留文件名 (2026-09-30, §49.11)。
  *
@@ -440,7 +473,7 @@ void ScanWindow::refreshMeterPanel()
       m_btnMtrRetry->setEnabled(!m_mtrOpening);
    }
 
-   /* 真机那一块 (波长/量程/模式 + 设备信息)。设备没开就没有选项表可填 */
+   /* 真机那一块 (波长/量程/模式/Filter + 设备信息)。设备没开就没有选项表可填 */
    if (m_devBox != nullptr)
       m_devBox->setVisible(open && isOphir);
 
@@ -455,11 +488,11 @@ void ScanWindow::refreshMeterPanel()
    if (m_cbMtrDev != nullptr)
       m_cbMtrDev->setEnabled(m_cbMtrDev->count() > 0 && !m_mtrOpening && !running && !loaded);
 
-   /* 真机那三项: 设备开着才可改, 扫描中不给改 (那三项会重开流), 空选项表也不放开
-    * (探头没有这一项, 放开就是个假控件)。
+   /* 真机那几项: 设备开着才可改, 扫描中不给改 (那几项会重开流), 空选项表也不放开
+    * (探头没有这一项, 放开就是个假控件 —— Filter 在光电二极管之外的探头上就是这一种)。
     * 原来这里判的是 `!rec`, 意思是"别在采着的时候改配置" —— 采集常开之后那个意思由 cfgBusy
     * 承担 (它由工作线程的 infoChanged / configFailed 关掉) */
-   for (QComboBox *cb : { m_cbWl, m_cbRange, m_cbMeasMode })
+   for (QComboBox *cb : { m_cbWl, m_cbRange, m_cbMeasMode, m_cbFilter })
       if (cb != nullptr)
          cb->setEnabled(open && isOphir && cb->count() > 0 && !running && !loaded && !cfgBusy);
 
@@ -1165,6 +1198,9 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
 
    /* 信息是工作线程攒好之后发过来的 (跨线程 → 自动排队, 落回 GUI 线程执行) */
    connect(m_ophir, &OphirMeter::infoChanged, this, &ScanWindow::onMeterInfoChanged);
+   /* 设备自己拨了滤片 (0x040001)。**这条连接与上面两条不是一回事**: 它不是"我们发出去的
+    * 那次改写走完了", 所以那个槽只重填 Filter 那一格, 不碰 m_cfgBusy (见 scanwindow.h) */
+   connect(m_ophir, &OphirMeter::filterChanged, this, &ScanWindow::onMtrFilterChanged);
    connect(m_ophir, &OphirMeter::configFailed, this,
            [this](const QString &e) {
               m_cfgBusy = false;   /* 配置这条路走完了 (失败也是走完), 采集可以回来 */
@@ -2408,11 +2444,11 @@ QWidget *ScanWindow::buildScanPanel()
    /* 两个入口, 屏幕上永远看得出此刻在哪种模式 (2026-09-30, docs/scan_sweep.md §49)。
     * 从前只有一个「打开 CSV 续扫」, 它把选文件 / 对齐参数 / 读回数据三件事捆在一起,
     * 于是分不清"我要新开一份"和"我要看/接着那一份" */
-   m_btnNew = new QPushButton(QStringLiteral("新建 CSV"), box);
+   m_btnNew = new QPushButton(QStringLiteral("新建测试"), box);
    m_btnNew->setToolTip(QStringLiteral("清掉当前这份, 输出路径换成当前时刻的新名字。"));
    connect(m_btnNew, &QPushButton::clicked, this, &ScanWindow::onNewCsvClicked);
 
-   m_btnOpen = new QPushButton(QStringLiteral("打开 CSV"), box);
+   m_btnOpen = new QPushButton(QStringLiteral("读取 csv"), box);
    m_btnOpen->setToolTip(QStringLiteral("读回已有数据并画到画布上, 参数对齐到这份文件。"
                                         "未采完的可继续补点, 采完的可重测单点。"
                                         "手里已有一份时, 按它会换成新选的这一份。"));
@@ -2430,12 +2466,26 @@ QWidget *ScanWindow::buildScanPanel()
     * (Qt 里大写的 MM 是**月**, 换成大写这张脸就与真实文件名对不上了) */
    m_edCsv = new QLineEdit(box);
    m_edCsv->setPlaceholderText(QStringLiteral("scan_out/scan_yyyyMMdd_HHmmss.csv"));
-   m_btnCsv = new QPushButton(QStringLiteral("…"), box);
-   /* **不设固定宽** (2026-09-30): 原先这里是 setFixedWidth(28), 而样式表给 QPushButton 的
-    * 内边距是 5px 12px、边框 1px —— 28 宽留给字的只剩 **2 px**, 那个「…」被剪成**一个点**
-    * (用户原话: 「后面的选择文件按钮要是三个点而不是一个点」)。不设固定宽就按 sizeHint 走
-    * (本机 100% 缩放下量到 32 px; 150% 缩放下三个点分得开), 字号 / DPI 变了它自己跟着长。
-    * 同一处毛病 m_btnMtrCsv 也有, 一起改 (那一行现在藏着, 见 buildMeterPanel) */
+   m_btnCsv = new QPushButton(QStringLiteral("选择保存文件"), box);
+   /* **按钮由「…」改成文字, 行为一个字没动** (2026-10-08)。用户原话:
+    * 「我的意思是改为选择保存文件 按钮功能不需要改变」。
+    *
+    * 改的只有**屏幕上那六个字**: 从前是个「…」, 光看它说不出按下去会出什么 —— 是选目录?
+    * 选文件? 还是别的。现在写着「选择保存文件」, 与它开的那个 `getSaveFileName` 对得上:
+    * 那个对话框一次能改两样 (目录 + 文件名), 所以「选择保存文件」比「选择保存目录」**完整**
+    * —— 后者把"能改文件名"那半件事说漏了。
+    *
+    * (中间有过一版把它连行为一起改成"只选目录"的 getExistingDirectory, 已按上面那句原话
+    * 改回来: onBrowseCsv 仍原样调用 getSaveFileName, 起点那处 (§49.12 换的) 没动。)
+    *
+    * 宽度: 从前那段 `setFixedWidth(28)` 的注释说的是"28 px 把「…」剪成**一个点**" (§47.4 量过
+    * 的数), 换成文字之后那件事不再存在。这里**仍然不设固定宽**, 理由与当时同: 按 sizeHint 走,
+    * 字号 / DPI 变了它自己跟着长。
+    * **没给它加 tooltip**: 一句话能说清的事写在自己身上就够了, 再加一句差不多意思的 tooltip
+    * 是同一件事说两遍。
+    * **m_btnMtrCsv 没有跟着改** (功率计那一行也是「…」, 也开 getSaveFileName): 那一行
+    * 2026-09-29 起整块藏着 (见 buildMeterPanel), 改了屏幕上暂时看不出差别 —— 留原样是为了
+    * "恢复显示"那一刻不至于变成一次谁也没看过的改动。 */
    connect(m_btnCsv, &QPushButton::clicked, this, &ScanWindow::onBrowseCsv);
 
    m_lProg = new QLabel(box);
@@ -2543,8 +2593,8 @@ QWidget *ScanWindow::buildMeterPanel()
    v->addWidget(m_btnMtrRetry);
 
    /* ---------------- 真机那一块 ----------------
-    * 选项表由设备给, 一个都不写死 (探头不同, 能选的波长与量程就不同)。三行连着小标签一起
-    * 收进 m_devBox, 真机没打开时整块 setVisible(false) —— 露不露归 refreshMeterPanel() */
+    * 选项表由设备给, 一个都不写死 (探头不同, 能选的波长与量程就不同)。这几行连着小标签
+    * 一起收进 m_devBox, 真机没打开时整块 setVisible(false) —— 露不露归 refreshMeterPanel() */
 
    m_devBox = new QWidget(box);
    {
@@ -2561,6 +2611,12 @@ QWidget *ScanWindow::buildMeterPanel()
       addDevRow(QStringLiteral("波长"), &m_cbWl);
       addDevRow(QStringLiteral("量程"), &m_cbRange);
       addDevRow(QStringLiteral("模式"), &m_cbMeasMode);
+      /* 滤片状态 (滤片在光路里 / 不在光路里, 手册 §3.6.4.4)。**标签就写 Filter** ——
+       * 选项字是设备原话, 而本机 PD300R 报的就是光秃秃的 `OUT` / `IN` (实测, 见自检那条
+       * `INFO … filter:` 行): 左边那一列不写两个字, 一个裸 `IN` 摆在界面上没人猜得出
+       * 是什么。与上面三行同一套: 选项由设备给、改一次走 停流→改→重开流、不记进 ini。
+       * 探头没有这一项时 (光电二极管之外) 这一格是空表 + 灰的, 由 refreshMeterPanel 判 */
+      addDevRow(QStringLiteral("Filter"), &m_cbFilter);
 
       /* 「添加波长」—— 设备给的那几档之外的值。它是**写设备**的动作, 所以与上面三个下拉框
        * 一样归 m_devBox (真机开着才露) , 可不可按另算 (见 refreshMeterPanel)
@@ -3571,13 +3627,18 @@ void ScanWindow::applyCsvDefaultName()
    if (!m_edCsv->text().trimmed().isEmpty())
       return;
 
-   const QString dir = QDir::current().filePath(QString::fromLatin1(kOutDir));
+   /* 占位字那个格式 (scan_out/scan_yyyyMMdd_HHmmss.csv) 说的就是下面这一句 —— 必须是**小写**
+    * yyyyMMdd_HHmmss: Qt 里大写的 MM 是**月**, 写成大写这张脸就与真实文件名对不上了。 */
    const QString name = QStringLiteral("scan_%1.csv")
                            .arg(QDateTime::currentDateTime().toString(
                                    QStringLiteral("yyyyMMdd_HHmmss")));
-   m_edCsv->setText(QDir(dir).filePath(name));
+   ensureOutDir();   /* 框里写出来的那个目录必须是**真的在** (2026-10-08, 理由见 kOutDir) */
+   m_edCsv->setText(QDir(outDirPath()).filePath(name));
 }
 
+/* 按钮「选择保存文件」的槽 (按钮原名「…」, 2026-10-08 只改了名字, **这里一个字没动**)。
+ * 起的还是 getSaveFileName: 目录与文件名一起改, 与按钮上那六个字对得上。
+ * 唯一变过的是**起点** —— 2026-10-08 起回 outDirPath() (见 §49.12), 从前是 QDir::current()。 */
 void ScanWindow::onBrowseCsv()
 {
    if (m_ctl->running())
@@ -3587,7 +3648,7 @@ void ScanWindow::onBrowseCsv()
    }
 
    const QString start = m_edCsv->text().trimmed().isEmpty()
-                            ? QDir::current().filePath(QString::fromLatin1(kOutDir))
+                            ? outDirPath()
                             : m_edCsv->text().trimmed();
 
    const QString f = QFileDialog::getSaveFileName(
@@ -3916,7 +3977,38 @@ void ScanWindow::onMeterInfoChanged()
    fill(m_cbWl,       i.wavelengths, i.wl_index);
    fill(m_cbRange,    i.ranges,      i.range_index);
    fill(m_cbMeasMode, i.modes,       i.mode_index);
+   fill(m_cbFilter,   i.filters,     i.filter_index);
 
+   m_meterCfgQuiet = false;
+}
+
+/* 设备自己报了滤片状态变化 (工作线程重读 GetFilter 之后发)。**只重填 Filter 那一格** ——
+ * 这是它与 onMeterInfoChanged 的全部区别: 别的事项 (设备下拉、波长/量程/模式、m_cfgBusy)
+ * 一个都不许动。理由见 ophirmeter.h 的 filterChanged: 这个信号不是"改配置结束"的回话。
+ *
+ * 与 onMeterInfoChanged 一样挡着信号填 (不挡的话每次 addItem 都会被当成操作员改配置,
+ * 于是往设备回写一次 —— 而这一次正是设备刚告诉我们的那个状态, 白跑一趟停流重开)。 */
+void ScanWindow::onMtrFilterChanged()
+{
+   if (m_cbFilter == nullptr || m_ophir == nullptr)
+      return;
+
+   const OphirInfo i = m_ophir->info();
+
+   /* 先比再填 (与 onMeterInfoChanged 里重建设备下拉那份写法同一条): 选项表与选中项都没变
+    * 就一个字节都不动 —— 每来一次都把框 clear 掉, 会跟操作员正在点的那一下抢 */
+   QStringList have;
+   for (int k = 0; k < m_cbFilter->count(); k++)
+      have << m_cbFilter->itemText(k);
+
+   if (have == i.filters && m_cbFilter->currentIndex() == i.filter_index)
+      return;
+
+   m_meterCfgQuiet = true;
+   m_cbFilter->clear();
+   m_cbFilter->addItems(i.filters);
+   if (i.filter_index >= 0 && i.filter_index < m_cbFilter->count())
+      m_cbFilter->setCurrentIndex(i.filter_index);
    m_meterCfgQuiet = false;
 }
 
@@ -3944,6 +4036,7 @@ void ScanWindow::onMeterCfgChanged()
    m_ophir->setWavelengthIndex(m_cbWl->currentIndex());
    m_ophir->setRangeIndex(m_cbRange->currentIndex());
    m_ophir->setModeIndex(m_cbMeasMode->currentIndex());
+   m_ophir->setFilterIndex(m_cbFilter->currentIndex());
 }
 
 /* 操作员在下拉里换了**另一台表头**。与上面那一条的区别是"换的是哪一台仪器"而不是"改它的
@@ -4117,7 +4210,7 @@ void ScanWindow::pushMeterMeta()
 void ScanWindow::onMtrBrowseCsv()
 {
    const QString start = m_edMtrCsv->text().trimmed().isEmpty()
-                            ? QDir::currentPath()
+                            ? outDirPath()
                             : QFileInfo(m_edMtrCsv->text().trimmed()).absolutePath();
 
    const QString f = QFileDialog::getSaveFileName(
@@ -4138,10 +4231,11 @@ void ScanWindow::applyMtrCsvDefaultName()
    if (!m_edMtrCsv->text().trimmed().isEmpty())
       return;
 
+   ensureOutDir();   /* 同 applyCsvDefaultName: 与扫描那份落在同一个目录里 */
    const QString name = QStringLiteral("meter_%1.csv")
                            .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss")));
    m_edMtrCsv->setText(QDir::toNativeSeparators(
-      QDir::current().filePath(QString::fromLatin1(kOutDir) + QLatin1Char('/') + name)));
+      QDir(outDirPath()).filePath(name)));
 }
 
 void ScanWindow::onMtrExportClicked()
@@ -4240,7 +4334,7 @@ void ScanWindow::onOpenCsvClicked()
       return;
 
    const QString start = m_last_dir.isEmpty()
-                            ? QDir::current().filePath(QString::fromLatin1(kOutDir))
+                            ? outDirPath()
                             : m_last_dir;
 
    /* 「未完成」三个字去掉了 (2026-09-30, §49.3): 采完的 CSV 现在也打得开 —— 打开来看、

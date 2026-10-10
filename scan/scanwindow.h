@@ -121,11 +121,16 @@ private:
    void onResumeRunClicked();
    void onAbortClicked();
    void onRetestClicked();
-   /* 设备信息回来了: 真机那三行填选项表 / 当前选中项。**灰不灰与露不露都不归这里管**,
+   /* 设备信息回来了: 真机那几行填选项表 / 当前选中项。**灰不灰与露不露都不归这里管**,
     * 那是 refreshMeterPanel() 每拍算的 */
    void onMeterInfoChanged();
-   /* 操作员改了波长/量程/模式 (真机才有那三项) */
+   /* 操作员改了波长/量程/模式/Filter (真机才有那几项) */
    void onMeterCfgChanged();
+   /* **设备自己**报了滤片状态变化 (OphirMeter 的 filterChanged: GetData status 0x040001),
+    * 工作线程重读 GetFilter 之后发。只重填 Filter 那一格 —— **不许碰 m_cfgBusy**: 这条信号
+    * 不是"改配置这一段结束了"的回话 (那个含义只有 infoChanged / configFailed 有),
+    * 在这里清它会在一次改写还在飞的时候把界面提前放开 (理由见 ophirmeter.h 的 filterChanged) */
+   void onMtrFilterChanged();
    /* 操作员换了一台设备 (下拉里那一列序列号)。**与上面那一条不同**: 它列的不是配置而是
     * 哪一台仪器, 所以不能挂在那个 connect 循环上 —— 走这儿: 记下序列号 -> 停采集 -> 清缓冲
     * -> 重开 (openMeter)。切换是**无声地清缓冲**的, 那条 tooltip 就在下拉框上 */
@@ -468,15 +473,17 @@ private:
     * (infoChanged 或 configFailed); 工作线程自己死了就两条都到不了 —— 那时采集会一直停着,
     * 界面上"采集中"的字还在而数不涨。这个缺口写在这里, 见 refreshMeterPanel 的说明 */
    bool         m_cfgBusy     = false;
-   /* 真机那三项。选项表由设备给 (探头不同, 能选的波长与量程就不同), 一个都不写死。
+   /* 真机那几项。选项表由设备给 (探头不同, 能选的波长与量程就不同), 一个都不写死。
     * 每一项没有单独的"那一行"要露/藏: 整块 m_devBox 一起显隐, 而某一项设备根本没有时
-    * 它是**空的 + 灰的** (判据在 refreshMeterPanel 里) */
+    * 它是**空的 + 灰的** (判据在 refreshMeterPanel 里)。
+    * Filter 是滤片状态 (滤片在光路里 / 不在光路里), 只对光电二极管探头有 */
    QComboBox *m_cbWl = nullptr, *m_cbRange = nullptr, *m_cbMeasMode = nullptr;
+   QComboBox *m_cbFilter = nullptr;
    /* 诊断那一行 (ROM 版本 / 探头类型 / 驱动报的两个版本号)。
     * **设备的身份 (型号 + 序列号) 不在这里** —— 它现在只由「设备」下拉说 (§37.9/§37.10);
     * 这一段在设备没读回来、两个版本号也取不到时是**空的**, 那时整行藏起来 (见 onMeterInfoChanged) */
    QLabel    *m_lDevInfo = nullptr;
-   /* 真机那一块 (波长/量程/模式 + 设备信息), 只在真机开着时才露 */
+   /* 真机那一块 (波长/量程/模式/Filter + 设备信息), 只在真机开着时才露 */
    QWidget *m_devBox = nullptr;
    /* 填充那三个下拉框时挡掉信号: 每 addItem 一次都会被当成操作员改配置 (一串 stop/set/start) */
    bool m_meterCfgQuiet = false;

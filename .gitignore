@@ -39,8 +39,11 @@ install_manifest.txt
 Thumbs.db
 .DS_Store
 
-# ==== 扫描采集产物 (scan/ 默认写这里) ====
+# ==== 扫描采集产物 ====
+# 2026-10-08 起 scan 默认写在 **exe 旁边**, 于是开发机上它落在 bin/scan_out/。
+# 仓库根这条留着: 以前是从仓库根敲 ./bin/scan.exe, 那几份老数据还在那儿。
 /scan_out/
+/bin/scan_out/
 
 # scan 记的参数 (exe 旁边的 scan.ini)。里面存着**这台机器**上次用的网卡,
 # 换一台机器那份 GUID 就没有意义了 —— 不入库。
