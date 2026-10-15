@@ -7929,7 +7929,7 @@ static void test_runlog_write_parse()
             "空行不是日志行");
    }
 
-   caseBegin("runlog: 追加而不是覆盖 (同一个文件开两次, 两段都在)");
+   caseBegin("runlog: 每次 open 清空重写 (同一个文件开两次, 只剩后一趟)");
    {
       QTemporaryDir dir;
       const QString path = dir.filePath(QStringLiteral("app.log"));
@@ -7949,22 +7949,29 @@ static void test_runlog_write_parse()
       }
 
       const QStringList lines = readAllLines(path);
-      int starts = 0, seps = 0;
+      int starts = 0, seps = 0, heads = 0, first_run = 0, stale_word = 0;
       for (const QString &l : lines)
       {
          if (l.contains(QStringLiteral("| start |")))
             starts++;
          if (l.startsWith(QStringLiteral("# ===== ")))
+         {
             seps++;
-      }
-      checkEq(starts, 2, "两趟的 start 都在 (第二趟没把第一趟冲掉)");
-      checkEq(seps, 2, "两趟各有一条启动分隔行");
-      /* 格式说明只在**新建**那一次写一遍 */
-      int heads = 0;
-      for (const QString &l : lines)
+            /* 分隔行里那个 `(追加)` 2026-10-15 跟着行为一起去掉了 —— 留着它就是一句谎 */
+            if (l.contains(QStringLiteral("追加")))
+               stale_word++;
+         }
          if (l.startsWith(QStringLiteral("# scan 异常日志")))
             heads++;
-      checkEq(heads, 1, "格式说明只写一次 (第二次打开时文件不是空的)");
+         if (l.contains(QStringLiteral("第一趟")))
+            first_run++;
+      }
+      checkEq(starts, 1, "只剩后一趟的 start (前一趟被清掉了)");
+      checkEq(seps, 1, "只剩一条启动分隔行");
+      checkEq(first_run, 0, "前一趟那一行已经不在了");
+      checkEq(stale_word, 0, "启动分隔行不再写「追加」");
+      /* 格式说明**每趟都写**: 文件每次都被截断, 所以每一趟都是"新的那一份" */
+      checkEq(heads, 1, "格式说明照样在 (现在是每趟写一遍, 不再是只写一次)");
    }
 
    caseBegin("runlog: 没打开时 line() 不崩, 只计数");
@@ -8278,6 +8285,47 @@ static void test_bus_runstat()
       check(f.value(QStringLiteral("al_code"))  == QLatin1String("0x001b"), "al_code 四位");
       check(f.value(QStringLiteral("al_ok"))    == QLatin1String("1"), "al_ok");
       check(f.contains(QStringLiteral("frames")), "累计量跟着一起来 (这一笔是第几帧处发生的)");
+   }
+
+   caseBegin("cmd_begin / cmd_end: 命令现场那一串 (第 6 趟那三个 gap_self 说不出是谁按的)");
+   {
+      ecatcmd::BusRunStat s;
+      s.connects            = 1;
+      s.gaps_over_total     = 3;
+      s.gaps_over_self_total = 3;
+
+      const QString beg = ecatcmd::cmdBeginFields(QStringLiteral("home"), 0, 0x3u, s);
+      const QString row = QStringLiteral("2026-10-15 23:28:08.100 | ECAT | cmd_begin | ") + beg;
+
+      QMap<QString, QString> f;
+      check(splitRunLogLine(row, nullptr, nullptr, nullptr, &f, nullptr), "拆得开", row.toStdString());
+      check(f.value(QStringLiteral("name")) == QLatin1String("home"), "name");
+      checkEq(f.value(QStringLiteral("ax")).toLongLong(), 0, "ax");
+      check(f.value(QStringLiteral("mask")) == QLatin1String("0x3"), "mask 是十六进制");
+      checkEq(f.value(QStringLiteral("gaps_over_self")).toLongLong(), 3,
+              "累计量跟着一起来 —— 这是第几次自家阻塞");
+      check(!f.contains(QStringLiteral("dur_ms")), "起手那一行**没有** dur_ms (那一刻它还没回来)");
+
+      /* 没有轴 / 没有掩码 -> `-`。不许写 0、不许写空: 0 轴与"不分轴"是两件事 */
+      const QString noax = ecatcmd::cmdBeginFields(QStringLiteral("list"), -1, 0u, s);
+      check(noax.contains(QStringLiteral("ax=-")), "没有轴就写 `-`", noax.toStdString());
+      check(noax.contains(QStringLiteral("mask=-")), "没有掩码就写 `-`", noax.toStdString());
+
+      /* 字段区自身的两条铁律 (见 runlog.h): 不许有 `|`, 值是纯 ASCII 无空格 */
+      check(!beg.contains(QLatin1Char('|')), "字段区里不许出现 `|` (它会把结构撑破)");
+      check(!beg.contains(QStringLiteral("  ")), "不许有连着两个空格 (空格是字段分隔符)",
+            beg.toStdString());
+
+      /* 收尾那一行: dur_ms 就是"这一次把主循环挡住多久" */
+      const QString endf = ecatcmd::cmdEndFields(QStringLiteral("home"), 0, 0x3u, 3662, s);
+      check(endf.startsWith(QStringLiteral("name=home ax=0 mask=0x3 dur_ms=3662")),
+            "收尾那一行的键序固定", endf.toStdString());
+
+      QMap<QString, QString> f2;
+      const QString row2 = QStringLiteral("2026-10-15 23:28:11.700 | ECAT | cmd_end | ") + endf;
+      check(splitRunLogLine(row2, nullptr, nullptr, nullptr, &f2, nullptr), "收尾那行也拆得开");
+      checkEq(f2.value(QStringLiteral("dur_ms")).toLongLong(), 3662, "dur_ms");
+      check(f2.value(QStringLiteral("name")) == QLatin1String("home"), "name 两头一致");
    }
 }
 

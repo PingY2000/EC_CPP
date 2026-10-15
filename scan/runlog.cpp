@@ -151,11 +151,18 @@ bool RunLog::open(const QString &path, const QStringList &meta, QString *err)
       }
    }
 
-   /* 新建的空文件才写格式说明: 判断要**在打开之前**做, 打开之后 size 就变了 */
-   const bool fresh = fi.size() <= 0;
-
+   /* ---- **截断, 不是追加** (2026-10-15, 用户原话: 「每次运行程序 清除之前的日志」) ----
+    * 改之前是 Append: 六趟实跑混在一个文件里, 每趟靠一段 `# ===== … 启动 =====` 切开。
+    * 现场那一头读起来费劲 (想看的永远是**最近这一趟**, 却要先翻过前五趟), 而首跑那次已经
+    * 出现过"手工把文件清掉"这一步 (docs/scan_runlog.md §10.1(e)②) —— 那就让程序自己清。
+    *
+    * **代价**: 上一趟的现场在下一次启动的瞬间就没了。要看两趟对照, 必须在重启前手工复制一份。
+    * 这一条不是疏忽, 是选定的口径 (2026-10-15 用户在两个选项里选了"整份清空, 只留本趟")。
+    *
+    * 安全性: `open()` 全仓库**只有一处调用** (scan/scanwindow.cpp 构造期一次, 路径固定),
+    * RunLog 对象也永不 delete —— 不存在"同一趟里被开第二次、把本趟前半段冲掉"的风险。 */
    m_f = new QFile(path);
-   if (!m_f->open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+   if (!m_f->open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text))
    {
       m_err = QStringLiteral("打开日志文件失败: %1").arg(m_f->errorString());
       delete m_f;
@@ -166,13 +173,13 @@ bool RunLog::open(const QString &path, const QStringList &meta, QString *err)
 
    m_path = path;
 
+   /* 格式说明**每次都写**: 文件每次启动都被清空重写, 所以每一趟都是"新的那一份"。
+    * (改之前这几行有条件 —— 只有文件原本是空的才写。) */
    QByteArray head;
-   if (fresh)
-   {
-      head += "# scan 异常日志。格式: <ts> | <TAG> | <event> | <k=v ...> | <自由文本>\n";
-      head += "# TAG = LIFE | ECAT | METER; 字段区一个都没有时写 `-`; `#` 开头的是内务行。\n";
-   }
-   head += QStringLiteral("# ===== %1 启动 (追加) =====\n").arg(nowStamp()).toUtf8();
+   head += "# scan 异常日志。格式: <ts> | <TAG> | <event> | <k=v ...> | <自由文本>\n";
+   head += "# TAG = LIFE | ECAT | METER; 字段区一个都没有时写 `-`; `#` 开头的是内务行。\n";
+   head += "# 每次启动清空重写: 文件里只有最近这一趟。要两趟对照请在重启前先复制一份。\n";
+   head += QStringLiteral("# ===== %1 启动 =====\n").arg(nowStamp()).toUtf8();
    for (const QString &m : meta)
       head += QStringLiteral("# %1\n").arg(m).toUtf8();
 
@@ -297,6 +304,9 @@ int RunLog::drain(QString *err)
          if (err) *err = m_err;
       }
 
+      /* ★ 这里**故意是 Append**, 与 open() 里那个 Truncate 不一样, 别去"统一"它们:
+       * 上面 runlogTrimHead 刚把保留下来的尾巴重写进同一个文件, 这一句是"接着那份尾巴往下写"。
+       * 换成 Truncate 会把刚留下来的那段尾巴一起抹掉。 */
       m_f = new QFile(p);
       if (!m_f->open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
       {

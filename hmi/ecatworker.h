@@ -2480,6 +2480,48 @@ inline QString busCommBadFields(const BusRunStat &s, int wkc, int exp, int badru
           + QLatin1Char(' ') + busStatFields(s);
 }
 
+/* ---- 命令现场: cmd_begin / cmd_end (2026-10-15) ----
+ *
+ * 加它的理由**是实跑逼出来的**, 不是"顺手多记一点": 2026-10-15 第 6 趟 (23:27:41 起)
+ * 头 30 秒有三次 >50 ms 的停顿, `gap_win` 分别是 **1627 / 1766 / 3662 ms**, 三次**全是
+ * `gap_self`** (`gaps_over_self` 同步 1→2→3) —— 也就是"自家阻塞命令造成的"。可这一族
+ * 日志里**一条命令的记录都没有**: `recov_total=0` 排除了自动恢复 (那条路会记 recover_try),
+ * 于是只剩四个候选 (使能 / 失能 / 故障复位 / 回零), **日志一个字都分不出来**。
+ * `gaps_over_self` 只说得出"是我们自己造成的", 说不出"是哪一下"。
+ *
+ * 两行的分工:
+ *   · `cmd_begin` **先写** —— 命令真的被执行的那一刻。命令要是卡住不返回 (甚至进程被杀),
+ *     至少留下"谁按了什么、什么时候"。与 doHome 那句"宣告要挡在动作前面"同一条道理。
+ *   · `cmd_end` 带 `dur_ms`, 直接指出"卡了 3662 ms 的是哪一条"。
+ *
+ * **不带 `ok=`**: 各条命令的成败没有统一口径 (`doEnable` 返回 void, `em_disable_all` 返回
+ * `EM_EXIT_OK`, `doZero` 干脆只用 note 说), 编一个假的 ok 比没有更坏 ——
+ * "判据没查的东西, 措辞就不许说"这一条对本仓库的**日志字段**同样成立。
+ *
+ * `ax` 与 `mask` **两个都要**: 两轴回零时 ax 只说得出第一根, 分不出"只回一根"还是"两根都回"。
+ * (方式号与速度**故意不记**: 屏幕上各自都说过, 这里只回答"是谁按的、卡了多久"。) */
+
+/* `name=` / `ax=` / `mask=` 那三个键 —— 起手与收尾共用一份, 免得两边写法漂开 */
+inline QString cmdKeyFields(const QString &name, int ax, unsigned mask)
+{
+   return QStringLiteral("name=%1 ax=%2 mask=%3")
+      .arg(name)
+      .arg(ax < 0 ? QStringLiteral("-") : QString::number(ax))
+      .arg(mask == 0 ? QStringLiteral("-") : QStringLiteral("0x%1").arg(mask, 0, 16));
+}
+
+inline QString cmdBeginFields(const QString &name, int ax, unsigned mask, const BusRunStat &s)
+{
+   return cmdKeyFields(name, ax, mask) + QLatin1Char(' ') + busStatFields(s);
+}
+
+inline QString cmdEndFields(const QString &name, int ax, unsigned mask, int dur_ms,
+                            const BusRunStat &s)
+{
+   return cmdKeyFields(name, ax, mask) + QStringLiteral(" dur_ms=%1").arg(dur_ms)
+          + QLatin1Char(' ') + busStatFields(s);
+}
+
 }   /* namespace ecatcmd */
 
 class EcatThread : public QThread
@@ -2767,6 +2809,15 @@ private:
    /* 往稳定性日志写一行 (tag 固定 ECAT)。没设 sink 时是个空动作 —— hmi 每一条都走这里,
     * 所以那个"空回调"必须便宜。**只在工作线程里调**, 免得跟 m_runstat 抢锁。 */
    void logBus(const QString &body);
+
+   /* 命令类型 -> 日志里那个稳定的小写词 (`name=` 的值)。定义在 .cpp, 与 switch(c.type) 挨着。
+    *
+    * **它是这一族里唯一自检钉不到的**: `CmdType` 是类里的私有枚举, 而 scan_selftest 不编
+    * ecatworker.cpp (见 docs/scan_runlog.md §9 的"没覆盖"清单)。所以 11 个分支一个不缺
+    * 靠的是 `-Wswitch` (仓库是 0 warning 政策: 枚举加了成员而这里没跟着加, 编译就不过),
+    * 而"名字对不对"只能人看日志。**没有为它把枚举搬出类** —— 那个改动要动 20 多处
+    * `CMD_*`, 换不来什么。 */
+   static QString cmdTypeName(CmdType t);
 
    mutable QMutex m_mtx;                 /* 保护 m_cmds / m_want / m_vel / m_telem */
    QQueue<Cmd>    m_cmds;

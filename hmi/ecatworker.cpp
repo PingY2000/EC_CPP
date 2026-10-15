@@ -584,6 +584,27 @@ void EcatThread::run()
    teardown();
 }
 
+/* 命令名那一张表。**与下面 switch(c.type) 是同一组词** —— 语义见头文件里的声明。
+ * 兜底那一支返回 `?` 而不是某个像模像样的名字: 认不出来就说不认识, 不许蒙一个。 */
+QString EcatThread::cmdTypeName(CmdType t)
+{
+   switch (t)
+   {
+      case CMD_LIST:        return QStringLiteral("list");
+      case CMD_CONNECT:     return QStringLiteral("connect");
+      case CMD_DISCONNECT:  return QStringLiteral("disconnect");
+      case CMD_ENABLE:      return QStringLiteral("enable");
+      case CMD_DISABLE:     return QStringLiteral("disable");
+      case CMD_STOP:        return QStringLiteral("stop");
+      case CMD_ZERO:        return QStringLiteral("zero");
+      case CMD_CENTER:      return QStringLiteral("center");
+      case CMD_RANGE:       return QStringLiteral("range");
+      case CMD_FAULT_RESET: return QStringLiteral("fault_reset");
+      case CMD_HOME:        return QStringLiteral("home");
+   }
+   return QStringLiteral("?");
+}
+
 void EcatThread::drainCommands()
 {
    for (;;)
@@ -629,9 +650,34 @@ void EcatThread::drainCommands()
          }
       }
 
+      /* ---- 命令现场: 起手这一行**先写**, 收尾那一行等命令回来再写 ----
+       * 加它的理由 (第 6 趟那三次 gap_self 说不出是谁按的) 见头文件里那一段 —— 这里只说
+       * 三处摆位的道理:
+       *   · **在 took_stop 之前**: 回零会话里那一条「停止」也是这样挑出来的, 而它正是
+       *     "为什么这一趟回零中止了"唯一可能的日志痕迹;
+       *   · **在 switch 之前**: 命令可能卡住不返回, 那样收尾那行永远不来 —— 先写下来的
+       *     这一行就是"点过它"的全部证据;
+       *   · `took_stop` 那一条没有自己的 Cmd (它是从队列里就地挑出来的, 没走 dequeue),
+       *     所以词要用 CMD_STOP 现填 —— 而不是给 `c.type` 赋值: 那会改掉 c, 而它下面
+       *     还要用 (CMD_HOME 那条兜底路读 `c.axis`)。
+       *
+       * 钟用 m_log_clk (单调钟, 墙钟被 NTP 拨过也不受影响): run() 在进循环前起的表,
+       * 而 drainCommands 只在那个循环里被调, 所以它一定已经走着。 */
+      const QString cmd_name = cmdTypeName(took_stop ? CMD_STOP : c.type);
+      const int     cmd_ax   = c.axis;
+      const unsigned cmd_msk = (took_stop ? 0u : c.hm_mask);
+      const qint64  cmd_t0   = m_log_clk.elapsed();
+
+      logBus(QStringLiteral("cmd_begin | ")
+             + ecatcmd::cmdBeginFields(cmd_name, cmd_ax, cmd_msk, m_runstat));
+
       if (took_stop)
       {
          em_request_stop();
+
+         logBus(QStringLiteral("cmd_end | ")
+                + ecatcmd::cmdEndFields(cmd_name, cmd_ax, cmd_msk,
+                                        (int)(m_log_clk.elapsed() - cmd_t0), m_runstat));
          return;
       }
 
@@ -728,6 +774,14 @@ void EcatThread::drainCommands()
             }
             break;
       }
+
+      /* 收尾: 这一行到了 = 命令**返回**了。`dur_ms` 就是"这一次把主循环挡住多久" ——
+       * 会阻塞的那四条 (使能 / 失能 / 故障复位 / 回零起手) 挂的 BlockTick 让界面在
+       * 这期间照样刷新, 所以同一个数在摘要的 `gap_win` 里也看得到 (量的是同一件事,
+       * 只是一个从命令这一侧报、一个从帧间隔那一侧报)。 */
+      logBus(QStringLiteral("cmd_end | ")
+             + ecatcmd::cmdEndFields(cmd_name, cmd_ax, cmd_msk,
+                                     (int)(m_log_clk.elapsed() - cmd_t0), m_runstat));
    }
 }
 

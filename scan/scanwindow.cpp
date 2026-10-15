@@ -3696,10 +3696,10 @@ void ScanWindow::pushParams()
     * 「随机 (可重复)」那一轮不会自己结束, 所以它这一行**不报全程的钟点**: 报出来的数
     * 只是"一轮"的长短, 写成一个确切的终点是假话 (用户定的写法: 只说「全程: 不限」)。 */
    if (modeEndless(p.mode))     /* 读**选中的**模式, 不读控制器的: 没开扫时它还是上一轮的值 */
-      m_lEst->setText(QStringLiteral("每点 ≈ %1 ms   全程: 不限\n(线性估计, 实际用时更长)")
+      m_lEst->setText(QStringLiteral("每点 ≈ %1 ms   全程: 不限")
                          .arg(estimatePerPointMs(p)));
    else
-      m_lEst->setText(QStringLiteral("每点 ≈ %1 ms   全程 ≈ %2\n(线性估计, 实际用时更长)")
+      m_lEst->setText(QStringLiteral("每点 ≈ %1 ms   全程 ≈ %2")
                          .arg(estimatePerPointMs(p)).arg(fmtDur(m_ctl->estimateTotalMs())));
 
    /* 两条否决: 参数本身不合法 / 几何超出量程 (超出的部分会被静默夹掉) */
