@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 
 EcatThread::EcatThread(QObject *parent) : QThread(parent)
 {
@@ -45,6 +46,24 @@ static void consoleNote(const QString &s)
 {
    std::printf("[hmi] %s\n", s.toUtf8().constData());
    std::fflush(stdout);
+}
+
+/* ---- 长时间稳定性日志的落点 (理由全在头文件 setLogSink 那一段) ----
+ *
+ * **这里一个判据都不加**: 写什么、什么时候写由 publish() 与各处事件点决定, 这一层只管
+ * 转发。**故意不加锁**: 头文件写明它只能在 start() 之前设一次, 加锁就等于承认它会在跑起来
+ * 之后被换掉, 而那样一来 m_log_sink 自己就成了并发读写的对象。 */
+void EcatThread::setLogSink(std::function<void(const QString &, const QString &)> sink)
+{
+   m_log_sink = std::move(sink);
+}
+
+void EcatThread::logBus(const QString &body)
+{
+   /* tag 是 QStringLiteral: 编译期字面量, 每次调用不多一次堆分配 —— 这个函数在事件密集时
+    * 可能一秒被调上百次。 */
+   if (m_log_sink)
+      m_log_sink(QStringLiteral("ECAT"), body);
 }
 
 void EcatThread::postListAdapters()
@@ -391,6 +410,12 @@ void EcatThread::run()
     * 进程级、幂等、老系统上办不到也只是返回 -1, 所以不看返回值 —— 它不是判据。 */
    em_reject_power_throttling();
 
+   /* 稳定性日志专用的钟 (不写日志时它一分钱不花, 但 elapse 它总得有个起点)。
+    * **与上面那个 clk 分开**: clk 是节拍统计用的, 而这个是"这一趟"的会话钟, 只在 run()
+    * 起手开一次 —— 之后重连不重开, 于是摘要里那个 up_s 说的是**进程起来多久**, 与
+    * "这次连接多久"分开 (后者看 conn= 与 LIFE 行)。 */
+   m_log_clk.start();
+
    QElapsedTimer clk;
    clk.start();
    qint64 last = clk.elapsed();
@@ -463,8 +488,21 @@ void EcatThread::run()
 
             if (gap > m_max_gap_ms)
                m_max_gap_ms = (int)gap;
+
+            /* 日志侧的窗口最大值: 上一次摘要以来本机最长停过多久。
+             * **它才是能在摘要上看出"这一分钟出事了"的数** —— m_max_gap_ms 是会话最大值,
+             * 被某一次大的钉住之后就再也不动了 (2026-10-15 首跑吃过的亏, 见 busSummaryFields)。 */
+            if (gap > m_log_gap_win_ms)
+               m_log_gap_win_ms = (int)gap;
+
             if (gap > HMI_GAP_WARN_MS)
                m_gaps_over++;
+
+            /* ★ 跨连接只增的那一份走**头文件里那个纯函数** —— 这样自检才能钉住"它到底有没有数"。
+             * 2026-10-15 首跑时这几个计数是散在这里的 `++`, 而实际一处都没写: 字段声明了、
+             * 摘要里也打了, 于是 82 分钟里有两次 >50 ms 的停顿而 492 条摘要全是 gaps_over=0。
+             * 自检当时只能验格式 (手赋 `= 7`), 验不到"有没有数" —— 那就是它漏掉的原因。 */
+            ecatcmd::busNoteGap(m_runstat, (int)gap, HMI_GAP_WARN_MS, self_caused);
 
             /* 上位机的健康状况: 这一帧发得及不及时。**只有我们自己造成的静默不算**
              * —— 那几百毫秒是我们自己在跑复位/使能/回零, 不是本机卡。算进去的话, 每次
@@ -738,6 +776,7 @@ void EcatThread::doConnectInner(const QString &ifname)
    if (m_bus == nullptr)
    {
       note(QStringLiteral("初始化总线失败 (em_bus_new)"));
+      logBus(QStringLiteral("connect_fail | reason=bus_new"));
       return;
    }
 
@@ -750,6 +789,10 @@ void EcatThread::doConnectInner(const QString &ifname)
    {
       note(QStringLiteral("网卡打开失败。请关闭其他占用该网卡的程序 (Npcap 为单进程), "
                           "并以管理员身份重新运行。"));
+      /* n 也记下来: em_open 返回的是**扫到的从站数**, 0 既可能是网卡没打开、也可能是网线
+       * 拔了/驱动器没电 —— 屏幕上那句话分不开, 而长稳调查里"什么时候总线不见的"正是要
+       * 回答的第一个问题 */
+      logBus(QStringLiteral("connect_fail | reason=open n=%1").arg(n));
       em_bus_free(m_bus);
       m_bus = nullptr;
       return;
@@ -759,6 +802,7 @@ void EcatThread::doConnectInner(const QString &ifname)
    {
       note(QStringLiteral("总线从站数 %1 超过本接口上限 %2, 未连接。")
               .arg(n).arg(EM_MAX_AXES));
+      logBus(QStringLiteral("connect_fail | reason=too_many n=%1").arg(n));
       teardown();
       return;
    }
@@ -812,6 +856,7 @@ void EcatThread::doConnectInner(const QString &ifname)
    if (em_setup(m_bus, cfg, n, /*allow_remap=*/1) != 0)
    {
       note(QStringLiteral("总线配置失败 (em_setup)。具体原因逐条写在控制台输出中。"));
+      logBus(QStringLiteral("connect_fail | reason=setup n=%1").arg(n));
       teardown();
       return;
    }
@@ -873,11 +918,18 @@ void EcatThread::doConnectInner(const QString &ifname)
    if (em_enter_op(m_bus, /*use_dc=*/0, HMI_CYCLE_US) != 0)
    {
       note(QStringLiteral("进入 OP 失败。请查看控制台输出后重试。"));
+      logBus(QStringLiteral("connect_fail | reason=enter_op n=%1").arg(n));
       teardown();
       return;
    }
 
    m_in_op = true;
+
+   /* 连上了 —— 这是长稳调查里每一段的**起跑线** (上面的 connect_fail 是没连上的那些)。
+    * 累计连接次数在这里加, 而不是在"重连成功"那种更细的地方: 这个函数就是唯一的连接路径。 */
+   m_runstat.connects++;
+   /* n 就是轴数 (总线上全部从站都当轴选, 见上面 cfg 那段), 所以不再另报一个 naxis */
+   logBus(QStringLiteral("connect_ok | naxis=%1 exp=%2").arg(n).arg(em_expected_wkc(m_bus)));
 
    /* ---- 从这里往下, 每一条 SDO 读都在**停过程数据** ----
     * SOEM 的 SDO 事务期间一帧过程数据都不发 (ecx_SDOread 走邮箱轮询, 见 public 头
@@ -2377,10 +2429,22 @@ void EcatThread::serviceAutoRecover(qint64 now_ms)
     * 弹窗一直顶着。 */
    if (v == ecatcmd::RECOVER_MASTER || v == ecatcmd::RECOVER_GIVEUP)
    {
+      /* ★ 这一句**只说这一帧迟了**, 不许再说"不在从站" (2026-10-15 去掉)。
+       * 判据是 recover_verdict 里那一条 `cur_gap_ms > gap_limit_ms` —— 它量的是**本机两次发帧
+       * 之间隔了多久**, 一个字都没说从站好不好。而 AL 只在 comm_bad 的上升沿读一次、还只读
+       * 第一台从站, 拿它替从站背书同样越界。
+       *
+       * 与 2026-09-23 那次是同一个错、方向相反: 那次写的是"从站仍不在 OP"(没查过 AL),
+       * 被它自己下一条消息当场打脸。**判据没查的东西, 措辞就不许说。**
+       *
+       * 也没有把 AL 的实况补进这一句 (改之前想过): 屏幕文案的长度上限是 50 字 (CLAUDE.md §1),
+       * 这一句已经贴着线, 而**当时读到的 AL 本来就进了日志** —— comm_bad_begin 那一行里
+       * al_state / al_code / al_ok 三个字段就是 (见 busCommBadFields)。屏幕说现象与出路,
+       * 现场的结构化数去看日志, 这两件事不混在一句里。 */
       const QString s =
          (v == ecatcmd::RECOVER_MASTER)
-            ? QStringLiteral("刚才这一帧迟了 %1 ms (超过 %2 ms): 停顿在这台机器自己, "
-                             "不在从站, 未动从站的 AL。请检查电源计划与网卡节能。")
+            ? QStringLiteral("刚才这一帧迟了 %1 ms (超过 %2 ms): 停顿在本机这一侧, "
+                             "未动从站的 AL。请检查电源计划与网卡节能。")
                  .arg(m_last_gap_ms).arg(HMI_GAP_WARN_MS)
             : QStringLiteral("本会话已自动重请求 OP %1 次 (上限 %2), 不再自动动手。"
                              "从站没回来请重连总线。")
@@ -2395,6 +2459,17 @@ void EcatThread::serviceAutoRecover(qint64 now_ms)
          m_recover_said    = s;
          m_recover_warn_ms = (int)now_ms;
          note(s);
+
+         /* 日志挂在冷却闸**里面**: 这两句本来就被限了频, 记在闸外面等于每 2 ms 一行。
+          * 措辞不带出来 —— 屏幕上那句原话在 note() 里, 这里只留机器要的数。 */
+         if (v == ecatcmd::RECOVER_MASTER)
+            logBus(QStringLiteral("recover_master | last_gap=%1 ok_run=%2 ")
+                      .arg(m_last_gap_ms).arg(m_gap_ok_run)
+                   + ecatcmd::busStatFields(m_runstat));
+         else
+            logBus(QStringLiteral("recover_giveup | tries=%1 ")
+                      .arg(m_recover_tries)
+                   + ecatcmd::busStatFields(m_runstat));
       }
       return;
    }
@@ -2418,6 +2493,10 @@ void EcatThread::serviceAutoRecover(qint64 now_ms)
    note(QStringLiteral("本机已连续 %1 帧按时发出, 而过程数据帧仍连续 %2 帧不足 —— "
                        "正在自动重请求 OP (只救过程数据交换, 不给力矩)…")
            .arg(m_gap_ok_run).arg(m_bad_wkc_run));
+
+   m_runstat.recover_total++;
+   logBus(QStringLiteral("recover_try | try=%1 last_gap=%2 ok_run=%3 badrun=%4")
+             .arg(m_recover_tries).arg(m_last_gap_ms).arg(m_gap_ok_run).arg(m_bad_wkc_run));
 
    /* 值初始化: em_recover_op 在**拒绝**那几条早退路径上不填 out (它的 out 是递增填的),
     * 这里不置 0 就会拿栈上的垃圾去组织给操作员的话 */
@@ -2495,6 +2574,14 @@ void EcatThread::serviceAutoRecover(qint64 now_ms)
    rep.max_gap_ms = m_max_gap_ms;
 
    note(ecatcmd::recover_done_text(rep));
+
+   /* 这一趟到底救回来没有 —— "试过了"与"救回来了"是两件事, 长稳调查里分不开就白记。
+    * refused 那一支单独一个字段, 不然 need=ok=fail=0 看起来像"没有轴需要救"。 */
+   logBus(QStringLiteral("recover_done | rc=%1 refused=%2 need=%3 ok=%4 fail=%5 gone=%6 "
+                         "nofit=%7 mixed=%8 stop=%9 ")
+             .arg(rc).arg(rep.refused ? 1 : 0).arg(r.need).arg(r.ok).arg(r.fail)
+             .arg(r.gone).arg(r.nofit).arg(r.mixed).arg(rep.stop ? 1 : 0)
+          + ecatcmd::busStatFields(m_runstat));
 }
 
 void EcatThread::doZero(int axis)
@@ -2977,7 +3064,11 @@ void EcatThread::publish(int wkc)
    }
    m_comm_bad = t.comm_bad;
 
-   if (t.fault && !m_fault_latched)
+   /* 这一帧是不是"驱动器自报故障"的**上升沿**。判据与下面那个 if 逐字一致, 只是先算出来:
+    * 日志要在同一个沿记一行, 而进到那段之后 m_fault_latched 已经变成"现在"了。 */
+   const bool fault_edge = (t.fault && !m_fault_latched);
+
+   if (fault_edge)
    {
       m_fault_latched = true;
       {
@@ -2994,6 +3085,110 @@ void EcatThread::publish(int wkc)
    else if (!t.fault)
    {
       m_fault_latched = false;
+   }
+
+   /* ---- (C) 长时间稳定性日志 (只有 scan/ 设了 sink, 见 setLogSink) ----
+    *
+    * 全部集中在 publish() 的**尾部**, 只有一个理由: 它是每帧唯一的汇聚点, 而且长阻塞命令
+    * 期间也经 BlockTick 被调 —— 那一刻 run() 的循环根本没在转, 节拍摘要要是挂在循环里就
+    * 永远发不出来, 而那正是最需要一行心跳的时候 (所以时刻取 m_log_clk 而不是循环变量)。
+    *
+    * 判据**只读不写**: 帧好坏、comm_bad、t.fault 都由上面那几段算好, 这里照抄结论。
+    * 要改判据请回上面改, 别在这里再写一套 —— 一处判据一套说法是这个仓库的老规矩。
+    *
+    * 所有 sink 调用都在 m_mtx **之外** (这一段整段都在锁外)。 */
+   if (m_log_sink)
+   {
+      const qint64 now_ms = m_log_clk.elapsed();
+
+      /* 累计帧数 (跨连接只增, 见 ecatcmd::BusRunStat)。判据与上面 (B) 那段逐条一致,
+       * 于是连接期的 publish(0) 与不在 OP 的帧都不会被记成坏帧。 */
+      m_runstat.onFrame(m_in_op, t.expected_wkc > 0, wkc < t.expected_wkc);
+
+      /* 突发起点只在**从 0 变 1**那一帧记一次 —— 每帧都记就成了"上一帧的时刻" */
+      if (m_in_op && m_bad_wkc_run == 1)
+         m_log_burst_start_ms = (int)now_ms;
+
+      if (m_bad_wkc_run >= HMI_RUNLOG_BURST_MIN && !m_log_burst_open)
+      {
+         m_log_burst_open   = true;
+         m_log_burst_frames = m_bad_wkc_run;
+         m_runstat.cbad_events++;
+         logBus(QStringLiteral("comm_bad_begin | started_ms_ago=%1 ")
+                   .arg(now_ms - m_log_burst_start_ms)
+                + ecatcmd::busCommBadFields(m_runstat, wkc, t.expected_wkc, m_bad_wkc_run,
+                                            m_max_gap_ms, m_max_gap_self_ms, m_period_avg,
+                                            m_al_state, m_al_code, m_al_checked));
+      }
+      else if (m_log_burst_open && m_bad_wkc_run > m_log_burst_frames)
+      {
+         m_log_burst_frames = m_bad_wkc_run;   /* 峰值, 收口那一行报的是它 */
+      }
+
+      /* 收口也是**防抖的**: 开一次要连续 HMI_RUNLOG_BURST_MIN 帧坏, 收一次要连续同样多帧好。
+       * 只防一头是不够的 —— 坏/好以"5 帧坏 + 1 帧好"的周期翻转时, 光靠开头那道闸能刷出
+       * 上百对 begin/end 每秒, 那正好把真正要看的东西埋掉。
+       * 不在 OP 里直接收: 那两个计数器在 OP 外都停着, 不认这一条就永远收不了口。 */
+      const bool burst_over = m_in_op ? (m_good_wkc_run >= HMI_RUNLOG_BURST_MIN) : true;
+
+      if (m_log_burst_open && burst_over)
+      {
+         logBus(QStringLiteral(
+                   "comm_bad_end | badrun=%1 dur_ms=%2 frames=%3 badf=%4 cbad=%5 recov_total=%6")
+                   .arg(m_log_burst_frames)
+                   .arg(now_ms - m_log_burst_start_ms)
+                   .arg(m_runstat.frames).arg(m_runstat.frames_bad)
+                   .arg(m_runstat.cbad_events).arg(m_runstat.recover_total));
+         m_log_burst_open   = false;
+         m_log_burst_frames = 0;
+      }
+
+      /* 驱动器自报故障的两个沿 (t.fault 是**全轴合并**的那一个, 与冻结目标同一判据) */
+      if (fault_edge)
+      {
+         m_log_fault_on = true;
+         m_runstat.fault_events++;
+         logBus(QStringLiteral("axis_fault_begin |") + ecatcmd::busAxisFields(t)
+                + QLatin1Char(' ') + ecatcmd::busStatFields(m_runstat));
+      }
+      else if (!t.fault && m_log_fault_on)
+      {
+         m_log_fault_on = false;
+         logBus(QStringLiteral("axis_fault_end |") + ecatcmd::busAxisFields(t)
+                + QLatin1Char(' ') + ecatcmd::busStatFields(m_runstat));
+      }
+
+      /* 逐轴限位: 只记**边沿**。一直触发着的那几个小时不该刷屏 —— 而"什么时候压上去的、
+       * 什么时候松开的"恰恰是排查撞限位最要紧的两笔。 */
+      for (int i = 0; i < t.naxis && i < EM_MAX_AXES; i++)
+      {
+         const bool now_on = t.ax[i].limit_active;
+
+         if (now_on == m_log_limit[i])
+            continue;
+
+         m_log_limit[i] = now_on;
+         logBus(QStringLiteral("limit_%1 | axis=%2 home=%3 pos=%4 neg=%5 known=%6")
+                   .arg(now_on ? QStringLiteral("begin") : QStringLiteral("end"))
+                   .arg(i)
+                   .arg(t.ax[i].dig_home ? 1 : 0)
+                   .arg(t.ax[i].dig_pos ? 1 : 0)
+                   .arg(t.ax[i].dig_neg ? 1 : 0)
+                   .arg(t.ax[i].dig_known ? 1 : 0));
+      }
+
+      /* 周期摘要 —— **长稳调查的主表**, 而且它也是"节拍断流时唯一还在跳的心跳"。
+       * 放最后: 上面几笔都可能刚改过计数器, 摘要在它们之后取数才是这一段的账。 */
+      if (m_log_last_sum_ms < 0 || now_ms - m_log_last_sum_ms >= HMI_RUNLOG_SUMMARY_MS)
+      {
+         m_log_last_sum_ms = now_ms;
+         logBus(QStringLiteral("summary | ")
+                + ecatcmd::busSummaryFields(m_runstat, t, now_ms / 1000,
+                                            m_last_gap_ms, m_log_gap_win_ms));
+         /* 窗口**发完就清零**: 这条数答的是"上一段里最长停过多久", 不清零它就退化成
+          * 与会话最大值同一个东西 (而那正是这一版要修的病) */
+         m_log_gap_win_ms = 0;
+      }
    }
 
    {
@@ -3078,6 +3273,35 @@ void EcatThread::teardown()
    }
 
    m_busy = false;
+
+   /* ---- 收尾这一笔 (只有 scan/ 设了 sink) ----
+    * 放在这里而不是函数开头: 上面那一大段已经把会话状态收干净了, 这一行说的是**收完之后**
+    * 的账 —— 尤其是 maybe_live, 它正是"断电前有没有确认失能"这个结论 (见 m_maybe_live)。 */
+   if (m_log_sink)
+   {
+      /* 收口没走完就断了 (坏帧一直到断): 补一条 end, 好让日志里 begin / end 配得上对。
+       * 少了它, 后面所有分析都会把这一段算成"还在坏"。 */
+      if (m_log_burst_open)
+      {
+         m_log_burst_open = false;
+         logBus(QStringLiteral("comm_bad_end | badrun=%1 dur_ms=- end=teardown")
+                   .arg(m_log_burst_frames));
+         m_log_burst_frames = 0;
+      }
+
+      /* 突发状态、限位沿、故障沿几个**只记上一帧**的量在这里归零, 免得重连之后拿上一趟的
+       * "上次是坏的"去比 —— 那会漏掉新连接里的第一笔沿。
+       * m_runstat 与 m_log_last_sum_ms **不在这里清**: 前者要跨连接只增, 后者留着是为了让
+       * 短连接不至于每次都重发一条摘要。 */
+      for (int i = 0; i < EM_MAX_AXES; i++)
+         m_log_limit[i] = false;
+      m_log_fault_on = false;
+
+      logBus(QStringLiteral("stop | maybe_live=%1 up_s=%2 ")
+                .arg(m_maybe_live ? 1 : 0)
+                .arg(m_log_clk.isValid() ? m_log_clk.elapsed() / 1000 : 0)
+             + ecatcmd::busStatFields(m_runstat));
+   }
 
    {
       QMutexLocker lk(&m_mtx);

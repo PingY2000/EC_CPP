@@ -1,8 +1,13 @@
 #include "ophirmeter.h"
 #include "ophircom.h"
 
+/* 只用它的 runlogSafe(): 事件行的自由文本段里不许出现 `|` 与换行 (见 runlog.h),
+ * 而这里的自由文本全是设备/COM 回的原话 */
+#include "runlog.h"
+
 #include <QDateTime>
 #include <QDeadlineTimer>
+#include <QElapsedTimer>
 #include <QHash>
 #include <QMutexLocker>
 #include <QSet>
@@ -10,6 +15,7 @@
 #include <QWaitCondition>
 
 #include <cstdio>
+#include <utility>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #  define WIN32_LEAN_AND_MEAN
@@ -245,10 +251,25 @@ struct OphirMeter::Private
 
    mutable QMutex info_mx;
    OphirInfo      info;
+
+   /* ---- 长时间稳定性日志 (见 ophirmeter.h 那一族) ----
+    * log_sink 只在 open() 之前由界面线程设一次, 之后只有工作线程读 —— 所以它不进锁
+    * (与 want_serial 同一条规矩)。
+    * stat 只由工作线程碰, **但 requestReading() 那一支是界面线程** —— 那条路 (功率计没打开
+    * 就来要读数) 只写日志、不动 stat, 于是这里没有并发写者。 */
+   std::function<void(const QString &tag, const QString &body)> log_sink;
+   MeterRunStat stat;
 };
 
 OphirMeter::OphirMeter(QObject *parent) : PowerMeter(parent), p(new Private)
 {
+}
+
+/* 见 ophirmeter.h 那段。**不加锁**: 头文件写明它只能在 open() 之前设一次 —— 加锁就等于
+ * 承认它会在跑起来之后被换掉, 而那样一来 p->log_sink 自己就成了并发读写的对象 */
+void OphirMeter::setLogSink(std::function<void(const QString &, const QString &)> sink)
+{
+   p->log_sink = std::move(sink);
 }
 
 /* 析构比 close() 多等一会儿 (15 秒): 工作线程的每一次 emit 都要碰 this, 线程还没停就删
@@ -276,6 +297,13 @@ OphirMeter::~OphirMeter()
       std::fprintf(stderr,
                    "[ophirmeter] 采集线程 15 s 没收掉 (COM 调用卡在驱动里?), "
                    "故意泄漏它以免 use-after-free。请检查设备与 USB\n");
+      /* **这一条正是本功能要抓的异常之一**: 采集线程卡在 COM 调用里收不掉, 说明那次
+       * USB 交互真的挂住了 —— 日志里它必须留痕, 而不只是 stderr 上一行 (那行随窗口关掉
+       * 就没了)。p 是故意漏掉的, 所以这里读它的 log_sink 是安全的。 */
+      if (p->log_sink)
+         p->log_sink(QStringLiteral("METER"),
+                     QStringLiteral("meter_thread_leak | where=dtor timeout_ms=15000 | "
+                                    "采集线程 15 s 没收掉, 已故意泄漏"));
       return;
    }
 
@@ -288,6 +316,10 @@ OphirMeter::~OphirMeter()
       std::fprintf(stderr,
                    "[ophirmeter] 早先有一个采集线程没收掉, 析构时它还在 (COM 调用卡在驱动里?), "
                    "故意泄漏状态以免 use-after-free。请检查设备与 USB\n");
+      if (p->log_sink)
+         p->log_sink(QStringLiteral("METER"),
+                     QStringLiteral("meter_thread_leak | where=dtor leaked=1 | "
+                                    "早先漏掉的那个采集线程到析构时还在"));
       return;
    }
 
@@ -470,6 +502,14 @@ void OphirMeter::close()
     * ★ **记下来**: 指针已经清了, 但那个线程还在 while (!quit) 上蹲着 —— open() 靠这个标志
     * 拒绝再起一个 (否则两个线程抢同一个表头), 也靠它保证不把 quit 清 0 把它复活。 */
    p->leaked = t;
+
+   /* 与析构那两处同一个理由: **采集线程卡在 COM 调用里收不掉**, 正是本功能要抓的异常。
+    * 这一支是「关功率计」那条路 (窗口还开着), 析构那两处是程序退出那条路 —— 三条都要留痕。 */
+   if (p->log_sink)
+      p->log_sink(QStringLiteral("METER"),
+                  QStringLiteral("meter_thread_leak | where=close timeout_ms=5000 | "
+                                 "采集线程 5 s 没收掉, 已记下并故意泄漏"));
+
    QObject::connect(t, &QThread::finished, t, &QObject::deleteLater);
    /* 它**后来**退出来了就把标志放开 —— 不加这一条的话, 一次卡住会让「重试」从此永远
     * 报"上一次的采集线程尚未结束", 而那件事已经不成立了 (只有重启程序能好)。
@@ -483,6 +523,13 @@ void OphirMeter::runSession()
    /* Apartment 模型: 本线程必须先 CoInitializeEx, 之后每一次 COM 调用都得在这个线程里 */
    ComApartment apt;
 
+   /* 往稳定性日志写一行 (tag 固定 METER)。没设 sink 时是个空动作。
+    * 局部 lambda 而不是成员: 只有这个函数会写, 而且它正好看得见 p。 */
+   auto logm = [this](const QString &body) {
+      if (p->log_sink)
+         p->log_sink(QStringLiteral("METER"), body);
+   };
+
    /* 上一次那一份设备表先作废: 枚举还没跑到, 界面上不该留着**上一次会话**的序列号 ——
     * 它可能已经不在了 (被拔走 / 换了 USB 口), 而那一行是让人照着换设备的 */
    {
@@ -490,7 +537,10 @@ void OphirMeter::runSession()
       p->info.device_serials.clear();
    }
 
-   auto failOpen = [this](const QString &msg) {
+   auto failOpen = [this, &logm](const QString &msg) {
+      /* **打开阶段十余个失败点都汇到这一个 lambda**, 所以日志也只挂这一处 ——
+       * 挂到每个 return 前面去, 漏一个就正好漏掉最难遇到的那一种。 */
+      logm(QStringLiteral("meter_open_fail | - | ") + runlogSafe(msg));
       {
          QMutexLocker<QMutex> lk(&p->mx);
          p->open_err  = msg;
@@ -730,6 +780,15 @@ void OphirMeter::runSession()
    }
    emit infoChanged();
 
+   /* 打开了 —— 长稳调查里每一段的**起跑线**。设备型号/序列号/单位都记下来: 换了一台表头
+    * (或者探头) 之后, 前后两段的数就不再可比, 而那件事光看读数看不出来。
+    * 名字里带空格, 所以型号那一串走自由文本段, 不进 k=v */
+   logm(QStringLiteral("meter_open_ok | serial=%1 wl=%2 range=%3 mode=%4 filter=%5 | ")
+           .arg(pick)
+           .arg(info.wl_index).arg(info.range_index).arg(info.mode_index).arg(info.filter_index)
+        + runlogSafe(deviceLabel(info.device_name, pick, info.sensor_name, info.sensor_serial)
+                     + QStringLiteral(" unit=") + info.unit));
+
    /* 水位线: 只认严格比它新的采样 —— 否则 samples_per_point > 1 求平均时会把同一个数
     * 加 N 次, 看着正常其实是假的 */
    double watermark = -1.0;
@@ -739,6 +798,13 @@ void OphirMeter::runSession()
     * 置位而不当场重读, 是为了把同一批里来的好几次 0x040001 折成一次 (取数那一趟只看最新的
     * 那一项, 见下面 best 那段) —— 也免得在读数那条路上插一次 COM 往返 */
    bool flt_reload = false;
+
+   /* ---- 稳定性日志的时间基准 (只有本线程用) ----
+    * **单调钟**, 不取墙钟: 摘要是每 10 s 一行, 而墙钟被 NTP 或夏令时拨一下, 节拍就再也不
+    * 可信了 —— 而"节拍还在不在"正是这张表要回答的事。 */
+   QElapsedTimer logclk;
+   logclk.start();
+   qint64 log_last_sum_ms = -1;
 
    while (!p->quit.loadAcquire())
    {
@@ -817,6 +883,9 @@ void OphirMeter::runSession()
          {
             /* 新流 = 新时间戳, 水位线作废 */
             watermark = -1.0;
+            logm(QStringLiteral("meter_config_ok | wl=%1 range=%2 mode=%3 filter=%4 add_wl=%5")
+                    .arg(info.wl_index).arg(info.range_index)
+                    .arg(info.mode_index).arg(info.filter_index).arg(addwl));
             readOptions();                 /* 设备可能把值夹到它接受的范围内 */
             /* 这一趟的 readOptions() 已经把滤片重读过了, 那个待办作废 */
             flt_reload = false;
@@ -842,7 +911,32 @@ void OphirMeter::runSession()
          {
             /* 配置没成功, 流是停着的: 得开回去, 否则后面每个点都会超时 */
             QString e3;
-            if (!com.startStream(h, k_channel, &e3))
+            const bool restarted = com.startStream(h, k_channel, &e3);
+
+            /* ★ **这一支故意不动 watermark** (与上面成功那一支不对称), 本轮也**刻意不修** ——
+             * 修了就看不到它了。可疑之处写在这里, 由日志去证:
+             *
+             *   成功那一支写着「新流 = 新时间戳, 水位线作废」(watermark = -1)。
+             *   而这一支重新开了流、时间戳从此重来, 水位线却留在**旧流**那个高位上。
+             *   若设备的时间戳确实随 StartStream 从头开始, 那么之后每一项都会被上面那句
+             *   `data.timestamps[i] <= watermark` 挡掉 —— 屏幕上的表现恰好就是
+             *   「功率计 1800 ms 未出新数据」一直挂着, 直到操作员手动换个设置 (走成功那一支)
+             *   才恢复。这与现场报的现象 (切一下设置就有读数了) 对得上。
+             *
+             *   要和"设备真的停流了"分开, 靠的正是下面那一行里的 wm= 与 tsmax=: 前者是
+             *   水位线、后者是设备手上最新的一条。wm 远大于 tsmax = 水位线卡住; 两个都
+             *   停着不动 = 设备没在出数。
+             *
+             * 证明了之后再改这一处 (改动很小, 就是在 restarted 为真时把 watermark 也置 -1),
+             * 并且要把这一个日志点留着 —— 它是这条路的唯一见证。 */
+            logm(QStringLiteral("meter_config_fail | restarted=%1 wm=%2 wl=%3 range=%4 "
+                                "mode=%5 filter=%6 add_wl=%7 | ")
+                    .arg(restarted ? 1 : 0)
+                    .arg(watermark, 0, 'f', 0)
+                    .arg(wl).arg(rg).arg(md).arg(flt).arg(addwl)
+                 + runlogSafe(restarted ? e2 : e2 + QStringLiteral("; 重新启动数据流也失败: ") + e3));
+
+            if (!restarted)
                emit configFailed(QStringLiteral("%1; 重新启动数据流也失败: %2").arg(e2, e3));
             else
                emit configFailed(e2);
@@ -895,6 +989,14 @@ void OphirMeter::runSession()
          if (!com.getData(h, k_channel, &data, &e2))
          {
             p->want.storeRelease(0);
+            /* COM 层直接失败 (表头没了 / 驱动没反应) —— 与"取到了数但不可用"、
+             * "等新数超时"是三种不同的病, 账上分开记 (见 MeterRunStat) */
+            p->stat.getdata_fail++;
+            p->stat.onFail();
+            logm(QStringLiteral("meter_getdata_fail | wm=%1 | ")
+                    .arg(watermark, 0, 'f', 0)
+                 + runlogSafe(e2)
+                 + QLatin1Char(' ') + meterStatFields(p->stat));
             emit readingFailed(QStringLiteral("读取功率计失败: ") + e2);
          }
          else
@@ -917,6 +1019,14 @@ void OphirMeter::runSession()
                if (st == 0)
                {
                   p->want.storeRelease(0);
+                  /* 一次成功就把"连续失败"归零。**失败之后第一次成功**要多记一行 ——
+                   * 那正是"自己好起来了没有"这个问题的答案, 而逐次成功记下来是噪音
+                   * (一个点一个数, 几分钟就是几万行)。 */
+                  if (p->stat.consec_fail > 0)
+                     logm(QStringLiteral("meter_recover | consec_fail=%1 ")
+                             .arg(p->stat.consec_fail)
+                          + meterStatFields(p->stat));
+                  p->stat.onOk();
                   emit readingReady(data.values[best]);
                }
                else if (isNotificationStatus(st))
@@ -928,12 +1038,22 @@ void OphirMeter::runSession()
                    * 下一轮开头重读 (这里不插 COM 往返: 读数那条路正等着新数) */
                   if (st == 0x040001)
                      flt_reload = true;
+
+                  /* 通知是**设备在正常工作**: 它只记账, 不算失败 (不算进 consec_fail,
+                   * 否则"操作员拨了一下滤片"会被记成一次故障) */
+                  p->stat.notif++;
                }
                else
                {
                   /* 过量程 / 饱和 / 过热: 手册 "Not every data item represents a valid
                    * measurement" —— 宁可报错也不把这个数记进 CSV */
                   p->want.storeRelease(0);
+                  p->stat.status_bad++;
+                  p->stat.onFail();
+                  logm(QStringLiteral("meter_status_bad | st=%1 wm=%2 | ")
+                          .arg(st).arg(watermark, 0, 'f', 0)
+                       + runlogSafe(OphirCom::statusText(st))
+                       + QLatin1Char(' ') + meterStatFields(p->stat));
                   emit readingFailed(QStringLiteral("该读数不可用: %1")
                                         .arg(OphirCom::statusText(st)));
                }
@@ -948,7 +1068,45 @@ void OphirMeter::runSession()
                }
                if (asked > 0 && nowMs() - asked > k_stale_ms)
                {
+                  /* ---- 本轮最要紧的一行: 把屏幕上那一句话拆成两种病 ----
+                   *   n      = 本批取回来的项数 (0 = 设备手上一个数都没有 = 真的停流了)
+                   *   tsmax  = 本批**全部**时间戳里的最大值, 含被水位线挡掉的那些 ——
+                   *            设备手上最新的一条有多新
+                   *   wm     = 请求之前的水位线
+                   *
+                   * tsmax <= wm 而 n > 0 = **水位线卡在前面** (我们自己的状态机);
+                   * n = 0                    = 设备没在出数 (线 / 供电 / 驱动)。
+                   * 两种的处置完全两样, 屏幕上那句话分不开, 这一行分得开。 */
+                  double tsmax = -1.0;
+                  for (int i = 0; i < data.size(); i++)
+                  {
+                     if (data.timestamps[i] > tsmax)
+                        tsmax = data.timestamps[i];
+                  }
+
+                  const StaleKind kind = staleKind(data.size(), tsmax, watermark);
+
+                  if (kind == STALE_EMPTY)
+                     p->stat.stale_empty++;
+                  else
+                     p->stat.stale_old++;
+                  p->stat.onFail();
+
                   p->want.storeRelease(0);
+                  logm(QStringLiteral("meter_stale | n=%1 wm=%2 tsmax=%3 waited_ms=%4 stale_ms=%5 "
+                                      "kind=%6 wm_ahead=%7 | ")
+                          .arg(data.size())
+                          .arg(watermark, 0, 'f', 0)
+                          .arg(tsmax, 0, 'f', 0)
+                          .arg(nowMs() - asked).arg(k_stale_ms)
+                          .arg(staleKindText(kind))
+                          /* 水位线比设备手上最新那条还新多少 —— 就是"卡住的深度"。
+                           * 有一头是 -1 (没量到) 时不编一个数出来 */
+                          .arg(tsmax >= 0 && watermark >= 0 ? (qlonglong)(watermark - tsmax) : -1)
+                       + QStringLiteral("功率计 %1 ms 未出新数据 (请确认设备在出数、量程是否正确)。")
+                            .arg(k_stale_ms)
+                       + QLatin1Char(' ') + meterStatFields(p->stat));
+
                   emit readingFailed(QStringLiteral("功率计 %1 ms 未出新数据 (请确认设备在出数、量程是否正确)。")
                                         .arg(k_stale_ms));
                }
@@ -956,8 +1114,32 @@ void OphirMeter::runSession()
          }
       }
 
+      /* ---- 周期摘要 (每 HMI_RUNLOG_SUMMARY_MS 一行) ----
+       * 功率计这一侧也要有"没爆任何错"的那张表: 连续读数这条路是**每点一发一收**的,
+       * 出数变慢不报错、只是每个点慢一点 —— 单看屏幕看不出来, 看 consec_max 与两个 stale
+       * 计数才看得出来。放在循环末尾, 于是每一个 COM 往返之后都会过一遍。 */
+      {
+         const qint64 now_ms = logclk.elapsed();
+
+         if (log_last_sum_ms < 0 || now_ms - log_last_sum_ms >= k_meter_summary_ms)
+         {
+            log_last_sum_ms = now_ms;
+            logm(QStringLiteral("meter_summary | up_s=%1 wm=%2 ")
+                    .arg(now_ms / 1000)
+                    .arg(watermark, 0, 'f', 0)
+                 + meterStatFields(p->stat));
+         }
+      }
+
       QThread::msleep((unsigned long)k_poll_ms);
    }
+
+   /* 收尾这一笔: **退出循环之后、关设备之前**。关设备那一趟自己也会失败, 混在一起就说不清
+    * "为什么退出来"了 (正常收摊 / close() 收掉的 / 中途出错)。 */
+   logm(QStringLiteral("meter_stop | up_s=%1 wm=%2 ")
+           .arg(logclk.elapsed() / 1000)
+           .arg(watermark, 0, 'f', 0)
+        + meterStatFields(p->stat));
 
    QString e4;
    com.stopStream(h, k_channel, &e4);
@@ -970,6 +1152,11 @@ void OphirMeter::requestReading()
    {
       /* 必须回一个: 接口约定恰好回一次, 不回控制器会一直等到它自己的超时 */
       emit readingFailed(QStringLiteral("功率计未打开"));
+
+      /* 这一条是**界面线程**来要读数 —— 所以只写日志, 不碰 p->stat (那是工作线程的账,
+       * 两条线程一起加就是数据竞争)。出现它说明扫描在功率计没打开时被启动了 */
+      if (p->log_sink)
+         p->log_sink(QStringLiteral("METER"), QStringLiteral("meter_req_closed | - | 功率计未打开"));
       return;
    }
 

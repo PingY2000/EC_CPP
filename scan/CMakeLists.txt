@@ -48,6 +48,7 @@ set(SCAN_COMMON_SRC
   meterlog.cpp      meterlog.h
   scanlog.cpp       scanlog.h
   scanprefs.cpp     scanprefs.h
+  runlog.cpp        runlog.h
   busview.h
   editgate.h
   axisutil.h

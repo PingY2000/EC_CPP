@@ -11,6 +11,8 @@
 #include <QString>
 #include <QStringList>
 
+#include <functional>
+
 #include "powermeter.h"
 
 class QThread;
@@ -101,6 +103,93 @@ QString deviceLabel(const QString &head_name, const QString &head_serial,
  * (setWavelength 只吃下标)。两处必须用同一个解析, 否则自己写的值自己认不出来 */
 int wavelengthNm(const QString &option);
 
+/* ================================================================ 长时间稳定性日志
+ *
+ * 这一族只为回答现场报的那件事: **长时间连着之后, 功率计为什么不再出数**。
+ *
+ * 屏幕上那句「功率计 %1 ms 未出新数据」把**两种成因完全不同的情况**说成了一句话:
+ *   ① `GetData` 回的是空数组 —— 设备的流真的停了 (USB 挂起 / 表头掉线);
+ *   ② 数组非空, 但每一项的时间戳都不比水位线新 —— 水位线卡在前面不动了。
+ * 处置完全两样 (① 查线/供电/驱动, ② 是我们自己的状态机), 所以日志必须把它们分开。
+ * 判据与 runSession() 里那条 `data.timestamps[i] <= watermark` **同源**: 相等就是"不比它新",
+ * 也就是会被丢掉 —— 边界那一条自检直接钉 (test_stale_kind)。 */
+/* 周期摘要的间隔 (ms)。**与 hmi/ecatworker.h 的 HMI_RUNLOG_SUMMARY_MS 取同一个数, 但刻意
+ * 是两个宏**: 那一份住在总线那个头文件里, 而它被 hmi 与 scan 两个目标共用 —— 让它反过来
+ * include scan/ 下的东西, hmi 就编不过了。改一个要一起改另一个, 否则两路摘要节拍对不齐,
+ * 事后对账会看不出"是哪一路慢了"。 */
+const int k_meter_summary_ms = 10000;
+
+enum StaleKind
+{
+   STALE_EMPTY   = 0,   /* 数组是空的: 设备没在出数 */
+   STALE_ALL_OLD = 1,   /* 有数, 但全都不比水位线新: 水位线 (或设备的时间戳) 有问题 */
+   STALE_FRESH   = 2    /* 有比水位线新的数 —— 走到这一支就不该报"未出新数据"了 */
+};
+
+/* 纯函数, 自检直接钉。tsmax 是**本批全部**时间戳里的最大值 (含被丢掉的那些) —— 它说的是
+ * "设备手上最新的一条有多新", 正是把 ① 与 ② 分开的那个数。 */
+inline StaleKind staleKind(int n, double tsmax, double wm)
+{
+   if (n <= 0)
+      return STALE_EMPTY;
+   if (tsmax <= wm)
+      return STALE_ALL_OLD;
+   return STALE_FRESH;
+}
+
+/* 只读日志用的字 (写进第 4 段那些 k=v 的值里) */
+inline QString staleKindText(StaleKind k)
+{
+   switch (k)
+   {
+      case STALE_EMPTY:   return QStringLiteral("empty");
+      case STALE_ALL_OLD: return QStringLiteral("all_old");
+      default:            return QStringLiteral("fresh");
+   }
+}
+
+/* 跨会话只增的累计量。**与 OphirInfo 里那些不是一回事**: 那一批每次 open() 重来, 而长稳
+ * 调查要问的是"这一趟跑下来一共坏了多少次" —— 会话一重来就归零的话, 日志看上去像"变好了"。
+ * 只有功率计那一条线程碰它, 所以不加锁 (与 runSession 里那几个局部量同一条规矩)。 */
+struct MeterRunStat
+{
+   quint64 ok           = 0;   /* 成功交付的读数 */
+   quint64 getdata_fail = 0;   /* GetData 自己失败 (COM 层: 表头没了 / 驱动没反应) */
+   quint64 status_bad   = 0;   /* 取到了数, 但 status 说它不可用 (过量程/饱和/过热) */
+   quint64 stale_empty  = 0;   /* 等新数等到超时, 而设备手上一个数都没有 */
+   quint64 stale_old    = 0;   /* 等新数等到超时, 而设备手上有数、全被水位线挡掉 */
+   quint64 notif        = 0;   /* 通知类 status (正常现象, 不是错) */
+   quint32 consec_fail  = 0;   /* 当前连续失败次数 (成功一次就归零) */
+   quint32 consec_max   = 0;   /* 上面那个数的历史峰值 */
+
+   void onOk()
+   {
+      ok++;
+      consec_fail = 0;
+   }
+
+   void onFail()
+   {
+      consec_fail++;
+      if (consec_fail > consec_max)
+         consec_max = consec_fail;
+   }
+
+   /* 失败总数。**stale 那两种分开记、合计在这里** —— 屏幕上是一句话, 账上是三种病 */
+   quint64 failTotal() const { return getdata_fail + status_bad + stale_empty + stale_old; }
+};
+
+/* 摘要行与事件行共用的字段区。摆在头文件里: scan_selftest 不编 ophirmeter.cpp,
+ * 写在 .cpp 里就永远验不到 (与 unitFromDeviceInfo / isNotificationStatus 同一条规矩)。 */
+inline QString meterStatFields(const MeterRunStat &s)
+{
+   return QStringLiteral("ok=%1 getdata_fail=%2 status_bad=%3 notif=%4 stale_empty=%5 stale_old=%6 "
+                         "fail=%7 consec=%8 consec_max=%9")
+      .arg(s.ok).arg(s.getdata_fail).arg(s.status_bad).arg(s.notif)
+      .arg(s.stale_empty).arg(s.stale_old).arg(s.failTotal())
+      .arg(s.consec_fail).arg(s.consec_max);
+}
+
 class OphirMeter : public PowerMeter
 {
    Q_OBJECT
@@ -147,6 +236,18 @@ public:
     * 并明说"未找到上次那台" —— 悄悄换成第一台是最坏的一种做法 */
    void setWantedSerial(const QString &serial);
    QString wantedSerial() const;
+
+   /* 长时间稳定性日志的落点。**只能在 open() 之前设一次** —— 工作线程起来之后只读它。
+    *
+    * tag 固定是 "METER", body 是拼好的 "event | k=v …" (见 meterStatFields 那一族)。
+    *
+    * ★ **回调在功率计那条工作线程里执行**。它不像总线那条是 2 ms 一圈 (这里是 10 ms 一次
+    *   COM 轮询), 但同一条规矩: 实现必须非阻塞, 入队可以、写盘不行 —— COM 那条路上多一次
+    *   磁盘等待, 拖慢的就是"多久才看得到新数"。
+    *
+    * ★ hmi 里没有这个类 (它是 scan/ 的目标), 所以这里没有"空回调"那一层顾虑;
+    *   没设 sink 时依旧是一条新路径都不走。 */
+   void setLogSink(std::function<void(const QString &tag, const QString &body)> sink);
 
 signals:
    void infoChanged();

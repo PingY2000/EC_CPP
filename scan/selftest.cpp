@@ -18,6 +18,7 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QIODevice>
+#include <QRegularExpression>   /* runlog 的行格式用正则钉住, 不靠肉眼 */
 #include <QSettings>          /* 限位记录那几个键的**字面量**要钉住, 所以直接读一次盘 */
 #include <QString>
 #include <QTemporaryDir>
@@ -34,12 +35,19 @@
 #include "editgate.h"
 #include "limitguard.h"
 #include "meterlog.h"
+#include "runlog.h"
 #include "scanarrive.h"
 #include "scancontroller.h"
 #include "scanlog.h"
 #include "scanplan.h"
 #include "scanprefs.h"
 #include "powermeter.h"
+
+/* ecatcmd::BusRunStat 与那一族字段拼接函数住在 ecatworker.h 里 —— **本文件不编
+ * ecatworker.cpp** (它不在 SCAN_COMMON_SRC 里), 所以那几条判据只有摆在头文件里才验得到。
+ * 这是加这些函数时把它们放头文件的唯一理由 (与 unitFromDeviceInfo 同一条规矩)。
+ * busview.h 其实已经把它带进来了, 这里显式再写一次: 用谁就 include 谁 */
+#include "ecatworker.h"
 
 /* test_ophir 那条腿要用 COM。这只是个头文件, 没有把 SOEM/Widgets 拖进来 ——
  * 本文件"不链 SOEM 也不链 Qt Widgets"那条不变量没破 */
@@ -7812,6 +7820,521 @@ static void test_autorecover()
    }
 }
 
+/* ================================================================ 长时间稳定性日志 */
+
+/* 把整个文件读回来 (逐行)。**不剥 `#` 内务行** —— 裁剪标记与格式说明也是要被断言的 */
+static QStringList readAllLines(const QString &path)
+{
+   QFile f(path);
+   if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+      return QStringList();
+   QStringList out;
+   while (!f.atEnd())
+   {
+      QString l = QString::fromUtf8(f.readLine());
+      while (l.endsWith(QLatin1Char('\n')) || l.endsWith(QLatin1Char('\r')))
+         l.chop(1);
+      out << l;
+   }
+   return out;
+}
+
+static void test_runlog_write_parse()
+{
+   caseBegin("runlog: 写进去再拆回来, 三段与字段表逐一相等");
+   {
+      QTemporaryDir dir;
+      check(dir.isValid(), "temp dir");
+      const QString path = dir.filePath(QStringLiteral("run.log"));
+
+      RunLog log;
+      QString err;
+      check(log.open(path, QStringList{ QStringLiteral("exe=scan.exe") }, &err),
+            "打开成功", err.toStdString());
+      check(log.isOpen(), "打开之后 isOpen");
+
+      log.line(QStringLiteral("LIFE"),  QStringLiteral("start | - | 进程启动"));
+      log.line(QStringLiteral("ECAT"),  QStringLiteral("connect_ok | naxis=2 exp=4"));
+      /* **自由文本里故意带一个 `|` 与一个换行**, 而且**由调用方**过 runlogSafe ——
+       * 它们要是没被折掉, 前四段的结构就散了, 那就是这个格式唯一的硬要求。
+       * (line() 自己折不了: 它拿到的是整条 body, 而 body 里那两个 ` | ` 正是结构本身。) */
+      log.line(QStringLiteral("METER"),
+               QStringLiteral("meter_stale | n=0 wm=88421.0 kind=empty | ")
+                  + runlogSafe(QStringLiteral("竖线|换行\n在此")));
+
+      /* runlogSafe 这个纯件单独钉一遍 —— 上面那一条整行的断言其实全靠它 */
+      check(runlogSafe(QStringLiteral("a|b\nc\rd")) == QLatin1String("a/b c d"),
+            "runlogSafe 把 `|` 与换行回车都折成 `/` 与空格",
+            runlogSafe(QStringLiteral("a|b\nc\rd")).toStdString());
+      check(runlogSafe(QString()).isEmpty(), "空串还是空串");
+      check(runlogSafe(QStringLiteral("没有特殊字符")) == QStringLiteral("没有特殊字符"),
+            "中文原样留着 (日志里要看得懂)");
+
+      checkEq(log.drain(&err), 3, "drain 写出 3 行");
+      check(log.pendingBytes() == 0, "排空之后队列是空的");
+      checkEq(log.dropped(), 0, "没有丢行");
+      log.close();
+
+      const QStringList lines = readAllLines(path);
+      check(lines.size() >= 6, "文件里有格式说明 + 启动分隔 + 三条日志", "");
+
+      /* 只挑真正的日志行 (splitRunLogLine 自己会跳过 `#`), 逐行拆回来 */
+      QStringList rows;
+      for (const QString &l : lines)
+         if (splitRunLogLine(l, nullptr, nullptr, nullptr, nullptr, nullptr))
+            rows << l;
+      checkEq(rows.size(), 3, "拆回来还是 3 行");
+
+      /* 整行的形状: 定宽时间戳 | TAG | event | … —— TAG 只许是那三种 */
+      const QRegularExpression re(
+         QStringLiteral("^\\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d\\.\\d{3} \\| (LIFE|ECAT|METER) \\| \\w+ \\| "));
+      for (const QString &r : rows)
+         check(re.match(r).hasMatch(), "行首形状 (时间戳 | TAG | event | )", r.toStdString());
+
+      QMap<QString, QString> f;
+      QString ts, tag, ev, free;
+      check(splitRunLogLine(rows.at(1), &ts, &tag, &ev, &f, &free), "第 2 行拆得开");
+      check(tag == QLatin1String("ECAT"), "TAG = ECAT", tag.toStdString());
+      check(ev == QLatin1String("connect_ok"), "event = connect_ok", ev.toStdString());
+      check(f.value(QStringLiteral("naxis")) == QLatin1String("2"), "naxis=2 回来了");
+      check(f.value(QStringLiteral("exp")) == QLatin1String("4"), "exp=4 回来了");
+      check(free.isEmpty(), "没有自由文本段时 free 是空");
+
+      check(splitRunLogLine(rows.at(2), &ts, &tag, &ev, &f, &free), "第 3 行拆得开");
+      check(tag == QLatin1String("METER"), "TAG = METER");
+      check(ev == QLatin1String("meter_stale"), "event = meter_stale");
+      check(f.value(QStringLiteral("kind")) == QLatin1String("empty"), "kind=empty 回来了");
+      /* 自由文本里的那个 `|` 与换行必须已经被折成 `/` 与空格 —— 否则它会被当成第 5 个分隔符 */
+      check(free.indexOf(QLatin1Char('|')) < 0, "自由文本里不许再有 `|`", free.toStdString());
+      check(free.indexOf(QLatin1Char('\n')) < 0, "自由文本里不许再有换行");
+      check(free.contains(QStringLiteral("竖线/换行 在此")), "折出来的原话还在", free.toStdString());
+
+      /* 整个字段表也拆得开: 每一项都是 k=v (没有 '=' 的项会被丢掉) */
+      checkEq(f.size(), 3, "meter_stale 那三个字段一个不多一个不少");
+   }
+
+   caseBegin("runlog: 字段区是 `-` 或空时拆出一张空表, 不是一项叫 \"-\" 的怪东西");
+   {
+      QMap<QString, QString> f;
+      QString ts, tag, ev;
+      check(splitRunLogLine(QStringLiteral("2026-10-15 14:00:00.000 | LIFE | start | -"),
+                            &ts, &tag, &ev, &f, nullptr), "拆得开");
+      checkEq(f.size(), 0, "字段区是 `-` -> 空表");
+      check(tag == QLatin1String("LIFE") && ev == QLatin1String("start"), "TAG 与 event 照旧");
+
+      /* `#` 与空行都不是日志行 */
+      check(!splitRunLogLine(QStringLiteral("# ===== 启动 ====="), nullptr, nullptr, nullptr, nullptr, nullptr),
+            "`#` 内务行不是日志行");
+      check(!splitRunLogLine(QString(), nullptr, nullptr, nullptr, nullptr, nullptr),
+            "空行不是日志行");
+   }
+
+   caseBegin("runlog: 追加而不是覆盖 (同一个文件开两次, 两段都在)");
+   {
+      QTemporaryDir dir;
+      const QString path = dir.filePath(QStringLiteral("app.log"));
+      QString err;
+
+      {
+         RunLog a;
+         a.open(path, QStringList{ QStringLiteral("exe=scan.exe") }, &err);
+         a.line(QStringLiteral("LIFE"), QStringLiteral("start | - | 第一趟"));
+         a.close();
+      }
+      {
+         RunLog b;
+         b.open(path, QStringList{ QStringLiteral("exe=scan.exe") }, &err);
+         b.line(QStringLiteral("LIFE"), QStringLiteral("start | - | 第二趟"));
+         b.close();
+      }
+
+      const QStringList lines = readAllLines(path);
+      int starts = 0, seps = 0;
+      for (const QString &l : lines)
+      {
+         if (l.contains(QStringLiteral("| start |")))
+            starts++;
+         if (l.startsWith(QStringLiteral("# ===== ")))
+            seps++;
+      }
+      checkEq(starts, 2, "两趟的 start 都在 (第二趟没把第一趟冲掉)");
+      checkEq(seps, 2, "两趟各有一条启动分隔行");
+      /* 格式说明只在**新建**那一次写一遍 */
+      int heads = 0;
+      for (const QString &l : lines)
+         if (l.startsWith(QStringLiteral("# scan 异常日志")))
+            heads++;
+      checkEq(heads, 1, "格式说明只写一次 (第二次打开时文件不是空的)");
+   }
+
+   caseBegin("runlog: 没打开时 line() 不崩, 只计数");
+   {
+      RunLog log;
+      log.line(QStringLiteral("LIFE"), QStringLiteral("start | - | 文件还没开"));
+      checkEq(log.dropped(), 1, "丢了一行");
+      checkEq(log.drain(), 0, "drain 是个空动作");
+      check(!log.isOpen(), "没打开");
+      log.close();    /* 再 close 一次也不许崩 */
+   }
+}
+
+static void test_runlog_backpressure()
+{
+   caseBegin("runlog: 队列有界, 压满了丢最旧的整行而不是阻塞");
+   {
+      QTemporaryDir dir;
+      const QString path = dir.filePath(QStringLiteral("bp.log"));
+      QString err;
+
+      RunLog log;
+      check(log.open(path, QStringList(), &err), "打开成功", err.toStdString());
+
+      /* 一直不 drain, 压到远超上限 —— 生产者不许阻塞、内存不许涨爆 */
+      const QString big = QString(200, QLatin1Char('x'));   /* 一行 200 字节左右 */
+      const int n = kRunLogMaxPendingBytes / 200 + 500;
+      for (int i = 0; i < n; i++)
+         log.line(QStringLiteral("ECAT"), QStringLiteral("flood | i=%1 pad=%2").arg(i).arg(big));
+
+      check(log.pendingBytes() <= kRunLogMaxPendingBytes, "队列长度封在上限之内");
+      check(log.dropped() > 0, "确实丢了行 (而且计数看得见)");
+
+      /* 丢的是**最旧**的那些: 最后写进去的那一行必须还在 */
+      const int drained = log.drain(&err);
+      check(drained > 0, "排空之后写出去了一些");
+      log.close();
+
+      const QStringList lines = readAllLines(path);
+      bool last_kept = false;
+      for (const QString &l : lines)
+         if (l.contains(QStringLiteral("i=%1 ").arg(n - 1)))
+            last_kept = true;
+      check(last_kept, "最后写进去的那一行还在 (丢的是最旧的)");
+   }
+}
+
+static void test_runlog_trim()
+{
+   caseBegin("runlog: 超上限时裁头保尾, 文件名不变、行边界对齐、留裁剪标记");
+   {
+      QTemporaryDir dir;
+      const QString path = dir.filePath(QStringLiteral("trim.log"));
+      QString err;
+
+      /* 小尺寸: 上限 4 KB / 保留 2 KB。**必须 keep < max**, 否则裁完还是超 */
+      const qint64 kMax = 4096, kKeep = 2048;
+
+      QFile f(path);
+      check(f.open(QIODevice::WriteOnly | QIODevice::Text), "先造一个超限的文件");
+      QString big;
+      for (int i = 0; i < 400; i++)
+         big += QStringLiteral("2026-10-15 14:00:00.000 | ECAT | row | i=%1\n").arg(i);
+      f.write(big.toUtf8());
+      f.close();
+      check(QFileInfo(path).size() > kMax, "造出来的确实超了上限");
+
+      check(runlogTrimHead(path, kMax, kKeep, &err), "裁剪成功", err.toStdString());
+
+      const qint64 sz = QFileInfo(path).size();
+      check(sz <= kMax, "裁完在上限之内");
+
+      const QStringList lines = readAllLines(path);
+      check(!lines.isEmpty(), "文件还在而且不是空的");
+      check(lines.first().startsWith(QStringLiteral("# trimmed ")),
+            "第一行是裁剪标记 (丢过历史这件事看得见)", lines.value(0).toStdString());
+
+      /* 裁出来的每一行都必须**结构完整** —— 半行留在头上最典型的症状就是第一行对不上 */
+      int parsed = 0;
+      for (int i = 1; i < lines.size(); i++)
+      {
+         QString tag, ev;
+         if (splitRunLogLine(lines.at(i), nullptr, &tag, &ev, nullptr, nullptr))
+            parsed++;
+      }
+      checkEq(parsed, lines.size() - 1, "裁剪之后每一行都还拆得开 (行边界对齐)");
+
+      /* 保留的是**尾部**: 最后那一行还在 */
+      check(lines.last().contains(QStringLiteral("i=399")), "最后一行还在 (保的是尾部)",
+            lines.last().toStdString());
+
+      /* 没超上限就是个空动作, 而且**不许把文件弄坏** */
+      check(runlogTrimHead(path, kMax, kKeep, &err), "再裁一次是空动作");
+      check(QFileInfo(path).size() <= kMax, "还是在上限之内");
+
+      /* keep >= max 这种配错了的参数当"不用裁", 不许报错 —— 一个配置写错不该把日志弄丢 */
+      check(runlogTrimHead(path, 100, 200, &err), "keep >= max 时当空动作, 不报错");
+      check(QFileInfo(path).size() > 0, "文件还在");
+   }
+
+   caseBegin("runlog: 裁剪之后还能接着追加 (RunLog 自己串起整条路)");
+   {
+      QTemporaryDir dir;
+      const QString path = dir.filePath(QStringLiteral("trim2.log"));
+      QString err;
+
+      RunLog log;
+      check(log.open(path, QStringList(), &err), "打开成功");
+
+      /* 直接把文件灌到超过 kRunLogMaxBytes 不现实 (64 MiB), 所以改用 runlogTrimHead
+       * 那一条路已经在上面验过了; 这里验的是 drain() 末尾那次裁剪之后**对象还能用**:
+       * 关掉再开、再写再读, 一切照旧 */
+      log.line(QStringLiteral("METER"), QStringLiteral("meter_stop | up_s=1"));
+      log.drain(&err);
+      log.close();
+
+      check(log.open(path, QStringList(), &err), "同一个对象可以再打开");
+      log.line(QStringLiteral("METER"), QStringLiteral("meter_stop | up_s=2"));
+      checkEq(log.drain(&err), 1, "再写再排空照常");
+      log.close();
+   }
+}
+
+static void test_stale_kind()
+{
+   caseBegin("stale_kind: 把「设备停流」与「水位线卡住」分开 (边界 tsmax==wm 必须是 all_old)");
+   {
+      /* 空数组 = 设备手上一个数都没有 */
+      check(staleKind(0, -1.0, 100.0) == STALE_EMPTY, "n=0 -> empty");
+      check(staleKind(0, 500.0, 100.0) == STALE_EMPTY, "n=0 时哪怕 tsmax 更大也是 empty");
+      check(staleKind(-3, 0.0, 0.0) == STALE_EMPTY, "n<0 也当 empty (不许拿它当 fresh)");
+
+      /* 有数, 但一条都不比水位线新 */
+      check(staleKind(5, 99.0, 100.0) == STALE_ALL_OLD, "tsmax < wm -> all_old");
+      /* ★ **边界**: 过滤那一条写的是 `<=`, 相等就是"不比它新"、就是要被丢掉的那一条。
+       * 这里要是判成 fresh, 屏幕上明明没出数而日志说"有新的", 那就把整个调查带偏了 */
+      check(staleKind(5, 100.0, 100.0) == STALE_ALL_OLD, "tsmax == wm -> all_old (与 <= 同源)");
+
+      /* 真的有比水位线新的 */
+      check(staleKind(5, 100.001, 100.0) == STALE_FRESH, "tsmax > wm -> fresh");
+
+      /* 水位线还没建立 (-1): 任何一条都比它新 */
+      check(staleKind(1, 0.0, -1.0) == STALE_FRESH, "wm=-1 时第一条就是新的");
+      check(staleKind(0, 0.0, -1.0) == STALE_EMPTY, "但数组空还是 empty");
+
+      check(staleKindText(STALE_EMPTY)   == QLatin1String("empty"),   "empty 那个字");
+      check(staleKindText(STALE_ALL_OLD) == QLatin1String("all_old"), "all_old 那个字");
+      check(staleKindText(STALE_FRESH)   == QLatin1String("fresh"),   "fresh 那个字");
+      /* 落到日志里的那个字是**纯 ASCII 无空格**的, 否则字段表会被撑破 */
+      check(!staleKindText(STALE_ALL_OLD).contains(QLatin1Char(' ')), "不带空格");
+   }
+}
+
+static void test_bus_runstat()
+{
+   caseBegin("BusRunStat: 帧是要数的, 但连接期与不在 OP 的帧一个都不许算进来");
+   {
+      ecatcmd::BusRunStat s;
+      checkEq((long long)s.frames, 0, "起手是 0");
+      checkNear(s.badPct(), -1.0, "一帧都没数到 -> -1 (没量到就别说, 不许编一个 0)");
+
+      /* 不在 OP: publish(0) 与连接期的帧走这一支 */
+      s.onFrame(false, true, true);
+      checkEq((long long)s.frames, 0, "不在 OP -> 不数");
+      checkEq((long long)s.frames_bad, 0, "不在 OP -> 也不记坏");
+
+      /* 在 OP 且 SOEM 算出了期望值: 这一帧才算可比 */
+      s.onFrame(true, true, false);
+      s.onFrame(true, true, true);
+      checkEq((long long)s.frames, 2, "在 OP -> 数");
+      checkEq((long long)s.frames_bad, 1, "wkc 不足那一帧记成坏帧");
+      checkNear(s.badPct(), 50.0, "坏帧占比");
+
+      /* 期望值没算出来 (expected_wkc == 0): **不可比**, 那一帧不算坏帧 ——
+       * 与 publish() 里数 m_bad_wkc_run 的那两条判据逐条一致 */
+      s.onFrame(true, false, true);
+      checkEq((long long)s.frames, 3, "还是数进总数");
+      checkEq((long long)s.frames_bad, 1, "但不算坏帧 (不可比)");
+
+      /* ★ 一帧都没数到就是 **-1 (不知道)**, 不是 0 (没有坏帧) —— 那两个数在屏幕上
+       * 长得一样, 在结论上正好相反 */
+      ecatcmd::BusRunStat z;
+      checkNear(z.badPct(), -1.0, "没数到帧 -> -1, 不许编一个 0 出来");
+      z.frames = 10;
+      checkNear(z.badPct(), 0.0, "数到了 10 帧、一个坏的都没有 -> 真的是 0");
+   }
+
+   caseBegin("BusRunStat: 拼出来的字段能被 runlog 的解析器拆开");
+   {
+      ecatcmd::BusRunStat s;
+      s.onFrame(true, true, false);
+      s.onFrame(true, true, true);
+      s.cbad_events   = 3;
+      s.fault_events  = 1;
+      s.recover_total = 2;
+      s.connects      = 4;
+      /* 卡顿次数**由真正的记账函数喂出来, 不手赋** —— 这一处原先写的是 `s.gaps_over_total = 7`,
+       * 于是「格式对了、数不存在」这件事在自检里永远是绿的: 2026-10-15 首跑 82 分钟里有两次
+       * >50 ms 的停顿 (601 ms / 1643 ms), 而 492 条摘要全是 gaps_over=0。 */
+      for (int i = 0; i < 5; i++)
+         ecatcmd::busNoteGap(s, 601, HMI_GAP_WARN_MS, false);
+      for (int i = 0; i < 2; i++)
+         ecatcmd::busNoteGap(s, 700, HMI_GAP_WARN_MS, true);
+
+      BusTelem t;
+      t.naxis        = 2;
+      t.wkc          = 6;
+      t.expected_wkc = 6;
+      t.bad_wkc_run  = 0;
+      t.period_avg_ms = 2.6;
+      t.max_gap_ms   = 812;
+      t.max_gap_self_ms = 0;
+      t.ax[0].fault      = true;
+      t.ax[0].fault_code = 0xFF02;
+      t.ax[0].mirror_ok  = true;
+      t.ax[1].fault      = false;
+      /* 哨兵: **还没读到**的故障码不许印成一个看着很真的 0xFFFE */
+      t.ax[1].fault_code = HMI_FAULT_CODE_UNREAD;
+      t.ax[1].mirror_ok  = false;
+
+      const QString row = QStringLiteral("2026-10-15 14:03:25.900 | ECAT | summary | ")
+                          + ecatcmd::busSummaryFields(s, t, 3612, 37, 601);
+
+      QMap<QString, QString> f;
+      QString ts, tag, ev;
+      check(splitRunLogLine(row, &ts, &tag, &ev, &f, nullptr), "整行拆得开", row.toStdString());
+      check(tag == QLatin1String("ECAT") && ev == QLatin1String("summary"), "TAG 与 event");
+      /* 10 (摘要自己那几项) + 9 (累计量) + 2 根轴 × 3 (fault/code/mirror) = 25 */
+      checkEq(f.size(), 25, "字段一个不多一个不少");
+
+      checkEq(f.value(QStringLiteral("up_s")).toLongLong(), 3612, "up_s");
+      checkEq(f.value(QStringLiteral("wkc")).toLongLong(), 6, "wkc");
+      checkEq(f.value(QStringLiteral("gap_max")).toLongLong(), 812, "gap_max");
+      /* ★ 会话最大值 812 与窗口里的 601 **同时出现**, 而且不许相等 ——
+       * 只有一个数的时候, 那 601 就会被 812 吃掉 (2026-10-15 首跑就是这样: 601 那次停顿
+       * 在 492 条摘要上一条也没留下, 因为 gap_max 早被启动那一下 1643 ms 钉死了) */
+      checkEq(f.value(QStringLiteral("last_gap")).toLongLong(), 37, "last_gap");
+      checkEq(f.value(QStringLiteral("gap_win")).toLongLong(), 601, "gap_win 是窗口里的最大值");
+      checkEq(f.value(QStringLiteral("frames")).toLongLong(), 2, "frames");
+      checkEq(f.value(QStringLiteral("badf")).toLongLong(), 1, "badf");
+      checkEq(f.value(QStringLiteral("cbad")).toLongLong(), 3, "cbad");
+      checkEq(f.value(QStringLiteral("conn")).toLongLong(), 4, "conn");
+      checkEq(f.value(QStringLiteral("gaps_over")).toLongLong(), 7, "gaps_over");
+      checkEq(f.value(QStringLiteral("gaps_over_self")).toLongLong(), 2,
+              "自家造成的那 2 次分开记 (合起来这个数就只反映按了几次按钮)");
+      check(f.value(QStringLiteral("a0_fault")) == QLatin1String("1"), "a0_fault=1");
+      check(f.value(QStringLiteral("a0_code")) == QLatin1String("0xff02"), "a0_code=0xff02");
+      check(f.value(QStringLiteral("a1_fault")) == QLatin1String("0"), "a1_fault=0");
+      check(f.value(QStringLiteral("a1_code")) == QLatin1String("-"),
+            "没读到的码写 `-`, 不写一个看着很真的 0xFFFE",
+            f.value(QStringLiteral("a1_code")).toStdString());
+      check(f.value(QStringLiteral("a1_mirror")) == QLatin1String("0"), "a1_mirror=0");
+
+      /* 只有 naxis 根: 第三格不许凭空出现 (轴数少的总线上写了就是假数据) */
+      check(!f.contains(QStringLiteral("a2_fault")), "naxis=2 时没有 a2_* 那一格");
+
+      /* 十六进制那个小件单独钉一遍 */
+      check(ecatcmd::busLogHex(0xFF02) == QLatin1String("0xff02"), "0xFF02 四位小写");
+      check(ecatcmd::busLogHex(0) == QLatin1String("0x0000"), "0 补足四位");
+      check(ecatcmd::busLogHex(-1) == QLatin1String("-"), "FAIL 哨兵 -> `-`");
+      check(ecatcmd::busLogHex(-2) == QLatin1String("-"), "UNREAD 哨兵 -> `-`");
+   }
+
+   caseBegin("busNoteGap: 卡顿次数**真的会涨** (这一条就是首跑漏掉的那种断言)");
+   {
+      /* 2026-10-15 首跑的教训在 BusRunStat 的注释里: 字段声明了、摘要里也打了, 但没有任何
+       * 一处 ++, 于是 82 分钟两次 >50 ms 的停顿在 492 条摘要上全是 0。当时自检只验格式
+       * (手赋 `= 7`), 所以一直是绿的。**计数器的断言必须落在"它有没有数"上。** */
+      const int W = HMI_GAP_WARN_MS;
+
+      ecatcmd::BusRunStat s;
+      ecatcmd::busNoteGap(s, W, W, false);
+      checkEq((long long)s.gaps_over_total, 0,
+              "正好压在告警线上不算 —— publish() 里写的是 `gap > HMI_GAP_WARN_MS`");
+
+      ecatcmd::busNoteGap(s, 1, W, false);
+      checkEq((long long)s.gaps_over_total, 0, "2 ms 的圈期抖动不算卡顿");
+
+      ecatcmd::busNoteGap(s, W + 1, W, false);
+      checkEq((long long)s.gaps_over_total, 1, "★ 越过一次线就要涨一次");
+
+      /* 首跑真出现过的那两个数, 各喂一次 */
+      ecatcmd::busNoteGap(s, 601,  W, false);
+      ecatcmd::busNoteGap(s, 1643, W, false);
+      checkEq((long long)s.gaps_over_total, 3, "601 / 1643 各算一次");
+      checkEq((long long)s.gaps_over_self_total, 0, "都不是自家造成的");
+
+      /* 自家造成的 (复位/使能/回零的 SDO 静默) 走子集, 不许另开一份总数 */
+      ecatcmd::busNoteGap(s, 700, W, true);
+      checkEq((long long)s.gaps_over_self_total, 1, "自家那一次进 self");
+      checkEq((long long)s.gaps_over_total, 4, "总数**同时**涨 —— self 是子集, 不是并列的一份");
+
+      /* 同一个纯函数喂给两个独立的 stat, 互不串 */
+      ecatcmd::BusRunStat s2;
+      checkEq((long long)s2.gaps_over_total, 0, "另一份起手还是 0");
+   }
+
+   caseBegin("busCommBadFields: 突发现场那一串也能拆开, 而且带累计量");
+   {
+      ecatcmd::BusRunStat s;
+      s.connects = 1;
+      const QString row = QStringLiteral("2026-10-15 14:03:22.123 | ECAT | comm_bad_begin | ")
+                          + ecatcmd::busCommBadFields(s, 5, 6, 14, 812, 0, 2, 0x04, 0x001B, true);
+
+      QMap<QString, QString> f;
+      check(splitRunLogLine(row, nullptr, nullptr, nullptr, &f, nullptr), "拆得开", row.toStdString());
+      checkEq(f.value(QStringLiteral("wkc")).toLongLong(), 5, "wkc");
+      checkEq(f.value(QStringLiteral("exp")).toLongLong(), 6, "exp");
+      checkEq(f.value(QStringLiteral("badrun")).toLongLong(), 14, "badrun");
+      check(f.value(QStringLiteral("al_state")) == QLatin1String("0x0004"), "al_state 补足四位");
+      check(f.value(QStringLiteral("al_code"))  == QLatin1String("0x001b"), "al_code 四位");
+      check(f.value(QStringLiteral("al_ok"))    == QLatin1String("1"), "al_ok");
+      check(f.contains(QStringLiteral("frames")), "累计量跟着一起来 (这一笔是第几帧处发生的)");
+   }
+}
+
+static void test_meter_summary_fields()
+{
+   caseBegin("MeterRunStat: 三种坏法分开记, 合计与连续次数都对得上");
+   {
+      MeterRunStat s;
+      checkEq((long long)s.failTotal(), 0, "起手 0");
+
+      s.onOk();
+      s.onOk();
+      checkEq((long long)s.ok, 2, "两次数成功");
+      checkEq(s.consec_fail, 0, "成功之后连续失败归零");
+      checkEq(s.consec_max, 0, "峰值也还是 0");
+
+      /* 连续失败: 中间夹一次成功就把计数断开 */
+      s.getdata_fail++; s.onFail();
+      s.stale_empty++;  s.onFail();
+      checkEq(s.consec_fail, 2, "连着两次");
+      checkEq(s.consec_max, 2, "峰值 2");
+      s.onOk();
+      s.status_bad++;   s.onFail();
+      checkEq(s.consec_fail, 1, "被那次成功断开了, 从头数");
+      checkEq(s.consec_max, 2, "峰值留在 2");
+
+      s.stale_old++;    s.onFail();
+      s.stale_old++;    s.onFail();
+      checkEq(s.consec_fail, 3, "现在是三次");
+      checkEq(s.consec_max, 3, "峰值跟着涨到 3");
+
+      checkEq((long long)s.failTotal(), 1 + 1 + 1 + 2, "四种坏法合起来是 5");
+
+      /* 通知**不算失败**: 操作员拨一下滤片不该被记成一次故障 */
+      s.notif++;
+      checkEq((long long)s.failTotal(), 5, "通知不计入失败");
+      checkEq(s.consec_fail, 3, "通知也不打断连续失败计数");
+
+      const QString row = QStringLiteral("2026-10-15 14:05:11.004 | METER | meter_summary | ")
+                          + meterStatFields(s);
+      QMap<QString, QString> f;
+      QString ts, tag, ev;
+      check(splitRunLogLine(row, &ts, &tag, &ev, &f, nullptr), "整行拆得开", row.toStdString());
+      check(tag == QLatin1String("METER") && ev == QLatin1String("meter_summary"), "TAG 与 event");
+      checkEq(f.size(), 9, "字段一个不多一个不少");
+      checkEq(f.value(QStringLiteral("ok")).toLongLong(), 3, "ok=3");
+      checkEq(f.value(QStringLiteral("getdata_fail")).toLongLong(), 1, "getdata_fail");
+      checkEq(f.value(QStringLiteral("status_bad")).toLongLong(), 1, "status_bad");
+      checkEq(f.value(QStringLiteral("notif")).toLongLong(), 1, "notif");
+      checkEq(f.value(QStringLiteral("stale_empty")).toLongLong(), 1, "stale_empty");
+      checkEq(f.value(QStringLiteral("stale_old")).toLongLong(), 2, "stale_old");
+      checkEq(f.value(QStringLiteral("fail")).toLongLong(), 5, "fail 是四种之和");
+      checkEq(f.value(QStringLiteral("consec")).toLongLong(), 3, "consec");
+      checkEq(f.value(QStringLiteral("consec_max")).toLongLong(), 3, "consec_max");
+   }
+}
+
 int main(int argc, char **argv)
 {
    QCoreApplication app(argc, argv);
@@ -7844,6 +8367,12 @@ int main(int argc, char **argv)
    test_meter_meta();
    test_meterlog();
    test_ophir();
+   test_runlog_write_parse();
+   test_runlog_backpressure();
+   test_runlog_trim();
+   test_stale_kind();
+   test_bus_runstat();
+   test_meter_summary_fields();
 
    std::printf("\n%d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
    return g_fail == 0 ? 0 : 1;

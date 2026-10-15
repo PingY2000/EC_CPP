@@ -12,6 +12,7 @@
 | 某句提示**背后的成因与排查** | [docs/scan_messages.md](docs/scan_messages.md) |
 | 改提示语之前逐条对的清单 | 同上 §11 |
 | 每个程序的设计与验收状态 | [docs/scan_sweep.md](docs/scan_sweep.md) / [docs/hmi_click_position.md](docs/hmi_click_position.md) |
+| 异常日志 `scan_runlog.log` 的格式、字段与**它为什么长这样** | [docs/scan_runlog.md](docs/scan_runlog.md) |
 
 ---
 

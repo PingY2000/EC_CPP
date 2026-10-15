@@ -3,6 +3,7 @@
  * include SOEM。坐标: 驱动器坐标 = 6064h 原始值; 显示坐标 = 驱动器坐标 - 零点 origin。 */
 #pragma once
 
+#include <QElapsedTimer>
 #include <QMutex>
 #include <QQueue>
 #include <QString>
@@ -10,6 +11,7 @@
 #include <QThread>
 
 #include <atomic>
+#include <functional>
 
 #include "ec_motor.h"
 
@@ -1987,6 +1989,16 @@ inline QString fault_banner_text(const BusTelem &t)
 #define HMI_PERIOD_WIN_FRAMES   64
 #define HMI_PERIOD_WARN_MS      (HMI_LOOP_MS * 3)
 
+/* 长时间稳定性日志的节奏 (见 setLogSink 与 ecatcmd::BusRunStat)。
+ *
+ * 摘要 10 s 一行: 48 小时约 1.7 万行 —— 够看出"节拍慢慢变差"这种趋势, 又不至于把日志淹掉。
+ *
+ * 最小突发长度 5 帧: 单帧抖动不值得记一行。坏/好逐帧翻转的线在 500 Hz 下能刷出几百行/秒,
+ * 那正好会把真正要看的东西埋掉。HMI_BAD_WKC_LIMIT(10) 是"够得上报给操作员"的门槛, 这里取
+ * 它的一半 —— 想在还没惊动操作员的时候就先留下痕。 */
+#define HMI_RUNLOG_SUMMARY_MS   10000
+#define HMI_RUNLOG_BURST_MIN        5
+
 /* **进了 OP 之后**所有 SDO 读的超时 (微秒) —— 进 OP 那一刻由 doConnectInner 用
  * em_set_sdo_timeout 装上, 之后 6061h / 1C32h / 2217h / 603Fh 那几条诊断读全走它。
  *
@@ -2323,6 +2335,151 @@ inline QString recover_done_text(const RecoverReport &r)
          .arg(r.need).arg(r.ok).arg(r.fail);
 }
 
+/* ================================================================ 长时间稳定性日志
+ *
+ * 只有 scan/ 会设 sink (见 EcatThread::setLogSink), hmi 从头到尾不碰 —— 所以下面这一族的
+ * 新代码在两个目标里都编得过, 但只有 scan 那一份会真的产生行。
+ *
+ * 这里放的是**跨连接只增**的量, 与 BusTelem 里那一批**不是一回事**: 那一批由
+ * doConnectInner() 每次连接清零 (它答的是"这一次连上之后怎么样"), 而长稳调查要问的是
+ * "这一趟跑下来总共坏了多少次" —— 重连一次就归零的话, 日志看上去会像"变好了", 而那恰好
+ * 就是现场报的那个现象。所以它们**绝不能被写进那个清零块**。
+ *
+ * 判据与字段拼法都放在头文件里: scan_selftest 不编 ecatworker.cpp, 写在 .cpp 里就永远验不到
+ * (与上面 comm_bad_from / cadence_text 同一条规矩)。
+ */
+struct BusRunStat
+{
+   quint64 frames          = 0;   /* 在 OP 里数过的帧 */
+   quint64 frames_bad      = 0;   /* 其中工作计数器不足的 */
+   quint32 cbad_events     = 0;   /* comm_bad 立起来几次 */
+   quint32 fault_events    = 0;   /* 驱动器自报故障几次 */
+   quint32 recover_total   = 0;   /* 自动重请求 OP 一共动过几次手 */
+   quint32 connects        = 0;   /* 连上过几次 */
+   /* 累计"卡顿"次数 —— 跨连接累加, 与 BusTelem::gaps_over_ms 分开。
+    *
+    * **必须分两份, 合成一份这个数就废了**: 每次使能/复位/回零都会静默几百毫秒 (SOEM 的 SDO
+    * 事务期间一帧都不发), 那一份是我们自己按下去的, 与"这台 PC 卡不卡"无关。合成一份的话,
+    * 这个数只反映"操作员按了几次按钮"。
+    *
+    * ★ **2026-10-15 实跑教训**: gaps_over_total 当时声明了、也在摘要里打了, 但**全仓库没有
+    *   任何一处 `++`** —— 于是 82 分钟里有两次 >50 ms 的停顿 (601 ms / 1643 ms), 而 492 条
+    *   摘要全是 `gaps_over=0`。自检当时直接手赋 `= 7` 验格式, 所以格式是对的、数是不存在的。
+    *   **加计数字段时, 断言要落在"它有没有数"上, 不是"它好不好看"上。**
+    *
+    * gaps_over_self_total 是其中**自家造成**的那一份 (m_gap_self_want 消费掉的那一帧),
+    * 判据与 ecatworker.cpp 里 `self_caused` 那一处逐条一致。 */
+   quint32 gaps_over_total      = 0;
+   quint32 gaps_over_self_total = 0;
+
+   /* expected_ok = SOEM 算出期望工作计数器了吗。没算出来时它不可比, 那一帧不算坏帧 ——
+    * 与 publish() 里数 m_bad_wkc_run 的那两条判据逐条一致 (那边写的是
+    * `m_in_op && t.expected_wkc > 0 && wkc < t.expected_wkc`) */
+   void onFrame(bool in_op, bool expected_ok, bool bad)
+   {
+      if (!in_op)
+         return;
+      frames++;
+      if (expected_ok && bad)
+         frames_bad++;
+   }
+
+   /* 坏帧占比 (百分数)。**一帧都没数到就给 -1**: 没量到就别说, 不许编一个 0 出来 */
+   double badPct() const
+   {
+      if (frames == 0)
+         return -1.0;
+      return 100.0 * (double)frames_bad / (double)frames;
+   }
+};
+
+/* 一次"卡顿"的记账 —— **纯函数, 故意放在头文件里**: scan_selftest 不编 ecatworker.cpp,
+ * 这几个 `++` 写在 .cpp 里就永远只有"字段好不好看"验得到、"它到底有没有数"验不到。
+ * 2026-10-15 首跑就是这么翻车的 (见上面 BusRunStat 里那段教训): 82 分钟两次 >50 ms 的停顿,
+ * 492 条摘要全是 gaps_over=0, 而自检手赋 `= 7` 照样绿。把判据搬到这里之后,
+ * 自检可以真的喂几个 gap 进去看它涨不涨。
+ *
+ * 判据与 publish() 里 live 那个 m_gaps_over 逐条一致: **严格大于** warn_ms 才算一次
+ * (50 ms 整不算 —— 与 `gap > HMI_GAP_WARN_MS` 一致), self_caused 就是自家造成的那些。 */
+inline void busNoteGap(BusRunStat &s, int gap_ms, int warn_ms, bool self_caused)
+{
+   if (gap_ms <= warn_ms)
+      return;
+   s.gaps_over_total++;
+   if (self_caused)
+      s.gaps_over_self_total++;
+}
+
+/* 十六进制四位。**负数是"-"**: fault_code 有 UNREAD(-2) / FAIL(-1) 两个哨兵, 拿
+ * `v & 0xFFFF` 印成 0xFFFE / 0xFFFF 会把"还没读到"说成一个看着很真的故障码
+ * (与 HMI_FAULT_CODE_* 那两个哨兵存在的理由同一条)。 */
+inline QString busLogHex(int v)
+{
+   if (v < 0)
+      return QStringLiteral("-");
+   return QStringLiteral("0x%1").arg(v & 0xFFFF, 4, 16, QLatin1Char('0'));
+}
+
+/* 字段区一律小写 k=v、值里不许有空格 (空格是字段分隔符, 见 scan/runlog.h)。
+ * 逐轴用**扁键** a0_fault=… 而不是 a0=fault=…: 后者一拆就散, 轴号也丢了。 */
+inline QString busStatFields(const BusRunStat &s)
+{
+   return QStringLiteral("frames=%1 badf=%2 badpct=%3 cbad=%4 faults=%5 recov_total=%6 conn=%7 "
+                         "gaps_over=%8 gaps_over_self=%9")
+      .arg(s.frames).arg(s.frames_bad)
+      .arg(s.frames == 0 ? QStringLiteral("-") : QString::number(s.badPct(), 'f', 3))
+      .arg(s.cbad_events).arg(s.fault_events).arg(s.recover_total)
+      .arg(s.connects).arg(s.gaps_over_total).arg(s.gaps_over_self_total);
+}
+
+inline QString busAxisFields(const BusTelem &t)
+{
+   QString out;
+   for (int i = 0; i < t.naxis && i < EM_MAX_AXES; i++)
+   {
+      const QString p = QStringLiteral(" a%1_").arg(i);
+      out += p + QStringLiteral("fault=") + QString::number(t.ax[i].fault ? 1 : 0);
+      out += p + QStringLiteral("code=") + busLogHex(t.ax[i].fault_code);
+      out += p + QStringLiteral("mirror=") + QString::number(t.ax[i].mirror_ok ? 1 : 0);
+   }
+   return out;
+}
+
+/* 周期性健康摘要那一行 —— **这是长稳调查的主表**: 它把"什么错都没爆、节拍却在慢慢变差"
+ * 变成一个能画曲线的数 (period_avg / gap_win / badpct)。up_s 是单调的会话秒数,
+ * 墙钟被 NTP 或夏令时拨过之后靠它对账。
+ *
+ * ★ gap_max / gap_self 是**会话最大值**, 一旦被某一次大的钉住就永远不动了 —— 2026-10-15 首跑
+ *   就是这样: 14:05:17 启动那一次 1643 ms 把它们钉死, 于是 14:51 那次**真实的 601 ms 停顿在
+ *   492 条摘要里一个数都没留下**(只活在 recover_master 那一行的 last_gap 里, 而那是"最后一次",
+ *   不是最早那次)。**看这两个要看它涨不涨, 不是看它的值。**
+ *
+ *   所以这里另给两个**窗口化**的: last_gap (本帧的间隔) 与 gap_win (上一次摘要以来的最大间隔)。
+ *   它们才是"这一分钟本机最长停过多久" —— 也就是"是 PC 先卡还是从站先掉"那条分水岭所缺的数。 */
+inline QString busSummaryFields(const BusRunStat &s, const BusTelem &t, qint64 up_s,
+                                int last_gap_ms, int gap_win_ms)
+{
+   return QStringLiteral("up_s=%1 wkc=%2 exp=%3 badrun=%4 comm=%5 period_avg=%6 "
+                         "last_gap=%7 gap_win=%8 gap_max=%9 gap_self=%10")
+             .arg(up_s).arg(t.wkc).arg(t.expected_wkc).arg(t.bad_wkc_run)
+             .arg(t.comm_bad ? 1 : 0).arg(t.period_avg_ms)
+             .arg(last_gap_ms).arg(gap_win_ms)
+             .arg(t.max_gap_ms).arg(t.max_gap_self_ms)
+          + QLatin1Char(' ') + busStatFields(s) + busAxisFields(t);
+}
+
+/* comm_bad 立起来那一下的现场。自由文本由调用方给 (屏幕上那句 note 原样), 这里只拼机器要的数 */
+inline QString busCommBadFields(const BusRunStat &s, int wkc, int exp, int badrun,
+                                int gap_max, int gap_self, int period_avg,
+                                int al_state, int al_code, bool al_ok)
+{
+   return QStringLiteral("wkc=%1 exp=%2 badrun=%3 gap_max=%4 gap_self=%5 period_avg=%6"
+                         " al_state=%7 al_code=%8 al_ok=%9")
+             .arg(wkc).arg(exp).arg(badrun).arg(gap_max).arg(gap_self).arg(period_avg)
+             .arg(busLogHex(al_state)).arg(busLogHex(al_code)).arg(al_ok ? 1 : 0)
+          + QLatin1Char(' ') + busStatFields(s);
+}
+
 }   /* namespace ecatcmd */
 
 class EcatThread : public QThread
@@ -2408,6 +2565,18 @@ public:
     * hmi 也改, 是因为 hmi 那一侧的界面文案与操作习惯全是围着后者写的。
     * 沿用还有一道硬条件 (见 ecatcmd::origin_keep_ok): 滑台必须仍在当前量程内。 */
    void setKeepOrigin(bool on);
+
+   /* 长时间稳定性日志的落点。**只能在 start() 之前设一次** —— 工作线程只读, 没有锁。
+    *
+    * tag 固定是 "ECAT", body 是拼好的 "event | k=v …" (见 ecatcmd::busSummaryFields 那一族)。
+    *
+    * ★ **回调在**工作线程**里执行** —— 就在那个 2 ms 一圈的循环里。所以实现必须非阻塞:
+    *   入队可以, 写盘不行。仓库文档记过 30 分钟跑下来帧节拍劣化的案例, 往这个循环里塞一次
+    *   可能被磁盘 (或杀毒) 拖住上百毫秒的写盘, 是拿被测对象换日志。scan/ 那个 RunLog
+    *   就是只入队的。
+    *
+    * ★ hmi **永远不设** —— 空回调, 一条新路径都不走, 行为与加这个功能之前逐字一样。 */
+   void setLogSink(std::function<void(const QString &tag, const QString &body)> sink);
 
    /* 把一份**记在 scan.ini 里**的零点交给工作线程, 第一次连接时当作"上次那份零点"来试。
     * 走的就是 setKeepOrigin 那条沿用路 —— 还是那道 origin_keep_ok 量程闸, 过了才用。
@@ -2595,6 +2764,10 @@ private:
 
    void note(const QString &s);   /* 记进遥测 + 发给界面 */
 
+   /* 往稳定性日志写一行 (tag 固定 ECAT)。没设 sink 时是个空动作 —— hmi 每一条都走这里,
+    * 所以那个"空回调"必须便宜。**只在工作线程里调**, 免得跟 m_runstat 抢锁。 */
+   void logBus(const QString &body);
+
    mutable QMutex m_mtx;                 /* 保护 m_cmds / m_want / m_vel / m_telem */
    QQueue<Cmd>    m_cmds;
    int32_t        m_want[EM_MAX_AXES] = {0};
@@ -2760,6 +2933,32 @@ private:
     * (见 HMI_RECOVER_ARM_FRAMES) —— 与 m_bad_wkc_run 是一对, 一个数坏一个数好。 */
    int        m_good_wkc_run = 0;
    bool       m_comm_bad    = false;
+
+   /* ---- 长时间稳定性日志 (只有 scan/ 设 sink, 见 setLogSink) ----
+    *
+    * m_runstat 与下面这几个**故意不被 doConnectInner() 的清零块与 teardown() 碰** ——
+    * 它们要跨连接只增, 好一眼看出"这一趟总共坏了多少次" (理由见 ecatcmd::BusRunStat)。
+    * 全是 worker-only, 不需要锁。 */
+   std::function<void(const QString &tag, const QString &body)> m_log_sink;
+   ecatcmd::BusRunStat m_runstat;
+   /* 日志专用的单调钟, run() 起手 start()。**不用墙钟**: 墙钟会被 NTP 与夏令时拨,
+       而摘要里那个 up_s 正是留给"时间戳看着不对"时对账的。publish() 也读它 —— 长阻塞命令
+       期间 run() 的那个循环根本没在转, 摘要要是靠循环更新时刻就永远发不出来, 而那恰恰是
+       最需要一行心跳的时候。 */
+   QElapsedTimer m_log_clk;
+   qint64     m_log_last_sum_ms   = -1;  /* 上次写摘要的时刻; < 0 = 这一趟还没写过 */
+   int        m_log_gap_win_ms    = 0;   /* **上一次摘要以来**最长的一次停顿。
+                                          * 与 m_max_gap_ms (会话最大值) 分开的理由见
+                                          * ecatcmd::busSummaryFields: 会话最大值会被某一次大的
+                                          * 钉死, 后面真正出事的那些在摘要上就再也看不见了 */
+   int        m_log_burst_frames  = 0;   /* 本轮连续坏帧的峰值 (掉出 OP / 恢复时印出来) */
+   int        m_log_burst_start_ms = 0;  /* 本轮坏帧从哪个 clk 开始的 (算 dur_ms) */
+   bool       m_log_burst_open    = false;/* 这一轮坏帧已经开过口了吗 —— **防逐帧刷屏**的关键:
+                                          * 坏/好逐帧翻转时没有它就会每 2 ms 来一行 */
+   bool       m_log_limit[EM_MAX_AXES] = {};  /* 逐轴限位**上一次**是不是触发的 (只记边沿) */
+   bool       m_log_fault_on = false;    /* 上一帧驱动器是不是在报故障 (只记边沿)。
+                                          * **不能拿 m_fault_latched 顶替**: 它在这一帧已经被
+                                          * 改成与 t.fault 一样了, 边沿信息在那一刻就没了 */
 
    /* 最近一次读到的 AL 状态 (只在 comm_bad 的**上升沿**读一次, 见 publish())。
     * 存成员而不是只在那一圈的电文里: 用户真正遇到的是**闩锁**的报警 —— 报警过去之后

@@ -5,6 +5,7 @@
 #include "mapcanvas.h"
 #include "metercurve.h"
 #include "meterlog.h"
+#include "runlog.h"
 #include "scanstyle.h"
 
 #include <QAbstractSpinBox>
@@ -1300,6 +1301,56 @@ ScanWindow::ScanWindow(QWidget *parent) : QMainWindow(parent)
 
    buildUi();
    applyCsvDefaultName();
+
+   /* ---------------------------------------------------------------- 长时间稳定性异常日志
+    *
+    * 定义、格式与完整的字段表见 docs/scan_runlog.md; 为什么要这样分层见 scan/runlog.h 顶部。
+    * 一句话: **工作线程只入队, 落盘只在 GUI 线程** —— 往 2 ms 一圈的总线循环里塞一次写盘,
+    * 是拿被测对象换日志。
+    *
+    * 摆在这里 (buildUi 之后、m_thr->start() 与 openMeter() 之前) 是硬要求:
+    *   · buildUi 之后 —— 打不开那句要上横幅, 横幅那时才存在;
+    *   · 两个 start 之前 —— setLogSink 两边都写明"只能在启动前设一次" (工作线程只读,
+    *     后面再换就是并发读写。见 EcatThread::setLogSink / OphirMeter::setLogSink 的注释)。
+    */
+   m_runlog = new RunLog;      /* ★ 故意不给 parent, 也永不 delete —— 理由见 scanwindow.h */
+
+   {
+      const QString logpath = outDirPath() + QStringLiteral("/scan_runlog.log");
+      QStringList   meta;
+      meta << QStringLiteral("exe=%1")
+                 .arg(QFileInfo(QCoreApplication::applicationFilePath()).fileName());
+      meta << QStringLiteral("built=%1 %2")
+                 .arg(QString::fromLatin1(__DATE__), QString::fromLatin1(__TIME__));
+      meta << QStringLiteral("qt=%1").arg(QString::fromLatin1(qVersion()));
+      meta << QStringLiteral("log=%1").arg(logpath);
+
+      QString lerr;
+      if (m_runlog->open(logpath, meta, &lerr))
+         m_runlog->line(QStringLiteral("LIFE"),
+                        QStringLiteral("start | - | 进程启动, 开始记录"));
+      else
+      {
+         /* 控制台留一句原话 (含系统给的原因), 屏幕上一句人能照做的。
+          * **仍然留着对象**: 它的 line() 会静默丢弃并计数, 上层一个判空都不必写 */
+         std::fprintf(stderr, "[scan] 异常日志打不开: %s\n", lerr.toUtf8().constData());
+         hint(QStringLiteral("异常日志打不开, 本次运行不记日志。请确认输出目录可写。"), true);
+      }
+   }
+
+   {
+      /* sink 在**工作线程**里执行, 所以它只许入队 —— RunLog::line 正好就是只入队的那一个
+       * (取时间戳 + 拼一行 + 短锁入队), 一个字节都不碰磁盘。 */
+      auto sink = [this](const QString &tag, const QString &body) { m_runlog->line(tag, body); };
+
+      m_thr->setLogSink(sink);
+      /* 只对真机那一路上 sink: 三个模拟源不会出异常, 给它们接上只会让日志里多一路空账 */
+      m_ophir->setLogSink(sink);
+   }
+
+   m_logDrain = new QTimer(this);
+   connect(m_logDrain, &QTimer::timeout, this, &ScanWindow::drainRunLog);
+   m_logDrain->start(1000);
 
    /* 软件零点: 把 ini 里那份种进工作线程, 并把世代接到 m_epoch 上 —— 下一句 setZeroEpoch
     * 用的就是它。**必须在这里**: buildUi() 里已经跑完 loadSettings (别的项都灌进去了),
@@ -2937,22 +2988,20 @@ QWidget *ScanWindow::buildShadePanel()
       applyShadeAutoUi(on);
    });
 
-   /* 两套说明按模式显隐。合成一句做不到: 两边的取舍正好相反 (锁定那句说"不跟着变"是优点,
-    * 自动那句得承认它变) */
+   /* 这一句只说**锁定**那一档 —— 自动那一档**没有**说明句 (2026-10-15 用户决定把那句删掉)。
+    * 合成一句做不到: 那句在自动档是**假话** (那时上下限每帧都在变), 所以 on 的时候整句收掉;
+    * 跟随的规则由勾选框自己的 tooltip 说 (见上面 m_cbShadeAuto), 同一件事在相隔两行的地方
+    * 说两遍本来就多余 (§37 那一族的做法)。
+    *
+    * 删掉的那个 m_lblAuto 留下的教训: 它被 new 的地方删了, 而 f->addRow 与
+    * applyShadeAutoUi 里的**引用各留了一处** —— 空指针进 QFormLayout 只是警告,
+    * setVisible 就是直接崩。**删标签时引用要一处不落地删干净**, 别只删 new。 */
    m_lblLocked = new QLabel(QStringLiteral(
       "色标锁定, 上下限固定, 不随数据变化。\n"
       "颜色仅表示读数在固定区间内的位置。\n"
       "超出范围的格子按端点着色, 数值仍可在悬停提示中读取。"), box);
-   m_lblAuto = new QLabel(QStringLiteral(
-      "色标跟随数据: 上下限 = 已采数据的最小值 / 最大值, 每次出现新极值时重算。\n"
-      "开启时上方两个数为只读显示。\n"
-      "超出范围的格子按端点着色, 数值仍可在悬停提示中读取。"), box);
-   for (QLabel *l : { m_lblLocked, m_lblAuto })
-   {
-      l->setWordWrap(true);
-      l->setStyleSheet(QStringLiteral("color:#6b7480;"));
-      l->setVisible(l == m_lblLocked);
-   }
+   m_lblLocked->setWordWrap(true);
+   m_lblLocked->setStyleSheet(QStringLiteral("color:#6b7480;"));
 
    /* [保存][取消] 摆在框标题那一行的右端, 不占这个表单的任何一行 */
    panelBar(PI_SHADE, box);
@@ -2973,7 +3022,6 @@ QWidget *ScanWindow::buildShadePanel()
    f->addRow(m_cbShadeAuto);
    f->addRow(m_btnFit);
    f->addRow(m_lblLocked);
-   f->addRow(m_lblAuto);
 
    /* 这一框没有"运行中锁住"的项 (改色阶不会把跑起来的那一趟弄歪), 也没有要等设备的项 */
    addPanel(PI_SHADE, box,
@@ -3119,8 +3167,8 @@ void ScanWindow::applyShadeAutoUi(bool on)
       on ? QAbstractSpinBox::NoButtons : QAbstractSpinBox::UpDownArrows;
    m_edShadeLo->setButtonSymbols(bs);
    m_edShadeHi->setButtonSymbols(bs);
+   /* 自动档没有说明句 (见 buildShadePanel): 这里只把锁定那句收掉, 不留一个空行 */
    m_lblLocked->setVisible(!on);
-   m_lblAuto->setVisible(on);
 
    if (on)
       syncShadeAuto();
@@ -5425,6 +5473,30 @@ void ScanWindow::disconnectAndStop()
    setConnected(false);
 }
 
+/* 稳定性日志的**唯一**落盘点 (GUI 线程, 1 s 一把, 关窗时再补一把)。
+ *
+ * 顺序不能反过来: 先 drain (把队排空、把队列腾出来), 再写"丢过多少"那一行 —— 倒过来写的话,
+ * 那一行正好挤在队列已满的时刻, 自己就成了被丢掉的那一行。 */
+void ScanWindow::drainRunLog()
+{
+   if (m_runlog == nullptr)
+      return;
+
+   QString err;
+   m_runlog->drain(&err);     /* 写盘 + 到上限就裁头; 失败不弹窗 (见 runlog.h 第 3 条) */
+
+   /* 背压丢行是**静默**的, 而"这一段日志缺了几行"正是事后最容易看错的地方 ——
+    * 曲线会看着像"那段时间一切正常"。所以计数一涨就补一条内务行, 让缺口在文件里看得见。 */
+   const quint64 dropped = m_runlog->dropped();
+   if (dropped > m_logDropped)
+   {
+      const quint64 lost = dropped - m_logDropped;
+      m_logDropped = dropped;
+      m_runlog->line(QStringLiteral("LIFE"),
+                     QStringLiteral("runlog_dropped | lost=%1 total=%2").arg(lost).arg(dropped));
+   }
+}
+
 void ScanWindow::closeEvent(QCloseEvent *e)
 {
    /* 扫描在跑也不弹确认框: 关窗 = 中止 + 断开, 已经采到的点都已经落在 CSV 里,
@@ -5435,6 +5507,17 @@ void ScanWindow::closeEvent(QCloseEvent *e)
     * 它那份 CSV 同理要在这时候落盘并关掉 (stop() 里做) */
    if (m_mlog != nullptr)
       m_mlog->stop();
+
+   /* 功率计那条工作线程也先收掉 —— **就从这一处提前** (从前要等窗口析构)。
+    *
+    * 两个理由, 缺一个都不行:
+    *   ① 它还在跑的时候会一直往稳定性日志里写行 (meter_summary 每 10 s 一条);
+    *   ② 下面 m_runlog->close() 之后再来行就只会被丢掉 —— "退出前那几笔"恰恰是最想看的。
+    * 行为上不会变: 它做的事与"窗口析构时"逐字一样, 只是提早到关窗这一刻。
+    * **它可能收不掉** (COM 调用卡在驱动里), 那时 close() 会把线程故意泄漏掉并留下
+    * meter_thread_leak 一笔 —— 那正是本功能要抓的异常之一。 */
+   if (m_ophir != nullptr)
+      m_ophir->close();
 
    if (m_thr->isRunning())
    {
@@ -5457,6 +5540,25 @@ void ScanWindow::closeEvent(QCloseEvent *e)
    /* 参数与网卡写回 scan.ini, 收尾之后才写: 上面那几步万一要弹"可能仍带电"的模态,
     * 那才是人要看的东西, 不该被一次写文件挡在前面 */
    saveSettings();
+
+   /* ---- 日志排空收摊。**必须排在所有写日志的东西都停之后** (上面那两步), 否则最后
+    * 那几笔 (ECAT|stop、meter_stop、meter_thread_leak) 还没排进来就被关了 */
+   if (m_logDrain != nullptr)
+      m_logDrain->stop();
+   if (m_runlog != nullptr)
+   {
+      drainRunLog();          /* 把队列里剩的写出去, 顺带把"丢过多少"落下来 */
+      m_runlog->close();      /* 排空 + flush + 关文件; 之后来的行静默丢弃并计数 */
+   }
+
+   /* 兜底: 把 sink 摘掉。RunLog 是进程寿命的 (见 scanwindow.h), 所以这里只是"关窗之后
+    * 不再往里面写", 与 use-after-free 无关 —— 那件事由"永不 delete"保证。
+    * ★ **顺序**: 上面 m_thr 已经 wait() 过、m_ophir 已经 close() 过, 两条工作线程都不在了,
+    *   所以这里摘 sink 没有并发。摘早了才会与正在跑的那条线程抢 m_log_sink。 */
+   if (m_thr != nullptr)
+      m_thr->setLogSink(nullptr);
+   if (m_ophir != nullptr)
+      m_ophir->setLogSink(nullptr);
 
    e->accept();
 }

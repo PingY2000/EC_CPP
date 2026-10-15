@@ -42,6 +42,9 @@ class MapCanvas;
 class MeterLog;
 class MeterCurve;
 
+/* 长时间稳定性异常日志 (见 runlog.h / docs/scan_runlog.md)。同一条规矩: 只用指针 */
+class RunLog;
+
 /* 滚轮闸, 定义在 .cpp 里 */
 class WheelNeedsCtrl;
 
@@ -316,6 +319,11 @@ private:
    /* 真机打不开那两句原因 (纯注册表查询, 不阻塞)。空 = 可以试着开 */
    static QString ophirOpenWhy();
 
+   /* ---- 长时间稳定性异常日志 (docs/scan_runlog.md) ----
+    * **GUI 线程的消费者**: 把工作线程排进 RunLog 的行写盘, 顺带把"被背压丢掉了多少行"
+    * 说一句。工作线程那一侧只入队, 落盘的**唯一**地方就是这里 (见 runlog.h 第 1 条)。 */
+   void drainRunLog();
+
    /* ---- 三件套 ---- */
    EcatThread       *m_thr  = nullptr;
    EcatBusView      *m_busv = nullptr;
@@ -346,6 +354,19 @@ private:
     * 「读一次」那第三方 2026-09-28 删了 (见 docs/scan_sweep.md §36)。 */
    MeterLog   *m_mlog  = nullptr;
    MeterCurve *m_curve = nullptr;
+
+   /* ---- 长时间稳定性异常日志 ----
+    * 定义、格式与字段表见 docs/scan_runlog.md; 为什么长这样见 scan/runlog.h 顶部。
+    *
+    * ★ **它是进程寿命的, 永不 delete** —— 与 scanwindow 的寿命**故意不一样**。
+    *   功率计那条工作线程在收不掉的时候是被故意泄漏的 (见 ophirmeter.cpp 的 close()/析构),
+    *   它**还在跑**、还会往这个 sink 上回调; 窗口析构时把它一起删掉, 那条线程就会踩在
+    *   已经释放的对象上 —— 这正是本功能要记录的异常, 却会让程序在记录它的过程中崩掉。
+    *   收尾只调 close() (排空 + flush + 关文件), 之后再来的 line() 静默丢弃并计数。
+    *   全仓库既有的先例就是"泄漏优于崩溃" (那几处也是这么写的)。 */
+   RunLog     *m_runlog = nullptr;
+   QTimer     *m_logDrain = nullptr;      /* 1 s 一把, 见 drainRunLog() */
+   quint64     m_logDropped = 0;          /* 上次看到的丢弃计数 (涨了才写一行) */
 
    /* ---- 顶栏 ---- */
    QComboBox   *m_nic       = nullptr;
@@ -449,8 +470,7 @@ private:
    QLabel         *m_lShadeUnit  = nullptr;
    QPushButton    *m_btnFit      = nullptr;
    QCheckBox      *m_cbShadeAuto = nullptr;
-   QLabel         *m_lblLocked   = nullptr;   /* 锁定模式那两句说明 (两行, 按模式显隐) */
-   QLabel         *m_lblAuto     = nullptr;
+   QLabel         *m_lblLocked   = nullptr;   /* 锁定那档的说明 (自动那档没有说明句, 见 .cpp) */
 
    /* ---- 功率计 ----
     * **这一块框不在可用性表里** (2026-09-22 起): 它里面没有"参数", 只有一台随时可以接上/断开的
