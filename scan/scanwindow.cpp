@@ -2649,15 +2649,51 @@ QWidget *ScanWindow::buildMeterPanel()
 
    m_devBox = new QWidget(box);
    {
-      QFormLayout *f = new QFormLayout(m_devBox);
+      /* **两列** (2026-10-15, 用户原话: "功率计界面 波长 量程 模式 filter改为两列"):
+       * 这四行纵排改成两行两列 —— 波长 / 量程 一行, 模式 / Filter 一行。
+       * 写法照抄 buildParamPanel() 里那套 `pair` / `lone` 游标 (2026-09-28 §37 把「扫描参数」
+       * 从 QFormLayout 改成两列的就是它), 两处不必各写一套。
+       *
+       * **QGridLayout 与 QFormLayout 有一处不能直接换**: 下面「添加波长」那一行原来是靠
+       * `QFormLayout::labelForField(row)` 拿到它左边那个标签、两个一起藏起来的; QGridLayout
+       * 没有那个函数 (它只管格子, 不管"哪一个是这一行的标签")。所以那一行的标签现在由这里
+       * **自己建、自己留着指针**, 藏的时候连它一起藏 —— 屏幕上的行为与改之前一字不差
+       * (QFormLayout 与 QGridLayout 都跳过隐藏的格子, 那两行照旧各自收掉)。
+       *
+       * **量过 (2026-10-15, offscreen 探针, 宽度钉在这框可用宽 374 px, 与 §37.12 同一个做法)**:
+       *   纵排(QFormLayout) 151x157, 每个下拉 **326 px**
+       *   两列(QGridLayout) 184x83,  每个下拉 **154 px**
+       * 也就是**矮 74 px (整整两行)**, 代价是**每个下拉窄掉一半**。这一框只有 374 px 可用,
+       * 把侧栏拖到最窄是 314 px (§46.2) —— 而这一格的布局**最小**只要 184 px, 两种宽度都放得下
+       * (374 px 下每个下拉比它自己的下限还高 95 px)。这一格的字都很短 (`1100 nm` 是波长那一列
+       * 最长的, 那是 `k_wl_max_nm` 写死的; Filter 那一列是本机表头报的 `OUT` / `IN`), 不截。
+       * **这一条量的是布局, 不是屏幕** —— 真界面上什么样仍归 §37.7 那份清单 (第 23 条)。 */
+      QGridLayout *f = new QGridLayout(m_devBox);
       f->setContentsMargins(0, 0, 0, 0);
+      /* 两个控件列各自吃掉多余宽度; 标签列不伸展 (它们只要那么宽) */
+      f->setColumnStretch(1, 1);
+      f->setColumnStretch(3, 1);
+
+      /* row / col 是游标: col = 0 表示这一格是某行的左半, 2 表示右半。
+       * 每 pair 一次推进一格, 填满一行 (两格) 才换行 —— 与 buildParamPanel 同一份游标逻辑 */
+      int row = 0, col = 0;
 
       auto addDevRow = [&](const QString &name, QComboBox **cb) {
          *cb = new QComboBox(m_devBox);
          (*cb)->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
          /* 不在这里 setEnabled(false): 灰不灰归 refreshMeterPanel() 一处管 (它每拍重算) */
          connect(*cb, &QComboBox::currentIndexChanged, this, &ScanWindow::onMeterCfgChanged);
-         f->addRow(name, *cb);
+         const int c = (col == 0) ? 0 : 2;
+         /* 标签右对齐: 与改两列之前那张表单同一个读法 (控件紧挨着标签左侧那一列) */
+         f->addWidget(new QLabel(name, m_devBox), row, c, Qt::AlignRight | Qt::AlignVCenter);
+         f->addWidget(*cb, row, c + 1);
+         if (c == 0)
+            col = 1;
+         else
+         {
+            col = 0;
+            row++;
+         }
       };
       addDevRow(QStringLiteral("波长"), &m_cbWl);
       addDevRow(QStringLiteral("量程"), &m_cbRange);
@@ -2669,7 +2705,7 @@ QWidget *ScanWindow::buildMeterPanel()
        * 探头没有这一项时 (光电二极管之外) 这一格是空表 + 灰的, 由 refreshMeterPanel 判 */
       addDevRow(QStringLiteral("Filter"), &m_cbFilter);
 
-      /* 「添加波长」—— 设备给的那几档之外的值。它是**写设备**的动作, 所以与上面三个下拉框
+      /* 「添加波长」—— 设备给的那几档之外的值。它是**写设备**的动作, 所以与上面那四个下拉框
        * 一样归 m_devBox (真机开着才露) , 可不可按另算 (见 refreshMeterPanel)
        *
        * **2026-09-28 晚: 整行藏起来** (用户原话"隐藏添加波长功能", 见 §37.12)。**代码一个
@@ -2677,16 +2713,26 @@ QWidget *ScanWindow::buildMeterPanel()
        * 钉着它的那几条断言都照旧在 ("保留但不露", 与 `MeterLog::setAverage` 同一个处理);
        * 想恢复就把下面那两句 `setVisible(false)` 删掉, 别的都不用动。
        *
-       * **行与它的标签要一起藏**: `addRow(QString, QWidget*)` 自己造的那个标签不属于这一行,
-       * 只藏行的话左边那一列会留下「添加波长」四个字。两个都藏了 QFormLayout 就把整行收掉
-       * (2026-09-28 实测: 隐藏前 form 高 101 px, 之后 72 px —— 正好少一行, 不留空行) */
+       * **行与它的标签要一起藏**: 左边那四个字是一个**独立**的控件, 不属于这一行 ——
+       * 只藏行的话那一列会留下「添加波长」四个字。两个都藏了, 布局就把整行收掉
+       * (2026-09-28 实测, 当时还是 QFormLayout: 隐藏前 form 高 101 px, 之后 72 px ——
+       * 正好少一行, 不留空行。**换 QGridLayout 之后同一天又量了一次, 同一条成立**:
+       * 露出来 112 px, 藏起来 83 px —— 差 29 px, 正是这一行自己的高 (它比一个下拉框高一点),
+       * 底下那行诊断跟着上移, 没有留空行、也没有留下半个标签) */
       {
-         QWidget *row = new QWidget(m_devBox);
-         QHBoxLayout *h = new QHBoxLayout(row);
+         /* 这一行是"标签 + 一个横排容器", 与上面那两行(标签 控件 标签 控件)不是一套:
+          * 标签占第 0 列, 容器**跨第 1~3 列** —— 那一行里旋钮要伸展, 所以起点在第 1 列而不是
+          * 第 2 列 (放第 2 列的话它会被压在半行里)。下面那行诊断跨满四列是另一个理由 (它没有标签) */
+
+         QLabel *wlLabel = new QLabel(QStringLiteral("添加波长"), m_devBox);
+         f->addWidget(wlLabel, row, 0, Qt::AlignRight | Qt::AlignVCenter);
+
+         QWidget *wlRow = new QWidget(m_devBox);
+         QHBoxLayout *h = new QHBoxLayout(wlRow);
          h->setContentsMargins(0, 0, 0, 0);
          h->setSpacing(6);
 
-         m_sbWlAdd = new QSpinBox(row);
+         m_sbWlAdd = new QSpinBox(wlRow);
          m_sbWlAdd->setRange(k_wl_min_nm, k_wl_max_nm);   /* 与工作线程的越界拒绝同一份常量 */
          m_sbWlAdd->setSuffix(QStringLiteral(" nm"));
          m_sbWlAdd->setToolTip(QStringLiteral(
@@ -2694,16 +2740,16 @@ QWidget *ScanWindow::buildMeterPanel()
             "写入后会向设备读回一次列表核对。"));
          h->addWidget(m_sbWlAdd, 1);
 
-         m_btnWlAdd = new QPushButton(QStringLiteral("添加"), row);
+         m_btnWlAdd = new QPushButton(QStringLiteral("添加"), wlRow);
          m_btnWlAdd->setToolTip(QStringLiteral("写进设备并选中; 写入后向设备读回一次列表核对。"));
          connect(m_btnWlAdd, &QPushButton::clicked, this, &ScanWindow::onMtrAddWavelength);
          h->addWidget(m_btnWlAdd);
 
-         f->addRow(QStringLiteral("添加波长"), row);
+         f->addWidget(wlRow, row, 1, 1, 3);
 
-         row->setVisible(false);
-         if (QWidget *wlLabel = f->labelForField(row))
-            wlLabel->setVisible(false);
+         wlLabel->setVisible(false);
+         wlRow->setVisible(false);
+         row++;
       }
 
       /* 诊断那一行 —— **只剩** ROM 版本 / 探头类型 / 驱动报的两个版本号 (2026-09-28 §37.10:
@@ -2714,7 +2760,7 @@ QWidget *ScanWindow::buildMeterPanel()
       m_lDevInfo->setWordWrap(true);
       m_lDevInfo->setTextFormat(Qt::PlainText);   /* 同样是设备给的字 */
       m_lDevInfo->setStyleSheet(QStringLiteral("color:#7b8391;"));
-      f->addRow(m_lDevInfo);
+      f->addWidget(m_lDevInfo, row, 0, 1, 4);   /* 跨满四列: 它不属于「标签 + 控件」那一对 */
    }
    v->addWidget(m_devBox);
 
