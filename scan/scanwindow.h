@@ -468,9 +468,12 @@ private:
    QComboBox      *m_cbShadeUnit = nullptr;
    /* 实际生效的是哪个单位 (只读)。随取样源模式下它跟着源每拍变, 由 refreshMeterReadout() 写 */
    QLabel         *m_lShadeUnit  = nullptr;
+   /* 「按数据定标」与「自动跟随数据」**同一行** (2026-10-15), 由 buildShadePanel 里一个
+    * `QHBoxLayout` 容器收着, 容器本身不留成员 —— 只有那一处用得到它 */
    QPushButton    *m_btnFit      = nullptr;
    QCheckBox      *m_cbShadeAuto = nullptr;
-   QLabel         *m_lblLocked   = nullptr;   /* 锁定那档的说明 (自动那档没有说明句, 见 .cpp) */
+   /* m_lblLocked (锁定那档的三行说明) 2026-10-15 删了, 连同屏幕上那一行 —— 不再是"藏着",
+    * 是**没有了**。理由与引用清单见 buildShadePanel 末尾那段注 */
 
    /* ---- 功率计 ----
     * **这一块框不在可用性表里** (2026-09-22 起): 它里面没有"参数", 只有一台随时可以接上/断开的

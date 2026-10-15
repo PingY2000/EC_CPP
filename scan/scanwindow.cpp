@@ -3034,21 +3034,6 @@ QWidget *ScanWindow::buildShadePanel()
       applyShadeAutoUi(on);
    });
 
-   /* 这一句只说**锁定**那一档 —— 自动那一档**没有**说明句 (2026-10-15 用户决定把那句删掉)。
-    * 合成一句做不到: 那句在自动档是**假话** (那时上下限每帧都在变), 所以 on 的时候整句收掉;
-    * 跟随的规则由勾选框自己的 tooltip 说 (见上面 m_cbShadeAuto), 同一件事在相隔两行的地方
-    * 说两遍本来就多余 (§37 那一族的做法)。
-    *
-    * 删掉的那个 m_lblAuto 留下的教训: 它被 new 的地方删了, 而 f->addRow 与
-    * applyShadeAutoUi 里的**引用各留了一处** —— 空指针进 QFormLayout 只是警告,
-    * setVisible 就是直接崩。**删标签时引用要一处不落地删干净**, 别只删 new。 */
-   m_lblLocked = new QLabel(QStringLiteral(
-      "色标锁定, 上下限固定, 不随数据变化。\n"
-      "颜色仅表示读数在固定区间内的位置。\n"
-      "超出范围的格子按端点着色, 数值仍可在悬停提示中读取。"), box);
-   m_lblLocked->setWordWrap(true);
-   m_lblLocked->setStyleSheet(QStringLiteral("color:#6b7480;"));
-
    /* [保存][取消] 摆在框标题那一行的右端, 不占这个表单的任何一行 */
    panelBar(PI_SHADE, box);
 
@@ -3065,9 +3050,38 @@ QWidget *ScanWindow::buildShadePanel()
    m_lShadeUnit->setStyleSheet(QStringLiteral("color:#7b8391;"));
    f->addRow(m_lShadeUnit);
 
-   f->addRow(m_cbShadeAuto);
-   f->addRow(m_btnFit);
-   f->addRow(m_lblLocked);
+   /* 「自动跟随数据」与「按数据定标」**同一行** (2026-10-15, 用户原话: "自动跟随数据 和
+    * 按数据定标按钮要在同一行 且下面不要有标签了")。
+    *
+    * 这两件本来就是一件事的两头: 勾上 = 每帧都按数据定标, 按钮 = 只按这一次。摆在一行上,
+    * "按数据定标在自动跟随时是灰的"这个因果一眼就看得出来 (原来各占一行、中间隔着别的东西,
+    * 看着像两件不相干的控件)。
+    *
+    * 写法与功率计那一框的「间隔 / 曲线时长 / 清空」同一套 (`QHBoxLayout`, 末尾一个
+    * `addStretch` 把多余的宽度吃掉); 用 `addRow(QWidget *)` 进表单, 所以整行跨两列 ——
+    * 这一行**没有标签**, 与它上面那几行(标签 + 控件)不是一套。 */
+   {
+      QWidget *shadeRow = new QWidget(box);
+      QHBoxLayout *h = new QHBoxLayout(shadeRow);
+      h->setContentsMargins(0, 0, 0, 0);
+      h->setSpacing(8);
+      h->addWidget(m_cbShadeAuto);
+      h->addWidget(m_btnFit);
+      h->addStretch(1);
+      f->addRow(shadeRow);
+   }
+
+   /* **原来这下面还有一段三行的说明** (m_lblLocked: "色标锁定, 上下限固定, 不随数据变化。…"),
+    * 2026-10-15 连同上面那一句"下面不要有标签了"一起**删掉了** —— 屏幕上一个字节都不剩。
+    * 它讲的"锁定是什么、超出范围的格子怎么显示"是**设计理由**, 按 CLAUDE.md §3 搬进文档
+    * (docs/scan_sweep.md 那一节开头那段"色阶是锁定的, 不跟着数据实时变"记的就是同一件事);
+    * 「自动跟随数据」这一档的规则由勾选框自己的 tooltip 说, 不在屏幕上再说一遍。
+    *
+    * **删标签时的教训** (删 m_lblAuto 那一次留下的, 这一处照它办): 一个标签除了 `new`,
+    * 在 `addRow` 与 `applyShadeAutoUi` 里还各有一处**引用** —— 只删 `new` 的话,
+    * 空指针进 `QFormLayout` 只是警告, 而 `setVisible` 是**直接崩**。
+    * **引用要一处不落地删干净**, 所以这一处同时删了: 这个文件里的 `new` / `addRow` /
+    * `applyShadeAutoUi` 那一句, 以及 `scanwindow.h` 里那个成员。 */
 
    /* 这一框没有"运行中锁住"的项 (改色阶不会把跑起来的那一趟弄歪), 也没有要等设备的项 */
    addPanel(PI_SHADE, box,
@@ -3207,14 +3221,13 @@ void ScanWindow::applyShadeAutoUi(bool on)
    m_edShadeHi->setReadOnly(on);
    /* 只读的框**不再画上下箭头**: 箭头画着、点上没反应, 与"亮着却没用"是同一条骗人
     * (2026-09-29 用户报的「上下按钮都没有用」里就有这两个)。只读就是读数, 读数该长成读数的
-    * 样子 —— 下面那句「开启时上方两个数为只读显示」才是实话。
+    * 样子 —— 没有箭头就是"这是数、不是输入"那一句话本身 (2026-10-15 起屏幕上不再有
+    * 替它解释的说明句, 见 buildShadePanel 末尾那段注)。
     * 关掉自动跟随时两个框又变回输入框, 箭头跟着回来 (那一趟会重排, 闸会再裁一次) */
    const QAbstractSpinBox::ButtonSymbols bs =
       on ? QAbstractSpinBox::NoButtons : QAbstractSpinBox::UpDownArrows;
    m_edShadeLo->setButtonSymbols(bs);
    m_edShadeHi->setButtonSymbols(bs);
-   /* 自动档没有说明句 (见 buildShadePanel): 这里只把锁定那句收掉, 不留一个空行 */
-   m_lblLocked->setVisible(!on);
 
    if (on)
       syncShadeAuto();
