@@ -311,7 +311,17 @@ void EcatThread::postCenter(int axis)
 void EcatThread::postCenterAll()
 {
    QMutexLocker lk(&m_mtx);
-   for (int i = 0; i < EM_MAX_AXES; i++)
+
+   /* 只发**存在**的轴 —— doCenter() 对 `axis >= m_naxis` 直接返回 (见那里), 所以发
+    * EM_MAX_AXES 个与发 naxis 个做的事逐条相同, 区别只在日志与队列开销上:
+    * 2026-10-16 那一趟的 2 轴台子上按一次「置中」写出了 8 对 cmd_begin / cmd_end, 其中
+    * 6 对 (ax=2…7) 是空转 —— 而那条日志行的用处正是"精确点名是哪一下", 掺进 6 对不存在的轴
+    * 等于把它稀释掉。
+    *
+    * 读的是电文里的那份 naxis, **不是 m_naxis**: 后者只有工作线程碰 (见它的声明), 界面线程
+    * 读它就是一个没上锁的竞态; m_telem 由 m_mtx 保护, 而这里正持着它。 */
+   const int n = m_telem.naxis;
+   for (int i = 0; i < n; i++)
    {
       Cmd c; c.type = CMD_CENTER; c.axis = i;
       m_cmds.enqueue(c);
@@ -374,7 +384,12 @@ EcatThread::BlockTick::BlockTick(EcatThread *t) : m_t(t)
    /* "下面这一段时间里主循环发不出帧, 是我们自己造成的" —— 给帧间隔归因用。
     * **在构造时置起、不在析构时清**: 命令跑完那一刻正是那个间隔被测到的那一刻,
     * 析构先清掉就什么都归不到自己头上了, 于是我们自己一次使能造成的 1 秒静默会被
-    * 读成"这台 PC 在卡", 把人支去查电源计划与网卡节能 (见 recover_verdict)。 */
+    * 读成"这台 PC 在卡", 把人支去查电源计划与网卡节能。
+    *
+    * 这个归因**一路传到 recover_verdict 的 self_caused** (2026-10-16 才接通): 在那之前它
+    * 止步于摘要的 gap_self 与日志的 gaps_over_self, 而屏幕上那句"请检查电源计划与网卡节能"
+    * 照样每次使能都弹一次 —— 9 h 47 min 实跑里就有这么一条 recover_master | last_gap=1628。
+    * 见 recover_verdict 里 self_caused 那一段。 */
    m_t->m_gap_self_want = true;
 
    /* **只有最外层那一次真的挂钩子** (理由见头文件里的 m_tick_depth)。
@@ -475,13 +490,22 @@ void EcatThread::run()
 
          const qint64 svc_t1 = clk.elapsed();
 
+         /* 这一段是不是**我们自己**造成的。默认 false: 还没量到间隔的那一圈 (刚进 OP 的
+          * 第一帧) 谈不上"自家造成"。
+          *
+          * **为什么提到循环体这一层**: serviceAutoRecover() 要等到这一圈的最后才被调, 而
+          * recover_verdict 需要这个归因, 好把自家造成的静默从"这台 PC 在卡"里摘出去
+          * (见那里 self_caused 那一段)。提一个局部变量比多存一个成员干净 —— 不用维护一份
+          * "哪些地方该清它"的清单, 也就没有清漏一个的可能。 */
+         bool self_caused = false;
+
          if (m_svc_prev_ms >= 0)
          {
             const qint64 gap = svc_t0 - m_svc_prev_ms;
 
-            /* 这一段是不是**我们自己**造成的 (刚跑完一条会静默总线的命令, 见 BlockTick)。
-             * m_gap_self_want 在这里消费掉 —— 置它的那次命令与本测量之间不会插别的测量。 */
-            const bool self_caused = m_gap_self_want;
+            /* 刚跑完一条会静默总线的命令 (见 BlockTick)。m_gap_self_want 在这里消费掉 ——
+             * 置它的那次命令与本测量之间不会插别的测量。 */
+            self_caused = m_gap_self_want;
             m_gap_self_want = false;
 
             m_last_gap_ms = (int)gap;
@@ -557,7 +581,7 @@ void EcatThread::run()
           * **调用点只能在这里, 不许搬进 publish()**: publish() 就是 BlockTick::tick 的
           * 回调体, 在它里面触发会经 em_recover_op -> em__cycle -> tick -> publish 当场递归,
           * 而 BlockTick 的注释已经写明这条。摆在这一圈的最后, 遥测与帧间隔都已经结完账。 */
-         serviceAutoRecover(svc_t1);
+         serviceAutoRecover(svc_t1, self_caused);
       }
       else
       {
@@ -2434,7 +2458,7 @@ void EcatThread::doStop()
  * 不清驱动器故障、不碰仍在 OP 的轴。三条规矩逐条写在 em_recover_op 的注释里。
  *
  * 调用点**只能**在 run() 那一圈的最后 (publish 之后) —— 见 run() 里那段说明。 */
-void EcatThread::serviceAutoRecover(qint64 now_ms)
+void EcatThread::serviceAutoRecover(qint64 now_ms, bool self_caused)
 {
    if (m_bus == nullptr || !m_in_op || m_naxis <= 0)
       return;
@@ -2459,10 +2483,13 @@ void EcatThread::serviceAutoRecover(qint64 now_ms)
    if (em_slave_count(m_bus) != m_naxis)
       return;
 
+   /* self_caused 一路传到底: 刚刚那个间隔若是本程序自己的命令造成的 (复位/使能/回零期间
+    * SOEM 的 SDO 事务一帧都不发), 它就不构成"这台 PC 在卡"的证据 —— 2026-10-16 那一趟
+    * 每次使能之后都误报一条 recover_master / 屏幕上那句"请检查电源计划与网卡节能"就是它。 */
    const ecatcmd::RecoverVerdict v =
       ecatcmd::recover_verdict(m_last_gap_ms, HMI_GAP_WARN_MS,
                                m_gap_ok_run, HMI_RECOVER_ARM_FRAMES,
-                               m_recover_tries, HMI_RECOVER_MAX_TRIES);
+                               m_recover_tries, HMI_RECOVER_MAX_TRIES, self_caused);
 
    if (v == ecatcmd::RECOVER_NO)
       return;
@@ -2484,9 +2511,9 @@ void EcatThread::serviceAutoRecover(qint64 now_ms)
    if (v == ecatcmd::RECOVER_MASTER || v == ecatcmd::RECOVER_GIVEUP)
    {
       /* ★ 这一句**只说这一帧迟了**, 不许再说"不在从站" (2026-10-15 去掉)。
-       * 判据是 recover_verdict 里那一条 `cur_gap_ms > gap_limit_ms` —— 它量的是**本机两次发帧
-       * 之间隔了多久**, 一个字都没说从站好不好。而 AL 只在 comm_bad 的上升沿读一次、还只读
-       * 第一台从站, 拿它替从站背书同样越界。
+       * 判据是 recover_verdict 里那一条 `cur_gap_ms > gap_limit_ms && !self_caused` —— 它量的
+       * 是**本机两次发帧之间隔了多久**, 一个字都没说从站好不好。而 AL 只在 comm_bad 的上升沿
+       * 读一次、还只读第一台从站, 拿它替从站背书同样越界。
        *
        * 与 2026-09-23 那次是同一个错、方向相反: 那次写的是"从站仍不在 OP"(没查过 AL),
        * 被它自己下一条消息当场打脸。**判据没查的东西, 措辞就不许说。**

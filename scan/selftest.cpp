@@ -7666,39 +7666,62 @@ static void test_autorecover()
    /* 判据的**次序**是内容: 先报"本机现在就在卡"这条最要紧的结论, 再报"试满了"。 */
    caseBegin("自动恢复: 该不该动手 (顺序 = 内容: MASTER 必须压过 GIVEUP)");
    {
-      checkEq(recover_verdict(LIM, LIM, ARM, ARM, 0, MAXT), RECOVER_TRY,
+      checkEq(recover_verdict(LIM, LIM, ARM, ARM, 0, MAXT, false), RECOVER_TRY,
               "刚好到阈值 (50) → 不算「本机在卡」, 且本机已经稳够 → 动手");
-      checkEq(recover_verdict(LIM + 1, LIM, ARM, ARM, 0, MAXT), RECOVER_MASTER,
+      checkEq(recover_verdict(LIM + 1, LIM, ARM, ARM, 0, MAXT, false), RECOVER_MASTER,
               "超过阈值一毫秒 (51) → 本机在卡, 不许动从站");
 
       /* **两条同时成立**: 本机在卡 **且** 本会话已试满 —— 必须先说前者 (根因), 而不是
        * "试满了" (那只是个结果)。写反了操作员会去点重连, 而真正该查的是这台 PC。 */
-      checkEq(recover_verdict(LIM + 500, LIM, ARM, ARM, MAXT, MAXT), RECOVER_MASTER,
+      checkEq(recover_verdict(LIM + 500, LIM, ARM, ARM, MAXT, MAXT, false), RECOVER_MASTER,
               "本机在卡 + 已试满 → 先说「本机在卡」");
-      checkEq(recover_verdict(LIM, LIM, ARM, ARM, MAXT, MAXT), RECOVER_GIVEUP,
+      checkEq(recover_verdict(LIM, LIM, ARM, ARM, MAXT, MAXT, false), RECOVER_GIVEUP,
               "本机不卡但已试满 → 只剩「重连总线」");
 
       /* 本机按时发帧还没跑够 ARM 帧 → 那一段停顿**还不能算过去了**: 从站可能正被
        * SM 看门狗踢出来, 这时候请求 OP 是白费一次机会 (而且它会消耗掉冷却与次数) */
-      checkEq(recover_verdict(2, LIM, 0, ARM, 0, MAXT), RECOVER_NO, "刚缓过来一帧 → 不动手");
-      checkEq(recover_verdict(2, LIM, ARM - 1, ARM, 0, MAXT), RECOVER_NO,
+      checkEq(recover_verdict(2, LIM, 0, ARM, 0, MAXT, false), RECOVER_NO, "刚缓过来一帧 → 不动手");
+      checkEq(recover_verdict(2, LIM, ARM - 1, ARM, 0, MAXT, false), RECOVER_NO,
               "差一帧到 arming → 不动手 (边界**不含**右边)");
-      checkEq(recover_verdict(2, LIM, ARM, ARM, 0, MAXT), RECOVER_TRY,
+      checkEq(recover_verdict(2, LIM, ARM, ARM, 0, MAXT, false), RECOVER_TRY,
               "正好到 arming → 动手 (边界**含**右边)");
 
       /* 阈值参数非法 (`<= 0`) 一律 RECOVER_NO —— 被改成 0 是个非法阈值, 不是"永不触发"
        * 以外的任何意思, 尤其不许变成"一帧都没按时发也动手"。与 comm_bad_from 同一套写法。 */
-      checkEq(recover_verdict(0, 0,    ARM, ARM,  0, MAXT), RECOVER_NO, "阈值 0 → 不动手");
-      checkEq(recover_verdict(0, -5,   ARM, ARM,  0, MAXT), RECOVER_NO, "负阈值 → 不动手");
-      checkEq(recover_verdict(0, LIM,  ARM, 0,    0, MAXT), RECOVER_NO, "arming 为 0 → 不动手");
-      checkEq(recover_verdict(0, LIM,  ARM, -1,   0, MAXT), RECOVER_NO, "负 arming → 不动手");
-      checkEq(recover_verdict(0, LIM,  ARM, ARM,  0, 0),    RECOVER_NO, "上限为 0 → 不动手");
-      checkEq(recover_verdict(0, LIM,  ARM, ARM,  0, -3),   RECOVER_NO, "负上限 → 不动手");
+      checkEq(recover_verdict(0, 0,    ARM, ARM,  0, MAXT, false), RECOVER_NO, "阈值 0 → 不动手");
+      checkEq(recover_verdict(0, -5,   ARM, ARM,  0, MAXT, false), RECOVER_NO, "负阈值 → 不动手");
+      checkEq(recover_verdict(0, LIM,  ARM, 0,    0, MAXT, false), RECOVER_NO, "arming 为 0 → 不动手");
+      checkEq(recover_verdict(0, LIM,  ARM, -1,   0, MAXT, false), RECOVER_NO, "负 arming → 不动手");
+      checkEq(recover_verdict(0, LIM,  ARM, ARM,  0, 0,    false), RECOVER_NO, "上限为 0 → 不动手");
+      checkEq(recover_verdict(0, LIM,  ARM, ARM,  0, -3,   false), RECOVER_NO, "负上限 → 不动手");
 
       /* 参数顺序写反 (把 arm 帧数当阈值传) 是这一族函数最容易犯的错, 这里钉一个不对称的
        * 输入: 阈值 1000 而 ok_run 只有 50 → 必须是 NO 而不是 TRY/MASTER。 */
-      checkEq(recover_verdict(50, ARM, 50, ARM, 0, MAXT), RECOVER_NO,
+      checkEq(recover_verdict(50, ARM, 50, ARM, 0, MAXT, false), RECOVER_NO,
               "阈值被误写成 1000 时不许动手 (防参数传串)");
+   }
+
+   /* 自家造成的静默 (复位/使能/回零期间 SOEM 的 SDO 事务一帧都不发) **不构成"这台 PC 在卡"
+    * 的证据** —— 2026-10-16 那一趟每次「使能」之后 2 ms 就出一条
+    * `recover_master | last_gap=1628`, 而屏幕上那句把人支去查电源计划与网卡节能。
+    *
+    * 钉两件事: ① 同一个 51 ms 的间隔, 归因一改成"自家造成"就不再是 MASTER;
+    * ② **它不是"一律 RECOVER_NO"** —— 摘掉的只有 MASTER 那一支, "试满了"与 arming 那两支
+    * 照常说话。写反成 `self_caused → NO` 就等于给自家命令发了一张免检通行证, 而总线真坏着
+    * 的那一次也照样有它自己的判据 (recover_bus_broken) 要过 —— 归因不许替它免检。 */
+   caseBegin("自动恢复: 自家的静默不算「本机在卡」(只摘 MASTER 一支, 不是一律 NO)");
+   {
+      checkEq(recover_verdict(LIM + 1, LIM, ARM, ARM, 0, MAXT, true), RECOVER_TRY,
+              "同一个 51 ms 改成自家造成 → 不再报 MASTER, 按「本机稳不够稳」往下判");
+      checkEq(recover_verdict(LIM + 1, LIM, ARM - 1, ARM, 0, MAXT, true), RECOVER_NO,
+              "自家造成 + 本机还没稳够 → 不动手 (不是 TRY)");
+      checkEq(recover_verdict(LIM + 1, LIM, ARM, ARM, MAXT, MAXT, true), RECOVER_GIVEUP,
+              "自家造成也照样报「试满了」—— 摘的只有 MASTER 那一支");
+      checkEq(recover_verdict(LIM + 500, LIM, 0, ARM, 0, MAXT, true), RECOVER_NO,
+              "自家造成 + 刚缓过来一帧 → 不动手");
+      /* 非法阈值压过归因: 归因不许把"阈值被改成 0"救成一次动手 */
+      checkEq(recover_verdict(LIM + 1, 0, ARM, ARM, 0, MAXT, true), RECOVER_NO,
+              "阈值非法时, 归因填哪个都是不动手");
    }
 
    /* 冷却: 两个反直觉的边界都在这里 —— **第一次动手不受限**, 而"cd <= 0"不是"过了"。 */

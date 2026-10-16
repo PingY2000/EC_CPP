@@ -2217,16 +2217,32 @@ enum RecoverVerdict
 /* cur_gap_ms: **刚刚**这一帧迟了多久 (不是会话最大值 —— 最大值一次停顿之后就再也下不来,
  *   拿它判就等于"从此永远认为本机在卡", 自动恢复再也动不了手)。
  * ok_run: 连续多少帧**按时**发出去了 (上位机的健康状况, 见 HMI_RECOVER_ARM_FRAMES)。
- * tries/max_tries: 本会话动过几次手 / 上限。 */
+ * tries/max_tries: 本会话动过几次手 / 上限。
+ * self_caused: 上面那个间隔是不是**本程序自己的命令**造成的 —— 复位/使能/回零期间 SOEM 的
+ *   SDO 事务一帧都不发 (见 EcatThread::m_gap_self_want 与 m_max_gap_self_ms)。
+ *
+ * ★ self_caused 只摘掉 RECOVER_MASTER 这一支, **不是**一律 RECOVER_NO —— 这是有意的:
+ *   "这一帧迟了"落在自家命令头上就不构成"这台 PC 在卡"的证据 (那几百毫秒是我们自己按下去的),
+ *   于是不许据此把人支去查电源计划与网卡节能; 可它同样不构成"本机够稳"的证据, 所以后面几支
+ *   照常走 —— 总线真坏着的时候, 动手与否该由 recover_bus_broken 那道闸说了算。
+ *
+ * 2026-10-16 补上这个参数 (9 h 47 min 实跑逼出来的): 那一趟每次「使能」之后 2 ms 就出一行
+ * `recover_master | last_gap=1628`, 而 1628 ms 正是我们自己那次使能造成的静默 —— 同一刻的
+ * 摘要里 `gap_self=1628` 白纸黑字。docs/scan_sweep.md §32 早就写着"自动恢复的触发只看净的
+ * 外部停顿", 但判据一直拿的是 m_last_gap_ms —— 文档在说一件代码没做的事, 这次把代码补齐。
+ *
+ * **不能**改成拿 m_gap_bad_ms 顶替这个参数: 那个量好帧归零, 而 publish() 就跑在本函数之前,
+ * 一次停顿之后紧跟一个好帧就把它清成 0 了 —— 那样 RECOVER_MASTER 会变成永远发不出来。 */
 inline RecoverVerdict recover_verdict(int cur_gap_ms, int gap_limit_ms,
                                       int ok_run, int arm_frames,
-                                      int tries, int max_tries)
+                                      int tries, int max_tries, bool self_caused)
 {
    if (gap_limit_ms <= 0 || arm_frames <= 0 || max_tries <= 0)
       return RECOVER_NO;
    /* 本机**现在**就在卡 -> 先说这个, 别去动从站: 这一帧都迟到, 请求 OP 之后下一帧
-    * 多半照样迟到, 从站只会被 SM 看门狗再踢一次。放在 tries 之前 —— 根因比结果要紧。 */
-   if (cur_gap_ms > gap_limit_ms)
+    * 多半照样迟到, 从站只会被 SM 看门狗再踢一次。放在 tries 之前 —— 根因比结果要紧。
+    * 自家造成的静默不算 (理由见上面 self_caused 那一段)。 */
+   if (cur_gap_ms > gap_limit_ms && !self_caused)
       return RECOVER_MASTER;
    if (tries >= max_tries)
       return RECOVER_GIVEUP;
@@ -2794,8 +2810,10 @@ private:
    void serviceFaultCodeReads();
 
    /* 兜底: 停顿过去了、从站没跟回来, 就自己把过程数据救回来 (em_recover_op)。
-    * **只能从 run() 的主循环调** (publish(wkc) 的下一行) —— 见 run() 里那一段注释。 */
-   void serviceAutoRecover(qint64 now_ms);
+    * **只能从 run() 的主循环调** (publish(wkc) 的下一行) —— 见 run() 里那一段注释。
+    * self_caused = 刚刚那个帧间隔是不是本程序自己的命令造成的 (同一个循环体的局部变量,
+    * 见 recover_verdict 的同名参数)。 */
+   void serviceAutoRecover(qint64 now_ms, bool self_caused);
    void doZero(int axis);
    void doCenter(int axis);
    void doRange(int32_t range);
