@@ -53,7 +53,13 @@ struct Params
 {
    double area_x_unit = 27.0;
    double area_y_unit = 27.0;
-   double res_unit    = 0.5;
+
+   /* 每根轴取几个点 (2026-10-27)。**点数是几何的唯一来源**: 分辨率由点数与区域算出
+    * (resX / resY), 不再是操作员直接输入的第三个数。两端都取 —— 首尾点正好落在区域边界上,
+    * 点数 55 / 区域 27 mm 时分辨率恰为 0.5 mm, 与旧缺省完全一致。 */
+   int    nx = 55;
+   int    ny = 55;
+
    double pulses_per_unit = 50000.0;
 
    uint32_t speed_pul_s        = 20000;   /* 会被 EcatThread 夹在 1000..100000 */
@@ -85,8 +91,20 @@ constexpr long long kMaxPlanPoints = 200000;
  * 为什么要有这条判据: QDoubleSpinBox::setValue 会把超范围的值**静默夹进来** (600 变成 500),
  * 于是"照 CSV 对齐"会悄悄对齐成另一个值, 而续扫那边一句"几何不一致"说得人不明不白。 */
 constexpr double kGeomAreaMin = 0.1,   kGeomAreaMax = 500.0;     /* mm */
-constexpr double kGeomResMin  = 0.001, kGeomResMax  = 50.0;      /* mm */
 constexpr double kGeomPpuMin  = 100.0, kGeomPpuMax  = 1000000.0; /* pul/mm */
+
+/* 点数输入框的量程 (2026-10-27)。**界面按这两个数 setRange, 判据也按它们判** —— 两处各写
+ * 一份的话, "CSV 里的值设得进面板吗"这件事迟早跟界面对不上 (与上面那三个 kGeom* 同一条)。
+ *
+ * 上限就是总点数上限: 另一根轴至少 2 点, 所以任何一根轴超过 kMaxPlanPoints 时总数必然超限,
+ * 不必再有一个更大的轴上限。下限 2 —— 1 点网格没有"分辨率"可言, axisCoordsByCount 也没有
+ * 可除的 (n-1)。 */
+constexpr int kGeomCountMin = 2;
+constexpr int kGeomCountMax = (int)kMaxPlanPoints;
+static_assert(kGeomCountMax == 200000, "kGeomCountMax 与 kMaxPlanPoints 必须同步");
+
+/* 派生的分辨率下限 (mm): 再小步长就落到位置噪声底以下 (0.001 mm × 50000 = 50 pul)。 */
+constexpr double kGeomResMin = 0.001;
 
 /* Params::meter_interval_ms 的量程。**与 MeterLog::kMinIntervalMs / kMaxIntervalMs 必须
  * 逐字一致** (那一头夹的是连续读数真的用的间隔, 这一头夹的是同一件事的估计与预算)。
@@ -99,11 +117,26 @@ constexpr int kMeterIntervalMaxMs = 60000;
 /* 参数体检。返回空串 = 通过, 否则是一句给操作员看的中文。不做自动修正。 */
 std::string validate(const Params &p);
 
-/* 一根轴上的点数: floor(area/res) + 1。闭区间两端都取。 */
+/* 由点数与区域算出的分辨率 (mm), **几何的派生量, 不是输入**:
+ *   resX = area_x / (nx - 1),  resY = area_y / (ny - 1)
+ * 两端都取 —— 首尾点正好在区域边界上。点数不足 2 时返回 0 (由 validate 拒绝)。 */
+double resX(const Params &p);
+double resY(const Params &p);
+
+/* 一根轴上的点数: floor(area/res) + 1。闭区间两端都取。
+ *
+ * **2026-10-27 起只给旧 CSV / 旧 ini 把 `res_unit=` 折算回点数用**, 以及既有的自检 ——
+ * 界面与扫描本身一律用 Params::nx/ny。浮点容差不能省: 旧表头用 6 位小数写 res, 27/0.5 这种
+ * 恰好整除的值也可能被压到整数下方一丁点。 */
 int  axisCount(double area_unit, double res_unit);
 
-/* 一根轴上的坐标, 居中: span = (n-1)*res 可能略小于 area, 于是网格落在区域内 */
+/* 一根轴上的坐标, 居中: span = (n-1)*res 可能略小于 area, 于是网格落在区域内。
+ * **只给旧格式折算与自检用** (新网格见 axisCoordsByCount)。 */
 std::vector<double> axisCoords(double area_unit, double res_unit);
+
+/* 按点数生成坐标 (2026-10-27): 间距 span/(n-1), 首尾正好落在 ±span/2。
+ * n < 2 返回空 (没有意义, 也除不了)。 */
+std::vector<double> axisCoordsByCount(double span_unit, int n);
 
 /* 完整点列, 已经按扫描顺序排好。随机那两种在这里出的是**基准网格** (每行同向那个顺序),
  * 真正的随机顺序由调用方再洗一次 —— 见 shufflePlan() 与 ScanController::start()。 */

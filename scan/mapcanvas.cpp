@@ -434,11 +434,15 @@ void MapCanvas::paintEvent(QPaintEvent *)
    if (!m_geo_done
        || m_c_nx != m_ctl->gridNx() || m_c_ny != m_ctl->gridNy()
        || m_c_pts != m_ctl->totalPoints()
+       || m_c_area_x != m_ctl->params().area_x_unit
+       || m_c_area_y != m_ctl->params().area_y_unit
        || m_c_mode != (int)m_ctl->params().mode)
    {
       m_c_nx = m_ctl->gridNx();
       m_c_ny = m_ctl->gridNy();
       m_c_pts = m_ctl->totalPoints();
+      m_c_area_x = m_ctl->params().area_x_unit;
+      m_c_area_y = m_ctl->params().area_y_unit;
       m_c_mode = (int)m_ctl->params().mode;
       m_geo_done = true;
       rebuildPath();
@@ -471,11 +475,17 @@ void MapCanvas::drawHeat(QPainter &p)
 
    const int nx = m_ctl->gridNx();
    const int ny = m_ctl->gridNy();
-   const double res = m_ctl->params().res_unit;
+   const Params &q = m_ctl->params();
 
-   /* 每格是 res×res 的方块, 以网格点为中心 —— 整块比网格点跨距两头各多出半格 */
-   const double half_x = (double)nx * res / 2.0;
-   const double half_y = (double)ny * res / 2.0;
+   /* 每格是 resX×resY 的方块 (2026-10-27 两轴可以不同, 格子是长方形), 以网格点为中心 ——
+    * 整块比网格点跨距两头各多出半格 */
+   const double rx = resX(q);
+   const double ry = resY(q);
+   if (!(rx > 0.0) || !(ry > 0.0))
+      return;
+
+   const double half_x = (double)nx * rx / 2.0;
+   const double half_y = (double)ny * ry / 2.0;
 
    const QPointF tl = pxOf(-half_x,  half_y);
    const QPointF br = pxOf( half_x, -half_y);
@@ -794,25 +804,32 @@ void MapCanvas::drawMarkers(QPainter &p)
    /* 当前扫描点: 白色空心方框 + 十字, 位置来自网格 (即"应该到的位置") */
    if (cur != nullptr)
    {
+      const Params &q0 = m_ctl->params();
       const QPointF q = pxOf(cur->x_unit, cur->y_unit);
+      /* 两轴分辨率可能不同 (2026-10-27), 方框取**较大**那个 —— 比细轴还小就看不见了 */
       const double h = std::max(5.0, plotRect().width() / (2.0 * viewHalfUnits())
-                                          * m_ctl->params().res_unit * 0.45);
+                                          * std::max(resX(q0), resY(q0)) * 0.45);
       p.setBrush(Qt::NoBrush);
       p.setPen(QPen(C_CUR, 1.5));
       p.drawRect(QRectF(q.x() - h, q.y() - h, 2 * h, 2 * h));
    }
 
-   /* 左键查看选中的格 */
-   if (m_sel_ix >= 0 && m_sel_iy >= 0)
+   /* 左键查看选中的格。点数被改小之后旧选中索引可能已经落在网格外 —— 那时不画
+    * (2026-10-27: 点数现在是个操作员随手能改的旋钮, 越界的选中不再是"几乎不可能")。 */
+   if (m_sel_ix >= 0 && m_sel_iy >= 0
+       && m_sel_ix < m_ctl->gridNx() && m_sel_iy < m_ctl->gridNy())
    {
-      const double res = m_ctl->params().res_unit;
-      const double span = ((double)m_ctl->gridNx() - 1.0) * res;
-      const double yspan = ((double)m_ctl->gridNy() - 1.0) * res;
-      const double xu = -span / 2.0 + (double)m_sel_ix * res;
-      const double yu = -yspan / 2.0 + (double)m_sel_iy * res;
+      const Params &q1 = m_ctl->params();
+      const double rx = resX(q1);
+      const double ry = resY(q1);
+      const double span = ((double)m_ctl->gridNx() - 1.0) * rx;
+      const double yspan = ((double)m_ctl->gridNy() - 1.0) * ry;
+      const double xu = -span / 2.0 + (double)m_sel_ix * rx;
+      const double yu = -yspan / 2.0 + (double)m_sel_iy * ry;
 
       const QPointF q = pxOf(xu, yu);
-      const double h = std::max(6.0, plotRect().width() / (2.0 * viewHalfUnits()) * res * 0.5);
+      const double h = std::max(6.0, plotRect().width() / (2.0 * viewHalfUnits())
+                                     * std::max(rx, ry) * 0.5);
       p.setBrush(Qt::NoBrush);
       p.setPen(QPen(C_SEL, 2));
       p.drawRect(QRectF(q.x() - h, q.y() - h, 2 * h, 2 * h));
@@ -1137,18 +1154,20 @@ void MapCanvas::drawHud(QPainter &p)
 void MapCanvas::pickCell(double xu, double yu)
 {
    const Params &q = m_ctl->params();
-   const double res = q.res_unit;
+   /* 两轴各用各的分辨率 (2026-10-27), 网格可以是长方形的 */
+   const double rx = resX(q);
+   const double ry = resY(q);
    const int nx = m_ctl->gridNx();
    const int ny = m_ctl->gridNy();
-   if (!(res > 0.0) || nx <= 0 || ny <= 0)
+   if (!(rx > 0.0) || !(ry > 0.0) || nx <= 0 || ny <= 0)
       return;
 
-   const double span_x = ((double)nx - 1.0) * res;
-   const double span_y = ((double)ny - 1.0) * res;
+   const double span_x = ((double)nx - 1.0) * rx;
+   const double span_y = ((double)ny - 1.0) * ry;
 
    /* lround 取的就是最近的格点 (|round(t) - t| <= 0.5), 不必再判"落在半格之内" */
-   const int ix = (int)std::lround((xu + span_x / 2.0) / res);
-   const int iy = (int)std::lround((yu + span_y / 2.0) / res);
+   const int ix = (int)std::lround((xu + span_x / 2.0) / rx);
+   const int iy = (int)std::lround((yu + span_y / 2.0) / ry);
 
    if (ix < 0 || ix >= nx || iy < 0 || iy >= ny)
    {

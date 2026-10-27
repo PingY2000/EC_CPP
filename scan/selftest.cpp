@@ -481,13 +481,14 @@ struct Rig
                                    || ctrl.state() == ScanController::State::Aborted; }, max_ms);
    }
 
-   /* 小网格, 跑得快: 2×2 单位 @ 0.5 → 5×5 = 25 点 */
+   /* 小网格, 跑得快: 2×2 单位 @ 5 点 → 分辨率 0.5 → 5×5 = 25 点 */
    static Params smallParams()
    {
       Params p;
       p.area_x_unit = 2.0;
       p.area_y_unit = 2.0;
-      p.res_unit    = 0.5;
+      p.nx = 5;
+      p.ny = 5;
       p.speed_pul_s = 100000;   /* 上限, 于是 0.5 单位 = 25000 pul 只要 0.25s */
       p.dwell_ms    = 40;
       p.settle_ms   = 60;
@@ -500,18 +501,50 @@ struct Rig
 
 static void test_grid()
 {
-   caseBegin("grid: 27x27 @ 0.5 → 55x55");
+   caseBegin("grid: 27x27, 55x55 点 → 0.5 mm");
 
    Params p;
-   checkEq(axisCount(p.area_x_unit, p.res_unit), 55, "nx");
-   checkEq(axisCount(p.area_y_unit, p.res_unit), 55, "ny");
+   checkEq(p.nx, 55, "default nx");
+   checkEq(p.ny, 55, "default ny");
+   checkNear(resX(p), 0.5, "resX = 27/(55-1)");
+   checkNear(resY(p), 0.5, "resY = 27/(55-1)");
+
+   /* 旧函数仍在 (只给旧 CSV/旧 ini 折算点数用) —— 27/0.5 折算回来还是 55 */
+   checkEq(axisCount(p.area_x_unit, 0.5), 55, "legacy axisCount nx");
+   checkEq(axisCount(p.area_y_unit, 0.5), 55, "legacy axisCount ny");
 
    std::vector<Point> plan = buildPlan(p);
    checkEq((long long)plan.size(), 3025, "point count");
 
    std::vector<double> xs = axisCoords(27.0, 0.5);
-   checkNear(xs.front(), -13.5, "first coord");
-   checkNear(xs.back(),   13.5, "last coord");
+   checkNear(xs.front(), -13.5, "legacy axisCoords first coord");
+   checkNear(xs.back(),   13.5, "legacy axisCoords last coord");
+
+   /* 新网格: 两端都取, 首尾正好在 ±区域/2 —— 差一个 ulp 都不行 (那是扫描范围的边) */
+   std::vector<double> xc = axisCoordsByCount(27.0, 55);
+   checkEq((long long)xc.size(), 55, "axisCoordsByCount size");
+   check(xc.front() == -13.5, "端点在区域边界上 (front)");
+   check(xc.back()  ==  13.5, "端点在区域边界上 (back)");
+   checkNear(xc[1] - xc[0], 0.5, "间距 = 区域/(n-1)");
+
+   /* 不对称点数 (2026-10-27): 两轴分辨率可以不同, 网格是长方形 */
+   {
+      Params q;
+      q.area_x_unit = 8.0;
+      q.area_y_unit = 6.0;
+      q.nx = 5;                    /* 8 / 4 = 2 */
+      q.ny = 3;                    /* 6 / 2 = 3 */
+      checkNear(resX(q), 2.0, "asymmetric resX");
+      checkNear(resY(q), 3.0, "asymmetric resY");
+      check(resX(q) != resY(q), "两轴分辨率不同");
+
+      std::vector<Point> qp = buildPlan(q);
+      checkEq((long long)qp.size(), 15, "asymmetric point count");
+      checkNear(qp.front().x_unit, -4.0, "asymmetric first x");
+      checkNear(qp.front().y_unit, -3.0, "asymmetric first y");
+      checkNear(qp.back().x_unit, 4.0, "asymmetric last x (row 2 forward)");
+      checkNear(qp.back().y_unit, 3.0, "asymmetric last y");
+   }
 
    /* 蛇形: 第 0 行正向, 第 1 行反向 */
    checkEq(plan[0].ix, 0,  "row0 first ix");
@@ -583,21 +616,27 @@ static void test_grid()
 
    /* 小步长时容差不该大到"允许偏一整个格子" */
    Params tiny = p;
-   tiny.res_unit = 0.002;                              /* 步长 100 pul */
+   tiny.area_x_unit = tiny.area_y_unit = 2.0;
+   tiny.nx = tiny.ny = 1001;                           /* 2/1000 = 0.002 → 步长 100 pul */
    int32_t tt = posTolPul(tiny);
    check(tt >= 1 && tt <= 100 / 4 + 1, "pos tol stays below a quarter step");
+   /* 一根标量容差守住两轴时取**小**的那个分辨率 (2026-10-27) */
+   tiny.area_x_unit = 2.0;  tiny.nx = 1001;            /* 0.002 → 100 pul */
+   tiny.area_y_unit = 20.0; tiny.ny = 1001;            /* 0.02  → 1000 pul */
+   check(posTolPul(tiny) <= 100 / 4 + 1, "两轴分辨率不同时按较细那根算");
 
    caseBegin("grid: 参数校验");
    Params bad = p;
-   bad.res_unit = 0.0;
-   check(!validate(bad).empty(), "res = 0 rejected");
+   bad.nx = 0;
+   check(!validate(bad).empty() && validate(bad).find("点数") != std::string::npos,
+         "nx = 0 rejected");
 
    bad = p;
-   bad.res_unit = 100.0;
-   check(!validate(bad).empty(), "res larger than the area rejected");
+   bad.ny = 1;
+   check(!validate(bad).empty(), "ny = 1 (网格没有间距) rejected");
 
    bad = p;
-   bad.res_unit = 0.001;                                /* 27000 x 27000 > 200000 */
+   bad.nx = bad.ny = 500;                               /* 250000 > 200000 */
    check(!validate(bad).empty(), "too many points rejected");
 
    bad = p;
@@ -980,7 +1019,7 @@ static void test_csv()
 
    caseBegin("csv: 几何一变就拒绝续扫, 而且指名道姓");
    Params moved = p;
-   moved.res_unit = 0.25;
+   moved.nx = moved.ny = 109;          /* 27 / 108 = 0.25 mm, 与文件的 0.5 不同 */
    std::string d2 = csvParseForResume(half, moved, nullptr, nullptr, nullptr, nullptr);
    check(!d2.empty(), "different resolution rejected");
    check(d2.find("0.5") != std::string::npos || d2.find("分辨率") != std::string::npos,
@@ -1140,14 +1179,49 @@ static void test_csv()
       checkEq(mio, 1, "max_index = 1");
       checkEq(epo, 1, "zero_epoch 读得回来");
       check(isoo == "2026-09-17T10:00:00", "started 读得回来");
+
+      /* 旧表头除不尽 (10 / 3 → 4 点, 旧网格居中留白): 折算出的点数照样要认, 而且
+       * **按点数比而不是按文件里那个 res 比** —— 否则刚对齐完的旧文件会被自己拒掉
+       * (2026-10-27) */
+      {
+         const std::string odd_file =
+            "# area_x_unit=10\n"
+            "# area_y_unit=10\n"
+            "# res_unit=3\n"
+            "# pulses_per_unit=50000\n"
+            "index,ix,iy,x_unit,y_unit,x_pul,y_pul,watts,ok,flags,"
+            "pos_x_pul,pos_y_pul,spread_x_pul,spread_y_pul,unix_ms,elapsed_ms\n"
+            "0,0,0,-4.5,-4.5,-225000,-225000,1.5,1,,0,0,0,0,1000,0\n";
+         Params q;
+         q.area_x_unit = 10.0;
+         q.area_y_unit = 10.0;
+         q.nx = q.ny = 4;            /* axisCount(10, 3) = 4 */
+         const std::string d4 = csvParseForResume(odd_file, q, nullptr, nullptr, nullptr, nullptr);
+         check(d4.empty(), "除不尽的旧网格按点数折算后仍然续得上", d4);
+
+         q.nx = q.ny = 5;            /* 多一个点就是另一片网格 */
+         const std::string d5 = csvParseForResume(odd_file, q, nullptr, nullptr, nullptr, nullptr);
+         check(!d5.empty() && d5.find("分辨率") != std::string::npos,
+               "点数不同仍然被拒", d5);
+      }
+
+      /* 新表头往返: csvMetaLines 写出去的 nx/ny 原样读得回来 */
+      {
+         Params q = p;
+         q.nx = 7;
+         q.ny = 9;
+         const std::string text = csvMetaLines(q, "2026-10-27T10:00:00", 0) + csvColumnHeader();
+         check(csvParseForResume(text, q, nullptr, nullptr, nullptr, nullptr).empty(),
+               "新表头往返一致");
+      }
    }
 }
 
 /* 续扫前把面板对齐到 CSV 的几何 (2026-09-29, docs/scan_sweep.md §44)。
  *
- * 这一支是**纯判据**: "能不能按这份 CSV 对齐"。界面那一步 (把结论设进那四个控件 / 最终没成
+ * 这一支是**纯判据**: "能不能按这份 CSV 对齐"。界面那一步 (把结论设进那几个控件 / 最终没成
  * 时退回去) 在 scanwindow.cpp 里, 自检够不着 —— 所以这里把每一种情形钉死, 屏幕前只需要看
- * "那四个数有没有真的跟着变" (报告时这两半要分开说)。 */
+ * "那几个数有没有真的跟着变" (报告时这两半要分开说)。 */
 static void test_csvalign()
 {
    caseBegin("csvalign: 四项照单全收, 别的字段一个都不动");
@@ -1156,7 +1230,8 @@ static void test_csvalign()
    Params cur = csv_p;
    cur.area_x_unit     = 30.0;
    cur.area_y_unit     = 30.0;
-   cur.res_unit        = 0.25;
+   cur.nx              = 121;          /* 30 / 120 = 0.25 mm */
+   cur.ny              = 121;
    cur.pulses_per_unit = 10000.0;
    /* 那四项之外的都设成与缺省不同的值: 对齐不许碰它们 */
    cur.speed_pul_s       = 5000;
@@ -1175,7 +1250,9 @@ static void test_csvalign()
    check(r.empty(), "一份正常的表头照收", r);
    checkNear(out.area_x_unit, 27.0, "区域X 按 CSV");
    checkNear(out.area_y_unit, 27.0, "区域Y 按 CSV");
-   checkNear(out.res_unit, 0.5, "分辨率按 CSV");
+   checkEq(out.nx, 55, "点数X 按 CSV");
+   checkEq(out.ny, 55, "点数Y 按 CSV");
+   checkNear(resX(out), 0.5, "分辨率由点数与区域算出");
    checkNear(out.pulses_per_unit, 50000.0, "每 mm 脉冲数按 CSV");
    checkEq(out.speed_pul_s, 5000, "扫描速度不许被动");
    checkEq(out.dwell_ms, 50, "停留不许被动");
@@ -1207,12 +1284,14 @@ static void test_csvalign()
    caseBegin("csvalign: 表头不全就拒绝, 而且一个数都不许写出去");
    /* out 里先放哨兵: 拒绝时**连一项都不许被写过** —— 界面那一侧就是"一个控件都不动" */
    Params sent;
-   sent.area_x_unit = -7; sent.area_y_unit = -8; sent.res_unit = -9; sent.pulses_per_unit = -10;
+   sent.area_x_unit = -7; sent.area_y_unit = -8; sent.nx = -9; sent.ny = -9;
+   sent.pulses_per_unit = -10;
    const std::string r3 = csvAlignParams(csvColumnHeader(), csv_p, &sent);
    check(!r3.empty() && r3.find("表头不完整") != std::string::npos, "连表头都没有", r3);
    checkNear(sent.area_x_unit, -7, "拒绝时不许写 out");
 
-   /* 只有三项: 本程序写出来的表头永远四项俱全 (csvMetaLines), 少一项只可能是手改/截断的文件 */
+   /* 缺一项 (这里缺 pulses_per_unit): 本程序写出来的表头永远俱全 (csvMetaLines),
+    * 少一项只可能是手改/截断的文件 */
    std::string three =
       "# scan v1\n# area_x_unit=27.000000 area_y_unit=27.000000 res_unit=0.500000\n";
    three += csvColumnHeader();
@@ -1228,12 +1307,23 @@ static void test_csvalign()
                && r5.find("600") != std::string::npos,
             "区域 600 mm 超出上限, 说出是哪一项", r5);
 
-      Params tiny = csv_p;
-      tiny.res_unit = 0.0001;
-      const std::string r6 = csvAlignParams(csvMetaLines(tiny, "x", 1), csv_p, &sent);
-      check(!r6.empty() && r6.find("分辨率") != std::string::npos, "分辨率 0.0001 mm 低于下限", r6);
+      /* 新表头的点数超出可设范围 (2026-10-27) */
+      Params huge = csv_p;
+      huge.nx = kGeomCountMax + 1;
+      const std::string r6 = csvAlignParams(csvMetaLines(huge, "x", 1), csv_p, &sent);
+      check(!r6.empty() && r6.find("点数X") != std::string::npos, "点数 200001 超出上限", r6);
       /* ★ 那句话里的数必须**原样**印出来: 按 3 位小数印就成了 0.000, 恰好把要说的那个数藏掉 */
-      check(r6.find("0.0001") != std::string::npos, "而且原样印出读到的是多少", r6);
+      check(r6.find("200001") != std::string::npos, "而且原样印出读到的是多少", r6);
+
+      /* 旧表头 (只有 res_unit) 折算不出可用的点数: 拒绝, 而且原样印出那个分辨率 */
+      std::string old_tiny =
+         "# scan v1\n"
+         "# area_x_unit=27 area_y_unit=27 res_unit=0.0001 pulses_per_unit=50000\n";
+      old_tiny += csvColumnHeader();
+      const std::string r6b = csvAlignParams(old_tiny, csv_p, &sent);
+      check(!r6b.empty() && r6b.find("res_unit") != std::string::npos,
+            "旧表的极小分辨率折算失败", r6b);
+      check(r6b.find("0.0001") != std::string::npos, "旧表也原样印出", r6b);
 
       Params ppu = csv_p;
       ppu.pulses_per_unit = 50.0;
@@ -1245,9 +1335,10 @@ static void test_csvalign()
    caseBegin("csvalign: 那份几何自己就不合法也拒绝");
    {
       Params bad = csv_p;
-      bad.area_x_unit = 0.2;         /* 分辨率 0.5 > 区域 0.2 */
+      bad.area_x_unit = 0.1;         /* 0.1 / 109 = 0.000917 mm, 低于 0.001 的下限 */
+      bad.nx          = 110;
       const std::string r8 = csvAlignParams(csvMetaLines(bad, "x", 1), csv_p, &sent);
-      check(!r8.empty() && r8.find("不合法") != std::string::npos, "分辨率大于区域", r8);
+      check(!r8.empty() && r8.find("不合法") != std::string::npos, "派生分辨率低于下限", r8);
    }
 
    caseBegin("csvalign: 区域变大不许被旧量程误判 (range_pul 是算出来的, 不是一条参数)");
@@ -1275,7 +1366,7 @@ static void test_csvalign()
    {
       /* csvParseForResume 照旧比差异、照旧拒绝 —— 它现在管的是手改过的 CSV 与不走界面的调用方 */
       Params other = csv_p;
-      other.res_unit = 0.25;
+      other.nx = other.ny = 109;       /* 27 / 108 = 0.25 */
       const std::string d = csvParseForResume(head, other, nullptr, nullptr, nullptr, nullptr);
       check(!d.empty(), "几何不同仍然给差异句", d);
       check(d.find("分辨率") != std::string::npos, "而且照旧指名道姓", d);
@@ -1519,7 +1610,7 @@ static void test_resumeload()
       /* 绕过界面那道锁直接改 (界面上那四项是灰的) —— armRun 只查 paramsError(),
        * **不查 m_order 的下标还对不对得上 m_plan**, 所以这一道非有不可 */
       Params q = p;
-      q.res_unit = 0.25;
+      q.nx = q.ny = 9;                 /* 2 / 8 = 0.25 */
       r.ctrl.setParams(q);
       checkEq(r.ctrl.totalPoints(), 81, "点列真的换了 (9×9), 老下标已经对不上");
 
@@ -1572,7 +1663,7 @@ static void test_resumeload()
       /* (b) 几何对不上 (手写一份别的分辨率的 CSV, 不走界面那次对齐) */
       {
          Params other = p;
-         other.res_unit = 0.25;
+         other.nx = other.ny = 9;      /* 2 / 8 = 0.25 */
          std::string text = csvMetaLines(other, "2026-09-17T10:00:00", 0);
          text += csvColumnHeader();
          text += "\n";
@@ -1859,7 +1950,7 @@ static void test_resumeload()
 
       /* 手写一份几何不同的 (不走界面那次对齐 —— 它就是用来当场被拒的) */
       Params other = p;
-      other.res_unit = 0.25;
+      other.nx = other.ny = 9;         /* 2 / 8 = 0.25 */
       std::string text = csvMetaLines(other, "2026-09-17T10:00:00", 0);
       text += csvColumnHeader();
       text += "\n";
@@ -2877,7 +2968,7 @@ static void test_retest()
 
    /* 参数改过之后不许重测 —— 坐标系已经对不上了 */
    Params moved = rig.ctrl.params();
-   moved.res_unit = 0.25;
+   moved.nx += 1;                      /* 几何一变, 坐标就不再是文件里那一点 */
    rig.ctrl.setParams(moved);
    check(!rig.retestAt(0, 0, &err), "retest refused after the geometry changed");
 
@@ -2984,10 +3075,10 @@ static void test_plancap()
       Params p = Rig::smallParams();
       p.area_x_unit = 500.0;
       p.area_y_unit = 500.0;
-      p.res_unit    = 0.001;
+      p.nx = p.ny = 500001;            /* 500 / 500000 = 0.001 mm */
 
       /* 先确认这份参数**真的**是超大的那份 —— 否则下面几条是空验 */
-      checkEq(axisCount(p.area_x_unit, p.res_unit), 500001, "the requested grid is huge");
+      checkEq(p.nx, 500001, "the requested grid is huge");
       checkEq((long long)500001 * 500001, 250001000001LL, "and its point count is astronomic");
 
       r.ctrl.setParams(p);
@@ -3013,11 +3104,13 @@ static void test_plancap()
 
       /* 400 × 500 = 200000, 正好是上限 */
       Params p = Rig::smallParams();
-      p.res_unit    = 0.5;
-      p.area_x_unit = 199.5;                 /* floor(199.5/0.5)+1 = 400 */
-      p.area_y_unit = 249.5;                 /* floor(249.5/0.5)+1 = 500 */
-      checkEq(axisCount(p.area_x_unit, p.res_unit), 400, "nx at the limit");
-      checkEq(axisCount(p.area_y_unit, p.res_unit), 500, "ny at the limit");
+      p.nx = 400;
+      p.ny = 500;
+      p.area_x_unit = 199.5;                 /* 199.5 / 399 = 0.5 mm */
+      p.area_y_unit = 249.5;                 /* 249.5 / 499 = 0.5 mm */
+      checkEq(p.nx, 400, "nx at the limit");
+      checkEq(p.ny, 500, "ny at the limit");
+      checkNear(resX(p), 0.5, "limiting grid keeps the 0.5 mm step");
 
       r.ctrl.setParams(p);
       check(r.ctrl.paramsError().isEmpty(), "exactly at the limit is legal");
@@ -3027,7 +3120,7 @@ static void test_plancap()
 
       /* 多一格就拒 */
       Params q = p;
-      q.area_x_unit = 200.0;                 /* floor(200/0.5)+1 = 401 -> 200500 点 */
+      q.nx = 401;                            /* 401 × 500 = 200500 点 */
       r.ctrl.setParams(q);
       check(!r.ctrl.paramsError().isEmpty(), "one column over the limit is refused");
       checkEq(r.ctrl.totalPoints(), 0, "and its plan is gone, not half-built");
@@ -3233,7 +3326,9 @@ static void test_prefs()
 
       const Prefs none = prefsLoad(ini);
       checkNear(none.params.area_x_unit, 27.0, "default area_x");
-      checkNear(none.params.res_unit, 0.5, "default res");
+      checkEq(none.params.nx, 55, "default nx");
+      checkEq(none.params.ny, 55, "default ny");
+      checkNear(resX(none.params), 0.5, "default res (derived)");
       checkEq((long long)none.params.speed_pul_s, 20000, "default speed");
       checkEq(none.params.samples_per_point, 1, "default samples");
       check(none.params.mode == ScanMode::Serpentine, "default mode = 逐行往返");
@@ -3250,7 +3345,8 @@ static void test_prefs()
       Prefs p;
       p.params.area_x_unit      = 12.5;
       p.params.area_y_unit      = 7.25;
-      p.params.res_unit         = 0.125;
+      p.params.nx               = 101;      /* 12.5 / 100 = 0.125 */
+      p.params.ny               = 59;       /* 7.25 / 58 = 0.125 */
       p.params.pulses_per_unit  = 4096.0;
       p.params.speed_pul_s      = 33333;
       p.params.dwell_ms         = 150;
@@ -3269,7 +3365,8 @@ static void test_prefs()
 
       checkNear(b.params.area_x_unit, 12.5, "area_x");
       checkNear(b.params.area_y_unit, 7.25, "area_y");
-      checkNear(b.params.res_unit, 0.125, "res");
+      checkEq(b.params.nx, 101, "nx");
+      checkEq(b.params.ny, 59, "ny");
       checkNear(b.params.pulses_per_unit, 4096.0, "pulses_per_unit");
       checkEq((long long)b.params.speed_pul_s, 33333, "speed");
       checkEq(b.params.dwell_ms, 150, "dwell");
@@ -3323,6 +3420,57 @@ static void test_prefs()
       check(prefsLoad(ini).params.mode == ScanMode::RandomRepeat, "3 照读 = 随机 (可重复)");
    }
 
+   caseBegin("prefs: 旧 ini 的 res_unit 折算成点数, 新键优先, 保存时删旧键");
+   {
+      QTemporaryDir dir;
+      const QString ini = dir.filePath(QStringLiteral("scan.ini"));
+      {
+         /* 老程序写下的那份: 只有 scan/res_unit, 没有 scan/nx / scan/ny */
+         QSettings s(ini, QSettings::IniFormat);
+         s.setValue(QStringLiteral("scan/area_x_unit"), 26.0);
+         s.setValue(QStringLiteral("scan/area_y_unit"), 18.0);
+         s.setValue(QStringLiteral("scan/res_unit"),    0.5);
+         s.setValue(QStringLiteral("scan/pulses_per_unit"), 50000.0);
+         s.sync();
+      }
+      const Prefs a = prefsLoad(ini);
+      checkEq(a.params.nx, 53, "26 / 0.5 折算为 53 点");
+      checkEq(a.params.ny, 37, "18 / 0.5 折算为 37 点");
+      checkNear(resX(a.params), 0.5, "折算回来的分辨率还是 0.5");
+
+      /* 两个新键都在就用它们, 旧键即使还留在盘上也不认 */
+      {
+         QSettings s(ini, QSettings::IniFormat);
+         s.setValue(QStringLiteral("scan/nx"), 11);
+         s.setValue(QStringLiteral("scan/ny"), 7);
+         s.sync();
+      }
+      const Prefs b = prefsLoad(ini);
+      checkEq(b.params.nx, 11, "新键优先 (nx)");
+      checkEq(b.params.ny, 7, "新键优先 (ny)");
+
+      /* 保存时必须把旧键删掉: 读-改-写的 QSettings 不会替我们删 */
+      prefsSave(ini, b);
+      {
+         QSettings s(ini, QSettings::IniFormat);
+         check(!s.contains(QStringLiteral("scan/res_unit")), "保存时删掉旧键");
+         checkEq(s.value(QStringLiteral("scan/nx")).toInt(), 11, "新键写进盘里");
+      }
+
+      /* 手改坏的新键 (写成 0) 不采纳; 盘上若还有旧键, 就按旧键折算 (扫描 26/18 mm,
+       * res 1.0 → 27 × 19 点) */
+      {
+         QSettings s(ini, QSettings::IniFormat);
+         s.setValue(QStringLiteral("scan/nx"), 0);
+         s.setValue(QStringLiteral("scan/ny"), 0);
+         s.setValue(QStringLiteral("scan/res_unit"), 1.0);
+         s.sync();
+      }
+      const Prefs c = prefsLoad(ini);
+      checkEq(c.params.nx, 27, "坏值不采纳, 退回旧键折算 (nx)");
+      checkEq(c.params.ny, 19, "坏值不采纳, 退回旧键折算 (ny)");
+   }
+
    caseBegin("prefs: 曲线时长窗缺项 / 手改坏 —— 都落到 MeterLog 的缺省与量程上");
    {
       QTemporaryDir dir;
@@ -3356,12 +3504,12 @@ static void test_prefs()
       prefsMergeParams(&store, good);
       checkNear(store.params.area_x_unit, 2.0, "a scannable set is remembered");
 
-      /* 手滑: 分辨率少打一位 —— 这份过不了 validate */
+      /* 手滑: 点数多打一位 —— 这份过不了 validate */
       Params bad = Rig::smallParams();
-      bad.res_unit = 0.0001;
+      bad.nx = bad.ny = 500;
       check(!validate(bad).empty(), "the slipped set really is illegal");
       prefsMergeParams(&store, bad);
-      checkNear(store.params.res_unit, 0.5, "the illegal set did NOT overwrite the old one");
+      checkEq(store.params.nx, 5, "the illegal set did NOT overwrite the old one");
       checkNear(store.params.area_x_unit, 2.0, "and the rest of the old set is intact");
 
       /* 量程一律归零 —— 它是算出来的 */

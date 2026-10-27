@@ -62,11 +62,36 @@ double unitOf(int32_t pul, double pulses_per_unit)
    return (double)pul / pulses_per_unit;
 }
 
+double resX(const Params &p)
+{
+   if (p.nx < 2 || !(p.area_x_unit > 0.0) || !std::isfinite(p.area_x_unit))
+      return 0.0;
+   return p.area_x_unit / (double)(p.nx - 1);
+}
+
+double resY(const Params &p)
+{
+   if (p.ny < 2 || !(p.area_y_unit > 0.0) || !std::isfinite(p.area_y_unit))
+      return 0.0;
+   return p.area_y_unit / (double)(p.ny - 1);
+}
+
 int axisCount(double area_unit, double res_unit)
 {
-   if (area_unit <= 0.0 || res_unit <= 0.0)
+   if (!(area_unit > 0.0) || !(res_unit > 0.0))
       return 0;
-   return (int)std::floor(area_unit / res_unit) + 1;
+   if (!std::isfinite(area_unit) || !std::isfinite(res_unit))
+      return 0;
+
+   const double q = area_unit / res_unit;
+   if (q > 1.0e9)      /* 折算出来的点数早已超上限, 让它走"超出范围"那条路 */
+      return 0;
+
+   /* 容差 (2026-10-27): 旧 CSV / 旧 ini 里的 res 是 6 位小数的十进制字面量, 反解回 double
+    * 可能差一两个 ulp (0.3/0.1 在 double 里是 2.9999999999999996)。不补这一下, floor 就少
+    * 一个点, 于是"刚对齐完的旧文件"换台机器又对不上了。1e-9 相对量级, 只吃掉舍入误差。 */
+   const double eps = 1e-9 * std::max(1.0, q);
+   return (int)std::floor(q + eps) + 1;
 }
 
 std::vector<double> axisCoords(double area_unit, double res_unit)
@@ -84,17 +109,45 @@ std::vector<double> axisCoords(double area_unit, double res_unit)
    return out;
 }
 
+std::vector<double> axisCoordsByCount(double span_unit, int n)
+{
+   std::vector<double> out;
+   if (n < 2 || !(span_unit > 0.0) || !std::isfinite(span_unit))
+      return out;
+
+   /* 两端都取 (2026-10-27 与用户确认的语义): 第 0 个点在 -span/2, 第 n-1 个在 +span/2。
+    * 首尾**直接赋值**而不是靠 i*step 累加出来 —— 累乘的最后一个点可能差一个 ulp, 而自检
+    * 钉的是"首尾正好落在区域边界上", 差一个 ulp 就会让那条断言时灵时不灵。 */
+   const double step = span_unit / (double)(n - 1);
+   const double half = span_unit / 2.0;
+
+   out.reserve((size_t)n);
+   for (int i = 0; i < n; i++)
+      out.push_back(-half + step * (double)i);
+
+   out.front() = -half;
+   out.back()  =  half;
+   return out;
+}
+
 std::vector<Point> buildPlan(const Params &p)
 {
    std::vector<Point> out;
 
-   std::vector<double> xs = axisCoords(p.area_x_unit, p.res_unit);
-   std::vector<double> ys = axisCoords(p.area_y_unit, p.res_unit);
-   if (xs.empty() || ys.empty())
+   /* 公开函数自己也要拦 (2026-10-27): 点数如今是入参, 一个没走 validate 的调用方
+    * (自检、将来的别的入口) 塞进 1 点或一亿点都会在这里除零 / 吃掉几个 GB。 */
+   if (p.nx < 2 || p.ny < 2)
+      return out;
+   if ((long long)p.nx * (long long)p.ny > kMaxPlanPoints)
       return out;
 
-   int nx = (int)xs.size();
-   int ny = (int)ys.size();
+   std::vector<double> xs = axisCoordsByCount(p.area_x_unit, p.nx);
+   std::vector<double> ys = axisCoordsByCount(p.area_y_unit, p.ny);
+   if ((int)xs.size() != p.nx || (int)ys.size() != p.ny)
+      return out;
+
+   int nx = p.nx;
+   int ny = p.ny;
    out.reserve((size_t)nx * (size_t)ny);
 
    for (int iy = 0; iy < ny; iy++)
@@ -152,7 +205,9 @@ int32_t autoRangePul(const Params &p)
 
 int32_t posTolPul(const Params &p)
 {
-   double step = p.res_unit * p.pulses_per_unit;
+   /* 一根标量容差要同时守住两根轴 (2026-10-27), 取**较小**的那个分辨率:
+    * 容差比细轴的一个步长还大, 就等于"还没走到位也算到了"。 */
+   double step = std::min(resX(p), resY(p)) * p.pulses_per_unit;
    if (step <= 0.0)
       return 50;
 
@@ -167,9 +222,9 @@ bool fitsRange(const Params &p, std::string *why)
 {
    int32_t rng = (p.range_pul > 0) ? p.range_pul : autoRangePul(p);
 
-   /* 网格上离原点最远的那个点, 两轴各算一次 */
-   std::vector<double> xs = axisCoords(p.area_x_unit, p.res_unit);
-   std::vector<double> ys = axisCoords(p.area_y_unit, p.res_unit);
+   /* 网格上离原点最远的那个点, 两轴各算一次 (按点数生成的坐标: 首尾就在 ±区域/2) */
+   std::vector<double> xs = axisCoordsByCount(p.area_x_unit, p.nx);
+   std::vector<double> ys = axisCoordsByCount(p.area_y_unit, p.ny);
    if (xs.empty() || ys.empty())
       return true;      /* 网格本身为空, 由 validate 去报 */
 
@@ -199,27 +254,36 @@ std::string validate(const Params &p)
 {
    if (!(p.area_x_unit > 0.0) || !(p.area_y_unit > 0.0))
       return "区域大小必须是正数";
-   if (!(p.res_unit > 0.0))
-      return "分辨率必须是正数";
+   if (!std::isfinite(p.area_x_unit) || !std::isfinite(p.area_y_unit))
+      return "区域大小必须是正数";
    if (!(p.pulses_per_unit > 0.0))
       return "「每 mm 脉冲数」必须是正数";
 
-   if (p.res_unit > p.area_x_unit || p.res_unit > p.area_y_unit)
-      return "分辨率大于区域, 网格只剩一个点。请调小分辨率或放大区域。";
+   /* 点数 (2026-10-27): 分辨率由它和区域推出, 所以这里判的是点数。
+    * 下限 2 —— 1 点网格没有间距可言 (resX/resY 也除不了 n-1)。 */
+   if (p.nx < kGeomCountMin || p.ny < kGeomCountMin)
+      return "点数至少 2 个, 否则网格没有间距。请调大点数。";
 
-   int nx = axisCount(p.area_x_unit, p.res_unit);
-   int ny = axisCount(p.area_y_unit, p.res_unit);
-   if (nx < 1 || ny < 1)
-      return "网格为空 (区域或分辨率不合法)";
-
-   /* 上限常量在 scanplan.h (kMaxPlanPoints), rebuildPlan() 拦的是同一个 */
-   long long total = (long long)nx * (long long)ny;
-   if (total > kMaxPlanPoints)
+   /* 上限常量在 scanplan.h (kMaxPlanPoints), rebuildPlan() 拦的是同一个。
+    * 单轴超过 kGeomCountMax 时另一根轴至少 2 点, 总数必然超限 —— 一并在这里拦。 */
+   long long total = (long long)p.nx * (long long)p.ny;
+   if (p.nx > kGeomCountMax || p.ny > kGeomCountMax || total > kMaxPlanPoints)
    {
       char buf[200];
       std::snprintf(buf, sizeof(buf),
-                    "点数 %lld 超出上限 %lld。请确认分辨率是否少打一位。",
+                    "点数 %lld 超出上限 %lld。请减少点数 X 或点数 Y。",
                     total, kMaxPlanPoints);
+      return buf;
+   }
+
+   /* 派生的分辨率下限: 再细一步就落到位置噪声底 (0.001 mm × 50000 = 50 pul)。
+    * 点数量程本身已经挡住了绝大多数情况, 这一句守的是"区域被改得极小"的那种参数。 */
+   if (resX(p) < kGeomResMin * (1.0 - 1e-9) || resY(p) < kGeomResMin * (1.0 - 1e-9))
+   {
+      char buf[200];
+      std::snprintf(buf, sizeof(buf),
+                    "分辨率小于下限 %g mm。请减少点数 X 或点数 Y。",
+                    kGeomResMin);
       return buf;
    }
 
@@ -273,7 +337,9 @@ int64_t estimatePerPointMs(const Params &p)
     * 就照正方形那个系数取 max(区域X, 区域Y)。**拉长的区域上这一项偏大**, 那是故意的:
     * 本函数的口径一直是"宁可高估", 而随机那一跳还常常是两轴同时走的斜线 (进近减速比单轴
     * 走更久), 偏大方向正好。 */
-   double step_unit = p.res_unit;
+   /* 行扫描: 每步只动一根轴, 走一个步长。两轴分辨率可能不同 (2026-10-27), 取**较大**的
+    * 那个 —— 口径照旧"宁可高估"。 */
+   double step_unit = std::max(resX(p), resY(p));
    if (modeRandom(p.mode))
       step_unit = 0.5214 * std::max(p.area_x_unit, p.area_y_unit);
 
@@ -311,17 +377,25 @@ std::string csvColumnHeader()
 
 std::string csvMetaLines(const Params &p, const std::string &started_iso, int zero_epoch)
 {
-   /* 两行 `#` 注释带全部参数, 续扫靠它做兼容性判定: 决定物理网格的那四项一个都不能少 */
+   /* 开头这几行 `#` 注释带全部参数, 续扫靠它做兼容性判定: 决定物理网格的那几项一个都不能少。
+    *
+    * 2026-10-27 起几何的**权威字段是 nx/ny** (整数, 精确); res_x_unit / res_y_unit 只供人读,
+    * 解析一律以点数为准。旧文件里那个单一的 res_unit 仍然认 (见 csvParseForResume 的折算),
+    * 于是新旧两边的文件都能续扫。 */
    char buf[1024];
    std::string s = "# scan v1\n";
    s += "# area_x_unit=" + std::to_string(p.area_x_unit);
    s += " area_y_unit="   + std::to_string(p.area_y_unit);
-   s += " res_unit="      + std::to_string(p.res_unit);
+   s += " nx="            + std::to_string(p.nx);
+   s += " ny="            + std::to_string(p.ny);
    s += " pulses_per_unit=" + std::to_string(p.pulses_per_unit);
+   s += "\n";
+   s += "# res_x_unit=" + std::to_string(resX(p));
+   s += " res_y_unit="  + std::to_string(resY(p));
    s += "\n";
 
    /* `mode=%d` 是 2026-10-11 从 `serp=%d` 改的 (0..3, 见 ScanMode)。**没有任何代码解析它**
-    * —— 续扫只比四项几何 (csvParseForResume), 所以这不是格式破坏, 只是这一栏记得更全:
+    * —— 续扫只比几何那几项 (csvParseForResume), 所以这不是格式破坏, 只是这一栏记得更全:
     * 一行一行走和随机走, 出来的数据不是一回事, 读文件的人该看得出来 (docs/scan_sweep.md §8)。 */
    std::snprintf(buf, sizeof(buf),
                  "# speed_pul_s=%u dwell_ms=%d settle_ms=%d samples=%d mode=%d start_pos=%d\n",
@@ -414,11 +488,12 @@ std::string csvParseForResume(const std::string &text, const Params &p,
                               std::vector<char> *done, int *max_index,
                               std::string *started_iso, int *zero_epoch)
 {
-   int nx = axisCount(p.area_x_unit, p.res_unit);
-   int ny = axisCount(p.area_y_unit, p.res_unit);
+   const int nx = p.nx;
+   const int ny = p.ny;
+   const bool grid_ok = (nx >= 2 && ny >= 2 && (long long)nx * (long long)ny <= kMaxPlanPoints);
 
    if (done != nullptr)
-      done->assign((size_t)std::max(0, nx) * (size_t)std::max(0, ny), 0);
+      done->assign(grid_ok ? (size_t)nx * (size_t)ny : 0, 0);
    if (max_index != nullptr)
       *max_index = -1;
    if (started_iso != nullptr)
@@ -427,7 +502,14 @@ std::string csvParseForResume(const std::string &text, const Params &p,
       *zero_epoch = -1;
 
    double a_x = -1, a_y = -1, r_u = -1, ppu = -1;
+   double n_xd = -1, n_yd = -1;       /* 新表头的整数点数, 读成 double 过一遍 metaGet */
    bool have_geom = false;
+
+   /* 索引越界先记下, 等几何差异判完再报 (2026-10-27): 几何不同时数组本来就不对,
+    * 先报"第 N 行索引超出"会把人引到错误的排查方向上去 (见函数末尾)。 */
+   bool   bad_index  = false;
+   size_t bad_lineno = 0;
+   int    bad_ix = 0, bad_iy = 0;
 
    std::string line;
    size_t pos = 0;
@@ -458,6 +540,8 @@ std::string csvParseForResume(const std::string &text, const Params &p,
          double v = 0;
          if (metaGet(line, "area_x_unit", &v))      { a_x = v; have_geom = true; }
          if (metaGet(line, "area_y_unit", &v))      { a_y = v; have_geom = true; }
+         if (metaGet(line, "nx", &v))               { n_xd = v; have_geom = true; }
+         if (metaGet(line, "ny", &v))               { n_yd = v; have_geom = true; }
          if (metaGet(line, "res_unit", &v))         { r_u = v; have_geom = true; }
          if (metaGet(line, "pulses_per_unit", &v))  { ppu = v; have_geom = true; }
          if (zero_epoch != nullptr && metaGet(line, "zero_epoch", &v))
@@ -497,26 +581,78 @@ std::string csvParseForResume(const std::string &text, const Params &p,
       int ix  = std::atoi(f[1].c_str());
       int iy  = std::atoi(f[2].c_str());
 
-      if (ix < 0 || iy < 0 || ix >= nx || iy >= ny)
+      if (ix < 0 || iy < 0 || ix >= nx || iy >= ny || !grid_ok)
       {
-         char buf[200];
-         std::snprintf(buf, sizeof(buf),
-                       "CSV 第 %zu 行的网格索引 (%d, %d) 超出 %d×%d, 几何参数可能填错。", lineno, ix, iy, nx, ny);
-         return std::string(buf);
+         if (!bad_index)
+         {
+            bad_index  = true;
+            bad_lineno = lineno;
+            bad_ix = ix;
+            bad_iy = iy;
+         }
       }
-
-      if (done != nullptr)
-         (*done)[(size_t)iy * (size_t)nx + (size_t)ix] = 1;
-      if (max_index != nullptr && idx > *max_index)
-         *max_index = idx;
+      else
+      {
+         if (done != nullptr)
+            (*done)[(size_t)iy * (size_t)nx + (size_t)ix] = 1;
+         if (max_index != nullptr && idx > *max_index)
+            *max_index = idx;
+      }
 
       if (nl == std::string::npos) break;
       pos = nl + 1;
    }
 
-   if (!have_geom)
+   if (!have_geom || !std::isfinite(a_x) || !std::isfinite(a_y) || !std::isfinite(ppu))
       return "CSV 中没有几何参数 (表头不完整), 无法确认与当前参数是否为同一片区域。";
    (void)seen_data;
+
+   /* 文件里的网格到底是几个点 (2026-10-27):
+    *   有 nx 也有 ny   → 直接用 (整数, 精确);
+    *   只有一个        → 表头不完整;
+    *   都没有, 有旧 res → 按旧公式折算 (axisCount)。 */
+   const bool have_counts = (n_xd >= 0.0 && n_yd >= 0.0);
+   const bool have_legacy = (r_u > 0.0);
+   if (!have_counts && !have_legacy)
+      return "CSV 中没有几何参数 (表头不完整), 无法确认与当前参数是否为同一片区域。";
+
+   int f_nx = -1, f_ny = -1;
+   if (have_counts)
+   {
+      auto toCount = [](double d) -> int
+      {
+         if (!std::isfinite(d))
+            return -1;
+         const double r = std::floor(d + 0.5);
+         if (std::fabs(d - r) > 1e-6)
+            return -1;
+         if (r < (double)kGeomCountMin || r > (double)kGeomCountMax)
+            return -1;
+         return (int)r;
+      };
+      f_nx = toCount(n_xd);
+      f_ny = toCount(n_yd);
+      if (f_nx < 0 || f_ny < 0)
+         return "CSV 的点数超出可设范围, 文件已损坏。请另建文件。";
+   }
+   else
+   {
+      f_nx = axisCount(a_x, r_u);
+      f_ny = axisCount(a_y, r_u);
+      if (f_nx < kGeomCountMin || f_ny < kGeomCountMin)
+         return "CSV 的分辨率折算不出至少 2 个点, 文件已损坏。请另建文件。";
+   }
+
+   /* **兼容判据按点数比, 不按文件里那个 res 比** (2026-10-27): 旧文件 area/res 除不尽时,
+    * 折算出的点数与它表头里写的 res 推不回同一个值 —— 拿 res 直接比, 就会出现"刚按 CSV 对
+    * 齐完, 再续扫却被自己拒掉"。这里两边都换成"由区域与点数算出的分辨率", 于是只剩整数
+    * 的一致性, 显示给人看的仍是 mm, 标签沿用旧名 (docs 与自检钉着"分辨率")。 */
+   auto resOfCount = [](double area, int n) -> double
+   {
+      if (n < 2 || !(area > 0.0))
+         return 0.0;
+      return area / (double)(n - 1);
+   };
 
    std::string diff;
    auto noteDiff = [&diff](const char *name, double was, double now)
@@ -529,24 +665,42 @@ std::string csvParseForResume(const std::string &text, const Params &p,
    };
    noteDiff("区域X(mm)", a_x, p.area_x_unit);
    noteDiff("区域Y(mm)", a_y, p.area_y_unit);
-   noteDiff("分辨率 (mm)", r_u, p.res_unit);
+   noteDiff("分辨率X (mm)", resOfCount(a_x, f_nx), resX(p));
+   noteDiff("分辨率Y (mm)", resOfCount(a_y, f_ny), resY(p));
    noteDiff("每 mm 脉冲数", ppu, p.pulses_per_unit);
 
    if (!diff.empty())
    {
       diff = "CSV 的几何参数与当前设置不一致: " + diff +
              "。几何不一致无法续扫, 请把参数改回或另建文件";
+      return diff;
    }
-   return diff;
+
+   /* 几何一致了才轮到索引: 到这一步 (ix,iy) 还越界, 就是文件本身被改坏了 */
+   if (bad_index)
+   {
+      char buf[200];
+      std::snprintf(buf, sizeof(buf),
+                    "CSV 第 %zu 行的网格索引 (%d, %d) 超出 %d×%d, 文件已损坏。",
+                    bad_lineno, bad_ix, bad_iy, nx, ny);
+      return std::string(buf);
+   }
+
+   return std::string();
 }
 
 std::string csvAlignParams(const std::string &text, const Params &cur, Params *out)
 {
-   /* 逐 `#` 行取那四项。**四项缺一不可**: 本程序写出来的表头永远四项俱全 (见 csvMetaLines),
-    * 少一项只可能是手改或截断的文件 —— 那种文件按哪一项去对齐都是猜, 不如说"表头不完整"。
-    * (今天那种文件也会被拒, 只是拒在 csvParseForResume 里, 报出来的是"区域Y -1 → 27"。) */
-   bool   have[4] = {false, false, false, false};
-   double v[4]    = {0.0, 0.0, 0.0, 0.0};
+   /* 逐 `#` 行取几何。**区域 X/Y、每 mm 脉冲数、以及点数 (或旧的单一 res) 缺一不可**:
+    * 本程序写出来的表头永远俱全 (见 csvMetaLines), 少一项只可能是手改或截断的文件 ——
+    * 那种文件按哪一项去对齐都是猜, 不如说"表头不完整"。
+    *
+    * 2026-10-27 起点数优先: 有新表头 (nx/ny) 就用它; 只有旧表头 (res_unit) 时按旧公式折算。
+    * 两个新键只出现一个也算不完整 —— 不说清是哪一根轴的文件, 对齐了也是猜。 */
+   bool   have_area_x = false, have_area_y = false, have_ppu = false;
+   bool   have_nx = false, have_ny = false, have_res = false;
+   double area_x = 0.0, area_y = 0.0, ppu = 0.0;
+   double n_xd = 0.0, n_yd = 0.0, res_legacy = 0.0;
 
    std::string line;
    size_t pos = 0;
@@ -561,34 +715,39 @@ std::string csvAlignParams(const std::string &text, const Params &cur, Params *o
          break;      /* 表头全在开头那一串 `#` 行里, 列名行一出现就不用再看了 */
 
       double d = 0;
-      if (metaGet(line, "area_x_unit", &d))     { have[0] = true; v[0] = d; }
-      if (metaGet(line, "area_y_unit", &d))     { have[1] = true; v[1] = d; }
-      if (metaGet(line, "res_unit", &d))        { have[2] = true; v[2] = d; }
-      if (metaGet(line, "pulses_per_unit", &d)) { have[3] = true; v[3] = d; }
+      if (metaGet(line, "area_x_unit", &d))     { have_area_x = true; area_x = d; }
+      if (metaGet(line, "area_y_unit", &d))     { have_area_y = true; area_y = d; }
+      if (metaGet(line, "nx", &d))              { have_nx = true; n_xd = d; }
+      if (metaGet(line, "ny", &d))              { have_ny = true; n_yd = d; }
+      if (metaGet(line, "res_unit", &d))        { have_res = true; res_legacy = d; }
+      if (metaGet(line, "pulses_per_unit", &d)) { have_ppu = true; ppu = d; }
 
       if (nl == std::string::npos)
          break;
       pos = nl + 1;
    }
 
-   if (!(have[0] && have[1] && have[2] && have[3]))
+   const bool counts_full   = (have_nx && have_ny);
+   const bool counts_partial = (have_nx != have_ny);
+   if (!have_area_x || !have_area_y || !have_ppu || counts_partial
+       || (!counts_full && !have_res))
       return "CSV 中没有几何参数 (表头不完整), 无法确认与当前参数是否为同一片区域。";
 
-   /* 名前缀与 csvParseForResume 那句诊断**同源** (docs/scan_sweep.md §24.1 钉着那四个名字):
-    * 同一个东西在两条路上不许有两个叫法 */
+   /* 区域与每 mm 脉冲数的量程, 名前缀与 csvParseForResume 那句诊断**同源**
+    * (docs/scan_sweep.md §24.1 钉着那几个名字): 同一个东西在两条路上不许有两个叫法。 */
    struct Bound
    {
       const char *name;
       double      lo, hi;
    };
-   static const Bound kBound[4] = {
-      { "区域X(mm)",    kGeomAreaMin, kGeomAreaMax },
-      { "区域Y(mm)",    kGeomAreaMin, kGeomAreaMax },
-      { "分辨率 (mm)",  kGeomResMin,  kGeomResMax  },
-      { "每 mm 脉冲数",  kGeomPpuMin,  kGeomPpuMax  },
+   static const Bound kBound[3] = {
+      { "区域X(mm)",   kGeomAreaMin, kGeomAreaMax },
+      { "区域Y(mm)",   kGeomAreaMin, kGeomAreaMax },
+      { "每 mm 脉冲数", kGeomPpuMin,  kGeomPpuMax  },
    };
+   const double v[3] = { area_x, area_y, ppu };
 
-   for (int i = 0; i < 4; i++)
+   for (int i = 0; i < 3; i++)
    {
       if (v[i] >= kBound[i].lo && v[i] <= kBound[i].hi)
          continue;
@@ -603,12 +762,55 @@ std::string csvAlignParams(const std::string &text, const Params &cur, Params *o
       return std::string(buf);
    }
 
-   /* 只改那四项, 别的字段原样 (= cur 的) —— 于是这一份整份交给 validate() 也是对的 */
+   /* 点数 (2026-10-27): 界面那个 QSpinBox 会把超范围的值**静默夹小**, 所以这里自己先判
+    * 一次 2..kGeomCountMax —— 夹过的值写进面板, 屏幕上与盘上就成了两份。 */
+   int n_x = 0, n_y = 0;
+   if (counts_full)
+   {
+      auto checked = [](double d, const char *axis, int *out, std::string *err) -> bool
+      {
+         const double r = std::isfinite(d) ? std::floor(d + 0.5) : -1.0;
+         if (!std::isfinite(d) || std::fabs(d - r) > 1e-6
+             || r < (double)kGeomCountMin || r > (double)kGeomCountMax)
+         {
+            char buf[240];
+            std::snprintf(buf, sizeof(buf),
+                          "CSV 的%s %g, 超出面板可设的范围, 无法按它对齐。请另建文件。",
+                          axis, d);
+            *err = buf;
+            return false;
+         }
+         *out = (int)r;
+         return true;
+      };
+      std::string err;
+      if (!checked(n_xd, "点数X", &n_x, &err) || !checked(n_yd, "点数Y", &n_y, &err))
+         return err;
+   }
+   else
+   {
+      /* 旧表头: 按旧公式折算。除不尽时旧网格居中留白、新网格两端顶满, 逐点最多差半格 ——
+       * 由点数定义出的新网格没有"半格"这个概念, 这是兼容旧文件必须付的代价 (见 .h)。 */
+      n_x = axisCount(area_x, res_legacy);
+      n_y = axisCount(area_y, res_legacy);
+      if (n_x < kGeomCountMin || n_y < kGeomCountMin || n_x > kGeomCountMax || n_y > kGeomCountMax)
+      {
+         char buf[240];
+         std::snprintf(buf, sizeof(buf),
+                       "CSV 的 res_unit = %g, 折算不出可用的点数, 无法按它对齐。请另建文件。",
+                       res_legacy);
+         return std::string(buf);
+      }
+   }
+
+   /* 只改这五项 (区域 X/Y、点数 X/Y、每 mm 脉冲数), 别的字段原样 (= cur 的) ——
+    * 于是这一份整份交给 validate() 也是对的 */
    Params q = cur;
-   q.area_x_unit     = v[0];
-   q.area_y_unit     = v[1];
-   q.res_unit        = v[2];
-   q.pulses_per_unit = v[3];
+   q.area_x_unit     = area_x;
+   q.area_y_unit     = area_y;
+   q.nx              = n_x;
+   q.ny              = n_y;
+   q.pulses_per_unit = ppu;
 
    /* 量程跟着新几何重算, 与 currentParams() 同一条规矩 ("量程永远按区域自动算")。
     * ★ **不重算会误判**: range_pul 是从**旧**几何算出来的数, 而它比新区域还小的场合
@@ -624,8 +826,8 @@ std::string csvAlignParams(const std::string &text, const Params &cur, Params *o
    {
       char buf[280];
       std::snprintf(buf, sizeof(buf),
-                    "CSV 的几何参数不合法: 区域 %g × %g mm, 分辨率 %g mm。请另建文件。",
-                    v[0], v[1], v[2]);
+                    "CSV 的几何参数不合法: 区域 %g × %g mm, 点数 %d × %d。请另建文件。",
+                    area_x, area_y, n_x, n_y);
       return std::string(buf);
    }
 
@@ -637,9 +839,16 @@ std::string csvAlignParams(const std::string &text, const Params &cur, Params *o
 void csvLoadGrid(const std::string &text, const Params &p,
                  std::vector<char> *have, std::vector<double> *watts)
 {
-   const int nx = axisCount(p.area_x_unit, p.res_unit);
-   const int ny = axisCount(p.area_y_unit, p.res_unit);
-   const size_t n = (size_t)std::max(0, nx) * (size_t)std::max(0, ny);
+   const int nx = p.nx;
+   const int ny = p.ny;
+   /* 同 buildPlan: 这个函数也是"谁都能调"的, 参数不合法时先挡一道再分配 */
+   if (nx < 2 || ny < 2 || (long long)nx * (long long)ny > kMaxPlanPoints)
+   {
+      if (have != nullptr)  have->clear();
+      if (watts != nullptr) watts->clear();
+      return;
+   }
+   const size_t n = (size_t)nx * (size_t)ny;
 
    if (have != nullptr)  have->assign(n, 0);
    if (watts != nullptr) watts->assign(n, 0.0);
@@ -704,7 +913,8 @@ bool sameGeom(const Params &a, const Params &b)
 {
    return nearly(a.area_x_unit, b.area_x_unit)
        && nearly(a.area_y_unit, b.area_y_unit)
-       && nearly(a.res_unit,    b.res_unit)
+       && a.nx == b.nx
+       && a.ny == b.ny
        && nearly(a.pulses_per_unit, b.pulses_per_unit);
 }
 

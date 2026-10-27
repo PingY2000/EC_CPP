@@ -131,14 +131,16 @@ void ScanController::rebuildPlan()
       return;
    }
 
-   const int nx = axisCount(m_p.area_x_unit, m_p.res_unit);
-   const int ny = axisCount(m_p.area_y_unit, m_p.res_unit);
-   const long long total = (long long)std::max(0, nx) * (long long)std::max(0, ny);
+   /* 2026-10-27: 网格尺寸直接就是点数额 (分辨率由它推出), 不再从区域/分辨率折算 */
+   const int nx = m_p.nx;
+   const int ny = m_p.ny;
+   const long long total = (long long)nx * (long long)ny;
 
    /* 点数上限的闸在这里 (不是 validate() 那句提示): 参数是边输边算的, 超过上限时一个
     * Point 都不能建, 否则分配几 GB 把界面卡死。网格当成 0×0 并把三个结果数组一起清掉 ——
-    * 它们按 nx*ny 索引 (cellDone 那条 m_done[iy*m_nx+ix]), 长度对不上就是越界读。 */
-   if (nx <= 0 || ny <= 0 || total > kMaxPlanPoints)
+    * 它们按 nx*ny 索引 (cellDone 那条 m_done[iy*m_nx+ix]), 长度对不上就是越界读。
+    * 下限 2: 1 点网格没有间距, resX/resY 与 axisCoordsByCount 都没有可除的 (n-1)。 */
+   if (nx < 2 || ny < 2 || total > kMaxPlanPoints)
    {
       m_nx = m_ny = 0;
       m_plan.clear();
@@ -761,7 +763,7 @@ bool ScanController::retest(int ix, int iy, QString *err)
 
    if (!sameGeom(m_run_p, m_p))
       return fail(err, QStringLiteral(
-         "区域 / 分辨率 / 每 mm 脉冲数已改动, 当前 (ix, iy) 已不是 CSV 中的那一点,\n"
+         "区域 / 点数 / 每 mm 脉冲数已改动, 当前 (ix, iy) 已不是 CSV 中的那一点,\n"
          "追加会在一份文件里混入两个坐标。请把参数改回, 或另开一轮。"));
 
    if (ix < 0 || iy < 0 || ix >= m_nx || iy >= m_ny)

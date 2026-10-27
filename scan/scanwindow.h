@@ -384,7 +384,12 @@ private:
    /* ---- 参数 ---- */
    QDoubleSpinBox *m_edAreaX = nullptr;
    QDoubleSpinBox *m_edAreaY = nullptr;
-   QDoubleSpinBox *m_edRes   = nullptr;
+   /* 每根轴取几个点 (2026-10-27)。**几何的唯一输入**: 分辨率由点数与区域算出, 所以它下面
+    * 那两个是只读标签, 不是控件 */
+   QSpinBox       *m_sbNx    = nullptr;
+   QSpinBox       *m_sbNy    = nullptr;
+   QLabel         *m_lResX   = nullptr;   /* 「分辨率 X」只读标签, 由 pushParams 刷新 */
+   QLabel         *m_lResY   = nullptr;
    QDoubleSpinBox *m_edPpu   = nullptr;
    QSpinBox       *m_edSpeed = nullptr;   /* 扫描速度: 由 ScanController::start 下发 */
    QSpinBox       *m_edManSpeed = nullptr;/* 手动速度: 点画布 / 全部回中用 */

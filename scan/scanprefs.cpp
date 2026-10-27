@@ -16,6 +16,10 @@ namespace k
 {
 static const char *area_x     = "scan/area_x_unit";
 static const char *area_y     = "scan/area_y_unit";
+static const char *nx         = "scan/nx";
+static const char *ny         = "scan/ny";
+/* 旧键 (2026-10-27 之前唯一的那个分辨率)。**只读不写**: 新程序保存时把它 remove 掉,
+ * 否则读-改-写的 QSettings 会让它永远留在盘上, 哪天新键丢了又被当成回退值读回来。 */
 static const char *res        = "scan/res_unit";
 static const char *ppu        = "scan/pulses_per_unit";
 static const char *speed      = "scan/speed_pul_s";
@@ -74,9 +78,48 @@ Prefs prefsLoad(const QString &path)
    /* 每项都显式带上缺省值: 缺项时 QSettings 给的是无效 QVariant, toDouble() 会当 0 */
    p.params.area_x_unit = s.value(QLatin1String(k::area_x), p.params.area_x_unit).toDouble();
    p.params.area_y_unit = s.value(QLatin1String(k::area_y), p.params.area_y_unit).toDouble();
-   p.params.res_unit    = s.value(QLatin1String(k::res),    p.params.res_unit).toDouble();
    p.params.pulses_per_unit =
       s.value(QLatin1String(k::ppu), p.params.pulses_per_unit).toDouble();
+
+   /* 点数 (2026-10-27)。三个层次, 从上往下:
+    *   ① scan/nx 与 scan/ny 都在且都合法 → 用它们;
+    *   ② 否则若有旧的 scan/res_unit → 按旧公式 (axisCount) 折算出点数 —— 这就是老 ini 的
+    *      迁移路径, 第一次保存时旧键会被删掉 (见 prefsSave);
+    *   ③ 都没有 → 留在缺省 55/55。
+    * **用 contains() 而不是看值**: 手改坏的 "nx=0" 是"有一项坏值", 与"缺这项"该有不同待遇
+    * —— 前者退回旧键 (或完全退不了), 后者才安静地留在缺省上。 */
+   {
+      auto usable = [](int n) { return n >= kGeomCountMin && n <= kGeomCountMax; };
+      int  nx = 0, ny = 0;
+      bool have_new = s.contains(QLatin1String(k::nx)) && s.contains(QLatin1String(k::ny));
+
+      if (have_new)
+      {
+         nx = s.value(QLatin1String(k::nx)).toInt();
+         ny = s.value(QLatin1String(k::ny)).toInt();
+         have_new = usable(nx) && usable(ny);
+      }
+
+      if (have_new)
+      {
+         p.params.nx = nx;
+         p.params.ny = ny;
+      }
+      else
+      {
+         const double legacy = s.value(QLatin1String(k::res), 0.0).toDouble();
+         if (legacy > 0.0)
+         {
+            const int lx = axisCount(p.params.area_x_unit, legacy);
+            const int ly = axisCount(p.params.area_y_unit, legacy);
+            if (usable(lx) && usable(ly))
+            {
+               p.params.nx = lx;
+               p.params.ny = ly;
+            }
+         }
+      }
+   }
 
    p.params.speed_pul_s =
       (uint32_t)s.value(QLatin1String(k::speed), (uint)p.params.speed_pul_s).toUInt();
@@ -226,8 +269,12 @@ void prefsSave(const QString &path, const Prefs &p)
 
    s.setValue(QLatin1String(k::area_x),    p.params.area_x_unit);
    s.setValue(QLatin1String(k::area_y),    p.params.area_y_unit);
-   s.setValue(QLatin1String(k::res),       p.params.res_unit);
+   s.setValue(QLatin1String(k::nx),        p.params.nx);
+   s.setValue(QLatin1String(k::ny),        p.params.ny);
    s.setValue(QLatin1String(k::ppu),       p.params.pulses_per_unit);
+   /* 旧键必须**显式删**: QSettings 是读-改-写, 不认识"整份重写"。留着的话, 哪天新键被谁
+    * 删了 / 改坏了, 读那边就会按一个早已不成立的旧分辨率把点数折回来。 */
+   s.remove(QLatin1String(k::res));
 
    s.setValue(QLatin1String(k::speed),     (uint)p.params.speed_pul_s);
    s.setValue(QLatin1String(k::dwell),     p.params.dwell_ms);

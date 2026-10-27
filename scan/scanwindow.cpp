@@ -2249,12 +2249,32 @@ QWidget *ScanWindow::buildParamPanel()
    m_edAreaY->setSingleStep(1.0);
    m_edAreaY->setSuffix(QStringLiteral(" mm"));
 
-   m_edRes = new QDoubleSpinBox(box);
-   m_edRes->setRange(kGeomResMin, kGeomResMax);
-   m_edRes->setDecimals(3);
-   m_edRes->setSingleStep(0.1);
-   m_edRes->setSuffix(QStringLiteral(" mm"));
-   m_edRes->setToolTip(QStringLiteral("分辨率 (mm); 点数 = (floor(区域 / 分辨率) + 1)²。"));
+   /* 点数 (2026-10-27): **操作员只设点数**, 分辨率由点数与区域算出来 (两端都取), 所以那两个
+    * 是只读标签而不是控件。步进 1 点; 上限是总点数上限 (见 kGeomCountMax)。 */
+   m_sbNx = new QSpinBox(box);
+   m_sbNx->setRange(kGeomCountMin, kGeomCountMax);
+   m_sbNx->setSingleStep(1);
+   m_sbNx->setSuffix(QStringLiteral(" 点"));
+   m_sbNx->setToolTip(QStringLiteral(
+      "X 方向取几个点, 两端都算。\n"
+      "分辨率 X = 区域 X ÷ (点数 X - 1)。"));
+
+   m_sbNy = new QSpinBox(box);
+   m_sbNy->setRange(kGeomCountMin, kGeomCountMax);
+   m_sbNy->setSingleStep(1);
+   m_sbNy->setSuffix(QStringLiteral(" 点"));
+   m_sbNy->setToolTip(QStringLiteral(
+      "Y 方向取几个点, 两端都算。\n"
+      "分辨率 Y = 区域 Y ÷ (点数 Y - 1)。"));
+
+   /* 派生出来的两个分辨率, 只读灰字。刷新只在 pushParams (参数有任何改动都必经那里);
+    * 初值先写一个占位, 免得 buildUi 末尾那次 pushParams 之前布局按 0 宽量一遍 */
+   m_lResX = new QLabel(QStringLiteral("—"), box);
+   m_lResX->setStyleSheet(QStringLiteral("color:#7b8391;"));
+   m_lResX->setToolTip(QStringLiteral("由区域 X 与点数 X 算出, 不可直接修改。"));
+   m_lResY = new QLabel(QStringLiteral("—"), box);
+   m_lResY->setStyleSheet(QStringLiteral("color:#7b8391;"));
+   m_lResY->setToolTip(QStringLiteral("由区域 Y 与点数 Y 算出, 不可直接修改。"));
 
    m_edPpu = new QDoubleSpinBox(box);
    m_edPpu->setRange(kGeomPpuMin, kGeomPpuMax);
@@ -2375,7 +2395,10 @@ QWidget *ScanWindow::buildParamPanel()
 
    pair(QStringLiteral("区域 X"),   m_edAreaX);
    pair(QStringLiteral("区域 Y"),   m_edAreaY);
-   pair(QStringLiteral("分辨率"),   m_edRes);
+   pair(QStringLiteral("点数 X"),   m_sbNx);
+   pair(QStringLiteral("点数 Y"),   m_sbNy);
+   pair(QStringLiteral("分辨率 X"), m_lResX);
+   pair(QStringLiteral("分辨率 Y"), m_lResY);
    pair(QStringLiteral("1 mm ="),   m_edPpu);
    pair(QStringLiteral("扫描速度"), m_edSpeed);
    pair(QStringLiteral("手动速度"), m_edManSpeed);
@@ -2415,10 +2438,10 @@ QWidget *ScanWindow::buildParamPanel()
    loadSettings();
 
    /* 参数一改就重算, 让操作员在按开始之前就看见这一趟多长 */
-   const QList<QDoubleSpinBox *> dspins{m_edAreaX, m_edAreaY, m_edRes, m_edPpu};
+   const QList<QDoubleSpinBox *> dspins{m_edAreaX, m_edAreaY, m_edPpu};
    for (QDoubleSpinBox *s : dspins)
       connect(s, &QDoubleSpinBox::valueChanged, this, &ScanWindow::pushParams);
-   const QList<QSpinBox *> ispins{m_edSpeed, m_edDwell, m_edSettle, m_edSamples};
+   const QList<QSpinBox *> ispins{m_sbNx, m_sbNy, m_edSpeed, m_edDwell, m_edSettle, m_edSamples};
    for (QSpinBox *s : ispins)
       connect(s, &QSpinBox::valueChanged, this, &ScanWindow::pushParams);
 
@@ -2447,7 +2470,8 @@ QWidget *ScanWindow::buildParamPanel()
             QList<GateItem>{
                GateItem{ m_edAreaX,    true,  false, true },   /* 区域 X */
                GateItem{ m_edAreaY,    true,  false, true },   /* 区域 Y */
-               GateItem{ m_edRes,      true,  false, true },   /* 分辨率 */
+               GateItem{ m_sbNx,       true,  false, true },   /* 点数 X: 同样是几何 */
+               GateItem{ m_sbNy,       true,  false, true },   /* 点数 Y */
                GateItem{ m_edPpu,      true,  false, true },   /* 1 mm = N 脉冲 */
                GateItem{ m_edSpeed,    true,  false },         /* 扫描速度: 一轮只设一次 */
                GateItem{ m_edManSpeed, true,  false },         /* 手动速度: 扫描中推不出去 */
@@ -3263,7 +3287,8 @@ void ScanWindow::applyDefaults()
 
    m_edAreaX->setValue(d.area_x_unit);
    m_edAreaY->setValue(d.area_y_unit);
-   m_edRes  ->setValue(d.res_unit);
+   m_sbNx   ->setValue(d.nx);
+   m_sbNy   ->setValue(d.ny);
    m_edPpu  ->setValue(d.pulses_per_unit);
    m_edSpeed->setValue((int)d.speed_pul_s);
    m_edDwell->setValue(d.dwell_ms);
@@ -3302,7 +3327,8 @@ void ScanWindow::loadSettings()
 
    m_edAreaX ->setValue(pf.params.area_x_unit);
    m_edAreaY ->setValue(pf.params.area_y_unit);
-   m_edRes   ->setValue(pf.params.res_unit);
+   m_sbNx    ->setValue(pf.params.nx);
+   m_sbNy    ->setValue(pf.params.ny);
    m_edPpu   ->setValue(pf.params.pulses_per_unit);
    m_edSpeed ->setValue((int)pf.params.speed_pul_s);
    m_edDwell ->setValue(pf.params.dwell_ms);
@@ -3639,7 +3665,8 @@ Params ScanWindow::currentParams() const
    Params p;
    p.area_x_unit = m_edAreaX->value();
    p.area_y_unit = m_edAreaY->value();
-   p.res_unit    = m_edRes->value();
+   p.nx          = m_sbNx->value();
+   p.ny          = m_sbNy->value();
    p.pulses_per_unit = m_edPpu->value();
 
    p.speed_pul_s = (uint32_t)m_edSpeed->value();
@@ -3674,10 +3701,16 @@ void ScanWindow::pushParams()
    m_ctl->setParams(p);
    m_ctl->rebuildPlan();
 
+   /* 两个只读的分辨率标签 (2026-10-27): 唯一刷新处就在这里 —— 参数的任何改动都会走到
+    * pushParams, 于是屏幕上那两个数永远跟着点数/区域走。 */
+   m_lResX->setText(QStringLiteral("%1 mm").arg(resX(p), 0, 'f', 3));
+   m_lResY->setText(QStringLiteral("%1 mm").arg(resY(p), 0, 'f', 3));
+
    /* 网格那一行自己按参数算 nx/ny, 不读 m_ctl->gridNx(): 超上限时控制器那边是 0×0
-    * (一个 Point 都没建), 而这一行要说的是"参数说的网格有多大" */
-   const int nx = axisCount(p.area_x_unit, p.res_unit);
-   const int ny = axisCount(p.area_y_unit, p.res_unit);
+    * (一个 Point 都没建), 而这一行要说的是"参数说的网格有多大"。
+    * 2026-10-27: nx/ny 就是点数本身, 不再从区域与分辨率折算。 */
+   const int nx = p.nx;
+   const int ny = p.ny;
    const qint64 total = (qint64)nx * (qint64)ny;
 
    if (total > kMaxPlanPoints)
@@ -4398,7 +4431,7 @@ void ScanWindow::onStartClicked()
 
    /* 不弹确认框 —— 这一趟的范围在按之前就全在眼前了 (参数栏填的数、扫描栏那两行、
     * 旁边的「开不了」红字)。这里只留一句"出发了": 点数、时长、写到哪个文件。
-    * **区域 / 分辨率 / 速度一个都不念** (2026-09-30, §49.11): 参数栏就在旁边, 而横幅压在
+    * **区域 / 点数 / 速度一个都不念** (2026-09-30, §49.11): 参数栏就在旁边, 而横幅压在
     * 画布顶上, 每多念一项就多折一行。 */
 
    /* 2026-09-29 §41.3: 这里原来有一句 setHold(true) —— "扫描起来就让连续读数让位"。
@@ -4453,12 +4486,12 @@ void ScanWindow::onOpenCsvClicked()
       return;
 
    m_last_dir = QFileInfo(f).absolutePath();
-   const QString old_path = m_edCsv->text();   /* 退回时与那四个几何控件同进退, 见下面 restore */
+   const QString old_path = m_edCsv->text();   /* 退回时与那几个几何控件同进退, 见下面 restore */
    m_edCsv->setText(QDir::toNativeSeparators(f));
 
    /* ---- 先把参数栏对齐到这份 CSV 的几何 (2026-09-29, docs/scan_sweep.md §44) -------------
     * 续扫要求几何逐项一致, 而"一致"只有一种做法: CSV 里那些 (ix,iy) 只在那份文件的几何下
-    * 才指向那些位置。从前是**拒绝**并让人回参数栏手抄那四个数 (区域 X/Y、分辨率、每 mm
+    * 才指向那些位置。从前是**拒绝**并让人回参数栏手抄那几个数 (区域 X/Y、点数 X/Y、每 mm
     * 脉冲数), 现在是直接抄过去。
     *
     * 下推走的就是控件自己的 valueChanged (与「恢复默认」同一条路), 于是参数栏那套"改了没
@@ -4487,43 +4520,53 @@ void ScanWindow::onOpenCsvClicked()
       return;
    }
 
-   const double old[4] = { m_edAreaX->value(), m_edAreaY->value(),
-                           m_edRes->value(),   m_edPpu->value() };
-   const bool changed = (old[0] != cand.area_x_unit) || (old[1] != cand.area_y_unit)
-                     || (old[2] != cand.res_unit)    || (old[3] != cand.pulses_per_unit);
+   /* 五项几何 (2026-10-27): 区域 X、区域 Y、点数 X、点数 Y、每 mm 脉冲数 —— 点数与区域是
+    * **两种类型** (int / double), 所以用一个小结构, 不塞进一个 double 数组里碰运气 */
+   struct GeomSnap
+   {
+      double area_x = 0.0, area_y = 0.0, ppu = 0.0;
+      int    nx = 0, ny = 0;
+   };
+   const GeomSnap old{ m_edAreaX->value(), m_edAreaY->value(), m_edPpu->value(),
+                       m_sbNx->value(),     m_sbNy->value() };
+   const bool changed = (old.area_x != cand.area_x_unit) || (old.area_y != cand.area_y_unit)
+                     || (old.nx     != cand.nx)          || (old.ny     != cand.ny)
+                     || (old.ppu    != cand.pulses_per_unit);
 
    if (changed)
    {
       m_edAreaX->setValue(cand.area_x_unit);
       m_edAreaY->setValue(cand.area_y_unit);
-      m_edRes  ->setValue(cand.res_unit);
+      m_sbNx   ->setValue(cand.nx);
+      m_sbNy   ->setValue(cand.ny);
       m_edPpu  ->setValue(cand.pulses_per_unit);
    }
 
-   /* 退回去的那一手: 打开最终没成时把四个控件退回原样 (也就退回了控制器与量程)。
+   /* 退回去的那一手: 打开最终没成时把这五个控件退回原样 (也就退回了控制器与量程)。
     * 「要么整件事成了, 要么屏幕回到按之前那样」—— 限位闸拦下 / 写不进文件都跟参数无关,
     * 让面板留着一份"为这趟改过而结果没跑"的几何只会让人看不懂。
     * (退回之后「● 未保存」那个标记也跟着回到按之前的样子 —— 基线比对是幂等的)
     *
     * **路径框一起退** (2026-09-30, §49.5): 它是 beginNew 的 Truncate 目标 (scanlog.cpp:32),
     * 打开失败却把它留在那份"没打开成"的文件上, 再按「开始扫描」就是静默清空一份**别人写的**
-    * 文件 —— 而屏幕上唯一能看出来的是这句 8 秒自灭的横幅。从前它退四个几何控件、不退路径,
+    * 文件 —— 而屏幕上唯一能看出来的是这句 8 秒自灭的横幅。从前它退几个几何控件、不退路径,
     * 这个不对称本身就是错的 */
    auto restore = [this, old, old_path]()
    {
-      m_edAreaX->setValue(old[0]);
-      m_edAreaY->setValue(old[1]);
-      m_edRes  ->setValue(old[2]);
-      m_edPpu  ->setValue(old[3]);
+      m_edAreaX->setValue(old.area_x);
+      m_edAreaY->setValue(old.area_y);
+      m_sbNx   ->setValue(old.nx);
+      m_sbNy   ->setValue(old.ny);
+      m_edPpu  ->setValue(old.ppu);
       m_edCsv  ->setText(old_path);
    };
 
    /* 打开态下按「打开 CSV」= **换一份** (2026-09-30, §49.9)。失败时的退法比"未打开"那条路
     * 多一步, 而且非有不可:
-    *   上面那句对齐 (把四个几何控件推到新文件那套值上) 走的是控件自己的 valueChanged,
+    *   上面那句对齐 (把几个几何控件推到新文件那套值上) 走的是控件自己的 valueChanged,
     *   控制器那边收到 setParams 之后 rebuildPlan() 一看几何变了就把**点列与三个结果数组
     *   一起清掉** (那是它的本分)。所以手里这一份在"对齐"那一步就已经被清空了 ——
-    *   只把四个控件退回去, 变不回来。要**把那份文件重新装一遍**。
+    *   只把几个控件退回去, 变不回来。要**把那份文件重新装一遍**。
     * 用 accept_zero_epoch_change=true: 那份文件的世代差操作员当初打开它时已经确认过一次,
     * 没有理由再问第二遍。装不回来 (刚被别的程序动过 / 删了) 就退回"未打开" —— 那也比一个
     * "写着已打开、画布空着、句柄关着"的撕裂态强。
@@ -4551,7 +4594,7 @@ void ScanWindow::onOpenCsvClicked()
       return false;
    };
 
-   /* 只有真变了才说这一句 —— 横幅就一个槽, 那四个数就在旁边的参数栏里 (横幅 1 句 / 40 字) */
+   /* 只有真变了才说这一句 —— 横幅就一个槽, 那几个数就在旁边的参数栏里 (横幅 1 句 / 40 字) */
    const QString aligned = changed ? QStringLiteral("已按 CSV 对齐扫描参数, ") : QString();
 
    /* 读入而已, **不开跑** (2026-09-29): 上半场已经在画布上, 要补的点也算好了,
