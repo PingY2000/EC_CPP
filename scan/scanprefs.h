@@ -24,6 +24,16 @@
 
 namespace scan {
 
+/* 「回零偏移」没记过时的值。★ **必须与 hmi/ecatworker.h 的 HMI_HOME_OFF_UNSET 逐位相同**
+ * (那边是 INT32_MIN), 读到它就走 home_off_from_pref 回落成缺省。
+ * 为什么不能借 -1 / 0 / -2147483647 里的任何一个: 2026-10-28 起这个偏移整个
+ * [-500000, 500000] 都合法, 负数是**有意义的数** (零点放在落点的另一侧), 拿任何一个
+ * 界内的值兼哨兵都会把操作员存下的数读成 75000。
+ * 这里不 include ecatworker.h 是**故意的** (scanprefs 只给 Core 层用), 所以这份常量抄了
+ * 一遍 —— selftest 里那条「advprefs: 被手改坏的偏移」钉着两处逐位相等,
+ * 改一边不改另一边会红。 */
+static constexpr int kHomeOffUnset = (-2147483647 - 1);   /* INT32_MIN */
+
 struct Prefs
 {
    Params  params;                  /* 缺省见 scanplan.h */
@@ -33,12 +43,13 @@ struct Prefs
    int     home_tmo_s   = -1;       /* 回零超时 (s); -1 = 没记过 (HMI_HOME_TMO_DEF_S)。
                                      * **单位是秒**: ini 键 / 界面 / Cmd 一律秒, 只在 doHome() 里
                                      * 乘一次 1000 (见 hmi/ecatworker.h 里那三个宏的注释)。 */
-   /* 「回零偏移」逐轴一个 (pul): 找原点收尾时把显示坐标 0 放在落点正方向多少个脉冲处。
-    * -1 = 没记过 (用 HMI_HOME_OFF_DEF)。 ★ **0 是合法值** (0 = 零点就放在落点上), 所以
-    * "没记过"的哨兵只能落在负数那一侧 —— 读它必须过 ecatcmd::home_off_from_pref,
-    * 照 home_vel / home_tmo_s 的 `<= 0` 抄会把"操作员存下的 0"读成 75000。 */
-   int     home_off_x   = -1;
-   int     home_off_y   = -1;
+   /* 「回零偏移」逐轴一个 (pul): 找原点收尾时把显示坐标 0 放在落点正方向 (off > 0) 或
+    * 负方向 (off < 0) 多少个脉冲处。kHomeOffUnset = 没记过 (用 HMI_HOME_OFF_DEF)。
+    * ★ **0 与负数都是合法值** (2026-10-28 起, §53), 所以哨兵只能落在 [MIN, MAX] 之外 ——
+    * 读它必须过 ecatcmd::home_off_from_pref, 照 home_vel / home_tmo_s 的 `<= 0` 抄会把
+    * 操作员存下的 0 或一个负偏移读成 75000。 */
+   int     home_off_x   = kHomeOffUnset;
+   int     home_off_y   = kHomeOffUnset;
 
    /* ---- 「高级选项」(只有 scan 界面有这三项; hmi 不读不写)。
     * 下面的初值就是"默认值"的唯一定义处: 界面初值 / ini 缺项回落 / 恢复默认都读它 ---- */

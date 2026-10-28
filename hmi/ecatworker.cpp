@@ -2197,7 +2197,7 @@ void EcatThread::finishHoming()
           * ★ **第二个坑就在这一对数上**: 偏移非 0 时 m_tgt 写的是 **-off 而不是 0**。
           * home_anchor() 保证 `origin + tgt == 落点`, 也就是物理目标一个脉冲都不动 ——
           * 只搬 origin 而把 m_tgt 留成 0, 就是命令驱动器从 origin+0 走到落点: 一次**没人按过
-          * 按钮的 off 个脉冲全速移动** (缺省 75000 pul = 1.5 mm)。理由与不变式见 ecatworker.h。
+          * 按钮的 |off| 个脉冲全速移动** (缺省 75000 pul = 1.5 mm)。理由与不变式见 ecatworker.h。
           * off == 0 时它逐字退回改造前那两行 {origin = 落点, tgt = 0}。 */
          const ecatcmd::HomeAnchor anc = ecatcmd::home_anchor(em_pos(ax), m_home_off[axis].eff);
 

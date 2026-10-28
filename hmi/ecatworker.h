@@ -51,16 +51,20 @@
 #define HMI_HOME_TMO_MAX_S    600
 #define HMI_HOME_TMO_DEF_S    120
 
-/* 「回零偏移」: 找原点 (方式 24/29) 停稳之后, 把显示坐标 0 放在落点**正方向**多少个脉冲处。
+/* 「回零偏移」: 找原点 (方式 24/29) 停稳之后, 把显示坐标 0 放在落点**正方向** off 个脉冲处
+ * (off < 0 时放在**负方向** |off| 个脉冲处 —— 2026-10-28 起符号有意义, 见 §53)。
  * 现场要的零点不在原点开关的落点上 (它离落点 1.5 mm), 所以缺省不是 0。
  *
- * **0 是一个合法值** (0 = 零点就放在落点上 = 改造前的行为), 于是"没记过"这个语义只能落在
- * 负数那一侧 —— 见 ecatcmd::home_off_from_pref()。界面 setRange 与工作线程的夹取读同一组宏,
- * 与 HMI_HOME_VEL_* 同一条规矩: 界面显示的数就是线上发的数, 不许漂移。
- * 上限取 HMI_RANGE: 再大也过不了 home_off_fits() (量程比它宽时那个数才是真的上限)。 */
-#define HMI_HOME_OFF_MIN        0
-#define HMI_HOME_OFF_MAX  HMI_RANGE   /* = 500000 pul, 约 10 圈 */
-#define HMI_HOME_OFF_DEF    75000     /* pul, 按缺省脉冲当量 1 mm = 50000 pul 即 1.5 mm */
+ * **0 是一个合法值** (0 = 零点就放在落点上 = 改造前的行为), **负数也是合法值** (它就是
+ * "零点在落点另一侧"), 于是"没记过"只能用一个**落在 [MIN, MAX] 之外**的哨兵 ——
+ * HMI_HOME_OFF_UNSET, 由 ecatcmd::home_off_from_pref() 认。界面 setRange 与工作线程的夹取
+ * 读同一组宏, 与 HMI_HOME_VEL_* 同一条规矩: 界面显示的数就是线上发的数, 不许漂移。
+ * 上下限取 ±HMI_RANGE: 再大也过不了 home_off_fits() (量程比它宽时那个数才是真的上限)。 */
+#define HMI_HOME_OFF_MIN  (-HMI_RANGE)   /* = -500000 pul, 约 10 圈 (落点另一侧) */
+#define HMI_HOME_OFF_MAX   HMI_RANGE     /* =  500000 pul, 约 10 圈 */
+#define HMI_HOME_OFF_DEF    75000        /* pul, 按缺省脉冲当量 1 mm = 50000 pul 即 1.5 mm */
+/* "没记过"的哨兵。**必须在 [MIN, MAX] 之外**, 否则一个合法的负数会被读成缺省。 */
+#define HMI_HOME_OFF_UNSET  (-2147483647 - 1)   /* INT32_MIN */
 
 /* AxisTelem::mode_disp 里"工作线程还没为这根轴读过 6061h"的哨兵值。
  * 不能拿 -1 兼这个语义 (em_get_mode 读失败也返回 -1), 也不能借 0 (合法模式号: 未定义)。 */
@@ -683,14 +687,17 @@ inline int32_t home_off_clamp(int32_t v)
    return v;
 }
 
-/* 从 scan.ini 读回来的回零偏移。★ **哨兵只能落在负数那一侧**: 0 是一个合法值 (0 = 零点就
- * 放在落点上 = 改造前的行为), 拿 <= 0 当"没记过"的后果是 —— 操作员把两个框都改成 0 存进
- * ini, 下次开程序读回来变成 75000, 一次静默的零点搬家。
+/* 从 scan.ini 读回来的回零偏移。★ **0 与负数都是合法值** (0 = 零点就放在落点上;
+ * 负数 = 零点放在落点另一侧), 于是"没记过"只能认 HMI_HOME_OFF_UNSET 这一个哨兵。
+ * 拿 `<= 0` / `< 0` 当"没记过"的后果是 —— 操作员存下的 0 或一个负偏移, 下次开程序读回来
+ * 变成 75000, 一次静默的零点搬家。
  * **不许照抄 home_vel_from_pref / home_tmo_s_from_pref 的 `<= 0`** —— 那两个的 0 确实是
- * 非法值 (速度 0 / 超时 0 都出事), 这一个不是。 */
+ * 非法值 (速度 0 / 超时 0 都出事), 这一个不是。
+ *
+ * 手改坏的超范围值 (哨兵之外) 照旧夹回 [MIN, MAX], 与 home_vel/tmo 那一套同一条。 */
 inline int32_t home_off_from_pref(int v)
 {
-   if (v < 0)
+   if (v == HMI_HOME_OFF_UNSET)
       return HMI_HOME_OFF_DEF;
    return home_off_clamp(v);
 }
@@ -698,12 +705,17 @@ inline int32_t home_off_from_pref(int v)
 /* 这个偏移装得进当前量程吗。量程未知 (<= 0) 一律不搬 —— 不知道就别赌。
  * **判据与 origin_keep_ok() 是同一条界** (闭区间, 那边是 |pos - origin| <= range 而
  * pos - origin 正好是 -off): 现在装得下的, 重连时才沿用得上; 若这里松一档, 重连那一刻
- * 零点会被静默重取, 偏移无声消失。 */
+ * 零点会被静默重取, 偏移无声消失。
+ *
+ * 2026-10-28 起 off 可以是负的, 判的是 **|off|** —— 负偏移把零点放到落点另一侧, 收尾时
+ * 落点读出的是 +|off|, 与重连那道闸关心的是同一个量。绝对值在 int64 里取, 于是连
+ * INT32_MIN 这个调用方本不该给的值也不会溢出。 */
 inline bool home_off_fits(int32_t off, int32_t range)
 {
-   if (range <= 0 || off < 0)
+   if (range <= 0)
       return false;
-   return (int64_t)off <= (int64_t)range;
+   const int64_t mag = (off < 0) ? -(int64_t)off : (int64_t)off;
+   return mag <= (int64_t)range;
 }
 
 /* 一趟采下来的账: 界面给的数 (req)、这一趟真正生效的数 (eff)、当时的量程、这一趟是不是找限位。
@@ -734,7 +746,8 @@ inline HomeOff home_off_decide(int32_t off_ui, bool is_limit, int32_t range)
  *
  * ★ **不变式: `origin + tgt == 落点 L`** —— 物理目标一个脉冲都不许动。
  *   - origin = L + off  : 落点处的显示坐标 = 6064h - origin = L - (L + off) = **-off**
- *                         (现场要的就是屏幕读 -75000, 即零点在落点的正方向)
+ *                         (现场要的就是屏幕读 -75000, 即零点在落点的正方向;
+ *                          off < 0 时屏幕读 +|off|, 零点在落点的负方向 —— 同一个式子)
  *   - tgt    = -off     : 只改 origin 而把 m_tgt/m_want 留成 0, 等于命令驱动器从
  *                         origin+0 走到落点 —— 一次**没人按过按钮的 75000 脉冲全速移动**
  *                         (缺省脉冲当量下 1.5 mm)。§18.5 那一行警告的同一个 bug 类。
@@ -753,9 +766,13 @@ struct HomeAnchor
 
 inline HomeAnchor home_anchor(int32_t landing, int32_t off)
 {
-   const int64_t o = (int64_t)landing + (int64_t)off;
+   const int64_t o   = (int64_t)landing + (int64_t)off;
+   const int64_t tgt = -(int64_t)off;
 
-   if (o > (int64_t)INT32_MAX || o < (int64_t)INT32_MIN)
+   /* tgt 那一路只在 off == INT32_MIN 时才可能越界 —— 那不在 [MIN, MAX] 里, 走不到这里;
+    * 但两道一起判, 免得日后有人接着扩范围时把它漏掉 (取负溢出同样是 UB)。 */
+   if (o > (int64_t)INT32_MAX || o < (int64_t)INT32_MIN ||
+       tgt > (int64_t)INT32_MAX || tgt < (int64_t)INT32_MIN)
    {
       HomeAnchor a;
       a.origin   = landing;
@@ -766,7 +783,7 @@ inline HomeAnchor home_anchor(int32_t landing, int32_t off)
 
    HomeAnchor a;
    a.origin = (int32_t)o;
-   a.tgt    = -off;   /* off >= 0, 所以取负不会溢出 */
+   a.tgt    = (int32_t)tgt;
    return a;
 }
 
@@ -780,8 +797,15 @@ inline QString home_off_clause(const HomeOff &o)
    if (o.is_limit)
       return QStringLiteral(" (显示坐标已把这里定为 0)");
 
+   /* 2026-10-28 起 eff 可以是负的: 方向词在前、数值取绝对值, 否则屏幕上会出现
+    * 「正方向 -75000 pul」这种自相矛盾的句子。 */
    if (o.eff != 0)
-      return QStringLiteral(" (显示坐标 0 在落点正方向 %1 pul 处)").arg(o.eff);
+   {
+      const int32_t mag = (o.eff < 0) ? (int32_t)(-(int64_t)o.eff) : o.eff;
+      return QStringLiteral(" (显示坐标 0 在落点%1方向 %2 pul 处)")
+                .arg(o.eff < 0 ? QStringLiteral("负") : QStringLiteral("正"))
+                .arg(mag);
+   }
 
    if (o.req != 0)
       return QStringLiteral(" (回零偏移 %1 pul 未生效: 当前量程 ±%2 pul)")

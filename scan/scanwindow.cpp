@@ -1981,17 +1981,18 @@ QWidget *ScanWindow::buildHomePanel()
    dg->addWidget(new QLabel(QStringLiteral("超时"), m_homeDetail), 1, 0);
    dg->addWidget(m_edHomeTmo, 1, 1, 1, 4);   /* 与速度同一列, 一眼看出是两个同类的数 */
 
-   /* ---- 回零偏移 (2026-09-28 加) ----
+   /* ---- 回零偏移 (2026-09-28 加; 2026-10-28 起允许负数, §53) ----
     * 找原点 (方式 24/29) 停稳之后, 显示坐标 0 放在落点**正方向**多少个脉冲处 —— 现场要的
     * 零点不在原点开关的落点上, 按缺省脉冲当量 75000 pul = 1.5 mm。逐轴一个, 填进
-    * m_edHomeOff[0] / [1]。
+    * m_edHomeOff[0] / [1]。**填负数 = 零点放在落点的负方向** (范围是 ±HMI_RANGE), 于是落点
+    * 在屏幕上读 +|off|, 而正数时读 -off —— 两边的数都不是笔误, 别在结论句或日志里"纠正"它。
     *
     * 名字里的「回零」不能省成「原点偏移」: 那是驱动器 607Ch 的名字, 而这一项**不写 607Ch**
     * (它是上位机的软件零点, 见 §20.5 / §38)。与结论句里那个「回零偏移」同一种说法。
     *
-    * 缺省显式设, 理由同上面两个框 (新建的 QSpinBox 是 0, setRange 会把它夹到下限 0 ——
-    * 而 0 在这里是"落点即零点", 一个**合法但不想要**的值: 不设的话升级之后没人会发现
-    * 缺省该是 75000)。界面 setRange 与工作线程的夹取读同一组宏。 */
+    * 缺省显式设, 理由同上面两个框: 新建的 QSpinBox 是 0, 而 0 在这里是"落点即零点" ——
+    * 一个**合法但不想要**的值 (升级之后没人会发现缺省该是 75000)。界面 setRange 与工作线程
+    * 的夹取读同一组宏。 */
    for (int i = 0; i < 2; i++)
    {
       m_edHomeOff[i] = new QSpinBox(m_homeDetail);
@@ -1999,9 +2000,11 @@ QWidget *ScanWindow::buildHomePanel()
       m_edHomeOff[i]->setSingleStep(1000);   /* 0.02 mm, 与「手动速度」同一个量级的步长 */
       m_edHomeOff[i]->setSuffix(QStringLiteral(" pul"));
       m_edHomeOff[i]->setValue(HMI_HOME_OFF_DEF);
-      /* 文案: 2 行 60 字以内, 一个数字都不写 (框收起时看不见), 出路那一句按规矩只说现象 */
+      /* 文案: 2 行 60 字以内, 一个数字都不写 (框收起时看不见), 出路那一句按规矩只说现象。
+       * 第一行那半句「填负数则定在负方向」是**符号语义**, 不是操作步骤 —— 这一格因此成了
+       * 全界面唯一能填负数的地方。 */
       m_edHomeOff[i]->setToolTip(QStringLiteral(
-         "回零后显示坐标 0 定在落点正方向该数处。\n"
+         "回零后显示坐标 0 定在落点正方向该数处, 填负数则定在负方向。\n"
          "0 = 落点即 0; 找限位不用; 超过量程本次不搬零点。"));
 
       dg->addWidget(new QLabel(QStringLiteral("回零偏移%1")
@@ -3363,9 +3366,10 @@ void ScanWindow::loadSettings()
     * **现存的那个 scan.ini 不需要迁移**: 缺这一项就是 -1, 落到 120 s, 正是要的缺省 */
    m_edHomeTmo->setValue(ecatcmd::home_tmo_s_from_pref(pf.home_tmo_s));
 
-   /* 回零偏移: -1 = 没记过 → HMI_HOME_OFF_DEF; 越界的夹回 [MIN, MAX]。
-    * ★ **0 读回来还是 0** —— home_off_from_pref 的哨兵落在负数那一侧, 与上面那两个框
-    * (它们的哨兵是 `<= 0`) 不一样: 0 在这里是一个合法选择 (落点即零点)。 */
+   /* 回零偏移: kHomeOffUnset = 没记过 → HMI_HOME_OFF_DEF; 越界的夹回 [MIN, MAX]。
+    * ★ **0 与负数读回来还是原数** —— home_off_from_pref 认的是一个落在 [MIN, MAX] 之外的
+    * 哨兵, 与上面那两个框 (它们的哨兵是 `<= 0`) 不一样: 0 (落点即零点) 与负数 (零点在落点
+    * 另一侧) 在这里都是合法选择。 */
    m_edHomeOff[0]->setValue(ecatcmd::home_off_from_pref(pf.home_off_x));
    m_edHomeOff[1]->setValue(ecatcmd::home_off_from_pref(pf.home_off_y));
 

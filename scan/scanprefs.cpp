@@ -144,10 +144,14 @@ Prefs prefsLoad(const QString &path)
    p.manual_speed = s.value(QLatin1String(k::manspeed), -1).toInt();
    p.home_vel     = s.value(QLatin1String(k::homevel),  -1).toInt();
    p.home_tmo_s   = s.value(QLatin1String(k::hometmo),  -1).toInt();
-   /* 缺省一律写 -1 (= 没记过), **不能写 0**: 0 是"零点就放在落点上"这个合法选择。
-    * 读回来之后由界面过 ecatcmd::home_off_from_pref (它才认这个哨兵)。 */
-   p.home_off_x   = s.value(QLatin1String(k::homeoffx), -1).toInt();
-   p.home_off_y   = s.value(QLatin1String(k::homeoffy), -1).toInt();
+   /* 缺省写 kHomeOffUnset (= 没记过), **不能写 0 或 -1**: 两个都是有意义的偏移
+    * (0 = 零点就在落点上, -1 = 零点在落点负方向 1 pul 处)。
+    * 读回来之后由界面过 ecatcmd::home_off_from_pref (它才认这个哨兵)。
+    * 老 ini (2026-10-28 之前) 在用户没碰过这两个框时存的是 -1, 现在会被读成一个合法的
+    * -1 pul 偏移 (缺省脉冲当量下 0.00002 mm = 20 nm, 与机械精度无关) —— 写进 §53
+    * 当作已知代价, 不做迁移。 */
+   p.home_off_x   = s.value(QLatin1String(k::homeoffx), kHomeOffUnset).toInt();
+   p.home_off_y   = s.value(QLatin1String(k::homeoffy), kHomeOffUnset).toInt();
 
    /* 这三项**必须显式带缺省值**: 缺项时 QSettings 给的是无效 QVariant, toBool() 一律返回
     * false —— 不写缺省的话, 旧 ini 会把"默认开"静默读成"用户把它关了" */

@@ -3912,38 +3912,53 @@ static void test_advprefs()
       checkEq(ecatcmd::home_tmo_s_from_pref(999999999), HMI_HOME_TMO_MAX_S, "太大 → 夹到上限");
    }
 
-   /* ---- 回零偏移 (2026-09-28) ------------------------------------ */
-   caseBegin("advprefs: 回零偏移 —— 0 是一个**合法值**, 不是「没记过」");
+   /* ---- 回零偏移 (2026-09-28; 2026-10-28 起负数也合法) ----------- */
+   caseBegin("advprefs: 回零偏移 —— 0 与负数都是**合法值**, 不是「没记过」");
    {
       const Prefs p;
-      checkEq(p.home_off_x, -1, "回零偏移X: 还没记过");
-      checkEq(p.home_off_y, -1, "回零偏移Y: 还没记过");
+      checkEq(p.home_off_x, scan::kHomeOffUnset, "回零偏移X: 还没记过");
+      checkEq(p.home_off_y, scan::kHomeOffUnset, "回零偏移Y: 还没记过");
 
       QTemporaryDir dir;
       const QString ini = dir.filePath(QStringLiteral("scan.ini"));
       Prefs q;
       q.home_off_x = 0;          /* ★ 这一条是这一组的全部意义: 0 必须存得住也读得回 0 —— */
-      q.home_off_y = 75000;      /* 读成缺省就是一次静默的零点搬家 (见 home_off_from_pref) */
+      q.home_off_y = -75000;     /* ★ 负数同理 (2026-10-28): 读成缺省就是一次静默的零点搬家 */
       prefsSave(ini, q);
       const Prefs b = prefsLoad(ini);
-      checkEq(b.home_off_x, 0,     "存下的 0 读回来还是 0");
-      checkEq(b.home_off_y, 75000, "另一个轴原样往返");
+      checkEq(b.home_off_x, 0,      "存下的 0 读回来还是 0");
+      checkEq(b.home_off_y, -75000, "存下的负偏移读回来还是负的");
 
-      /* 文件不存在 / 旧 ini 没有这两个键 —— 都是 -1 (交给 home_off_from_pref 落到 75000) */
+      /* 老 ini (2026-10-28 之前) 里"没记过"写的就是 -1 —— 现在它是一个合法的
+       * -1 pul 偏移, 必须原样往返。把它再当哨兵读成 75000 才是那个要防的 bug (§53) */
+      q.home_off_x = -1;
+      q.home_off_y = 75000;
+      prefsSave(ini, q);
+      const Prefs c = prefsLoad(ini);
+      checkEq(c.home_off_x, -1,    "-1 原样往返 (不再是哨兵)");
+      checkEq(c.home_off_y, 75000, "另一个轴原样往返 (正数路径没被改坏)");
+
+      /* 文件不存在 / 旧 ini 没有这两个键 —— 都是哨兵 (交给 home_off_from_pref 落到 75000) */
       const Prefs fresh = prefsLoad(dir.filePath(QStringLiteral("scan2.ini")));
-      checkEq(fresh.home_off_x, -1, "文件不存在 → -1");
-      checkEq(fresh.home_off_y, -1, "文件不存在 → -1 (另一根)");
+      checkEq(fresh.home_off_x, scan::kHomeOffUnset, "文件不存在 → 哨兵");
+      checkEq(fresh.home_off_y, scan::kHomeOffUnset, "文件不存在 → 哨兵 (另一根)");
    }
 
-   caseBegin("advprefs: 被手改坏的偏移 —— 哨兵只在负数那一侧");
+   caseBegin("advprefs: 被手改坏的偏移 —— 哨兵落在 [MIN, MAX] 之外, 负数照用");
    {
-      checkEq(ecatcmd::home_off_from_pref(-1), HMI_HOME_OFF_DEF, "-1 = 没记过 → 缺省");
-      checkEq(ecatcmd::home_off_from_pref(-5), HMI_HOME_OFF_DEF, "任何负数 = 没记过");
-      /* ★ 这一条与上面那两条是**对着**的: 照 home_vel_from_pref 的 `<= 0` 抄的话,
-       * 这一条会变成 EXPECT 75000 —— 那正是要防的那个 bug */
-      checkEq(ecatcmd::home_off_from_pref(0),  0,             "0 原样用 (落点即零点)");
-      checkEq(ecatcmd::home_off_from_pref(75000), 75000,      "正常值原样用");
-      checkEq(ecatcmd::home_off_from_pref(999999999), HMI_HOME_OFF_MAX, "太大 → 夹到上限");
+      /* ★ 两处抄的同一个哨兵: 改一边不改另一边必须红 (scanprefs.h 不 include
+       * ecatworker.h 是故意的, 所以那里只能存一份副本) */
+      checkEq(HMI_HOME_OFF_UNSET, scan::kHomeOffUnset, "两个哨兵逐位相同");
+      checkEq(ecatcmd::home_off_from_pref(HMI_HOME_OFF_UNSET), HMI_HOME_OFF_DEF,
+              "哨兵 = 没记过 → 缺省");
+      /* ★ 这几条与哨兵那条是**对着**的: 照 home_vel_from_pref 的 `<= 0` 抄的话,
+       * 它们会变成 EXPECT 75000 —— 那正是要防的那个 bug */
+      checkEq(ecatcmd::home_off_from_pref(0),       0,        "0 原样用 (落点即零点)");
+      checkEq(ecatcmd::home_off_from_pref(-1),      -1,       "-1 是一个合法的负偏移");
+      checkEq(ecatcmd::home_off_from_pref(-75000),  -75000,   "负偏移原样用 (零点在另一侧)");
+      checkEq(ecatcmd::home_off_from_pref(75000),   75000,    "正常值原样用");
+      checkEq(ecatcmd::home_off_from_pref(999999999),  HMI_HOME_OFF_MAX, "太大 → 夹到上限");
+      checkEq(ecatcmd::home_off_from_pref(-999999999), HMI_HOME_OFF_MIN, "太小 → 夹到下限");
    }
 
    /* ---- 软件零点 (2026-09-29) ------------------------------------
@@ -4842,12 +4857,17 @@ static void test_homing()
     * 最后是那一步真正写进 m_origin/m_tgt 的算术。 */
    caseBegin("回零偏移: 夹取与输入框的上下限是同一个宏");
    {
-      checkEq(ecatcmd::home_off_clamp(-1), HMI_HOME_OFF_MIN, "-1 → 下限");
+      checkEq(ecatcmd::home_off_clamp(-1), -1, "-1 是合法值, 原样通过 (2026-10-28 起)");
       checkEq(ecatcmd::home_off_clamp(HMI_HOME_OFF_MIN - 1), HMI_HOME_OFF_MIN, "MIN - 1 → 下限");
+      checkEq(ecatcmd::home_off_clamp(HMI_HOME_OFF_MIN), HMI_HOME_OFF_MIN, "MIN → 原样");
       checkEq(ecatcmd::home_off_clamp((int32_t)HMI_HOME_OFF_MAX + 1), HMI_HOME_OFF_MAX,
               "MAX + 1 → 上限");
       checkEq(ecatcmd::home_off_clamp(2147483647), HMI_HOME_OFF_MAX, "INT32_MAX → 上限");
+      checkEq(ecatcmd::home_off_clamp(-2147483647 - 1), HMI_HOME_OFF_MIN, "INT32_MIN → 下限");
       checkEq(ecatcmd::home_off_clamp(0), 0, "0 是合法值, 原样通过");
+      /* 上下限关于 0 对称: home_off_fits 判的是 |off|, 不对称的话"正方向装得下、
+       * 负方向装不下"这种怪事就会出现在同一个绝对值上 */
+      checkEq(HMI_HOME_OFF_MIN, -HMI_HOME_OFF_MAX, "上下限对称 (MIN == -MAX)");
 
       /* "界面上显示的数就是线上发的数": spin box 的 setRange 与这道夹取读的是同一组宏 */
       checkEq(ecatcmd::home_off_clamp(HMI_HOME_OFF_MAX), HMI_HOME_OFF_MAX,
@@ -4873,14 +4893,19 @@ static void test_homing()
        * 压根不搬零点), 但它让这一条与 origin_keep_ok 是**同一条界**: `range > 0` 是两者的
        * 第一句。给它开一个 off == 0 的特例, 下面那条"判据焊在算法上"的断言就松了。 */
       check(!ecatcmd::home_off_fits(0, 0),          "量程未知 (0) 时连 off = 0 也说装不下");
-      check(!ecatcmd::home_off_fits(-1, 800000),    "负数偏移不存在 (界面是无符号的量)");
+      /* 2026-10-28 起负数也合法: 判的是 |off|, 与 origin_keep_ok 关心的 |pos - origin|
+       * 是同一个量 (负偏移时 tgt = -off > 0, 落点读出 +|off|) */
+      check(ecatcmd::home_off_fits(-75000, 800000), "负偏移: 量程更宽 → 装得下");
+      check(ecatcmd::home_off_fits(-75000, 75000),  "负偏移: 正好相等 → 装得下 (闭区间)");
+      check(!ecatcmd::home_off_fits(-75001, 75000), "负偏移: 刚过一根脉冲 → 装不下");
+      check(ecatcmd::home_off_fits(-1, 800000),     "负偏移 -1 也照常判, 不再一律拒绝");
 
       /* ★ **判据与算法焊在一起**: 「装得下」必须恰好等于「收尾那一对数里的 tgt 在量程内」。
        * 两条判据各写一遍的话, 迟早有一条松一档 —— 而松的那一档 = 收尾时 tgt 被
-       * interpolate() 夹掉 = 一次没人按过的运动。 */
+       * interpolate() 夹掉 = 一次没人按过的运动。负偏移那一列同样在里面。 */
       bool welded = true;
       for (int32_t range : { 0, -1, 1, 75000, 800000 })
-         for (int32_t off : { 0, 1, 75000, HMI_HOME_OFF_MAX })
+         for (int32_t off : { 0, 1, 75000, HMI_HOME_OFF_MAX, -1, -75000, HMI_HOME_OFF_MIN })
          {
             const int32_t tgt = ecatcmd::home_anchor(0, off).tgt;
             const bool in_range = (range > 0) && ((int64_t)tgt <= (int64_t)range)
@@ -4915,6 +4940,19 @@ static void test_homing()
       /* 界面那个数本身越界 → 先夹 (夹取在 decide 里面, 调用方不必再夹一次) */
       checkEq(ecatcmd::home_off_decide(999999999, false, HMI_RANGE).eff, HMI_HOME_OFF_MAX,
               "界面给的数越界 → 先夹再用");
+      checkEq(ecatcmd::home_off_decide(-999999999, false, HMI_RANGE).eff, HMI_HOME_OFF_MIN,
+              "界面给的负数越界 → 夹到下限再用");
+
+      /* 负偏移 (2026-10-28): 与正偏移走完全相同的三档, 唯一的不同是屏幕读数的符号 */
+      const ecatcmd::HomeOff n = ecatcmd::home_off_decide(-75000, false, 800000);
+      checkEq(n.req, -75000, "负偏移: req 原样记下");
+      checkEq(n.eff, -75000, "负偏移: 找原点时生效 (零点在落点另一侧)");
+      checkEq(ecatcmd::home_off_decide(-75000, true,  800000).eff, 0,
+              "负偏移 + 找限位 → 同样不搬");
+      checkEq(ecatcmd::home_off_decide(-75000, false, 74999).eff, 0,
+              "负偏移装不下 → 这一趟不搬");
+      checkEq(ecatcmd::home_off_decide(-75000, false, 75000).eff, -75000,
+              "负偏移正好等于量程 → 装得下 (闭区间, 与正偏移同一条界)");
 
       /* 0 = 今天的行为: 三档里都该给出"什么都不搬" */
       checkEq(ecatcmd::home_off_decide(0, false, 800000).eff, 0, "0 → 不搬");
@@ -4935,7 +4973,8 @@ static void test_homing()
       check(!z.degraded,        "off = 0 不是什么退档");
 
       const int32_t landings[] = { 0, 1, -1, 123456, -123456, 2147483000, -2147483000 };
-      const int32_t offs[]     = { 0, 1, 75000, HMI_HOME_OFF_MAX };
+      const int32_t offs[]     = { 0, 1, 75000, HMI_HOME_OFF_MAX,
+                                   -1, -75000, HMI_HOME_OFF_MIN };
 
       bool inv = true, sign = true, read = true;
       for (int32_t L : landings)
@@ -4948,7 +4987,7 @@ static void test_homing()
             /* 物理目标一步不动 */
             if ((int64_t)a.origin + (int64_t)a.tgt != (int64_t)L)
                inv = false;
-            /* 落点处屏幕读到的就是 -off (需求要的就是它读 -75000) */
+            /* 落点处屏幕读到的就是 -off (正偏移时读 -75000, 负偏移时读 +75000 —— 同一个式子) */
             if ((int64_t)L - (int64_t)a.origin != -(int64_t)off)
                read = false;
             /* tgt 就是 -off: 上面那条不变式一旦成立, 这一条把"搬错了方向"挡在外面 */
@@ -4967,7 +5006,16 @@ static void test_homing()
       checkEq(ov.tgt,    0,          "退回 tgt = 0 (不搬零点那一档)");
       check(!ecatcmd::home_anchor(2147483000, 0).degraded, "同一落点 + off = 0 → 不认账");
       check(!ecatcmd::home_anchor(-2147483000, HMI_HOME_OFF_MAX).degraded,
-            "负边界那一侧离得远 (off 是正的), 不许误判");
+            "负边界 + 正偏移: 离得远, 不许误判");
+
+      /* 2026-10-28 起负偏移也走这条路: 负边界那一侧现在是**向下**溢出 */
+      const ecatcmd::HomeAnchor un = ecatcmd::home_anchor(-2147483000, HMI_HOME_OFF_MIN);
+      check(un.degraded,             "负边界 + 负偏移 → 认账 (向下溢出)");
+      checkEq(un.origin, -2147483000, "退回落点本身");
+      checkEq(un.tgt,    0,           "退回 tgt = 0");
+      /* 取负那一路的溢出: off == INT32_MIN 时 origin 还在界内, 但 tgt = +2147483648 越界 */
+      check(ecatcmd::home_anchor(0, -2147483647 - 1).degraded,
+            "off == INT32_MIN (量程外) → 取负溢出 → 退档, 不是 UB");
    }
 
    /* ---- 加减速 -------------------------------------------------- */
@@ -5559,6 +5607,21 @@ static void test_homing()
       check(hasq(c2, "显示坐标 0 在落点正方向 75000 pul 处"), "生效那一档报出偏移量");
       check(!hasq(c2, "已把这里定为 0"), "而且不许与「已把这里定为 0」同时出现 (互斥)");
       check(!hasq(c2, "未生效"), "也不许说未生效");
+
+      /* 2b. 负偏移 (2026-10-28): 方向词取「负」, 数值取绝对值 —— 屏幕上不许出现
+       * 「正方向 -75000 pul」这种自相矛盾的句子 */
+      ecatcmd::HomeOff neg;
+      neg.req = neg.eff = -75000; neg.range = 800000;
+      const QString c2n = ecatcmd::home_off_clause(neg);
+      check(hasq(c2n, "显示坐标 0 在落点负方向 75000 pul 处"),
+            "负偏移: 方向词与数值分开写", c2n.toStdString());
+      check(!hasq(c2n, "-75000"), "而且数值里不带负号 (负号已经在方向词上)");
+
+      /* 装不下那一档照旧报**界面那个数**, 负号留着 —— 操作员要能对着框里的数找 */
+      ecatcmd::HomeOff no2;
+      no2.req = -75000; no2.eff = 0; no2.range = 1600;
+      check(hasq(ecatcmd::home_off_clause(no2), "回零偏移 -75000 pul 未生效"),
+            "负偏移装不下: 报的数与框里看到的一致 (带负号)");
 
       /* 3. 装不下: 现象 + 当时量程 (操作员要能一眼看出该去改哪个数) */
       ecatcmd::HomeOff no;
