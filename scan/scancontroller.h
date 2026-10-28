@@ -2,6 +2,8 @@
  * scan/scancontroller.h —— 扫描状态机: 只活在 GUI 线程里 (不碰总线, 不用加锁), 节拍由外部
  * 30Hz QTimer 喂 tick(now_ms), 时间一律用单调钟 (QElapsedTimer)。
  * 状态 Idle/Moving/Dwelling/Reading → 下一个点 / Done; Paused / Aborted 可从任意状态进入。
+ * 连续行进 (2026-10-29, docs/scan_sweep.md §54) 那一路是 Moving → Traversing → 下一行,
+ * 行内不停车, 每格只取经过中心最近的一笔采样。
  * 自动中止的条件每个 tick 都查 (含暂停中), 见 healthProblem() 与 externalWantChanged()。
  */
 #pragma once
@@ -42,6 +44,9 @@ public:
       Moving,    /* 已下发目标, 等两轴到位且稳 (含 settle 窗口) */
       Dwelling,  /* 到了, 停 dwell_ms */
       Reading,
+      /* 连续行进 (2026-10-29, §54): 行末目标已下发, 整行不停车地走; 每格取经过中心
+       * 最近的一笔采样。行首/行末各停在中心等一笔 (见 beginTraverse/issueTraverseTarget) */
+      Traversing,
       Paused,    /* 冻住, 保持力矩; 继续时会重新走完当前点 */
       Aborted,
       Done       /* 全部点跑完 */
@@ -60,8 +65,13 @@ public:
    void setParams(const Params &p);
    const Params &params() const { return m_p; }
 
-   /* validate() 的话; 空 = 可以开始 */
+   /* validate() 的话; 空 = 参数本身站得住 (不一定意味着"这一趟跑得起来") */
    QString paramsError() const;
+
+   /* "这一趟跑得起来"的那一句: paramsError() + 连续行进的速度闸 (continuousRunError)。
+    * **起扫 / armRun / 界面那个「开始扫描」用它**; 打开 CSV、对齐几何、存 ini 只认
+    * paramsError() —— 它们不跑扫描 (理由见 scanplan.h 里 continuousRunError 的注释)。 */
+   QString runError() const;
 
    /* 重算网格与预计时长。几何没变就不动 —— 不清掉刚采完的结果 */
    void rebuildPlan();
@@ -72,8 +82,14 @@ public:
    int64_t estimateTotalMs() const;
 
    State state() const { return m_st; }
-   bool  running() const;              /* Moving/Dwelling/Reading/Paused */
+   bool  running() const;              /* Moving/Dwelling/Reading/Traversing/Paused */
    bool  loaded() const { return m_st == State::Loaded; }   /* 打开一份 CSV, 停着等操作员 */
+
+   /* 这一轮是不是连续行进 (armRun 时按 onFly(m_run_p) 定死, 一轮里不变)。
+    * 界面拿它判「每点采样」亮不亮 —— 连续行进时那个框改了也没用 (每格只取一笔)。
+    * **名字不能叫 onFly()**: 类成员会遮住命名空间里的 scan::onFly(p), armRun 里那句
+    * `onFly(m_run_p)` 就成了找不到重载的编译错。 */
+   bool  onTheFly() const { return m_onfly; }
    /* 本轮是「随机 (可重复)」: 永远到不了 Done, 只有「暂停」「中止」能停。
     * 界面拿它决定进度那几行怎么写 (pendingPoints 在那一支里会一轮一轮往回跳, 报出来是假话) */
    bool  endless() const { return m_endless; }
@@ -89,10 +105,12 @@ public:
    int pendingPoints() const { return m_order.empty() ? 0 : (int)m_order.size() - m_ord_i; }
    int64_t elapsedMs() const { return m_run_ms >= 0 ? m_now_ms - m_run_ms : 0; }
 
-   /* 本状态已经待了多久 (界面拿它做 "等稳定 1.2s" 这种提示) */
+   /* 本状态已经待了多久 (界面用来算"已用 / 预计剩余") */
    int64_t stateMs() const { return m_state_ms >= 0 ? m_now_ms - m_state_ms : 0; }
 
-   /* 正在 Moving 里开稳定窗口 = 机械已经进容差了, 在等 settle_ms。界面提示用 */
+   /* 正在 Moving 里开稳定窗口 = 机械已经进容差了, 在等 settle_ms。
+    * **2026-10-29 起界面这一路恒推 settle 0**, 于是它恒为假 —— 判据本身留着
+    * (ArrivalJudge 仍有稳定窗口能力), 只是没有地方把它调大于 0 了。 */
    bool settlingNow() const;
 
    bool  cellDone(int ix, int iy) const;
@@ -166,12 +184,15 @@ public:
    void tick(int64_t now_ms);
 
 public slots:
-   /* 连续读数那条流到齐了一笔 (接 MeterLog::sampled)。**只在"正读这一个点"时算数** ——
+   /* 连续读数那条流到齐了一笔 (接 MeterLog::sampled)。**只在两种状态下算数**:
+    *   Reading    —— 逐点停: 累加到平均, 凑够 samples_per_point 就收尾;
+    *   Traversing —— 连续行进: 只留"到达位置离当前格中心最近"的那一笔, 一格只有一笔。
     * 移动/停留/暂停期间到齐的采样属于曲线上那条流, 不属于任何一个点。
     *
     * ok = false 的那一笔**不算进平均也不当场判死**: 它只是"这一次没要回来", 期限到了自然
     * 会收尾成 ok=false 的那一行 (与 MeterLog::setAverage 同一个口径 —— 拿缺了一笔的数求
-    * 平均是编出来的, 而它在 CSV 里和别的行长得一模一样)。
+    * 平均是编出来的, 而它在 CSV 里和别的行长得一模一样)。连续行进同理: 那一格没有候选,
+    * 收尾时写 ok=false。
     *
     * 时刻 ms 收下不用 (当前点用的是 tick 那条单调钟)。Qt 的 connect 只能丢**尾部**参数,
     * 而 ok 是最后一个, 所以只能整个收下来。 */
@@ -209,6 +230,21 @@ private:
    void beginReading();
    void finishPoint(bool ok, const std::string &flags);
    void advance();                      /* 当前点收尾 → 下一个点 / Done */
+
+   /* ---- 连续行进 (2026-10-29, docs/scan_sweep.md §54) ---- */
+   void beginTraverse();                /* Moving 到位 → 进这一段 (行首先停在中心等一笔) */
+   void issueTraverseTarget();          /* 行首那笔到手 → 下发段尾目标, 整行不停车 */
+   /* 位置往前走就把当前格收掉、槽位 +1 (判据是"离下一格中心更近" = 过了中点)。
+    * 会写 CSV —— 失败时内部已 abort, 调用方接着 return 就行 */
+   void syncOnFlyCell(const BusTelem &t);
+   bool finishOnFlyCell(int cell, bool have);   /* false = 写失败, 已 abort */
+   void advanceLeg();                   /* 一段走完 → 下一段 / 整轮结束 */
+   /* advance() 与 advanceLeg() 共用的收尾: 清点列、清行段、置 stale、Done、runFinished */
+   void finishRun();
+   /* finishPoint / finishOnFlyCell 共用的一段: 补 retest 后缀、写文件 (失败即 abort)、
+    * 更新三个结果数组、发 pointLogged。**返回 false = 已经中止, 调用方必须当场 return** */
+   bool logAndMark(Row &r);
+
    void enter(State s);
    void stopMotion();                   /* postStop + 丢掉未决读数 */
    void abortInternal(const QString &why, bool automatic);
@@ -247,6 +283,27 @@ private:
    std::vector<int>   m_order;   /* m_plan 的下标序列 (续扫时已滤掉采过的) */
    size_t  m_ord_i = 0;
    int     m_cur   = -1;         /* m_plan 下标; -1 = 不在点上 */
+
+   /* ---- 连续行进 (2026-10-29, §54)。m_onfly 为假时下面那些一个都不参与 ---- */
+   bool    m_onfly = false;      /* armRun 里按 onFly(m_run_p) 定死, 一轮里不变 */
+   /* 行段: 每一段 = 同一行里**待扫**格子的 m_plan 下标, 按扫描顺序 (从右往左那一行也是
+    * 这个顺序)。续扫留下的空洞格之间隔着已采格, 仍然算同一段 —— 中间那些格不停 */
+   std::vector<std::vector<int>> m_legs;
+   size_t  m_leg_i = 0;          /* 当前段 */
+   size_t  m_leg_slot = 0;       /* 段内正在采的格子槽位 */
+   size_t  m_leg_slot0 = 0;      /* 暂停续走从哪个槽位开始 */
+   bool    m_of_started = false; /* 行首那笔已到, 段尾目标已下发 */
+   bool    m_of_at_end = false;  /* 段尾到位这件事已经处理过 (别每拍重入) */
+   bool    m_of_stop_wait = false; /* 段尾已到位, 在等"停稳之后到齐"的那一笔 */
+   int64_t m_flush_deadline_ms = 0; /* 行首/行末等一笔的期限; 0 = 不在等 */
+
+   /* 当前格的一笔候选采样: 只留离格中心最近的那一笔 (连续行进每格只出一行) */
+   bool     m_of_have = false;
+   double   m_of_watts = 0.0;
+   int32_t  m_of_pos[EM_MAX_AXES] = {0, 0};
+   int64_t  m_of_dist = 0;       /* |pos_x - 格中心 x|, 脉冲 */
+   int64_t  m_of_unix_ms = 0;
+   std::string m_of_time;        /* 与 m_of_unix_ms 同一次 QDateTime */
 
    ArrivalJudge m_judge[EM_MAX_AXES];
    int      m_nsamp = 0;         /* 这一个点已经到齐的采样数 (那个"半份"就在这里) */

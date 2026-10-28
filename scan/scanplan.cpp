@@ -38,6 +38,13 @@ bool modeEndless(ScanMode m)
    return m == ScanMode::RandomRepeat;
 }
 
+bool onFly(const Params &p)
+{
+   /* 随机走法没有"行", 连续不了 (见头文件)。dwell 的下限是 0 (validate 允许),
+    * 于是 0 这个值天然可以当开关用, 不另加字段 */
+   return !modeRandom(p.mode) && p.dwell_ms == 0;
+}
+
 /* 同 hmi/ecatworker.h 的 HMI_VEL_MIN / HMI_VEL_MAX, 照抄一份以保持本文件不依赖 Qt。
  * 两边必须一致: EcatThread::setSpeed 会夹速度, 而估算是照原值算的。 */
 static const uint32_t VEL_MIN = 1000;
@@ -316,6 +323,9 @@ std::string validate(const Params &p)
       return buf;
    }
 
+   /* 连续行进那条闸**不在这儿** (2026-10-29): 它说的是"这一趟能不能连续走", 而 validate()
+    * 的调用方里有一半不跑扫描 (打开 CSV / 存 ini)。见 continuousRunError 的注释。 */
+
    std::string why;
    if (!fitsRange(p, &why))
       return why;
@@ -323,9 +333,62 @@ std::string validate(const Params &p)
    return std::string();
 }
 
+std::string continuousRunError(const Params &p)
+{
+   /* 只有连续行进那一趟才管这条; 逐点停 (停留 > 0, 或随机那两种) 一格在中心停着采,
+    * 采样间距与格宽没有关系 */
+   if (!onFly(p))
+      return std::string();
+
+   /* 连续行进时每格的值是"经过格中心时最近的一笔采样", 而采样是按「间隔」一笔笔到的 ——
+    * 一格在中心附近停留多久由速度决定:
+    * 采样间距 (脉冲) = 速度 × (间隔 + 往返) / 1000, 它必须 ≤ 格宽 (resX)。
+    * 超过格宽时会有格子**一笔都采不到**, 而那些格子在 CSV 里与采到的行长得一样 (ok=0),
+    * 起扫前拦掉比走完再解释便宜。
+    *
+    * `+ 50` 是往返的占位, 与 estimatePerPointMs 里那笔 `interval + 50` 同一个口径
+    * (MeterLog 是"回包之后再排下一拍", 真实周期 = 间隔 + 往返)。 */
+   const double spacing_mm = (double)p.speed_pul_s * (double)(p.meter_interval_ms + 50)
+                           / 1000.0 / p.pulses_per_unit;
+   if (spacing_mm > resX(p) + 1e-9)
+   {
+      char buf[200];
+      std::snprintf(buf, sizeof(buf),
+                    "连续行进时采样间距 %.2f mm 超过分辨率 %.2f mm, "
+                    "请降低扫描速度或调小「间隔」。",
+                    spacing_mm, resX(p));
+      return buf;
+   }
+
+   return std::string();
+}
+
 int64_t estimatePerPointMs(const Params &p)
 {
    uint32_t vel = clampVel(p.speed_pul_s ? p.speed_pul_s : 1);
+
+   /* 连续行进 (2026-10-29, §54): 一个"点"的长短不再是"一步 + 停 + 读", 而是**一行的平均**:
+    * 一行 = 行内移动 + 一次换行 (蛇形) 或整行返程 (同向) + 行首/行末各等一笔采样。
+    * 除回 nx 就是每点的估计。600 是行首加速 + 行末减速的余量; 2×(间隔+50) 是行首、行末
+    * 各等一笔 (往返占位与下面那句同一个口径)。口径照旧"宁可高估"。 */
+   if (onFly(p))
+   {
+      const double rx = resX(p) * p.pulses_per_unit;
+      const double ry = resY(p) * p.pulses_per_unit;
+
+      double row_pul = rx * (double)(p.nx - 1) + ry;
+      if (p.mode == ScanMode::SameDir)
+         row_pul += rx * (double)(p.nx - 1);      /* 每行同向: 还要整行走回去 */
+
+      double row_ms = row_pul / (double)vel * 1000.0
+                    + (double)p.settle_ms + 600.0
+                    + 2.0 * (double)(p.meter_interval_ms + 50);
+
+      double per = row_ms / (double)std::max(1, p.nx);
+      if (per < 1.0)
+         per = 1.0;
+      return (int64_t)per;
+   }
 
    /* "移动"这一项走多少距离, 看走法。
     *

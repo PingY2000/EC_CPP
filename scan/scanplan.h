@@ -114,8 +114,33 @@ constexpr double kGeomResMin = 0.001;
 constexpr int kMeterIntervalMinMs = 20;
 constexpr int kMeterIntervalMaxMs = 60000;
 
-/* 参数体检。返回空串 = 通过, 否则是一句给操作员看的中文。不做自动修正。 */
+/* 连续行进 (2026-10-29, docs/scan_sweep.md §54): 「单点停留」= 0 就自动进入。
+ *
+ * **入口只此一处** —— 不新增走法、不加复选框: 用户定的口径是"把单点时间设为 0 时候自动触发,
+ * 此时每点只采样一次"。随机那两种走法**永远为假**: 它们每一步都是一个随机跳, 没有"行"可以
+ * 连续走, 仍然逐点停 + 取平均。
+ *
+ * 判据只看 Params, 因为它是"这一趟怎么走"的一部分; 控制器在 armRun 里调一次并**冻结**
+ * (运行中改 dwell 不切换走法)。 */
+bool onFly(const Params &p);
+
+/* 参数体检 (自洽性)。返回空串 = 通过, 否则是一句给操作员看的中文。不做自动修正。
+ *
+ * **它只管"这份参数本身立不立得住"** (区域/点数/量程/各项量程)。"这一趟能不能连续走"
+ * 那一条 (采样间距 ≤ 格宽) 不在这里 —— 见 continuousRunError 那段。 */
 std::string validate(const Params &p);
+
+/* 连续行进的可运行性 (2026-10-29, §54.5)。返回空串 = 这一趟走得起来。
+ *
+ * **刻意不在 validate() 里** (2026-10-29 从那里搬出来的): validate() 的另外三个调用方
+ * 都**不跑扫描** —— 打开 CSV 时对齐几何 (csvAlignParams)、打开 CSV 时读参数
+ * (loadResume 里那句 paramsError)、以及存 scan.ini (prefsMergeParams)。把它们也按这条拦,
+ * 会出现"参数栏停在 停留 0 + 高速、于是这份 CSV 打不开", 而"打开看一眼"与"跑这一趟"
+ * 本来就是两件事 (§52)。
+ *
+ * 判据只与 Params 有关: 间距 = 速度 × (间隔 + 50) / 1000 / 每单位脉冲, 必须 ≤ 格宽 (resX)。
+ * 相等放行。`+ 50` 是往返占位, 与 estimatePerPointMs 那一笔同一个口径。 */
+std::string continuousRunError(const Params &p);
 
 /* 由点数与区域算出的分辨率 (mm), **几何的派生量, 不是输入**:
  *   resX = area_x / (nx - 1),  resY = area_y / (ny - 1)
@@ -199,7 +224,9 @@ struct Row
    Point    pt;
    double   watts   = 0.0;
    bool     ok      = false;      /* false = 这一点没采到 (超时/失败), watts 无意义 */
-   std::string flags;             /* ok=false 时写原因; 重测写 "retest" */
+   /* ok=false 时写原因; 重测写 "retest"; 连续行进写 "onfly" (ok=1 也写 —— 见 §54.7,
+    * 它是**不表示失败**的第一种 flags)。多个记号用 `|` 连起来 */
+   std::string flags;
    int32_t  pos_x_pul = 0;        /* 采样那一刻的实测位置, 采不到也要记 */
    int32_t  pos_y_pul = 0;
    int32_t  spread_x_pul = 0;     /* 稳定窗口内 pos 的极差 —— 振没振, 在这儿看得见 */

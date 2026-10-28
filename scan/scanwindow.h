@@ -215,6 +215,10 @@ private:
        * 与 need_manual 同型: 判据跟着**此刻的模式**走, 不另外记一份状态。
        * 加在末尾并给默认值, 别的面板那些 GateItem{…} 初始化式一处都不用改。 */
       bool     need_row_mode = false;
+      /* 只在"这一趟逐点停"时可用 (2026-10-29)。连续行进时每格只取一笔, 「每点采样」
+       * 那个数一个都不读 —— 亮着就是让人白改 (与 need_row_mode 同型, 每拍按此刻的
+       * 走法重算, 不另记一份状态) */
+      bool     need_stop_mode = false;
    };
    struct PanelItems
    {
@@ -250,6 +254,9 @@ private:
    void onPanelSave(int pi);
    void onPanelCancel(int pi);
    void refreshEditability();
+   /* 「单点停留」框的特值文本跟着扫描方式变 (2026-10-29, §54.8): 行那两种走法停留 0 是
+    * 连续行进, 显示「连续行进」; 随机那两种停留 0 仍然逐点停, 显示 0 ms */
+   void syncDwellSpecialText();
    /* 功率计那一块框的**全部**判据 (灰不灰 + 哪几行露出来)。只由 refreshEditability() 调 */
    void refreshMeterPanel();
    /* 那一框每拍要跟新的字 (状态行 / 统计 / 计数 / 曲线)。放 refresh() 里, 与可用性分开 */
@@ -394,7 +401,6 @@ private:
    QSpinBox       *m_edSpeed = nullptr;   /* 扫描速度: 由 ScanController::start 下发 */
    QSpinBox       *m_edManSpeed = nullptr;/* 手动速度: 点画布 / 全部回中用 */
    QSpinBox       *m_edDwell = nullptr;
-   QSpinBox       *m_edSettle = nullptr;
    QSpinBox       *m_edSamples = nullptr;
    QComboBox      *m_cbDir   = nullptr;
    QComboBox      *m_cbMode  = nullptr;

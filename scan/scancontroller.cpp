@@ -82,6 +82,18 @@ QString ScanController::paramsError() const
    return fromStd(validate(m_p));
 }
 
+QString ScanController::runError() const
+{
+   /* 两条分开报, 不拼在一起: 参数本身不合法时那一句更根本, 先报它 (与原来一模一样的
+    * 那句话); 过了它才轮到"这一趟走得起来吗" */
+   const QString pe = paramsError();
+   if (!pe.isEmpty())
+      return pe;
+
+   /* continuousRunError() 自己判 onFly —— 随机 + 停留 0 仍是逐点停, 不该被这条拦 */
+   return fromStd(continuousRunError(m_p));
+}
+
 void ScanController::setLimitLines(const limitguard::LimitAxis *ax)
 {
    /* 整份换掉, 不是逐条改 —— 推过来的那一份永远比这里的新 (界面是主)。传 nullptr 就是
@@ -177,7 +189,8 @@ int ScanController::completedPoints() const
 bool ScanController::running() const
 {
    return m_st == State::Moving || m_st == State::Dwelling
-       || m_st == State::Reading || m_st == State::Paused;
+       || m_st == State::Reading || m_st == State::Traversing
+       || m_st == State::Paused;
 }
 
 /* 为什么 Loaded **不在** running() 里 (2026-09-29)。
@@ -219,6 +232,16 @@ void ScanController::resetRunState()
    m_cur       = -1;
    m_is_retest = false;
    m_endless   = false;      /* 这一轮收掉了, endless() 不许对着一轮过去的事点头 (见 advance) */
+
+   /* 连续行进那几样 (2026-10-29): 放开这一轮之后它们一个都不该留着 —— onTheFly() 还报
+    * true 的话, 界面会把「每点采样」灰掉, 而此刻面板改参数是真生效的 */
+   m_onfly = false;
+   m_legs.clear();
+   m_leg_i = 0;
+   m_leg_slot = m_leg_slot0 = 0;
+   m_of_have = false;
+   m_of_started = m_of_at_end = m_of_stop_wait = false;
+   m_flush_deadline_ms = 0;
 
    clearResults();
 
@@ -278,10 +301,12 @@ QString ScanController::stateText() const
    case State::Loaded:   return m_order.empty()
                                 ? QStringLiteral("已打开 CSV (此文件已采完)")
                                 : QStringLiteral("已打开 CSV (未启动)");
-   case State::Moving:   return settlingNow() ? QStringLiteral("到位中 (已进稳定窗口)")
-                                              : QStringLiteral("移动中");
+   /* 「稳定窗口」2026-10-29 从界面移除, 到位 = 进容差即算, 于是这里不再分两句 */
+   case State::Moving:   return QStringLiteral("移动中");
    case State::Dwelling: return QStringLiteral("停留 (等待机械余振衰减)");
    case State::Reading:  return QStringLiteral("读功率计…");
+   /* 连续行进 (2026-10-29, §54)。这一句进画布 HUD, 与上面那几条同一个字数上限 */
+   case State::Traversing: return QStringLiteral("连续行进中");
    case State::Paused:   return QStringLiteral("已暂停 (目标冻结, 保持力矩)");
    case State::Aborted:  return QStringLiteral("已中止");
    case State::Done:     return QStringLiteral("本轮结束");
@@ -373,7 +398,9 @@ bool ScanController::armRun(QString *err)
    if (m_order.empty())
       return fail(err, QStringLiteral("网格中没有要扫的点。"));
 
-   QString pe = paramsError();
+   /* 这里是"真的要开动"的那一道, 所以用 runError() (参数自洽 + 连续行进走得起来)。
+    * 打开 CSV 的那条路 (loadResume) 只查 paramsError() —— 它不跑扫描 */
+   QString pe = runError();
    if (!pe.isEmpty())
       return fail(err, pe);
 
@@ -457,6 +484,36 @@ bool ScanController::armRun(QString *err)
    m_bad_wkc = 0;
    m_ord_i   = 0;
 
+   /* 连续行进 (2026-10-29, §54): 走法在**这一刻**定死。运行中把「单点停留」改成 0
+    * 不会切换 —— 那个框运行中仍可改 (用户定的), 所以必须按 m_run_p 留一份结果。
+    *
+    * 行段 = 同一行里**待扫**的格子。行模式的 m_order 本来就是行主序 (buildPlan 按 iy 外层
+    * 循环, 蛇形只在行内反向), 续扫滤掉已采点之后仍然按行连续 —— 于是"iy 相同且相邻"就是
+    * 一行。中间的已采格不进段, 走过去不停。
+    *
+    * 逐点停的一轮也要清: 上一轮留下的段不许漏进来 (m_onfly 为假时下面全不参与)。 */
+   /* 单点重测**永远逐点停** (用户 2026-10-29 定): 重测是把这一格认真再量一遍, 照「每点采样」
+    * 取平均那一套走, 不跟「单点停留」= 0 去连续行进 —— 否则重测值与扫描那一轮还不是同一个
+    * 口径 (一个是一笔, 一个是 N 笔平均), 拿去比对反而分不清差在哪。
+    * m_is_retest 必须在**这一句之前**置位: retest() 就是这么排的。 */
+   m_onfly = onFly(m_run_p) && !m_is_retest;
+   m_legs.clear();
+   if (m_onfly)
+   {
+      for (size_t k = 0; k < m_order.size(); k++)
+      {
+         const int iy = m_plan[(size_t)m_order[k]].iy;
+         if (m_legs.empty() || m_plan[(size_t)m_legs.back().back()].iy != iy)
+            m_legs.push_back(std::vector<int>());
+         m_legs.back().push_back(m_order[k]);
+      }
+   }
+   m_leg_i = 0;
+   m_leg_slot = m_leg_slot0 = 0;
+   m_of_started = m_of_at_end = m_of_stop_wait = false;
+   m_of_have = false;
+   m_flush_deadline_ms = 0;
+
    /* 速度只在这里设一次: 一轮扫描从头到尾一个速度 */
    m_bus->setSpeed(0, m_p.speed_pul_s);
    m_bus->setSpeed(1, m_p.speed_pul_s);
@@ -492,9 +549,23 @@ void ScanController::startPoint(int plan_index)
    int64_t dy = std::abs((int64_t)pt.y_pul - (int64_t)t.ax[1].pos);
    int64_t d  = std::max(dx, dy);
    int64_t ms = (m_p.speed_pul_s > 0) ? (d * 1000 / (int64_t)m_p.speed_pul_s) : 0;
-   ms = ms * 3 + 3000;
-   if (ms <  5000)   ms =  5000;
-   if (ms > 120000)  ms = 120000;
+
+   /* 连续行进的段间换行**可能是一整行** (「每行同向」要从行尾整行走回下一行行首),
+    * 而下面那条 3 倍 + 120 s 上限是按"一步一个格"的逐点停放定的 —— 慢速下一整行超过
+    * 120 s, 就会被误判"未到位" (2026-10-29)。分段用与 issueTraverseTarget 同一条更宽的
+    * 公式: 实际行程 + 60 s 余量, 下限 30 s, **不设上限**。 */
+   if (m_onfly)
+   {
+      ms += 60000;
+      if (ms < 30000)
+         ms = 30000;
+   }
+   else
+   {
+      ms = ms * 3 + 3000;
+      if (ms <  5000)   ms =  5000;
+      if (ms > 120000)  ms = 120000;
+   }
    m_move_deadline_ms = m_now_ms + ms;
 
    if (m_run_ms < 0)
@@ -515,7 +586,9 @@ bool ScanController::start(const QString &csv_path, QString *err)
    if (loaded())
       return fail(err, QStringLiteral("已打开一份 CSV, 请先「中止」。"));
 
-   QString pe = paramsError();
+   /* 用 runError() 而不是 paramsError(): 这一按就是要开动, 连续行进走得起来才能建文件
+    * (查在 m_log.close()/beginNew 之前, 被拒时不截断已有文件) */
+   QString pe = runError();
    if (!pe.isEmpty())
       return fail(err, pe);
 
@@ -711,8 +784,8 @@ bool ScanController::loadResume(const QString &csv_path, bool accept_zero_epoch_
  *
  * 开工之前把**装载那一刻的两条前提**重查一遍。这两件事都能在"装载好、还没按继续"那段
  * 时间里变掉, 而 m_order 里那些 (ix, iy) 绑的就是它们:
- *   1. 几何 —— 界面那几项是锁着的, 这一道是控制器侧的兜底 (armRun 只查 paramsError(),
- *      **不查 m_order 的下标还对不对得上 m_plan**);
+ *   1. 几何 —— 界面那几项是锁着的, 这一道是控制器侧的兜底 (armRun 只查 runError(),
+ *      **不查 m_order 的下标还对不对得上 m_plan**; runError = paramsError + 连续行进那条闸);
  *   2. 零点世代 —— 界面锁不住这个: 工作线程自己会在"沿用不了只好重取"那条路上搬零点,
  *      而零点一搬, 补的点就整体平移到别的物理位置, 却与上半场拼进同一张图。
  * 拦下时留在装载态 (一个字节不动), 接好线 / 重开一份再按一次就行。 */
@@ -800,6 +873,20 @@ void ScanController::pause()
       return;
 
    stopMotion();
+
+   /* 连续行进 (2026-10-29, §54): 当前格那半份候选丢掉 —— 它是在"停之前"的位置上采的,
+    * 留着会与重走这一格之后的那一笔混成一格 (一格只出一行)。已写出的行不动。
+    * m_cur 此刻就是当前格 (beginTraverse/syncOnFlyCell 一直维持着), 所以 resumeRun 那句
+    * startPoint(m_cur) 不用改; 这里只记住"从这一格接着走"。 */
+   if (m_onfly)
+   {
+      m_of_have    = false;
+      m_of_dist    = 0;
+      m_of_started = m_of_at_end = m_of_stop_wait = false;
+      m_flush_deadline_ms = 0;
+      m_leg_slot0  = m_leg_slot;
+   }
+
    enter(State::Paused);
 }
 
@@ -847,6 +934,17 @@ void ScanController::abortInternal(const QString &why, bool automatic)
    }
 
    stopMotion();
+
+   /* 连续行进那一路的段与候选一起扔掉: 中止之后这一轮不会再走了 (重测 / 下一轮 armRun
+    * 会重填)。m_cur 照旧在下一行归 -1, 这里只清"还剩几段、手上有哪一笔" */
+   m_onfly = false;
+   m_legs.clear();
+   m_leg_i = 0;
+   m_leg_slot = m_leg_slot0 = 0;
+   m_of_have = false;
+   m_of_started = m_of_at_end = m_of_stop_wait = false;
+   m_flush_deadline_ms = 0;
+
    m_cur = -1;
    enter(State::Aborted);
 
@@ -878,6 +976,54 @@ void ScanController::beginReading()
 void ScanController::feedMeterSample(int64_t ms, double watts, bool ok)
 {
    Q_UNUSED(ms);           /* 用 tick 那条单调钟, 见头文件 */
+
+   /* 连续行进 (2026-10-29, §54): 一格只留**离格中心最近**的那一笔。
+    *
+    * 位置取的是"这一笔到齐那一刻"的遥测 —— 功率计的响应延迟未知, 而 MeterLog 只报"回来了",
+    * 不报"什么时候量的"。于是在 1 mm/s 量级下这一笔的位置最多偏几十微米, 远小于半格;
+    * 真机上要判断的是现场数据, 这句注释就是那条边界的说明。
+    *
+    * ok = false 的一笔直接丢: 那一格没有候选, 收尾时写 ok=false (与逐点停同一个口径)。 */
+   if (m_st == State::Traversing)
+   {
+      if (!ok)
+         return;
+
+      const BusTelem t = m_bus->telemetry();
+      syncOnFlyCell(t);           /* 位置可能已经越过格界, 先追上 */
+
+      /* **不能加 `!m_of_started` 这道条件**: 行首那一笔正是在 m_of_started 之前到的,
+       * 它既是第 0 格的候选, 也是"可以下发段尾目标了"的信号 (见 tick) */
+      if (m_leg_i >= m_legs.size() || m_leg_slot >= m_legs[m_leg_i].size())
+         return;
+
+      const Point &pt = m_plan[(size_t)m_legs[m_leg_i][m_leg_slot]];
+
+      /* 中心窗口: 离格中心不超过半格 (+位置容差)。中点分界已经保证"属于这一格", 这一条防的
+       * 是续扫留下的空洞格 —— 那两个待补格之间隔着已采格, 而那个已采格上采的一笔按中点分界
+       * 是"属于"待补格的。没有这一条, 名字叫"中心读数"而值可能取自隔壁半格之外。 */
+      const int64_t half = (int64_t)std::llround(resX(m_p) * m_p.pulses_per_unit / 2.0);
+      const int64_t d    = std::abs((int64_t)t.ax[0].pos - (int64_t)pt.x_pul);
+      if (d > half + (int64_t)posTolPul(m_p))
+         return;
+
+      /* 段尾那次"停稳之后再等一笔": 这一笔到了, 下一拍就收尾 (见 tick) */
+      m_of_stop_wait = false;
+
+      if (!m_of_have || d < m_of_dist)
+      {
+         m_of_have    = true;
+         m_of_watts   = watts;
+         m_of_dist    = d;
+         m_of_pos[0]  = t.ax[0].pos;
+         m_of_pos[1]  = t.ax[1].pos;
+         /* 与 finishPoint 同一条: 两个时间字段从同一个 QDateTime 来 */
+         const QDateTime now = QDateTime::currentDateTime();
+         m_of_unix_ms = now.toMSecsSinceEpoch();
+         m_of_time    = isoOf(now).toStdString();
+      }
+      return;
+   }
 
    /* 不在读数期间到齐的采样 (移动/停留/暂停/收尾之后) 属于曲线上那条流, 不属于任何一个点。
     * 这一道守卫是"上一个点的数混进下一个点"的唯一防线 —— 少了它, 停止/暂停之前手上那半份
@@ -916,8 +1062,6 @@ void ScanController::finishPoint(bool ok, const std::string &flags)
    r.watts        = ok ? m_acc : 0.0;
    r.ok           = ok;
    r.flags        = flags;
-   if (m_is_retest)
-      r.flags = r.flags.empty() ? std::string("retest") : (r.flags + "|retest");
    r.pos_x_pul    = t.ax[0].pos;
    r.pos_y_pul    = t.ax[1].pos;
    r.spread_x_pul = m_spread[0];
@@ -929,26 +1073,42 @@ void ScanController::finishPoint(bool ok, const std::string &flags)
    r.time_local   = isoOf(now).toStdString();
    r.elapsed_ms   = (m_run_ms >= 0) ? (m_now_ms - m_run_ms) : 0;
 
+   if (!logAndMark(r))
+      return;
+
+   advance();
+}
+
+/* finishPoint / finishOnFlyCell 共用的那一段 (2026-10-29)。**两处必须同源**: 一行怎么落盘、
+ * 怎么写进三个结果数组、怎么通知画布, 只有这一份 —— 分成两套的话, 连续行进那一路迟早漏掉
+ * 其中一个 (那正是"图上这一格没变色、CSV 里却有"这类静默错的来源)。
+ *
+ * 返回 false = 写失败且已经 abort; 调用方**必须当场 return**, 不许接着 advance()。 */
+bool ScanController::logAndMark(Row &r)
+{
+   if (m_is_retest)
+      r.flags = r.flags.empty() ? std::string("retest") : (r.flags + "|retest");
+
    if (!m_log.isOpen() || !m_log.append(r))
    {
       abortInternal(QStringLiteral("CSV 写入失败, 已自动中止 (此后数据丢失): %1")
                        .arg(m_log.lastError()), true);
-      return;
+      return false;
    }
 
-   const size_t cell = (size_t)pt.iy * (size_t)m_nx + (size_t)pt.ix;
+   const size_t cell = (size_t)r.pt.iy * (size_t)m_nx + (size_t)r.pt.ix;
    if (cell < m_done.size())
    {
       m_done[cell] = 1;
-      if (ok)
+      if (r.ok)
       {
          m_have[cell]  = 1;
-         m_watts[cell] = m_acc;
+         m_watts[cell] = r.watts;
       }
    }
 
-   emit pointLogged(pt.ix, pt.iy, ok);
-   advance();
+   emit pointLogged(r.pt.ix, r.pt.iy, r.ok);
+   return true;
 }
 
 void ScanController::advance()
@@ -986,9 +1146,27 @@ void ScanController::advance()
       return;
    }
 
-   /* 走完了 (整轮或单点重测)。文件不关: 重测要往同一个文件追加 */
+   /* 走完了 (整轮或单点重测)。收尾那一段与连续行进的 advanceLeg 共用 */
+   finishRun();
+}
+
+/* advance() 与 advanceLeg() 的收尾 (2026-10-29)。这一轮结束: 关的是"要写的那一份"这个概念,
+ * **文件句柄不关** —— 重测还要往同一个文件追加 (那一句见下面)。 */
+void ScanController::finishRun()
+{
+   m_cur       = -1;
    m_is_retest = false;
    m_endless   = false;      /* 这一轮已经收掉, endless() 不许对着一轮过去的事点头 */
+
+   /* 连续行进那几个指针一起清: 下一轮 armRun 会重填, 但"这一轮还剩几段"不许留在成员里
+    * 让人误读 (界面那边 onTheFly() 在下一轮开扫前报的还是旧值也一样是假线索) */
+   m_onfly = false;
+   m_legs.clear();
+   m_leg_i = 0;
+   m_leg_slot = m_leg_slot0 = 0;
+   m_of_have = false;
+   m_of_started = m_of_at_end = m_of_stop_wait = false;
+   m_flush_deadline_ms = 0;
 
    /* 点列清掉 (2026-09-30)。单点重测走完之后 m_order 是 {k} 而 m_ord_i 是 0 (重测那一路
     * 跳过上面那句 m_ord_i++), 于是 pendingPoints() 报 **1** —— 画布左上角那行「N / M 点,
@@ -1004,6 +1182,192 @@ void ScanController::advance()
 
    enter(State::Done);
    emit runFinished(true);
+}
+
+/* ================= 连续行进 (2026-10-29, docs/scan_sweep.md §54) =================
+ *
+ * 一套"行段" (leg): 同一行里待扫的格子, 按扫描顺序。状态机在段里只做三件事:
+ *   1. 行首停在中心, 等一笔采样 (行首本来就要停, 不多一次停车);
+ *   2. 下发段尾目标, 整行不停车地走; 采样照常到齐, 每格只留离中心最近的那一笔;
+ *   3. 段尾停在中心, 再等一笔"停稳之后到齐"的采样, 然后换行。
+ *
+ * 为什么行首/行末要等一笔: 那两处滑台本来就停着, 而"最近的一笔"在没有停住的时候只能取到
+ * 半个采样间隔以内的近似 —— 停住之后到齐的那一笔位置就是中心, 不用白不用。
+ */
+
+void ScanController::beginTraverse()
+{
+   /* 兜一道: 调用方 (tick 的 Moving 分支) 只看 m_onfly。段是空的说明 armRun 与这里对不上,
+    * 按逐点停的老路走, 总比在 GUI 线程里越界读好 */
+   if (!m_onfly || m_leg_i >= m_legs.size() || m_legs[m_leg_i].empty())
+   {
+      enter(State::Dwelling);
+      m_deadline_ms = m_now_ms + m_p.dwell_ms;
+      if (m_now_ms >= m_deadline_ms)
+         beginReading();
+      return;
+   }
+
+   m_leg_slot = m_leg_slot0;
+   m_cur      = m_legs[m_leg_i][m_leg_slot];
+
+   m_of_have      = false;
+   m_of_dist      = 0;
+   m_of_started   = false;
+   m_of_at_end    = false;
+   m_of_stop_wait = false;
+
+   /* 行首等第一笔的期限: 与「读一个点」的预算同一个口径 (超时 + 一个间隔)。到不了也不卡死,
+    * 照旧下发段尾目标 —— 那一格会以"没有采样"收尾 (ok=0) */
+   m_flush_deadline_ms = m_now_ms + (int64_t)m_p.meter_timeout_ms
+                       + (int64_t)m_p.meter_interval_ms;
+
+   enter(State::Traversing);
+}
+
+void ScanController::issueTraverseTarget()
+{
+   const std::vector<int> &leg = m_legs[m_leg_i];
+   const Point &last = m_plan[(size_t)leg.back()];
+   const BusTelem t  = m_bus->telemetry();
+
+   m_issued[0] = last.x_pul;
+   m_issued[1] = last.y_pul;
+   m_issued_ms[0] = m_issued_ms[1] = m_now_ms;
+   m_want_ok[0] = m_want_ok[1] = false;
+
+   m_bus->setTarget(0, last.x_pul);
+   m_bus->setTarget(1, last.y_pul);
+
+   /* 段尾不需要稳定窗口: 到位即收 (0)。at_target 在整行移动期间一直是 false,
+    * ArrivalJudge 那个"先看到一次 false"的开窗条件已经满足 */
+   const int32_t tol = posTolPul(m_p);
+   m_judge[0].begin(last.x_pul, tol, 0, m_now_ms);
+   m_judge[1].begin(last.y_pul, tol, 0, m_now_ms);
+
+   /* 走不到就中止的最后期限。**比 startPoint 那条宽**: 一段可能是一整行 (几十上百毫米),
+    * 而那条只有 120 s 的上限。多给的 60 s 是行末减速与调度抖动的余量 */
+   int64_t dx = std::abs((int64_t)last.x_pul - (int64_t)t.ax[0].pos);
+   int64_t dy = std::abs((int64_t)last.y_pul - (int64_t)t.ax[1].pos);
+   int64_t d  = std::max(dx, dy);
+   int64_t ms = (m_p.speed_pul_s > 0) ? (d * 1000 / (int64_t)m_p.speed_pul_s) : 0;
+   ms += 60000;
+   if (ms < 30000)
+      ms = 30000;
+   m_move_deadline_ms = m_now_ms + ms;
+
+   m_flush_deadline_ms = 0;
+   m_of_started        = true;
+}
+
+void ScanController::syncOnFlyCell(const BusTelem &t)
+{
+   if (!m_onfly || m_leg_i >= m_legs.size())
+      return;
+
+   const std::vector<int> &leg = m_legs[m_leg_i];
+   const int32_t pos = t.ax[0].pos;
+
+   /* 判据写成**离谁更近**, 不写"pos_x 大于中点": 蛇形与同向都有从右往左走的那一行,
+    * 按坐标大小判会永远不前进。槽位只许往前走 (滑台不会倒着扫)。
+    *
+    * 收尾会写 CSV —— finishOnFlyCell 写失败时内部已经 abort, 这里当场 return,
+    * 后面的槽位不再动 */
+   while (m_leg_slot + 1 < leg.size())
+   {
+      const Point &cur = m_plan[(size_t)leg[m_leg_slot]];
+      const Point &nxt = m_plan[(size_t)leg[m_leg_slot + 1]];
+
+      const int64_t dc = std::abs((int64_t)pos - (int64_t)cur.x_pul);
+      const int64_t dn = std::abs((int64_t)pos - (int64_t)nxt.x_pul);
+      if (dn >= dc)
+         break;
+
+      if (!finishOnFlyCell(leg[m_leg_slot], m_of_have))
+         return;
+
+      m_leg_slot++;
+      m_cur       = leg[m_leg_slot];
+      m_of_have   = false;
+      m_of_dist   = 0;
+      m_of_stop_wait = false;
+   }
+}
+
+bool ScanController::finishOnFlyCell(int cell, bool have)
+{
+   if (cell < 0 || (size_t)cell >= m_plan.size())
+   {
+      abortInternal(QStringLiteral("内部错误: 连续行进收尾时格子下标越界。"), true);
+      return false;
+   }
+
+   const Point &pt = m_plan[(size_t)cell];
+
+   Row r;
+   r.index        = cell;
+   r.pt           = pt;
+   r.ok           = have;
+   r.watts        = have ? m_of_watts : 0.0;
+   /* flags 记下"这一行是连续行进采的" —— ok=1 的行从前一律留空, 于是它是唯一能区分
+    * "停下采的"与"走过采的"的记号。失败时多一句原因 (不含逗号, 它就是 CSV 的一列) */
+   r.flags        = have ? std::string("onfly")
+                         : std::string("onfly|连续行进未采到");
+   r.spread_x_pul = 0;      /* 没有稳定窗口可量 —— 连续行进不停车, 极差没有意义 */
+   r.spread_y_pul = 0;
+   r.elapsed_ms   = (m_run_ms >= 0) ? (m_now_ms - m_run_ms) : 0;
+
+   if (have)
+   {
+      /* 位置与时刻都取**那一笔采样到齐**的时候, 不是收尾这一刻 */
+      r.pos_x_pul = m_of_pos[0];
+      r.pos_y_pul = m_of_pos[1];
+      r.unix_ms   = m_of_unix_ms;
+      r.time_local = m_of_time;
+   }
+   else
+   {
+      /* Row 的约定: 采不到也要记位置。用收尾这一刻的遥测, 时间同一个 QDateTime */
+      const BusTelem t = m_bus->telemetry();
+      r.pos_x_pul = t.ax[0].pos;
+      r.pos_y_pul = t.ax[1].pos;
+      const QDateTime now = QDateTime::currentDateTime();
+      r.unix_ms    = now.toMSecsSinceEpoch();
+      r.time_local = isoOf(now).toStdString();
+   }
+
+   if (!logAndMark(r))
+      return false;
+
+   /* 进度与 pendingPoints() 靠它 (连续模式不走 advance(), 那句 m_ord_i++ 在那里)。
+    * 单点重测不数 —— 与 advance() 的守卫同一条 */
+   if (!m_is_retest)
+      m_ord_i++;
+
+   return true;
+}
+
+void ScanController::advanceLeg()
+{
+   m_of_have      = false;
+   m_of_dist      = 0;
+   m_of_started   = false;
+   m_of_at_end    = false;
+   m_of_stop_wait = false;
+   m_flush_deadline_ms = 0;
+
+   /* 三个指针一起归零: 段间那一次 startPoint 也会走 Moving, 中途暂停时 m_cur 就是新段
+    * 第 0 格 —— 保持一致, resumeRun() 才不用另开一条路 */
+   m_leg_slot = m_leg_slot0 = 0;
+   m_leg_i++;
+
+   if (m_leg_i < m_legs.size() && !m_legs[m_leg_i].empty())
+   {
+      startPoint(m_legs[m_leg_i][0]);   /* 回 Moving; 到位后 beginTraverse 接上 */
+      return;
+   }
+
+   finishRun();
 }
 
 void ScanController::tick(int64_t now_ms)
@@ -1058,6 +1422,14 @@ void ScanController::tick(int64_t now_ms)
       if (!all)
          return;
 
+      /* 连续行进 (2026-10-29, §54): 到了行首就换一条路, 不再逐点停 —— 这一等
+       * (settle_ms) 照旧算数, 它保证第一格采到的是机械站稳之后的中心那一笔 */
+      if (m_onfly)
+      {
+         beginTraverse();
+         return;
+      }
+
       enter(State::Dwelling);
       m_deadline_ms = m_now_ms + m_p.dwell_ms;
       if (m_now_ms >= m_deadline_ms)          /* dwell = 0 时直接过 */
@@ -1082,6 +1454,70 @@ void ScanController::tick(int64_t now_ms)
                          + std::to_string(m_nsamp) + "/"
                          + std::to_string(std::max(1, m_p.samples_per_point)) + " 笔采样)");
       return;
+
+   case State::Traversing:
+   {
+      /* 位置的账先算: 跨过的格子当场收掉 (那一笔候选已经定了), 槽位只往前走 */
+      syncOnFlyCell(t);
+      if (m_leg_i >= m_legs.size() || m_legs[m_leg_i].empty())
+         return;
+
+      /* 行首: 停在中心等第一笔。等到 (或超期) 才下发段尾目标 —— 行内从此不停车 */
+      if (!m_of_started)
+      {
+         if (m_of_have || m_now_ms >= m_flush_deadline_ms)
+            issueTraverseTarget();
+         return;
+      }
+
+      bool all = true;
+      for (int i = 0; i < 2; i++)
+      {
+         std::string why;
+         const ArrivalJudge::Verdict v = m_judge[i].feed(obsOf(t, i), m_now_ms, &why);
+         if (v == ArrivalJudge::Verdict::Faulted)
+         {
+            abortInternal(fromStd(why), true);
+            return;
+         }
+         if (v != ArrivalJudge::Verdict::Arrived)
+            all = false;
+      }
+
+      if (!all)
+      {
+         /* 期限从**下发段尾目标**那一刻算 (m_issued_ms), 不是从进 Traversing 算 ——
+          * 后者还含着行首等采样那一段 */
+         if (m_now_ms > m_move_deadline_ms)
+         {
+            abortInternal(QStringLiteral(
+               "未到位: 下发目标 (%1, %2) 已等待 %3 s, 实测位置 (%4, %5) 始终未进入容差 ±%6。\n"
+               "可能原因: 机械卡住 / 被限位挡住 / 目标被量程夹掉。")
+               .arg(m_issued[0]).arg(m_issued[1])
+               .arg((m_now_ms - m_issued_ms[0]) / 1000)
+               .arg(t.ax[0].pos).arg(t.ax[1].pos).arg(posTolPul(m_p)), true);
+         }
+         return;
+      }
+
+      /* 段尾也停在中心: 再等一笔"停稳之后到齐"的采样 (有上限, 与行首同一条理由)。
+       * m_of_at_end 防每拍重入 —— 不然每拍都把期限往后推, 永远等不到 */
+      if (!m_of_at_end)
+      {
+         m_of_at_end    = true;
+         m_of_stop_wait = true;
+         m_flush_deadline_ms = m_now_ms + (int64_t)m_p.meter_timeout_ms
+                             + (int64_t)m_p.meter_interval_ms;
+      }
+
+      if (m_of_stop_wait && m_now_ms < m_flush_deadline_ms)
+         return;
+
+      if (!finishOnFlyCell(m_legs[m_leg_i][m_leg_slot], m_of_have))
+         return;                  /* 写失败, 已经 abort */
+      advanceLeg();
+      return;
+   }
 
    case State::Idle:
    case State::Aborted:
@@ -1186,7 +1622,7 @@ QString ScanController::healthProblem(const BusTelem &t)
       int32_t seen = 0;
       if (externalWantChanged(t, i, &seen))
          return QStringLiteral(
-            "轴%1 的目标被外部改动 (当前 %2, 本点应为 %3)。\n"
+            "轴%1 的目标被外部改动 (当前 %2, 当前目标应为 %3)。\n"
             "扫描期间不允许手动干预, 已自动中止。")
             .arg(i).arg(seen).arg(asClamped(m_issued[i], t.range));
    }

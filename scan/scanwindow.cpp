@@ -345,10 +345,31 @@ void ScanWindow::panelRevert(int pi)
    }
 }
 
+/* 「单点停留」框在值为 0 时显示什么 (2026-10-29, §54.8)。
+ *
+ * 只有**行那两种走法**的 0 是连续行进; 随机那两种的 0 仍然逐点停 (onFly 判据里那条
+ * modeRandom), 这时显示「连续行进」是在说假话, 让回 0 ms。判据读控件自己此刻的选中项,
+ * 与 need_row_mode 那条同一个体例 —— 不另记状态。改动只在文本真的不一样时落下去,
+ * 所以从 refresh() 每拍调也不会每拍重排一次。 */
+void ScanWindow::syncDwellSpecialText()
+{
+   if (m_edDwell == nullptr)
+      return;
+   const bool row_mode =
+      !modeRandom(modeFromIndex(m_cbMode != nullptr ? m_cbMode->currentIndex() : 0));
+   const QString want = row_mode ? QStringLiteral("连续行进") : QString();
+   if (m_edDwell->specialValueText() != want)
+      m_edDwell->setSpecialValueText(want);
+}
+
 /* 全部参数控件 setEnabled 的**唯一写点**。由 refresh() 每拍调用。
  * 每拍顺手把"有没有改动"重算一遍 (比对是幂等的, 每拍重算比在信号里点灯更难写错)。 */
 void ScanWindow::refreshEditability()
 {
+   /* 勾选框/ini 那几条路可能改了扫描方式而没走 currentIndexChanged 的那条连接;
+    * 这里每拍对一次 (文本没变就什么都不做) */
+   syncDwellSpecialText();
+
    const bool running = m_ctl->running();
    /* 装载态锁的是 Running 那一批里"这一趟怎么走 / 往哪写"的那些 (GateItem.lock_loaded),
     * 不是整批复用 —— 速度那两项在装载态是**真改得动**的 (按「继续」时才读), 锁它们是错的 */
@@ -376,6 +397,19 @@ void ScanWindow::refreshEditability()
           * 当前选中的那一项, 与 need_manual 那条同一个体例: 它跟着模式一起变, 不另记状态 */
          if (ok && it.need_row_mode)
             ok = !modeRandom(modeFromIndex(m_cbMode != nullptr ? m_cbMode->currentIndex() : 0));
+         /* 「每点采样」在连续行进里一个数都不读 (每格只取一笔, 2026-10-29 §54)。
+          * **运行中读控制器的冻结值**: 逐点停那一轮里把「单点停留」改成 0 不会切走法,
+          * 那几格读的仍是平均 —— 这时它必须继续亮着。没在跑时按面板此刻的值算 (与
+          * need_row_mode 同一条: 跟着控件自己变, 不另记状态) */
+         if (ok && it.need_stop_mode)
+         {
+            const bool of = running ? m_ctl->onTheFly()
+                                    : (m_edDwell != nullptr && m_edDwell->value() == 0
+                                       && !modeRandom(modeFromIndex(
+                                             m_cbMode != nullptr ? m_cbMode->currentIndex()
+                                                                 : 0)));
+            ok = !of;
+         }
          it.w->setEnabled(ok);
       }
 
@@ -2307,21 +2341,32 @@ QWidget *ScanWindow::buildParamPanel()
    /* 提示里不提「重测选中点」—— 它走扫描状态机 (armRun), 用的是「扫描速度」 */
    m_edManSpeed->setToolTip(QStringLiteral("画布点动与「全部回中」的速度。扫描过程使用「扫描速度」。"));
 
+   /* 「单点停留」= 0 是连续行进的入口 (2026-10-29, §54) —— 不新增走法、不加复选框,
+    * 用户定的口径就是"把单点时间设为 0 时候自动触发"。值为 0 时框里直接写「连续行进」
+    * (不再显示 0 ms), 让人一眼看出这个 0 不是"没设"。
+    *
+    * **特值文本跟着扫描方式走**: 随机那两种停留 0 仍然逐点停, 那时写「连续行进」是假话,
+    * 改回 0 ms。谁来写不在构造函数里定死 —— 见 syncDwellSpecialText() */
    m_edDwell = new QSpinBox(box);
    m_edDwell->setRange(0, 60000);
    m_edDwell->setSingleStep(50);
    m_edDwell->setSuffix(QStringLiteral(" ms"));
-   m_edDwell->setToolTip(QStringLiteral("到位稳定后, 再停留此时长开始采样。"));
+   /* 特殊值文本不一定进 sizeHint; 先按现宽度看, 屏幕上被截成「连续行」时这里给它兜底
+    * (40 留给上下箭头) */
+   m_edDwell->setMinimumWidth(
+      m_edDwell->fontMetrics().horizontalAdvance(QStringLiteral("连续行进")) + 40);
+   m_edDwell->setToolTip(QStringLiteral(
+      "0 = 连续行进: 不在每点停留, 每点只取经过中心的一笔读数。\n"
+      "随机那两种仍逐点停。"));
 
-   m_edSettle = new QSpinBox(box);
-   m_edSettle->setRange(0, 10000);
-   m_edSettle->setSingleStep(20);
-   m_edSettle->setSuffix(QStringLiteral(" ms"));
-   m_edSettle->setToolTip(QStringLiteral("到位信号需连续成立此时长, 方判定为到位。"));
+   /* 「稳定窗口」那一项 2026-10-29 移除 (用户: 移除这个设定)。到位 = 两轴 at_target 且进容差,
+    * 不再等一段连续成立时间; 停稳要多久由「单点停留」那一项管。Params::settle_ms 还留着
+    * (ini 键 / CSV 表头 / 估算公式都不动), 界面这一路恒推 0 —— 见 currentParams() */
 
    m_edSamples = new QSpinBox(box);
    m_edSamples->setRange(1, 100);
-   m_edSamples->setToolTip(QStringLiteral("每点连续采样的次数, 取平均值; 采样时间相应增加。"));
+   m_edSamples->setToolTip(QStringLiteral(
+      "每点连续采样的次数, 取平均值; 连续行进时只取一笔。"));
 
    m_cbDir = new QComboBox(box);
    m_cbDir->addItem(QStringLiteral("X 正向 (+X)"));
@@ -2336,6 +2381,8 @@ QWidget *ScanWindow::buildParamPanel()
     * 不会自己结束 —— 不说的话, 屏幕上那个「全程: 不限」与停不下来的进度看着像是出了岔子。
     * 30 字, 在「普通 tooltip 2 行 / 60 字」之内 (§26.2) */
    m_cbMode->setToolTip(QStringLiteral("随机 (可重复) 的池子始终是整片网格, 一轮不会自己结束。"));
+   /* 走法一定, 「单点停留」那个 0 的意思就跟着变 (见 syncDwellSpecialText) */
+   syncDwellSpecialText();
 
    /* 输出路径那一行 (m_edCsv + m_btnCsv) **不在这里建** (2026-09-30): 那一行整个搬进
     * 「扫描控制」了, 归 buildScanPanel() 建 (用户原话: 「扫描参数的csv栏并入扫描控制中」;
@@ -2409,7 +2456,6 @@ QWidget *ScanWindow::buildParamPanel()
    pair(QStringLiteral("扫描速度"), m_edSpeed);
    pair(QStringLiteral("手动速度"), m_edManSpeed);
    pair(QStringLiteral("单点停留"), m_edDwell);
-   pair(QStringLiteral("稳定窗口"), m_edSettle);
    pair(QStringLiteral("每点采样"), m_edSamples);
    pair(QStringLiteral("起始方向"), m_cbDir);
    pair(QStringLiteral("扫描方式"), m_cbMode);
@@ -2447,7 +2493,7 @@ QWidget *ScanWindow::buildParamPanel()
    const QList<QDoubleSpinBox *> dspins{m_edAreaX, m_edAreaY, m_edPpu};
    for (QDoubleSpinBox *s : dspins)
       connect(s, &QDoubleSpinBox::valueChanged, this, &ScanWindow::pushParams);
-   const QList<QSpinBox *> ispins{m_sbNx, m_sbNy, m_edSpeed, m_edDwell, m_edSettle, m_edSamples};
+   const QList<QSpinBox *> ispins{m_sbNx, m_sbNy, m_edSpeed, m_edDwell, m_edSamples};
    for (QSpinBox *s : ispins)
       connect(s, &QSpinBox::valueChanged, this, &ScanWindow::pushParams);
 
@@ -2455,6 +2501,8 @@ QWidget *ScanWindow::buildParamPanel()
    connect(m_edManSpeed, &QSpinBox::valueChanged, this, &ScanWindow::refresh);
    connect(m_cbDir,  &QComboBox::currentIndexChanged, this, &ScanWindow::pushParams);
    connect(m_cbMode, &QComboBox::currentIndexChanged, this, &ScanWindow::pushParams);
+   /* 「单点停留」那个 0 的含义跟着扫描方式变 (随机那两种的 0 不是连续行进) */
+   connect(m_cbMode, &QComboBox::currentIndexChanged, this, &ScanWindow::syncDwellSpecialText);
 
    /* 可用性表。锁住的有两族, 判据是同一句话: **亮着就得真的有用**。
     *
@@ -2465,8 +2513,13 @@ QWidget *ScanWindow::buildParamPanel()
     *    (pushManualSpeed 一进门就 return) —— 留着能改就是让人白改 (2026-09-29 用户报的
     *    「正在扫描时依然有一部分扫描参数是亮的」)。
     *
-    * 剩下的「单点停留 / 稳定窗口 / 每点采样」**不锁**: 控制器每个点读一次, 改完从下一个点起
-    * 算数 —— 那才是真的改得动。
+    * 剩下的「单点停留 / 每点采样」**不锁**: 控制器每个点读一次, 改完从下一个点起算数 ——
+    * 那才是真的改得动。
+    *
+    * **连续行进 (2026-10-29, §54) 只多一条**: 「每点采样」在那一轮里一个数都不读 (每格只取
+    * 一笔), 所以用 need_stop_mode 把它灰掉。「单点停留」**照旧不锁** (用户定的: 保持可改) ——
+    * 走法在 armRun 那一刻定死, 运行中把它改成 0 不会切到连续行进; 那正是"改完从下一个点起
+    * 算数"这条口径在连续行进上的例外, 写在这里免得下一个人以为是漏锁。
     *
     * **装载态 (2026-09-29) 锁的只有第 1 族** (第四个字段 lock_loaded): 装进来的 (ix,iy) 绑在
     * 那份几何上, 与运行中同一个理由。第 2 族**恰恰不能锁** —— 它们运行中锁是因为"改了白改",
@@ -2482,8 +2535,8 @@ QWidget *ScanWindow::buildParamPanel()
                GateItem{ m_edSpeed,    true,  false },         /* 扫描速度: 一轮只设一次 */
                GateItem{ m_edManSpeed, true,  false },         /* 手动速度: 扫描中推不出去 */
                GateItem{ m_edDwell,    false, false },
-               GateItem{ m_edSettle,   false, false },
-               GateItem{ m_edSamples,  false, false },
+               /* 每点采样: 末位 true = 只在逐点停的扫描里可用 (连续行进每格只取一笔) */
+               GateItem{ m_edSamples,  false, false, false, false, true },
                /* 起始方向: 改的是轨迹 (末一个 true = 只在按行走的那两种走法下可用, 随机时灰) */
                GateItem{ m_cbDir,      true,  false, true,  true },
                GateItem{ m_cbMode,     true,  false, true },   /* 扫描方式: 同上 */
@@ -3298,7 +3351,6 @@ void ScanWindow::applyDefaults()
    m_edPpu  ->setValue(d.pulses_per_unit);
    m_edSpeed->setValue((int)d.speed_pul_s);
    m_edDwell->setValue(d.dwell_ms);
-   m_edSettle->setValue(d.settle_ms);
    m_edSamples->setValue(d.samples_per_point);
    m_cbDir  ->setCurrentIndex(d.start_positive ? 0 : 1);
    m_cbMode ->setCurrentIndex((int)d.mode);
@@ -3338,7 +3390,6 @@ void ScanWindow::loadSettings()
    m_edPpu   ->setValue(pf.params.pulses_per_unit);
    m_edSpeed ->setValue((int)pf.params.speed_pul_s);
    m_edDwell ->setValue(pf.params.dwell_ms);
-   m_edSettle->setValue(pf.params.settle_ms);
    m_edSamples->setValue(pf.params.samples_per_point);
    m_cbDir   ->setCurrentIndex(pf.params.start_positive ? 0 : 1);
    m_cbMode  ->setCurrentIndex((int)pf.params.mode);
@@ -3678,7 +3729,10 @@ Params ScanWindow::currentParams() const
 
    p.speed_pul_s = (uint32_t)m_edSpeed->value();
    p.dwell_ms    = m_edDwell->value();
-   p.settle_ms   = m_edSettle->value();
+   /* 「稳定窗口」2026-10-29 从界面移除: 到位不再等一段连续成立时间, 这两处要求的就是 0。
+    * 字段本身留着 (ini 键 / CSV 表头的 settle_ms 照旧写, 读旧文件的路径也照旧解析) ——
+    * 只是界面这一路恒为 0, 控制器读到的就是 0。 */
+   p.settle_ms   = 0;
    p.samples_per_point = m_edSamples->value();
 
    p.mode           = modeFromIndex(m_cbMode->currentIndex());
@@ -3742,8 +3796,10 @@ void ScanWindow::pushParams()
       m_lEst->setText(QStringLiteral("每点 ≈ %1 ms   全程 ≈ %2")
                          .arg(estimatePerPointMs(p)).arg(fmtDur(m_ctl->estimateTotalMs())));
 
-   /* 两条否决: 参数本身不合法 / 几何超出量程 (超出的部分会被静默夹掉) */
-   QString bad = m_ctl->paramsError();
+   /* 两条否决: 参数本身不合法 (含连续行进走得起来与否, 见 runError) / 几何超出量程
+    * (超出的部分会被静默夹掉)。这里与「开始扫描」用同一条判据, 红字说的就是那一按
+    * 会被拒的理由 */
+   QString bad = m_ctl->runError();
    if (bad.isEmpty())
    {
       std::string why;
@@ -5298,7 +5354,9 @@ void ScanWindow::refresh()
     * 回灌会让勾自己跳回去。措辞那边走 BusTelem::di_invert (那是真值)。 */
 
    const bool meter_ok = (m_meter != nullptr) && m_meter->isOpen();
-   const bool params_ok = m_ctl->paramsError().isEmpty();
+   /* runError() 而不是 paramsError(): 「开始扫描」按下会跑 start(), 它查的就是这一条
+    * (连续行进的速度闸)。打开 CSV 那条路不受它影响 —— 那边只认 paramsError() */
+   const bool params_ok = m_ctl->runError().isEmpty();
    /* 回零中不能起扫: 回零把轴留在使能, 扫描半路撞上既不会自动中止也等不到插补 ——
     * 状态机会以为到了点, 其实一格没动。纵深防御, armRun() 里那道才是权威。
     *
@@ -5337,9 +5395,8 @@ void ScanWindow::refresh()
    /* ---- 进度 ---- */
    if (running || st == ScanController::State::Paused)
    {
-      QString extra;
-      if (m_ctl->settlingNow())
-         extra = QStringLiteral("  (等待稳定 %1 ms)").arg(m_ctl->stateMs());
+      /* 「等待稳定 N ms」那一段 2026-10-29 跟着「稳定窗口」一起撤了 —— 到位不再等窗口,
+       * settlingNow() 恒为假, 留着只能显示 0 ms */
 
       /* 「随机 (可重复)」那一支**不报「剩 / 第 i/j 个」**: 它的池子一轮一轮地整份重来,
        * pendingPoints() 会从 0 猛地跳回满格, 报在屏幕上就是一句假话。已采格数是准的
@@ -5349,7 +5406,7 @@ void ScanWindow::refresh()
          m_lProg->setText(QStringLiteral("%1 / %2 点 (可重复, 不设终点)")
                              .arg(m_ctl->completedPoints())
                              .arg(m_ctl->totalPoints()));
-         m_lTime->setText(QStringLiteral("已用 %1%2").arg(fmtDur(m_ctl->elapsedMs())).arg(extra));
+         m_lTime->setText(QStringLiteral("已用 %1").arg(fmtDur(m_ctl->elapsedMs())));
       }
       else
       {
@@ -5360,15 +5417,14 @@ void ScanWindow::refresh()
                              .arg(m_ctl->index() >= 0 ? m_ctl->index() + 1 : 0)
                              .arg(m_ctl->totalPoints()));
 
-         m_lTime->setText(QStringLiteral("已用 %1   预计剩余 %2%3")
+         m_lTime->setText(QStringLiteral("已用 %1   预计剩余 %2")
                              .arg(fmtDur(m_ctl->elapsedMs()))
                              .arg(fmtDur(m_ctl->state() == ScanController::State::Paused
                                             ? -1
                                             : (int64_t)((double)m_ctl->estimateTotalMs()
                                                         * m_ctl->pendingPoints()
                                                         / (m_ctl->totalPoints() > 0
-                                                              ? m_ctl->totalPoints() : 1))))
-                             .arg(extra));
+                                                              ? m_ctl->totalPoints() : 1)))));
       }
    }
    else

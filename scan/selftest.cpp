@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -316,7 +317,7 @@ public:
 
       requests_++;
       armed_ = true;
-      fails_ = fail_next_;
+      fails_ = fail_all_ || fail_next_;
       fail_next_ = false;
       due_   = now_ + latency_ms_;
    }
@@ -325,6 +326,12 @@ public:
    void setLatency(int ms) { latency_ms_ = ms; }
    void setValue(double v) { value_ = v; }
    void failNext()         { fail_next_ = true; }
+   /* 整轮都失败 (源开着, 但每次回的都是失败)。连续行进那几条用它验"行首/行末等不到采样
+    * 也不卡死" —— 与 failNext (只失败一次) 是两件事 */
+   void setFailAll(bool f) { fail_all_ = f; }
+   /* 每一笔成功读数在基值上再加 n × ramp (n = 第几笔)。缺省 0 = 常数, 既有用例全按常数写;
+    * 连续行进那条用它把"每一笔"区分开, 才能断言"一格取的是某一笔, 不是几笔的平均" */
+   void setRamp(double r)  { ramp_ = r; }
 
    /* 把到期的回包放出去。由 rig 在每个 tick 之后调用 */
    void pump(int64_t now)
@@ -342,7 +349,7 @@ public:
       }
 
       readings_++;
-      emit readingReady(value_);
+      emit readingReady(value_ + ramp_ * (double)readings_);
    }
 
    int readings() const { return readings_; }
@@ -362,6 +369,8 @@ private:
    bool    armed_      = false;
    bool    fails_      = false;
    bool    fail_next_  = false;
+   bool    fail_all_   = false;
+   double  ramp_       = 0.0;
 };
 
 /* ---------------------------------------------------------------- 台架 */
@@ -379,7 +388,21 @@ struct Rig
    int fed_move  = 0;
    int fed_read  = 0;
    int fed_pause = 0;
+   int fed_trav  = 0;
    int fed_other = 0;
+
+   /* 每一笔喂进状态机的采样都记一笔 (时刻 / 值 / 那一刻的位置 / 状态)。
+    * 连续行进那条断言要用它: "这一格的值是**某一笔**采样, 且那一笔发生在它写下的位置上"
+    * —— 只看 cellValue 分不出"取了一笔"与"几笔的平均" */
+   struct FedSample
+   {
+      int64_t ms;
+      double  w;
+      int32_t pos0;
+      int32_t pos1;
+      ScanController::State st;
+   };
+   std::vector<FedSample> fed_hist;
 
    Rig()
    {
@@ -398,13 +421,17 @@ struct Rig
        * 状态机。分成两个 connect 的话, 谁先谁后靠连接顺序, 那是看不见的约定 */
       QObject::connect(&mlog, &MeterLog::sampled,
                        [this](int64_t ms, double w, bool ok) {
+                          const BusTelem t = bus.telemetry();
+                          fed_hist.push_back(FedSample { ms, w, t.ax[0].pos,
+                                                         t.ax[1].pos, ctrl.state() });
                           switch (ctrl.state())
                           {
-                          case ScanController::State::Reading:  fed_read++;  break;
+                          case ScanController::State::Reading:    fed_read++;  break;
+                          case ScanController::State::Traversing: fed_trav++;  break;
                           case ScanController::State::Moving:
-                          case ScanController::State::Dwelling: fed_move++;  break;
-                          case ScanController::State::Paused:   fed_pause++; break;
-                          default:                              fed_other++; break;
+                          case ScanController::State::Dwelling:   fed_move++;  break;
+                          case ScanController::State::Paused:     fed_pause++; break;
+                          default:                                fed_other++; break;
                           }
                           ctrl.feedMeterSample(ms, w, ok);
                        });
@@ -493,6 +520,20 @@ struct Rig
       p.dwell_ms    = 40;
       p.settle_ms   = 60;
       p.samples_per_point = 1;
+      return p;
+   }
+
+   /* 连续行进那几条的缺省参数 (2026-10-29): 同一个 2×2 单位 / 5×5 网格, 停留 0 就是开关。
+    * 速度取 50000 而不是 smallParams 的 100000 —— 采样间距 = 50000 × 250 µs = 0.25 mm,
+    * 稳稳小于 0.5 mm 的格宽 (速度闸那条判据要的是这个不等式成立); 100000 时间距 = 格宽,
+    * 也能过, 但每一步 2000 pul 已经接近半格的 1/6, 断言会变得依赖步长。 */
+   static Params onFlyParams()
+   {
+      Params p = smallParams();
+      p.speed_pul_s = 50000;
+      p.dwell_ms    = 0;
+      p.settle_ms   = 60;
+      p.meter_interval_ms = 200;
       return p;
    }
 };
@@ -969,6 +1010,121 @@ static void test_randommode()
       r.ctrl.abort(QStringLiteral("收尾"));
       check(r.ctrl.state() == ScanController::State::Aborted, "中止才停得下来");
    }
+}
+
+/* ---------------------------------------------------------------- 连续行进: 纯逻辑 */
+
+/* 「单点停留」= 0 就进入连续行进 (2026-10-29, docs/scan_sweep.md §54)。这一组只跑纯函数
+ * (判据 / 速度闸 / 时长估算 / flags); 跑状态机的那一组在 test_onfly_run()。 */
+static void test_onfly_pure()
+{
+   caseBegin("onfly: 判据 = 行那两种走法 + 「单点停留」= 0");
+
+   Params p;                                /* 缺省: 逐行往返, 停留 200 */
+   check(!onFly(p), "缺省参数不是连续行进");
+   p.dwell_ms = 0;
+   check(onFly(p), "逐行往返 + 停留 0 → 连续行进");
+   p.mode = ScanMode::SameDir;
+   check(onFly(p), "每行同向 + 停留 0 → 连续行进");
+   p.mode = ScanMode::RandomOnce;
+   check(!onFly(p), "随机 (不重复) + 停留 0 → 仍逐点停");
+   p.mode = ScanMode::RandomRepeat;
+   check(!onFly(p), "随机 (可重复) + 停留 0 → 仍逐点停");
+   p.mode = ScanMode::Serpentine;
+   p.dwell_ms = 1;
+   check(!onFly(p), "停留 1 ms 就回到逐点停 (判据是 == 0, 不是某个阈值)");
+
+   /* 速度闸。2 单位 / 5 点 → 格宽 0.5 mm = 25000 pul;
+    *   间距 = 速度 × (间隔 + 50) / 1000 / 每单位脉冲
+    *   100000 × 250 / 1000 / 50000 = 0.50 mm  → 恰好等于格宽, **放行** (判据是 >, 不是 >=)
+    *   100000 × 260 / 1000 / 50000 = 0.52 mm  → 超过, 拒绝
+    *
+    * 闸在 continuousRunError(), **不在 validate()** (2026-10-29 拆开): validate() 还被
+    * "读入 CSV / 对齐参数 / 存参数" 那几条不跑机器的路用着, 把只在开跑时才成立的闸塞进去,
+    * 读一份停留 0 的 CSV 会被当成"这份 CSV 的几何不合法"。 */
+   caseBegin("onfly: 速度闸 —— 采样间距不许超过格宽");
+   Params q = Rig::smallParams();
+   q.dwell_ms = 0;
+   q.speed_pul_s = 100000;
+   q.meter_interval_ms = 200;
+   check(continuousRunError(q).empty(), "间距 = 格宽 → 放行", continuousRunError(q));
+
+   q.meter_interval_ms = 210;
+   const std::string why = continuousRunError(q);
+   check(!why.empty(), "间距 > 格宽 → 拒绝", why);
+   check(why.find("采样间距") != std::string::npos, "拒绝的话点明是采样间距", why);
+   check(why.find("请降低扫描速度") != std::string::npos, "并且给出出路", why);
+   check(why.find("「间隔」") != std::string::npos, "出路里连「间隔」一起说 (另一条出路)", why);
+   check(why.find(',') == std::string::npos || why.find(", ") != std::string::npos,
+         "标点用半角逗号 + 空格", why);
+
+   /* 同一份参数 validate() 必须**不吭声**: 读入停留 0 的 CSV、保存参数都还得放行。
+    * 这条是回归闸 —— 闸要是漏回 validate(), 这里先红 */
+   check(validate(q).empty(), "validate() 不管这条闸 (读 CSV / 存参数照常)", validate(q));
+
+   /* 随机那两种不走连续行进, 于是同一条间距**不该**拦它 —— 它们是逐点停, 采样在停车时到齐 */
+   q.mode = ScanMode::RandomOnce;
+   check(continuousRunError(q).empty(), "随机 + 停留 0 不套这条闸", continuousRunError(q));
+
+   /* 起扫那一刻必须真拦下来, 而且**不建文件** —— 半截 CSV 比没有文件难收拾 */
+   caseBegin("onfly: 速度闸拦在起扫, 文件不建");
+   {
+      QTemporaryDir dir;
+      const QString csv = dir.filePath("gate.csv");
+      Rig r;
+      Params g = Rig::smallParams();
+      g.dwell_ms = 0;
+      g.speed_pul_s = 100000;
+      g.meter_interval_ms = 210;
+      r.ctrl.setParams(g);
+      check(r.ctrl.paramsError().isEmpty(), "参数体检本身是过的",
+            r.ctrl.paramsError().toStdString());
+      check(!r.ctrl.runError().isEmpty(), "runError() 才把这条说出来");
+      QString err;
+      check(!r.startScan(csv, &err), "起扫被拒");
+      check(err.contains(QStringLiteral("采样间距")), "理由是采样间距", err.toStdString());
+      check(!QFileInfo::exists(csv), "被拒时一个字节都没写");
+      check(r.ctrl.state() == ScanController::State::Idle, "状态还停在 Idle");
+   }
+
+   /* 时长估算 (2026-10-29): 连续行进一个"点"是**一行的平均**, 不再是"一步 + 停 + 读"。
+    * 缺省参数逐字算一遍 (0.5 mm 格, 20000 pul/s):
+    *   rx = ry = 25000 pul
+    *   蛇形: 一行 = 25000×54 + 25000 (换行) = 1375000 pul → 68750 ms
+    *         + 稳定 100 + 行首行末余量 600 + 2×(200 + 50)  → 69950 ms
+    *   除以 55 点 → 1271 ms/点 (整数截断)
+    *   同向: 还要整行返程 (+1350000 pul = 67500 ms) → 2499 ms/点 */
+   caseBegin("onfly: 「预计全程」按一行摊到每点, 不再是逐点停那一套");
+   Params of;                                /* 缺省参数, 停留 0 */
+   of.dwell_ms = 0;
+   check(onFly(of), "这一份确实是连续行进的参数");
+   checkEq(estimatePerPointMs(of), 1271, "蛇形 1271 ms/点");
+   Params same = of;
+   same.mode = ScanMode::SameDir;
+   checkEq(estimatePerPointMs(same), 2499, "同向 2499 ms/点 (多一次整行返程)");
+
+   /* 同几何的逐点停 (停留 200) 是 2175 ms/点 —— 连续行进必须**更短**, 否则「预计全程」
+    * 那个数就没反映出"不停车"这件事。
+    * **没有"停留 0 的逐点停"这个对照组**: 行那两种走法停留 0 就是连续行进 (onFly 本身就是
+    * 那条判据), 于是它不再是"逐点停" —— 这个估算函数里根本没有那样一条路 */
+   Params stop = of;                       /* of 仍是蛇形 (上面那个同向是副本) */
+   stop.dwell_ms = 200;
+   check(!onFly(stop), "对照组是逐点停");
+   checkEq(estimatePerPointMs(stop), 2175, "逐点停仍是 2175 ms/点");
+   check(estimatePerPointMs(of) < estimatePerPointMs(stop),
+         "连续行进比同几何的逐点停短 (这是它存在的理由)");
+
+   /* 连续行进那一行在 CSV 里靠 flags=onfly 认。表头**一个字节都不动** —— 那条旧账
+    * (2026-09-29: 「间隔」不进表头) 不为新功能翻 */
+   caseBegin("onfly: CSV 里 flags=onfly, 表头不动");
+   Row row;
+   row.flags = "onfly";
+   check(csvRowLine(row).find(",onfly") != std::string::npos,
+         "ok 的行也能有 flags —— 那是「走过采的」的记号", csvRowLine(row));
+   check(csvColumnHeader().find("onfly") == std::string::npos,
+         "列名一个都没加");
+   check(csvMetaLines(Params(), "2026-10-29T00:00:00", 0).find("dwell") != std::string::npos,
+         "dwell 本来就在表头里 —— 连续行进由 dwell=0 推出来, 不用另加一列");
 }
 
 static void test_csv()
@@ -2523,6 +2679,76 @@ static void test_arrive()
          "arrives once the position really is there");
 }
 
+/* CSV 的数据行拆成字段表, 列名那一行单独收着。csvParseForResume 只回答"哪些格子有数据",
+ * 而连续行进那几条要问"那一行写了什么" (x 位置 / ok / flags) —— 所以另有一个拆表的小工具。
+ * 按**列名**取下标, 不写死列序 (与 csvLoadGrid 同一条规矩)。 */
+struct CsvTable
+{
+   std::vector<std::string>              names;
+   std::vector<std::vector<std::string>> rows;
+
+   int col(const char *name) const
+   {
+      for (size_t i = 0; i < names.size(); i++)
+         if (names[i] == name)
+            return (int)i;
+      return -1;
+   }
+
+   const std::string &cell(size_t row, const char *name) const
+   {
+      static const std::string empty;
+      const int c = col(name);
+      if (c < 0 || (size_t)c >= rows[row].size())
+         return empty;
+      return rows[row][(size_t)c];
+   }
+};
+
+static CsvTable parseCsvTable(const std::string &text)
+{
+   CsvTable t;
+   size_t pos = 0;
+   while (pos < text.size())
+   {
+      size_t e = text.find('\n', pos);
+      if (e == std::string::npos)
+         e = text.size();
+      std::string line = text.substr(pos, e - pos);
+      pos = e + 1;
+      if (!line.empty() && line.back() == '\r')
+         line.pop_back();
+      if (line.empty() || line[0] == '#')
+         continue;
+
+      std::vector<std::string> f;
+      size_t s = 0;
+      while (true)
+      {
+         const size_t c = line.find(',', s);
+         f.push_back(line.substr(s, c == std::string::npos ? std::string::npos : c - s));
+         if (c == std::string::npos)
+            break;
+         s = c + 1;
+      }
+      if (t.names.empty())
+         t.names = f;
+      else
+         t.rows.push_back(f);
+   }
+   return t;
+}
+
+/* 出现次数 (只看子串, 足够数 flags 那一列) */
+static int countSub(const std::string &hay, const std::string &needle)
+{
+   int n = 0;
+   for (size_t p = hay.find(needle); p != std::string::npos;
+        p = hay.find(needle, p + needle.size()))
+      n++;
+   return n;
+}
+
 static void test_run()
 {
    caseBegin("run: 一整轮扫完 (FakeBus + FakeMeter)");
@@ -2758,6 +2984,327 @@ static void test_run()
             "超时那一行写的是**这次给的预算** (2000 + 4×200), 不是 meter_timeout_ms", want);
       /* flags 要进 CSV 的一列, 逗号会把列数撑开 */
       check(want.find(',') == std::string::npos, "那句 flags 里没有逗号");
+   }
+}
+
+/* ---------------------------------------------------------------- 连续行进: 跑状态机 */
+
+/* 「单点停留」= 0 → 一段行内不停车, 每格取经过中心最近的一笔 (docs/scan_sweep.md §54)。
+ * 这一组验的是时序: 行内真的不停 (`ntarget`)、每格恰好一行一笔、暂停/继续/中止/续扫/重测
+ * 各走一趟、采不到也不卡死。纯函数那几条在 test_onfly_pure()。 */
+static void test_onfly_run()
+{
+   QTemporaryDir dir;
+   check(dir.isValid(), "temp dir");
+
+   caseBegin("onfly: 5×5 一行不停车地扫完, 每格一行、一笔");
+
+   const QString csv = dir.filePath("onfly.csv");
+   Rig rig;
+   rig.ctrl.setParams(Rig::onFlyParams());
+   rig.ctrl.rebuildPlan();
+   checkEq(rig.ctrl.totalPoints(), 25, "5x5 = 25 点");
+   rig.meter.setValue(2.5);
+   /* 每一笔读数都不同 (3.5, 4.5, …): 这样"这一格的值"能唯一对上"某一笔采样"。
+    * 常数的话"取了一笔"与"几笔平均"在屏幕上长得一模一样 */
+   rig.meter.setRamp(1.0);
+
+   QString err;
+   check(rig.startScan(csv, &err), "start accepted", err.toStdString());
+   check(rig.ctrl.onTheFly(), "控制器把这一轮认作连续行进");
+
+   check(rig.runToIdle(), "the run reaches Done");
+   check(rig.ctrl.state() == ScanController::State::Done, "state is Done");
+   checkEq(rig.ctrl.completedPoints(), 25, "25 cells completed");
+   checkEq(rig.ctrl.pendingPoints(), 0, "待补点数归零");
+
+   /* 采样照旧在走, 只是它们落在 Traversing 里; Reading 那一路一次都没进 (不停车取平均) */
+   check(rig.fed_trav > 25, "行进期间确实在收采样 (比 25 多 —— 每格不止到一笔)");
+   checkEq(rig.fed_read, 0, "一次都没走「停下取平均」那一路");
+   checkEq(rig.fed_other, 0, "也没有采样落在扫描之外");
+
+   /* **行内不停**: 每段最多 4 次轴下发 (行首 startPoint 两次 + 行末目标两次),
+    * 5 行 ≤ 22 次。逐点停是 2×25 = 50 次 —— 这两个数差的就是"停不停车" */
+   check(rig.bus.ntarget <= 4 * 5 + 2,
+         "一行只下发几次目标 (行内不停车)");
+   check(rig.bus.ntarget < 50, "明显少于逐点停的 2 × 25 次");
+
+   std::string text;
+   check(readCsvText(csv, &text, &err), "csv readable", err.toStdString());
+   const CsvTable tb = parseCsvTable(text);
+   checkEq((long long)tb.rows.size(), 25, "CSV 里恰好 25 个数据行 (一格一行)");
+   check(tb.col("flags") >= 0 && tb.col("pos_x_pul") >= 0, "列名都在");
+
+   const int64_t half = 12500;             /* resX 0.5 mm × 50000 pul/mm / 2 */
+   int ok_rows = 0, onfly_rows = 0, in_window = 0, from_a_sample = 0;
+   for (size_t i = 0; i < tb.rows.size(); i++)
+   {
+      if (tb.cell(i, "ok") == "1")
+         ok_rows++;
+      if (tb.cell(i, "flags") == "onfly")
+         onfly_rows++;
+
+      const int64_t x    = std::atoll(tb.cell(i, "x_pul").c_str());
+      const int64_t posx = std::atoll(tb.cell(i, "pos_x_pul").c_str());
+      int64_t d = posx - x;
+      if (d < 0)
+         d = -d;
+      if (d <= half)
+         in_window++;
+
+      /* 值必须能在采样流水里找到**同一笔** (值 + 那一刻的位置都对得上) ——
+       * "取的是某一笔"与"取的是几笔平均"只有这一条能分开 */
+      const double w = std::atof(tb.cell(i, "watts").c_str());
+      for (const Rig::FedSample &f : rig.fed_hist)
+      {
+         if (f.st == ScanController::State::Traversing && f.pos0 == (int32_t)posx
+             && std::fabs(f.w - w) < 1e-6)
+         {
+            from_a_sample++;
+            break;
+         }
+      }
+   }
+   checkEq(ok_rows, 25, "每格都采到了 (ok=1)");
+   checkEq(onfly_rows, 25, "每行的 flags 都是 onfly");
+   checkEq(in_window, 25, "每一笔的位置都在格中心 ±半格以内");
+   checkEq(from_a_sample, 25,
+           "每一格的值都来自某一笔采样 (值与那一刻的位置都能对上), 不是平均");
+   checkEq(countSub(text, "onfly"), 25, "onfly 只出现在数据行里, 一行一次");
+
+   /* 行首/行末那两格是**停着采**的 (等一笔到齐再走 / 到站再等一笔), 于是位置恰好是格中心。
+    * 这是"中心读数"这个名字唯一能在自检里钉住的证据 —— 行进途中那几笔只能近似到采样间隔 */
+   int rows_total = 0, centered_ends = 0;
+   for (size_t i = 0; i < tb.rows.size();)
+   {
+      size_t j = i;
+      while (j < tb.rows.size() && tb.cell(j, "iy") == tb.cell(i, "iy"))
+         j++;
+      if (tb.cell(i, "pos_x_pul") == tb.cell(i, "x_pul"))
+         centered_ends++;
+      if (tb.cell(j - 1, "pos_x_pul") == tb.cell(j - 1, "x_pul"))
+         centered_ends++;
+      rows_total++;
+      i = j;
+   }
+   checkEq(rows_total, 5, "5 行");
+   checkEq(centered_ends, 10, "每行首尾两格采在正中心 (那两处是停着等来的)");
+
+   caseBegin("onfly: 行中途暂停 —— 当前格没写, 继续后补齐, 一格仍只有一行");
+   {
+      Rig r;
+      r.ctrl.setParams(Rig::onFlyParams());
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(4.0);
+
+      const QString c = dir.filePath("onfly_pause.csv");
+      check(r.startScan(c, &err), "start", err.toStdString());
+      check(r.runUntil([&] { return r.ctrl.completedPoints() >= 7; }, 60000),
+            "走到第二行中途");
+      r.ctrl.pause();
+      check(r.ctrl.state() == ScanController::State::Paused, "paused");
+
+      const int done_at_pause = r.ctrl.completedPoints();
+      for (int k = 0; k < 20; k++)
+         r.stepOnce();
+      checkEq(r.ctrl.completedPoints(), done_at_pause, "暂停期间没有新行写出");
+
+      r.ctrl.resumeRun();
+      check(r.ctrl.state() == ScanController::State::Moving, "back to Moving");
+      check(r.ctrl.onTheFly(), "继续之后仍是连续行进");
+      check(r.runToIdle(), "finishes after resuming");
+      checkEq(r.ctrl.completedPoints(), 25, "all 25 done after resume");
+
+      std::string t;
+      check(readCsvText(c, &t, &err), "read back", err.toStdString());
+      const CsvTable pt = parseCsvTable(t);
+      int dup = 0;
+      for (size_t i = 0; i < pt.rows.size(); i++)
+         for (size_t k = i + 1; k < pt.rows.size(); k++)
+            if (pt.cell(i, "ix") == pt.cell(k, "ix")
+                && pt.cell(i, "iy") == pt.cell(k, "iy"))
+               dup++;
+      checkEq((long long)pt.rows.size(), 25, "暂停/继续之后仍是 25 行");
+      checkEq(dup, 0, "没有哪一格被写了两行 (暂停时丢掉的那半份没混进来)");
+   }
+
+   caseBegin("onfly: 中止 —— 已写的保留, 当前格不留半行");
+   {
+      Rig r;
+      r.ctrl.setParams(Rig::onFlyParams());
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(5.0);
+
+      const QString c = dir.filePath("onfly_abort.csv");
+      check(r.startScan(c, &err), "start", err.toStdString());
+      check(r.runUntil([&] { return r.ctrl.completedPoints() >= 9; }, 60000), "走完一行多");
+      r.ctrl.abort(QStringLiteral("操作员按了中止"));
+      check(r.ctrl.state() == ScanController::State::Aborted, "aborted");
+
+      std::string t;
+      check(readCsvText(c, &t, &err), "read back", err.toStdString());
+      const CsvTable at = parseCsvTable(t);
+      check((int)at.rows.size() >= 9, "已写出的行都在");
+      check((int)at.rows.size() <= 10, "中止之后一行都没再多写");
+
+      /* 续扫: 只补没采的格, 补出来的行同样是 onfly */
+      Rig r2;
+      r2.ctrl.setParams(Rig::onFlyParams());
+      r2.ctrl.rebuildPlan();
+      r2.ctrl.setZeroEpoch(0);
+      r2.meter.setValue(6.0);
+
+      QString why;
+      check(r2.resumeScan(c, false, &err, &why), "resume accepted",
+            (err + " | " + why).toStdString());
+      check(r2.ctrl.onTheFly(), "续扫的这条路也自动是连续行进");
+      checkEq(r2.ctrl.completedPoints(), (long long)at.rows.size(),
+              "文件里已有的格子算作进度");
+      checkEq(r2.ctrl.pendingPoints(), 25 - (int)at.rows.size(),
+              "待补的只有没采的那几格");
+
+      check(r2.runToIdle(), "the resume finishes");
+      checkEq(r2.ctrl.completedPoints(), 25, "补完就是 25 格");
+
+      std::string t2;
+      check(readCsvText(c, &t2, &err), "read back", err.toStdString());
+      const CsvTable ft = parseCsvTable(t2);
+      int dup2 = 0, bad_flags = 0, bad_ok = 0;
+      for (size_t i = 0; i < ft.rows.size(); i++)
+      {
+         if (ft.cell(i, "flags").find("onfly") == std::string::npos)
+            bad_flags++;
+         if (ft.cell(i, "ok") != "1")
+            bad_ok++;
+         for (size_t k = i + 1; k < ft.rows.size(); k++)
+            if (ft.cell(i, "ix") == ft.cell(k, "ix")
+                && ft.cell(i, "iy") == ft.cell(k, "iy"))
+               dup2++;
+      }
+      checkEq((long long)ft.rows.size(), 25, "续扫之后总共 25 行");
+      checkEq(dup2, 0, "没有一个格子被重采两行");
+      checkEq(bad_flags, 0, "两段 (中止前 / 续扫) 写下的都是 onfly");
+      checkEq(bad_ok, 0, "全部采到了");
+   }
+
+   caseBegin("onfly: 一笔采样都等不到 —— 每格 ok=0, 等满期限后照常结束");
+   {
+      Rig r;
+      r.ctrl.setParams(Rig::onFlyParams());
+      r.ctrl.rebuildPlan();
+      r.meter.setFailAll(true);            /* 源开着, 但每次回的都是失败 */
+
+      const QString c = dir.filePath("onfly_fail.csv");
+      check(r.startScan(c, &err), "start", err.toStdString());
+      check(r.runToIdle(180000), "跑到底了 (行首/行末的等待各有期限, 不会卡死)");
+      checkEq(r.ctrl.completedPoints(), 25, "25 格都走过了 (只是都没数)");
+      checkEq(r.ctrl.cellHasValue(0, 0), 0, "没采到: 记的是 ok=false, 不是 0 W");
+
+      std::string t;
+      check(readCsvText(c, &t, &err), "read back", err.toStdString());
+      const CsvTable ft = parseCsvTable(t);
+      int ok_rows = 0, want_flags = 0;
+      for (size_t i = 0; i < ft.rows.size(); i++)
+      {
+         if (ft.cell(i, "ok") == "1")
+            ok_rows++;
+         if (ft.cell(i, "flags") == "onfly|连续行进未采到")
+            want_flags++;
+      }
+      checkEq((long long)ft.rows.size(), 25, "仍然是一格一行");
+      checkEq(ok_rows, 0, "一行都没有值");
+      checkEq(want_flags, 25, "每行的 flags 都写着「连续行进未采到」");
+   }
+
+   caseBegin("onfly: 单点重测永远逐点停 (停留 0 也一样), flags 只有 retest");
+   {
+      Rig r;
+      r.ctrl.setParams(Rig::onFlyParams());
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(1.0);
+
+      const QString c = dir.filePath("onfly_retest.csv");
+      check(r.startScan(c, &err), "start", err.toStdString());
+      check(r.runToIdle(), "first pass finishes");
+
+      std::string before;
+      check(readCsvText(c, &before, &err), "read back", err.toStdString());
+      const int rows_before = countSub(before, "\n");
+
+      /* 重测照「每点采样」取平均 (用户 2026-10-29 定): 它不跟停留 0 走连续行进 ——
+       * 重测是把这一格认真再量一遍, 与"走过采一笔"不是同一个用途 */
+      Params p = r.ctrl.params();
+      p.samples_per_point = 3;
+      r.ctrl.setParams(p);
+      r.meter.setValue(99.0);
+      const int read_before = r.fed_read;
+      const int trav_before = r.fed_trav;
+
+      check(r.retestAt(2, 3, &err), "retest accepted", err.toStdString());
+      check(!r.ctrl.onTheFly(), "停留 0 也不把重测判成连续行进");
+      check(r.runToIdle(), "retest finishes");
+      checkNear(r.ctrl.cellValue(2, 3), 99.0, "重测那一格取了新值");
+      checkNear(r.ctrl.cellValue(0, 0), 1.0, "别格不动");
+      checkEq(r.fed_read - read_before, 3, "照「每点采样」补 3 笔 (停着取平均)");
+      checkEq(r.fed_trav, trav_before, "一笔都没落进 Traversing");
+
+      std::string after;
+      check(readCsvText(c, &after, &err), "read back", err.toStdString());
+      checkEq(countSub(after, "\n"), rows_before + 1, "恰好追加一行");
+      const CsvTable ft = parseCsvTable(after);
+      const std::string &fl = ft.cell(ft.rows.size() - 1, "flags");
+      check(fl.find("retest") != std::string::npos, "那一行标着 retest", fl);
+      check(fl.find("onfly") == std::string::npos, "没有 onfly (重测是停下采的)", fl);
+   }
+
+   /* 段间换行可能是一整行 (「每行同向」要从行尾走回下一行行首)。那条移动期限若还沿用逐点停
+    * 的「距离 × 3 封顶 120 s」(2026-10-29 之前的样子), 慢速下一整行越过 120 s 就会被判
+    * 「未到位」中止 —— 而扫描本身是好的。这里让一次整行返程要 150 s, 跑完一整轮证明不误判。
+    * 3 mm × 2 mm / 2 × 3 点: 格宽 3 mm, 一行来回 6 mm, 1000 pul/s → 每行 300 s */
+   caseBegin("onfly: 每行同向 + 慢速 —— 整行返程超过 120 s 也不误判未到位");
+   {
+      Rig r;
+      Params p = Rig::onFlyParams();
+      p.mode = ScanMode::SameDir;
+      p.area_x_unit = 3.0;
+      p.area_y_unit = 2.0;
+      p.nx = 2;
+      p.ny = 3;
+      p.speed_pul_s = 1000;               /* 速度下限: 3 mm = 150000 pul → 150 s */
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      checkEq(r.ctrl.totalPoints(), 6, "2 × 3 = 6 点");
+      check(continuousRunError(p).empty(), "速度这么低, 采样间距反而更小, 不拦",
+            continuousRunError(p));
+
+      const QString c = dir.filePath("onfly_slow_samedir.csv");
+      check(r.startScan(c, &err), "start", err.toStdString());
+      check(r.runToIdle(2000000), "跑到底 (一次整行返程 150 s, 超过旧上限 120 s)");
+      check(r.ctrl.state() == ScanController::State::Done,
+            "是 Done, 不是被「未到位」中止的 Aborted");
+      checkEq(r.ctrl.completedPoints(), 6, "6 格都采到了");
+   }
+
+   caseBegin("onfly: 随机那两种仍逐点停 (停留 0 也不例外)");
+   {
+      Rig r;
+      Params p = Rig::smallParams();
+      p.mode = ScanMode::RandomOnce;
+      p.dwell_ms = 0;
+      p.samples_per_point = 3;
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(6.0);
+
+      const QString c = dir.filePath("onfly_random.csv");
+      check(r.startScan(c, &err), "start", err.toStdString());
+      check(!r.ctrl.onTheFly(), "控制器说这一轮不是连续行进");
+      check(r.runToIdle(), "跑到底");
+      checkEq(r.ctrl.completedPoints(), 25, "25 格全采到");
+      checkEq(r.fed_trav, 0, "一次都没进过 Traversing");
+      checkEq(r.fed_read, 75, "25 点 × 3 笔全落在读数期间 (仍是取平均)");
+      checkEq(r.bus.ntarget, 50, "每点两轴各一次 = 逐点停的写法");
+      checkNear(r.ctrl.cellValue(0, 0), 6.0, "值仍是平均 (3 笔常数一样)");
    }
 }
 
@@ -8625,11 +9172,13 @@ int main(int argc, char **argv)
 
    test_grid();
    test_randommode();
+   test_onfly_pure();
    test_csv();
    test_csvalign();
    test_resumeload();
    test_arrive();
    test_run();
+   test_onfly_run();
    test_aborts();
    test_retest();
    test_preflight();
