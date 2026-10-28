@@ -17,8 +17,10 @@ const char *modeText(ScanMode m)
    case ScanMode::SameDir:      return "每行同向";
    case ScanMode::RandomOnce:   return "随机 (不重复)";
    case ScanMode::RandomRepeat: return "随机 (可重复)";
+   case ScanMode::SpiralCW:     return "由外向内 (顺时针)";
+   case ScanMode::SpiralCCW:    return "由外向内 (逆时针)";
    }
-   return "逐行往返";      /* 到不了: 上面四支盖满了 enum。兜底只为 -Wreturn-type */
+   return "逐行往返";      /* 到不了: 上面六支盖满了 enum。兜底只为 -Wreturn-type */
 }
 
 ScanMode modeFromIndex(int i)
@@ -38,10 +40,20 @@ bool modeEndless(ScanMode m)
    return m == ScanMode::RandomRepeat;
 }
 
+bool modeSpiral(ScanMode m)
+{
+   return m == ScanMode::SpiralCW || m == ScanMode::SpiralCCW;
+}
+
+bool modeRow(ScanMode m)
+{
+   return m == ScanMode::Serpentine || m == ScanMode::SameDir;
+}
+
 bool onFly(const Params &p)
 {
-   /* 随机走法没有"行", 连续不了 (见头文件)。dwell 的下限是 0 (validate 允许),
-    * 于是 0 这个值天然可以当开关用, 不另加字段 */
+   /* 随机走法没有直的一段, 连续不了 (见头文件); 环形两种每段是直线段, 为真。
+    * dwell 的下限是 0 (validate 允许), 于是 0 这个值天然可以当开关用, 不另加字段 */
    return !modeRandom(p.mode) && p.dwell_ms == 0;
 }
 
@@ -137,6 +149,93 @@ std::vector<double> axisCoordsByCount(double span_unit, int n)
    return out;
 }
 
+/* 由外向内两种走法的点列 (2026-10-29, docs/scan_sweep.md §55)。
+ *
+ * 区域按**格数**剥矩形环: 一圈走整条边框 (四角只算一次), 然后缩一圈。方向约定见
+ * scanplan.h 的 enum: iy 大 = 屏幕上方 (画布 row = ny-1-iy), 于是顺时针从左上角沿上边
+ * 向右起绕, 逆时针从右上角沿上边向左起绕。
+ *
+ * 退化块 (内层只剩一行/一列/一格):
+ *   一行: 顺时针左→右, 逆时针右→左;
+ *   一列: **两种方向都是上→下** —— 上一圈的末格停在它的上端, 从下往上走要一次斜跳;
+ *   一格: 就是一个点。
+ *
+ * 一圈走完若 w<=2 或 h<=2 就收尾: 那一圈本身已经盖住了整块 (2w+2h-4 == w*h), 再缩一圈会
+ * 把剩下的条带重走一遍。 */
+static std::vector<Point> spiralPlan(const Params &p,
+                                     const std::vector<double> &xs,
+                                     const std::vector<double> &ys)
+{
+   std::vector<Point> out;
+   out.reserve((size_t)p.nx * (size_t)p.ny);
+
+   const bool cw = (p.mode == ScanMode::SpiralCW);
+
+   auto add = [&](int ix, int iy)
+   {
+      Point pt;
+      pt.ix = ix;
+      pt.iy = iy;
+      pt.x_unit = xs[(size_t)ix];
+      pt.y_unit = ys[(size_t)iy];
+      pt.x_pul  = pulseOf(pt.x_unit, p.pulses_per_unit);
+      pt.y_pul  = pulseOf(pt.y_unit, p.pulses_per_unit);
+      out.push_back(pt);
+   };
+
+   int xl = 0, xr = p.nx - 1, ybot = 0, ytop = p.ny - 1;
+
+   for (;;)
+   {
+      const int w = xr - xl + 1;
+      const int h = ytop - ybot + 1;
+      if (w <= 0 || h <= 0)
+         break;
+
+      if (w == 1 && h == 1)
+      {
+         add(xl, ytop);
+         break;
+      }
+      if (w == 1)                    /* 一列: 两种方向都是上→下 */
+      {
+         for (int y = ytop; y >= ybot; y--)
+            add(xl, y);
+         break;
+      }
+      if (h == 1)                    /* 一行 */
+      {
+         if (cw)
+            for (int x = xl; x <= xr; x++) add(x, ytop);
+         else
+            for (int x = xr; x >= xl; x--) add(x, ytop);
+         break;
+      }
+
+      if (cw)
+      {
+         for (int x = xl; x <= xr; x++)             add(x, ytop);   /* 上边 +X */
+         for (int y = ytop - 1; y >= ybot; y--)     add(xr, y);    /* 右边 -Y */
+         for (int x = xr - 1; x >= xl; x--)         add(x, ybot);  /* 下边 -X */
+         for (int y = ybot + 1; y <= ytop - 1; y++) add(xl, y);    /* 左边 +Y */
+      }
+      else
+      {
+         for (int x = xr; x >= xl; x--)             add(x, ytop);  /* 上边 -X */
+         for (int y = ytop - 1; y >= ybot; y--)     add(xl, y);    /* 左边 -Y */
+         for (int x = xl + 1; x <= xr; x++)         add(x, ybot);  /* 下边 +X */
+         for (int y = ybot + 1; y <= ytop - 1; y++) add(xr, y);    /* 右边 +Y */
+      }
+
+      if (w <= 2 || h <= 2)          /* 这一圈已经盖住整块 */
+         break;
+
+      xl++; xr--; ybot++; ytop--;
+   }
+
+   return out;
+}
+
 std::vector<Point> buildPlan(const Params &p)
 {
    std::vector<Point> out;
@@ -152,6 +251,11 @@ std::vector<Point> buildPlan(const Params &p)
    std::vector<double> ys = axisCoordsByCount(p.area_y_unit, p.ny);
    if ((int)xs.size() != p.nx || (int)ys.size() != p.ny)
       return out;
+
+   /* 环形在行循环**之前**分流 (2026-10-29): 下面那句 `start_positive` 的翻向对环形没有
+    * 意义 (方向由走法本身定), 排在它后面就会被「起始方向」悄悄翻成反的 */
+   if (modeSpiral(p.mode))
+      return spiralPlan(p, xs, ys);
 
    int nx = p.nx;
    int ny = p.ny;
@@ -191,6 +295,141 @@ void shufflePlan(std::vector<Point> *pts, uint32_t seed)
       return;
    std::mt19937 rng(seed);
    std::shuffle(pts->begin(), pts->end(), rng);
+}
+
+std::vector<std::vector<int>> buildSpiralLegs(const std::vector<Point> &plan,
+                                              const std::vector<int> &order)
+{
+   std::vector<std::vector<int>> legs;
+   if (order.empty())
+      return legs;
+
+   legs.push_back(std::vector<int>(1, order[0]));
+
+   /* have_dir = "当前这一段已经有内部移动, 方向定了"。它**不是**"当前这一段存在":
+    * 刚换段时新段只有一格, 方向要由下一格定 —— 那一格若又换了方向, 不算再换一段
+    * (不然 2xN、3xN 这类条带的尾巴会凭空多出几段)。这条与 spiralStats 里的状态机同一套。 */
+   bool have_dir = false;
+   int  axis = -1;
+   int  sign = 0;
+
+   for (size_t k = 1; k < order.size(); k++)
+   {
+      const int a = order[k - 1];
+      const int b = order[k];
+      if (a < 0 || b < 0 || (size_t)a >= plan.size() || (size_t)b >= plan.size())
+         break;                  /* 越界不该发生; 断在这里, 不猜一个格子出来 */
+
+      const int dx = plan[(size_t)b].ix - plan[(size_t)a].ix;
+      const int dy = plan[(size_t)b].iy - plan[(size_t)a].iy;
+
+      int ax = -1, sg = 0;
+      if (dx == 0 && dy != 0)      { ax = 1; sg = (dy > 0) ? 1 : -1; }
+      else if (dy == 0 && dx != 0) { ax = 0; sg = (dx > 0) ? 1 : -1; }
+
+      if (ax < 0)                 /* 斜步 / 同格: 判不出轴, 断段 (跨着洞的同轴一步**不**断) */
+      {
+         legs.push_back(std::vector<int>(1, b));
+         have_dir = false;
+      }
+      else if (!have_dir)         /* 新段的第一格: 这一格定下这一段的方向 */
+      {
+         legs.back().push_back(b);
+         axis = ax;
+         sign = sg;
+         have_dir = true;
+      }
+      else if (ax == axis && sg == sign)
+      {
+         legs.back().push_back(b);
+      }
+      else                        /* 真拐角: 拐角格留在上一段, 新段从这一格起 */
+      {
+         legs.push_back(std::vector<int>(1, b));
+         have_dir = false;
+      }
+   }
+
+   return legs;
+}
+
+SpiralStats spiralStats(int nx, int ny)
+{
+   SpiralStats s;
+   if (nx < 2 || ny < 2)
+      return s;
+
+   int  legs     = 1;
+   bool have_dir = false;
+   int  axis = -1, sign = 0;
+
+   /* 一条**同向的边**: n 步, 轴 0=X / 1=Y, 符号 ±1。方向与当前这一段不同就从这一条边的
+    * 第一格换段; 换段之后这一条边的第一步是"入口步" (新段段首那一格), 段内方向由第二步起算。
+    * 与 buildSpiralLegs 逐格走出来的段数一致 —— 自检拿两边对比钉着。 */
+   auto edge = [&](int n, int ax, int sg)
+   {
+      if (n <= 0)
+         return;
+
+      if (ax == 0) s.h_steps += n;
+      else         s.v_steps += n;
+
+      if (have_dir && (ax != axis || sg != sign))
+      {
+         legs++;
+         have_dir = false;
+         n--;                    /* 这一步是入口步, 不在段内 */
+         if (n == 0)
+            return;
+      }
+
+      if (!have_dir)
+      {
+         axis = ax;
+         sign = sg;
+         have_dir = true;
+      }
+   };
+
+   int xl = 0, xr = nx - 1, ybot = 0, ytop = ny - 1;
+
+   for (;;)
+   {
+      const int w = xr - xl + 1;
+      const int h = ytop - ybot + 1;
+      if (w <= 0 || h <= 0)
+         break;
+
+      if (w == 1 && h == 1)
+         break;
+
+      if (w == 1)                 /* 一列, 上→下 */
+      {
+         edge(h - 1, 1, -1);
+         break;
+      }
+      if (h == 1)                 /* 一行, 顺时针左→右 */
+      {
+         edge(w - 1, 0, 1);
+         break;
+      }
+
+      /* 顺时针那四边 (逆时针是镜像, 步数与段数一模一样 —— 这个函数不带方向参数) */
+      edge(w - 1, 0, 1);          /* 上边 */
+      edge(h - 1, 1, -1);         /* 右边 */
+      edge(w - 1, 0, -1);         /* 下边 */
+      edge(h - 2, 1, 1);          /* 左边 (h==2 时为 0) */
+
+      if (w <= 2 || h <= 2)
+         break;
+
+      edge(1, 0, 1);              /* 跨环连接步: 横向一格 */
+
+      xl++; xr--; ybot++; ytop--;
+   }
+
+   s.legs = legs;
+   return s;
 }
 
 int32_t autoRangePul(const Params &p)
@@ -342,21 +581,26 @@ std::string continuousRunError(const Params &p)
 
    /* 连续行进时每格的值是"经过格中心时最近的一笔采样", 而采样是按「间隔」一笔笔到的 ——
     * 一格在中心附近停留多久由速度决定:
-    * 采样间距 (脉冲) = 速度 × (间隔 + 往返) / 1000, 它必须 ≤ 格宽 (resX)。
+    * 采样间距 (脉冲) = 速度 × (间隔 + 往返) / 1000, 它必须 ≤ 格宽。
     * 超过格宽时会有格子**一笔都采不到**, 而那些格子在 CSV 里与采到的行长得一样 (ok=0),
     * 起扫前拦掉比走完再解释便宜。
     *
+    * 格宽: 行那两种一段之内只动 X, 取 resX; 两种环形横边竖边都在走 (2026-10-29), 取
+    * **min(resX, resY)** —— 只看 X 会把竖边上"一格一笔都采不到"放过去。**不能对所有走法
+    * 都取 min**: 行模式在 resY < resX 时会被误拒。
+    *
     * `+ 50` 是往返的占位, 与 estimatePerPointMs 里那笔 `interval + 50` 同一个口径
     * (MeterLog 是"回包之后再排下一拍", 真实周期 = 间隔 + 往返)。 */
+   const double cell_mm = modeSpiral(p.mode) ? std::min(resX(p), resY(p)) : resX(p);
    const double spacing_mm = (double)p.speed_pul_s * (double)(p.meter_interval_ms + 50)
                            / 1000.0 / p.pulses_per_unit;
-   if (spacing_mm > resX(p) + 1e-9)
+   if (spacing_mm > cell_mm + 1e-9)
    {
       char buf[200];
       std::snprintf(buf, sizeof(buf),
                     "连续行进时采样间距 %.2f mm 超过分辨率 %.2f mm, "
                     "请降低扫描速度或调小「间隔」。",
-                    spacing_mm, resX(p));
+                    spacing_mm, cell_mm);
       return buf;
    }
 
@@ -375,6 +619,23 @@ int64_t estimatePerPointMs(const Params &p)
    {
       const double rx = resX(p) * p.pulses_per_unit;
       const double ry = resY(p) * p.pulses_per_unit;
+
+      /* 环形 (2026-10-29) 没有"行", 按**整条路径**估: 横向步数 × resX + 纵向步数 × resY,
+       * 每段再加一次"段首等一笔 + 段尾停稳等一笔 + 加/减速余量"。步数与段数只按圈数算
+       * (spiralStats), 不建点列 —— 这个函数每拍都会被调一次。 */
+      if (modeSpiral(p.mode))
+      {
+         const SpiralStats st = spiralStats(p.nx, p.ny);
+         const double travel_ms = ((double)st.h_steps * rx + (double)st.v_steps * ry)
+                                / (double)vel * 1000.0;
+         const double per_leg = (double)p.settle_ms + 600.0
+                              + 2.0 * (double)(p.meter_interval_ms + 50);
+         double per = (travel_ms + (double)st.legs * per_leg)
+                    / (double)std::max(1, p.nx * p.ny);
+         if (per < 1.0)
+            per = 1.0;
+         return (int64_t)per;
+      }
 
       double row_pul = rx * (double)(p.nx - 1) + ry;
       if (p.mode == ScanMode::SameDir)
@@ -457,7 +718,7 @@ std::string csvMetaLines(const Params &p, const std::string &started_iso, int ze
    s += " res_y_unit="  + std::to_string(resY(p));
    s += "\n";
 
-   /* `mode=%d` 是 2026-10-11 从 `serp=%d` 改的 (0..3, 见 ScanMode)。**没有任何代码解析它**
+   /* `mode=%d` 是 2026-10-11 从 `serp=%d` 改的 (0..5, 见 ScanMode)。**没有任何代码解析它**
     * —— 续扫只比几何那几项 (csvParseForResume), 所以这不是格式破坏, 只是这一栏记得更全:
     * 一行一行走和随机走, 出来的数据不是一回事, 读文件的人该看得出来 (docs/scan_sweep.md §8)。 */
    std::snprintf(buf, sizeof(buf),

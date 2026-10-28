@@ -16,7 +16,7 @@
 | [SOEM/](SOEM/) | 下载的第三方 EtherCAT 主站库 (**Simple Open EtherCAT Master**),保持原样不改动 |
 | [motor_api/](motor_api/) | 自有代码:**多轴 CiA402 运动接口** (位置同步 CSP / 速度 PV / 回零 HM)。**至少支持同时驱动两台**, 目标值每周期经过程数据下发。**纯源码目录** —— 没有 CMakeLists, 两个 `.c` 由 `hmi` 与 `scan` 各自直接编进去 |
 | [hmi/](hmi/) | 自有程序:**Qt Widgets 上位机 (手动调试台)** —— 两台滑台 ±500000 脉冲的 **CSP 点击定位界面** (点哪里去哪里 / 开机位置即零点 / 速度可调), 外加 `ecatworker` 这个总线工作线程。**默认不编**, 见下 |
-| [scan/](scan/) | 自有程序:**Qt Widgets 上位机 (自动采集)** —— 控制滑台**扫描**一个矩形区域 (逐行往返 / 每行同向 / 随机不重复 / 随机可重复), 逐点停、逐点读功率计、写 CSV 并画二维热力图。**共用 `hmi/` 的总线工作线程** (原样编进来, 不复制)。默认跟随 `EC_BUILD_HMI`, 见下 |
+| [scan/](scan/) | 自有程序:**Qt Widgets 上位机 (自动采集)** —— 控制滑台**扫描**一个矩形区域 (逐行往返 / 每行同向 / 随机不重复 / 随机可重复 / 由外向内顺时针 / 由外向内逆时针), 逐点停、逐点读功率计、写 CSV 并画二维热力图。**共用 `hmi/` 的总线工作线程** (原样编进来, 不复制)。默认跟随 `EC_BUILD_HMI`, 见下 |
 | [docs/ykd2205pe_ci402.md](docs/ykd2205pe_ci402.md) | YKD2205PE 对象速查与实读记录 |
 | [docs/hmi_click_position.md](docs/hmi_click_position.md) | `hmi` (Qt 上位机) 的完整设计: 线程模型 / 坐标与零点 / CSP 插补 / 护栏 / 构建部署的坑 / 验收状态 |
 | [docs/scan_sweep.md](docs/scan_sweep.md) | `scan` (扫描采集) 的完整设计: 网格与走法 / 到位判据 / 状态机 / 功率计接口 / CSV 与断点续扫 / 量程算法 / 护栏 / 验收状态 |

@@ -347,17 +347,17 @@ void ScanWindow::panelRevert(int pi)
 
 /* 「单点停留」框在值为 0 时显示什么 (2026-10-29, §54.8)。
  *
- * 只有**行那两种走法**的 0 是连续行进; 随机那两种的 0 仍然逐点停 (onFly 判据里那条
- * modeRandom), 这时显示「连续行进」是在说假话, 让回 0 ms。判据读控件自己此刻的选中项,
- * 与 need_row_mode 那条同一个体例 —— 不另记状态。改动只在文本真的不一样时落下去,
- * 所以从 refresh() 每拍调也不会每拍重排一次。 */
+ * 只有**非随机的走法**的 0 是连续行进 —— 行那两种各是一行, 两种环形各是一条边; 随机那两种的
+ * 0 仍然逐点停 (onFly 判据里那条 modeRandom), 这时显示「连续行进」是在说假话, 让回 0 ms。
+ * 判据读控件自己此刻的选中项, 与 need_row_mode 那条同一个体例 —— 不另记状态。改动只在文本
+ * 真的不一样时落下去, 所以从 refresh() 每拍调也不会每拍重排一次。 */
 void ScanWindow::syncDwellSpecialText()
 {
    if (m_edDwell == nullptr)
       return;
-   const bool row_mode =
+   const bool continuous =
       !modeRandom(modeFromIndex(m_cbMode != nullptr ? m_cbMode->currentIndex() : 0));
-   const QString want = row_mode ? QStringLiteral("连续行进") : QString();
+   const QString want = continuous ? QStringLiteral("连续行进") : QString();
    if (m_edDwell->specialValueText() != want)
       m_edDwell->setSpecialValueText(want);
 }
@@ -393,10 +393,12 @@ void ScanWindow::refreshEditability()
           * 判据跟勾选框的状态走而不是"模式", 所以它跟着勾一起变, 不用另外记一份 */
          if (ok && it.need_manual)
             ok = (m_cbShadeAuto == nullptr) || !m_cbShadeAuto->isChecked();
-         /* 「起始方向」在随机那两种走法下是多余的 (每步都是随机跳)。判据读**控件自己**
-          * 当前选中的那一项, 与 need_manual 那条同一个体例: 它跟着模式一起变, 不另记状态 */
+         /* 「起始方向」只在**按行走的那两种**下有用: 随机那两种每步都是随机跳; 两种环形
+          * 从哪一角起绕由走法本身定, start_positive 根本不参与 (buildPlan 在翻向之前就分流了)。
+          * 判据读**控件自己**当前选中的那一项, 与 need_manual 那条同一个体例: 它跟着模式一起变,
+          * 不另记状态 */
          if (ok && it.need_row_mode)
-            ok = !modeRandom(modeFromIndex(m_cbMode != nullptr ? m_cbMode->currentIndex() : 0));
+            ok = modeRow(modeFromIndex(m_cbMode != nullptr ? m_cbMode->currentIndex() : 0));
          /* 「每点采样」在连续行进里一个数都不读 (每格只取一笔, 2026-10-29 §54)。
           * **运行中读控制器的冻结值**: 逐点停那一轮里把「单点停留」改成 0 不会切走法,
           * 那几格读的仍是平均 —— 这时它必须继续亮着。没在跑时按面板此刻的值算 (与
@@ -2341,7 +2343,7 @@ QWidget *ScanWindow::buildParamPanel()
    /* 提示里不提「重测选中点」—— 它走扫描状态机 (armRun), 用的是「扫描速度」 */
    m_edManSpeed->setToolTip(QStringLiteral("画布点动与「全部回中」的速度。扫描过程使用「扫描速度」。"));
 
-   /* 「单点停留」= 0 是连续行进的入口 (2026-10-29, §54) —— 不新增走法、不加复选框,
+   /* 「单点停留」= 0 是连续行进的入口 (2026-10-29, §54) —— 不新增触发方式、不加复选框,
     * 用户定的口径就是"把单点时间设为 0 时候自动触发"。值为 0 时框里直接写「连续行进」
     * (不再显示 0 ms), 让人一眼看出这个 0 不是"没设"。
     *
@@ -2377,7 +2379,7 @@ QWidget *ScanWindow::buildParamPanel()
    m_cbMode = new QComboBox(box);
    for (int i = 0; i < kScanModeCount; i++)
       m_cbMode->addItem(QString::fromUtf8(modeText((ScanMode)i)));
-   /* 四个项的名字自己说了怎么走, 所以 tooltip 只讲名字说不出来的那一件: 「随机 (可重复)」
+   /* 六项的名字自己说了怎么走, 所以 tooltip 只讲名字说不出来的那一件: 「随机 (可重复)」
     * 不会自己结束 —— 不说的话, 屏幕上那个「全程: 不限」与停不下来的进度看着像是出了岔子。
     * 30 字, 在「普通 tooltip 2 行 / 60 字」之内 (§26.2) */
    m_cbMode->setToolTip(QStringLiteral("随机 (可重复) 的池子始终是整片网格, 一轮不会自己结束。"));

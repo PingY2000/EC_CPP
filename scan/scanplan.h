@@ -25,8 +25,9 @@ struct Point
 /* 走法 (2026-10-11)。**这是"这一趟怎么走"的唯一定义处** —— 界面那个「扫描方式」下拉、
  * 点列的排法、预览画不画、一轮会不会自己结束, 全从这里推。
  *
- * 前两种是按行走的**几何式**走法 (每步只动一根轴, 时间是常数); 后两种是随机抽点,
- * 每一步都是一个随机跳, 所以时间估算那一项另算 (见 estimatePerPointMs)。
+ * 前两种是按行走的**几何式**走法 (每步只动一根轴, 时间是常数); 中间两种是随机抽点,
+ * 每一步都是一个随机跳, 所以时间估算那一项另算; 最后两种 (2026-10-29) 是由外向内剥矩形环,
+ * 每步只动一根轴, 但"段"是直线段而不是行 (见 buildSpiralLegs)。
  * 数值即界面下拉的下标, 也是 ini 与 CSV 表头里记的那个数 —— **别改这几个数**。 */
 enum class ScanMode
 {
@@ -34,10 +35,12 @@ enum class ScanMode
    SameDir      = 1,   /* 每行同向 */
    RandomOnce   = 2,   /* 随机 (不重复): 整片网格洗成一个随机顺序走一遍, 走完即止 */
    RandomRepeat = 3,   /* 随机 (可重复): 走完一遍再洗一遍接着走, 永远不结束 */
+   SpiralCW     = 4,   /* 由外向内 (顺时针): 从左上角沿上边向右起绕 */
+   SpiralCCW    = 5,   /* 由外向内 (逆时针): 从右上角沿上边向左起绕 */
 };
 
-/* 四个下拉项文案的**唯一来源** (界面循环建项, 自检钉着这几个字) */
-constexpr int kScanModeCount = 4;
+/* 六个下拉项文案的**唯一来源** (界面循环建项, 自检钉着这几个字) */
+constexpr int kScanModeCount = 6;
 const char *modeText(ScanMode m);
 
 /* 下标 (界面下拉 / ini 里那个数) → 模式。越界一律回落 Serpentine, 不做别的解释 */
@@ -48,6 +51,13 @@ bool modeRandom(ScanMode m);
 
 /* 只有「随机 (可重复)」为真: 这一轮永远到不了 Done, 只有暂停 / 中止能停 */
 bool modeEndless(ScanMode m);
+
+/* 两种由外向内 (2026-10-29): 点列按矩形环剥向中心, 段是**直线段**而不是行 */
+bool modeSpiral(ScanMode m);
+
+/* 按行走的那两种 (逐行往返 / 每行同向)。**只给「起始方向」那道门用** —— 随机与环形
+ * 都不吃 start_positive, 界面在它们下面把这个框灰掉 */
+bool modeRow(ScanMode m);
 
 struct Params
 {
@@ -116,9 +126,10 @@ constexpr int kMeterIntervalMaxMs = 60000;
 
 /* 连续行进 (2026-10-29, docs/scan_sweep.md §54): 「单点停留」= 0 就自动进入。
  *
- * **入口只此一处** —— 不新增走法、不加复选框: 用户定的口径是"把单点时间设为 0 时候自动触发,
- * 此时每点只采样一次"。随机那两种走法**永远为假**: 它们每一步都是一个随机跳, 没有"行"可以
- * 连续走, 仍然逐点停 + 取平均。
+ * **入口只此一处** —— 不新增触发方式、不加复选框: 用户定的口径是"把单点时间设为 0 时候自动
+ * 触发, 此时每点只采样一次"。随机那两种走法**永远为假**: 它们每一步都是一个随机跳, 没有
+ * 直的一段可以连续走, 仍然逐点停 + 取平均。两种环形走法 (2026-10-29) 为真 —— 它们虽然不是
+ * 按行走的, 但每段是一条直线, 走法与行模式同一套 (段怎么切见 buildSpiralLegs)。
  *
  * 判据只看 Params, 因为它是"这一趟怎么走"的一部分; 控制器在 armRun 里调一次并**冻结**
  * (运行中改 dwell 不切换走法)。 */
@@ -138,8 +149,10 @@ std::string validate(const Params &p);
  * 会出现"参数栏停在 停留 0 + 高速、于是这份 CSV 打不开", 而"打开看一眼"与"跑这一趟"
  * 本来就是两件事 (§52)。
  *
- * 判据只与 Params 有关: 间距 = 速度 × (间隔 + 50) / 1000 / 每单位脉冲, 必须 ≤ 格宽 (resX)。
- * 相等放行。`+ 50` 是往返占位, 与 estimatePerPointMs 那一笔同一个口径。 */
+ * 判据只与 Params 有关: 间距 = 速度 × (间隔 + 50) / 1000 / 每单位脉冲, 必须 ≤ 格宽。
+ * 行那两种只动 X, 格宽取 resX; 两种环形横边竖边都在走, 取 min(resX, resY) —— 只看 X 会把
+ * 竖边上"一格一笔都采不到"放过去。相等放行。`+ 50` 是往返占位, 与 estimatePerPointMs
+ * 那一笔同一个口径。 */
 std::string continuousRunError(const Params &p);
 
 /* 由点数与区域算出的分辨率 (mm), **几何的派生量, 不是输入**:
@@ -164,7 +177,8 @@ std::vector<double> axisCoords(double area_unit, double res_unit);
 std::vector<double> axisCoordsByCount(double span_unit, int n);
 
 /* 完整点列, 已经按扫描顺序排好。随机那两种在这里出的是**基准网格** (每行同向那个顺序),
- * 真正的随机顺序由调用方再洗一次 —— 见 shufflePlan() 与 ScanController::start()。 */
+ * 真正的随机顺序由调用方再洗一次 —— 见 shufflePlan() 与 ScanController::start()。
+ * 两种环形 (2026-10-29) 在这里就直接排成由外向内的顺序。 */
 std::vector<Point> buildPlan(const Params &p);
 
 /* 把点列洗成随机顺序 (随机那两种走法用)。
@@ -172,6 +186,25 @@ std::vector<Point> buildPlan(const Params &p);
  * seed **由调用方给**而不是在这里现抽: 自检要能钉住"同一个 seed 给出同一份点列",
  * 而界面每次开扫给一个新的。行模式不调用它 —— 它们的顺序是算出来的, 不是抽出来的。 */
 void shufflePlan(std::vector<Point> *pts, uint32_t seed);
+
+/* 由外向内两种走法的**段** (2026-10-29，见 docs/scan_sweep.md §55): 把 order 切成"同轴
+ * 同向"的直线段, 每段是一串 plan 下标。拐角格归前一段的末格, 新段从拐角之后那一格起 ——
+ * 于是段首那一次 startPoint 是真实的一格移动, 拐角不会被两段各采一遍。斜步 (换了轴) 断段;
+ * 同轴同向但跨过续扫空洞的一步**不断段** —— 走过去中间那格不停, 与行那两种隔着已采格照样
+ * 算同一行同理。行那两种**不用**它, 它们按 iy 分组。 */
+std::vector<std::vector<int>> buildSpiralLegs(const std::vector<Point> &plan,
+                                             const std::vector<int> &order);
+
+/* 环形路径的步数与段数。只按圈数算, 不建点列 —— 估算每拍都要算, 而点数上限是 200000。
+ * h_steps / v_steps 是"沿 X / 沿 Y 走一格"的步数, legs 是 buildSpiralLegs 的段数。
+ * 恒有 h_steps + v_steps == nx*ny - 1 (自检钉着)。两种方向同一组数。 */
+struct SpiralStats
+{
+   long long h_steps = 0;
+   long long v_steps = 0;
+   int       legs    = 0;
+};
+SpiralStats spiralStats(int nx, int ny);
 
 /* 单位 <-> 脉冲。用 llround, 不做截断 —— 截断会让 27/2*50000 少一个脉冲。 */
 int32_t pulseOf(double unit, double pulses_per_unit);
@@ -210,7 +243,8 @@ bool fitsRange(const Params &p, std::string *why);
 bool sameGeom(const Params &a, const Params &b);
 
 /* 按参数估一个每点耗时 (ms), 用于开始之前报出总时长。线性估计, 实际一定更长。
- * 随机那两种走法每一步是一个随机跳, "移动"那一项按**平均跳距**估, 不按分辨率 (见 .cpp)。 */
+ * 随机那两种走法每一步是一个随机跳, "移动"那一项按**平均跳距**估, 不按分辨率 (见 .cpp)。
+ * 连续行进的环形按**整条路径**估 (spiralStats 的步数与段数), 不按"一行平均"。 */
 int64_t estimatePerPointMs(const Params &p);
 
 /* CSV 表头与行格式。表头两行 `#` 注释带全部参数, 续扫靠它做兼容性判定; 列名一律 ASCII,

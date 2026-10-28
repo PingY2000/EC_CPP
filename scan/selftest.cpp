@@ -757,11 +757,11 @@ static void test_grid()
  *   不重复 = 只在还没扫过的点里抽 (等价于把整片网格洗成一个随机顺序走一遍, 走完即止);
  *   可重复 = 不管扫没扫过都进池子, 走完一遍再洗一遍接着走, **永远不结束**。
  *
- * 四个下拉项的文案与两个真值表钉在这儿 —— 它们同时是 scan.ini 与 CSV 表头里那个数
+ * 六个下拉项的文案与三条真值表钉在这儿 —— 它们同时是 scan.ini 与 CSV 表头里那个数
  * 说出来的东西 (与仓库里钉 6041h bit3 / 轴X / 0xFF02 那些是同一个理由)。 */
 static void test_randommode()
 {
-   caseBegin("random: 四个走法的文案与两条真值表");
+   caseBegin("random: 六个走法的文案与三条真值表");
    {
       /* 文案是**逐字**钉的: 下拉项、ini 里那个数、CSV 表头里的 mode= 指的都是它 */
       check(std::string(modeText(ScanMode::Serpentine)) == "逐行往返",
@@ -772,24 +772,47 @@ static void test_randommode()
             "modeText(2) = 随机 (不重复)", modeText(ScanMode::RandomOnce));
       check(std::string(modeText(ScanMode::RandomRepeat)) == "随机 (可重复)",
             "modeText(3) = 随机 (可重复)", modeText(ScanMode::RandomRepeat));
-      checkEq(kScanModeCount, 4, "下拉一共四项");
+      check(std::string(modeText(ScanMode::SpiralCW)) == "由外向内 (顺时针)",
+            "modeText(4) = 由外向内 (顺时针)", modeText(ScanMode::SpiralCW));
+      check(std::string(modeText(ScanMode::SpiralCCW)) == "由外向内 (逆时针)",
+            "modeText(5) = 由外向内 (逆时针)", modeText(ScanMode::SpiralCCW));
+      checkEq(kScanModeCount, 6, "下拉一共六项");
 
       check(!modeRandom(ScanMode::Serpentine) && !modeRandom(ScanMode::SameDir),
             "行那两种不是随机的");
       check(modeRandom(ScanMode::RandomOnce) && modeRandom(ScanMode::RandomRepeat),
             "随机那两种是随机的 (预览不画 / 开扫要洗牌, 都认这一条)");
+      check(!modeRandom(ScanMode::SpiralCW) && !modeRandom(ScanMode::SpiralCCW),
+            "两种环形不是随机的 (预览照画, 开扫不洗牌)");
 
       check(!modeEndless(ScanMode::Serpentine) && !modeEndless(ScanMode::SameDir)
                && !modeEndless(ScanMode::RandomOnce),
             "只有「可重复」到不了 Done");
       check(modeEndless(ScanMode::RandomRepeat), "「可重复」到不了 Done");
+      check(!modeEndless(ScanMode::SpiralCW) && !modeEndless(ScanMode::SpiralCCW),
+            "环形走完一遍就 Done (与「可重复」那条并列)");
+
+      /* 「起始方向」的门控只认行那两种 (2026-10-29): 环形从哪一角起绕由走法本身定 */
+      check(modeRow(ScanMode::Serpentine) && modeRow(ScanMode::SameDir),
+            "modeRow: 行那两种为真");
+      check(!modeRow(ScanMode::RandomOnce) && !modeRow(ScanMode::RandomRepeat)
+               && !modeRow(ScanMode::SpiralCW) && !modeRow(ScanMode::SpiralCCW),
+            "modeRow: 随机与环形都为假 (「起始方向」在这四种下灰掉)");
+
+      check(modeSpiral(ScanMode::SpiralCW) && modeSpiral(ScanMode::SpiralCCW),
+            "modeSpiral: 两种环形为真");
+      check(!modeSpiral(ScanMode::Serpentine) && !modeSpiral(ScanMode::SameDir)
+               && !modeSpiral(ScanMode::RandomOnce) && !modeSpiral(ScanMode::RandomRepeat),
+            "modeSpiral: 其余四种为假");
 
       /* 下标是一张来回票 (界面拿到的是 currentIndex, 存盘写的是 (int)mode) */
       bool rt = true;
       for (int i = 0; i < kScanModeCount; i++)
          rt = rt && ((int)modeFromIndex(i) == i);
       check(rt, "modeFromIndex 与 enum 的数值同号");
-      check(modeFromIndex(-1) == ScanMode::Serpentine && modeFromIndex(4) == ScanMode::Serpentine,
+      check(modeFromIndex(4) == ScanMode::SpiralCW && modeFromIndex(5) == ScanMode::SpiralCCW,
+            "4/5 是两个新走法 (追加, 0..3 的历史含义不动)");
+      check(modeFromIndex(-1) == ScanMode::Serpentine && modeFromIndex(6) == ScanMode::Serpentine,
             "越界的下标回落「逐行往返」(手改坏的 ini 走这一条)");
    }
 
@@ -877,7 +900,7 @@ static void test_randommode()
             "比按行走的每点 (2175) 大一个量级 —— 随机那一跳是全区域宽");
    }
 
-   caseBegin("random: CSV 表头把走法记下来 (mode=0/2/3)");
+   caseBegin("random: CSV 表头把走法记下来 (mode=0/2/3/4/5)");
    {
       /* 老那栏 `serp=` 换成了 `mode=`。**没有任何代码解析它** (续扫只比四项几何), 所以这不是
        * 格式破坏, 只是"一行一行走"和"随机走"出来的数据不是一回事, 读文件的人该看得出来 */
@@ -891,6 +914,14 @@ static void test_randommode()
       b.mode = ScanMode::RandomRepeat;
       check(csvMetaLines(b, "2026-10-11T00:00:00", 0).find("mode=3") != std::string::npos,
             "「可重复」写 mode=3");
+
+      Params sc;
+      sc.mode = ScanMode::SpiralCW;
+      check(csvMetaLines(sc, "2026-10-11T00:00:00", 0).find("mode=4") != std::string::npos,
+            "由外向内 (顺时针) 写 mode=4");
+      sc.mode = ScanMode::SpiralCCW;
+      check(csvMetaLines(sc, "2026-10-11T00:00:00", 0).find("mode=5") != std::string::npos,
+            "由外向内 (逆时针) 写 mode=5");
 
       check(csvMetaLines(Params(), "2026-10-11T00:00:00", 0).find("mode=0") != std::string::npos,
             "缺省 (逐行往返) 写 mode=0");
@@ -1018,7 +1049,7 @@ static void test_randommode()
  * (判据 / 速度闸 / 时长估算 / flags); 跑状态机的那一组在 test_onfly_run()。 */
 static void test_onfly_pure()
 {
-   caseBegin("onfly: 判据 = 行那两种走法 + 「单点停留」= 0");
+   caseBegin("onfly: 判据 = 非随机的走法 + 「单点停留」= 0");
 
    Params p;                                /* 缺省: 逐行往返, 停留 200 */
    check(!onFly(p), "缺省参数不是连续行进");
@@ -1030,6 +1061,12 @@ static void test_onfly_pure()
    check(!onFly(p), "随机 (不重复) + 停留 0 → 仍逐点停");
    p.mode = ScanMode::RandomRepeat;
    check(!onFly(p), "随机 (可重复) + 停留 0 → 仍逐点停");
+   p.mode = ScanMode::SpiralCW;
+   check(onFly(p), "由外向内 (顺时针) + 停留 0 → 连续行进");
+   p.mode = ScanMode::SpiralCCW;
+   check(onFly(p), "由外向内 (逆时针) + 停留 0 → 连续行进");
+   p.dwell_ms = 200;
+   check(!onFly(p), "环形 + 停留 200 → 逐点停 (与行那两种同一条判据)");
    p.mode = ScanMode::Serpentine;
    p.dwell_ms = 1;
    check(!onFly(p), "停留 1 ms 就回到逐点停 (判据是 == 0, 不是某个阈值)");
@@ -3308,6 +3345,763 @@ static void test_onfly_run()
    }
 }
 
+/* ---------------------------------------------------------------- 由外向内 (环形) */
+
+/* 两种环形走法 (2026-10-29, docs/scan_sweep.md §55)。三处口径必须逐字一致: buildPlan 的点列、
+ * buildSpiralLegs 的切段、spiralStats 的步数/段数。前两者逐格走, 后者按圈数算 —— 这里拿
+ * 前两者反过来钉住后者 (test_spiral_stats 的朴素比对)。
+ *
+ * 屏幕坐标: 画布 `row = ny-1-iy`, 所以 **iy 大 = 屏幕上方**。顺时针 = 从左下角看是顺时针,
+ * 于是从左上角沿上边向右起绕; 逆时针镜像。 */
+
+struct SpiralDim
+{
+   int nx, ny;
+};
+
+static void test_spiral_plan()
+{
+   caseBegin("spiral: 点列 —— 不重不漏、相邻、转向同号、与「起始方向」无关");
+
+   const SpiralDim dims[] = {{5, 5}, {5, 4}, {3, 4}, {4, 3}, {3, 5},
+                             {2, 5}, {4, 4}, {2, 2}, {7, 3}, {3, 7}};
+
+   for (int cw = 0; cw < 2; cw++)
+   {
+      const ScanMode mode = cw ? ScanMode::SpiralCW : ScanMode::SpiralCCW;
+      const char    *dir  = cw ? "顺时针" : "逆时针";
+
+      for (const SpiralDim &d : dims)
+      {
+         Params p;
+         p.area_x_unit = 2.0;
+         p.area_y_unit = 2.0;
+         p.nx = d.nx;
+         p.ny = d.ny;
+         p.mode = mode;
+         p.start_positive = true;
+
+         const std::vector<Point> plan = buildPlan(p);
+
+         std::string bad;
+         auto want = [&](bool ok, const char *m)
+         {
+            if (!ok && bad.empty())
+               bad = m;
+         };
+
+         want((int)plan.size() == d.nx * d.ny, "点数不是 nx*ny");
+
+         /* 不重不漏 + 全部在界内 */
+         std::vector<int> seen((size_t)d.nx * (size_t)d.ny, 0);
+         for (const Point &pt : plan)
+         {
+            if (pt.ix < 0 || pt.ix >= d.nx || pt.iy < 0 || pt.iy >= d.ny)
+               want(false, "有点出界");
+            else if (seen[(size_t)pt.iy * (size_t)d.nx + (size_t)pt.ix]++)
+               want(false, "同一格走了两次");
+         }
+         for (int v : seen)
+            if (v == 0)
+               want(false, "有格子没走到");
+
+         /* 相邻两步只差一格 (正好一格, 不会有斜跳) */
+         for (size_t i = 1; i < plan.size(); i++)
+         {
+            const int dx = plan[i].ix - plan[i - 1].ix;
+            const int dy = plan[i].iy - plan[i - 1].iy;
+            if (std::abs(dx) + std::abs(dy) != 1)
+               want(false, "相邻两步不是一格");
+         }
+
+         /* 转向叉积同号: 顺时针恒为右转 (-1), 逆时针恒为左转 (+1) */
+         for (size_t i = 1; i + 1 < plan.size(); i++)
+         {
+            const int ax = plan[i].ix - plan[i - 1].ix;
+            const int ay = plan[i].iy - plan[i - 1].iy;
+            const int bx = plan[i + 1].ix - plan[i].ix;
+            const int by = plan[i + 1].iy - plan[i].iy;
+            const long long cross = (long long)ax * (long long)by
+                                  - (long long)ay * (long long)bx;
+            if (cw && cross > 0)
+               want(false, "顺时针里出现了一次左转");
+            if (!cw && cross < 0)
+               want(false, "逆时针里出现了一次右转");
+         }
+
+         /* 起点与第一步 */
+         if (!plan.empty())
+         {
+            const int fx = cw ? 0 : d.nx - 1;
+            if (plan[0].ix != fx || plan[0].iy != d.ny - 1)
+               want(false, "起点不是那一角");
+            if (plan.size() > 1)
+            {
+               const int sx = plan[1].ix - plan[0].ix;
+               const int sy = plan[1].iy - plan[0].iy;
+               if (cw && (sx != 1 || sy != 0))
+                  want(false, "顺时针第一步不是 +X");
+               if (!cw && (sx != -1 || sy != 0))
+                  want(false, "逆时针第一步不是 -X");
+            }
+         }
+
+         /* 「起始方向」与环形的绕向无关: buildPlan 必须在翻向**之前**分流 */
+         Params q = p;
+         q.start_positive = false;
+         const std::vector<Point> plan2 = buildPlan(q);
+         bool same = plan.size() == plan2.size();
+         if (same)
+            for (size_t i = 0; i < plan.size(); i++)
+               if (plan[i].ix != plan2[i].ix || plan[i].iy != plan2[i].iy)
+                  same = false;
+         want(same, "「起始方向」把环形翻成了反的");
+
+         const std::string label = std::string(dir) + " " + std::to_string(d.nx) + "x"
+                                 + std::to_string(d.ny);
+         check(bad.empty(), label.c_str(), bad);
+      }
+   }
+}
+
+static void test_spiral_legs()
+{
+   caseBegin("spiral: 切段 = 同轴同向的直线段, 拐角归前一段");
+
+   struct Expect
+   {
+      int              nx, ny;
+      std::vector<int> sizes;     /* 手算值, 两种方向一样 (镜像不改段数) */
+   };
+
+   const Expect ex[] = {
+      {5, 5, {5, 4, 4, 3, 3, 2, 2, 2}},
+      {5, 4, {5, 3, 4, 2, 3, 3}},
+      {3, 4, {3, 3, 2, 2, 2}},
+      {4, 3, {4, 2, 3, 3}},
+      {3, 5, {3, 4, 2, 3, 3}},
+      {2, 5, {2, 4, 4}},
+      {4, 4, {4, 3, 3, 2, 2, 2}},
+      {2, 2, {2, 2}},
+   };
+
+   for (const Expect &e : ex)
+   {
+      for (int cw = 0; cw < 2; cw++)
+      {
+         Params p;
+         p.area_x_unit = 2.0;
+         p.area_y_unit = 2.0;
+         p.nx = e.nx;
+         p.ny = e.ny;
+         p.mode = cw ? ScanMode::SpiralCW : ScanMode::SpiralCCW;
+
+         const std::vector<Point> plan = buildPlan(p);
+         std::vector<int> order(plan.size());
+         for (size_t i = 0; i < order.size(); i++)
+            order[i] = (int)i;
+
+         const std::vector<std::vector<int>> legs = buildSpiralLegs(plan, order);
+
+         std::string bad;
+         auto want = [&](bool ok, const char *m)
+         {
+            if (!ok && bad.empty())
+               bad = m;
+         };
+
+         std::vector<int> sizes;
+         std::vector<int> flat;
+         for (const std::vector<int> &l : legs)
+         {
+            sizes.push_back((int)l.size());
+            for (int k : l)
+               flat.push_back(k);
+
+            /* 段 [0]→[1] 定轴, 其余各步必须同轴 (相邻已由"一格一步"保证, 同轴即同向) */
+            if (l.size() < 2)
+               continue;
+            const Point &a = plan[(size_t)l[0]];
+            const Point &b = plan[(size_t)l[1]];
+            const bool   x_axis = (a.iy == b.iy);
+            for (size_t k = 2; k < l.size(); k++)
+            {
+               const Point &u = plan[(size_t)l[k - 1]];
+               const Point &v = plan[(size_t)l[k]];
+               const int dx = v.ix - u.ix;
+               const int dy = v.iy - u.iy;
+               if (std::abs(dx) + std::abs(dy) != 1)
+                  want(false, "段内出现了一次跨格");
+               if (x_axis ? (dy != 0 || dx == 0) : (dx != 0 || dy == 0))
+                  want(false, "段内换了轴 (本该在拐角断段)");
+            }
+         }
+
+         want(sizes == e.sizes, "段长与手算值不一样");
+         want(flat == order, "各段拼起来不等于原顺序 (漏格 / 重格)");
+
+         const std::string label = std::string(cw ? "顺时针 " : "逆时针 ")
+                                 + std::to_string(e.nx) + "x" + std::to_string(e.ny);
+         check(bad.empty(), label.c_str(), bad);
+      }
+   }
+
+   /* 续扫留下的洞: 跨不过去就断段。直边中间挖一格 → 那一段被切成两段;
+    * 拐角挖一格 → 前后两条边各留一段, 段数不变 */
+   caseBegin("spiral: 续扫的洞 —— 跨不过去就断段");
+   {
+      Params p;
+      p.area_x_unit = 2.0;
+      p.area_y_unit = 2.0;
+      p.nx = 5;
+      p.ny = 5;
+      p.mode = ScanMode::SpiralCW;
+
+      const std::vector<Point> plan = buildPlan(p);
+      std::vector<int> order(plan.size());
+      for (size_t i = 0; i < order.size(); i++)
+         order[i] = (int)i;
+
+      /* 下标 2 = (2,4), 上边正中: 剩下的 order 是 0,1,3,4,5,…。跨过去的那一步仍是"只动
+       * 一根轴", 所以**不断段** —— 走过去中间那格不停, 与行模式隔着已采格照样算同一行同理 */
+      std::vector<int> hole_edge = order;
+      hole_edge.erase(hole_edge.begin() + 2);
+      std::vector<int> got;
+      for (const std::vector<int> &l : buildSpiralLegs(plan, hole_edge))
+         got.push_back((int)l.size());
+      const std::vector<int> want_edge = {4, 4, 4, 3, 3, 2, 2, 2};
+      check(got == want_edge, "直边的洞不断段 (只是那一段少一格, 跨过去仍然同轴同向)");
+
+      /* 下标 4 = (4,4), 上边右端那个拐角: 剩下的 order 是 0,1,2,3,5,6,… */
+      std::vector<int> hole_corner = order;
+      hole_corner.erase(hole_corner.begin() + 4);
+      got.clear();
+      for (const std::vector<int> &l : buildSpiralLegs(plan, hole_corner))
+         got.push_back((int)l.size());
+      const std::vector<int> want_corner = {4, 4, 4, 3, 3, 2, 2, 2};
+      check(got == want_corner, "拐角的洞只是让前一段少一格 (4), 段数不变");
+   }
+}
+
+static void test_spiral_stats()
+{
+   caseBegin("spiral: 步数 / 段数 —— 手算值");
+   {
+      struct Expect
+      {
+         int       nx, ny;
+         long long h, v;
+         int       legs;
+      };
+      const Expect ex[] = {
+         {5, 5, 14, 10, 8}, {5, 4, 13, 6, 6}, {3, 4, 5, 6, 5}, {4, 3, 8, 3, 4},
+         {3, 5, 5, 9, 5},   {2, 5, 2, 7, 3},  {4, 4, 9, 6, 6}, {2, 2, 2, 1, 2},
+      };
+
+      for (const Expect &e : ex)
+      {
+         const SpiralStats st = spiralStats(e.nx, e.ny);
+         const std::string label = std::to_string(e.nx) + "x" + std::to_string(e.ny);
+         checkEq(st.h_steps, e.h, (std::string(label) + " 横向步数").c_str());
+         checkEq(st.v_steps, e.v, (std::string(label) + " 纵向步数").c_str());
+         checkEq(st.legs, e.legs, (std::string(label) + " 段数").c_str());
+      }
+
+      /* 缺省网格 55×55 单钉一组 (docs/scan_sweep.md §4 引的就是这几个数):
+       * 27 圈, 每圈 4 段 (圈内三条边各一段, 第四条边与跨环那一步并成一段)。
+       * h = 2·(54+52+…+2) + 27 次跨环 = 1512 + 27 = 1539; v = 2·(55+53+…+3) - 3·27 = 1485 */
+      const SpiralStats def = spiralStats(55, 55);
+      checkEq(def.h_steps, 1539, "55x55 横向步数");
+      checkEq(def.v_steps, 1485, "55x55 纵向步数");
+      checkEq(def.legs, 108, "55x55 段数");
+      checkEq(def.h_steps + def.v_steps, 55LL * 55 - 1, "55x55 步数总和 = nx*ny-1");
+   }
+
+   /* 朴素比对: 逐格走一遍点列, 自己数 h/v, 再拿 buildSpiralLegs 的段数对 spiralStats。
+    * **这条是"估算 / 切段 / 点列"三处不走样的唯一保险** —— 那个函数按圈数算, 一旦圈里的
+    * 边界条件与 spiralPlan 差一格, 屏幕上只会看到「预计全程」慢慢偏。 */
+   caseBegin("spiral: 按圈数算的统计 == 逐格走出来的");
+   {
+      const SpiralDim many[] = {{2, 2}, {2, 3}, {3, 2}, {2, 7}, {7, 2}, {3, 3}, {4, 5},
+                                {5, 4}, {6, 9}, {9, 6}, {13, 5}, {5, 13}, {40, 3},
+                                {3, 40}, {11, 11}, {2, 20}, {20, 2}, {7, 9}, {9, 7},
+                                {12, 5}, {55, 55}};
+
+      for (const SpiralDim &d : many)
+      {
+         for (int cw = 0; cw < 2; cw++)
+         {
+            Params p;
+            p.area_x_unit = 2.0;
+            p.area_y_unit = 2.0;
+            p.nx = d.nx;
+            p.ny = d.ny;
+            p.mode = cw ? ScanMode::SpiralCW : ScanMode::SpiralCCW;
+
+            const std::vector<Point> plan = buildPlan(p);
+            std::vector<int> order(plan.size());
+            for (size_t i = 0; i < order.size(); i++)
+               order[i] = (int)i;
+
+            long long h = 0, v = 0;
+            for (size_t i = 1; i < plan.size(); i++)
+            {
+               if (plan[i].ix != plan[i - 1].ix)
+                  h++;
+               else
+                  v++;
+            }
+
+            const SpiralStats st = spiralStats(d.nx, d.ny);
+            const int legs = (int)buildSpiralLegs(plan, order).size();
+
+            std::string bad;
+            auto want = [&](bool ok, const char *m)
+            {
+               if (!ok && bad.empty())
+                  bad = m;
+            };
+            want(st.h_steps == h, "横向步数对不上");
+            want(st.v_steps == v, "纵向步数对不上");
+            want(st.legs == legs, "段数对不上");
+            want(h + v == (long long)d.nx * (long long)d.ny - 1, "h+v != nx*ny-1");
+
+            const std::string label = std::string(cw ? "顺时针 " : "逆时针 ")
+                                    + std::to_string(d.nx) + "x" + std::to_string(d.ny);
+            check(bad.empty(), label.c_str(), bad);
+         }
+      }
+   }
+}
+
+static void test_spiral_estimate()
+{
+   /* 连续行进的环形不再有"一行", 按**整条路径**摊到每点:
+    *   travel = h_steps × resX × ppu + v_steps × resY × ppu
+    *   total  = travel / 速度 × 1000 + 段数 × (稳定 + 600 + 2 × (间隔 + 50))
+    * 2 单位 / 5×5 / 50000 pul/s: rx = ry = 25000, h = 14, v = 10, 8 段
+    *   travel = 24 × 25000 = 600000 pul → 12000 ms
+    *   每段 = 60 + 600 + 2 × 250 = 1160 → 9280 ms
+    *   (12000 + 9280) / 25 = 851.2 → 851 ms/点 */
+   caseBegin("spiral: 「预计全程」按整条路径摊到每点");
+   Params p = Rig::onFlyParams();
+   p.mode = ScanMode::SpiralCW;
+   check(onFly(p), "停留 0 的环形就是连续行进");
+   checkEq(estimatePerPointMs(p), 851, "顺时针 851 ms/点");
+
+   Params ccw = p;
+   ccw.mode = ScanMode::SpiralCCW;
+   checkEq(estimatePerPointMs(ccw), 851, "逆时针同一个数 (步数与段数一样)");
+
+   Params row = p;
+   row.mode = ScanMode::Serpentine;
+   checkEq(estimatePerPointMs(row), 732, "逐行往返 732 ms/点 (走的确实是另一个分支)");
+
+   /* 逐点停的环形落回「每一步一个 max(resX, resY)」那条老公式:
+    *   0.5 × 50000 = 25000 pul → 500 ms; ×1.3 = 650; + 稳定 60 + 停留 40
+    *   + 间隔 200 + 50 = 1000 */
+   Params slow = p;
+   slow.dwell_ms = 40;
+   check(!onFly(slow), "停留 40 不是连续行进");
+   checkEq(estimatePerPointMs(slow), 1000, "逐点停的环形仍走老公式");
+}
+
+static void test_spiral_gate()
+{
+   /* 两种环形横边竖边都在走, 格宽取 min(resX, resY) (行那两种**不能**这么取: 竖轴细的
+    * 网格上会把它们误拒)。2 × 1 单位 / 3 × 3 点 → resX = 1.0, resY = 0.5;
+    * 间距 = 速度 × (间隔 + 50) / 1000 / 每单位脉冲 = 50000 × (间隔 + 50) / 1000 / 50000
+    *      = (间隔 + 50) / 1000 mm */
+   caseBegin("spiral: 速度闸按 min(resX, resY) 判");
+   Params p;
+   p.area_x_unit = 2.0;
+   p.area_y_unit = 1.0;
+   p.nx = 3;
+   p.ny = 3;
+   p.dwell_ms = 0;
+   p.speed_pul_s = 50000;
+   p.meter_interval_ms = 700;               /* 间距 0.75 mm */
+
+   p.mode = ScanMode::Serpentine;
+   check(continuousRunError(p).empty(), "逐行往返只看 resX = 1.00, 0.75 放行",
+         continuousRunError(p));
+
+   p.mode = ScanMode::SpiralCW;
+   const std::string why = continuousRunError(p);
+   check(!why.empty(), "环形按 resY = 0.50 判, 0.75 被拒", why);
+   check(why.find("0.75") != std::string::npos, "报文里有实际间距", why);
+   check(why.find("0.50") != std::string::npos, "报文里有判据格宽 (min 那一根)", why);
+   check(why.find("请降低扫描速度") != std::string::npos, "仍然给那一句出路", why);
+
+   p.mode = ScanMode::SpiralCCW;
+   check(continuousRunError(p) == why, "两种环形同一句话");
+
+   p.meter_interval_ms = 450;               /* 间距 0.50 mm */
+   p.mode = ScanMode::SpiralCW;
+   check(continuousRunError(p).empty(), "恰好等于 min 格宽 → 放行 (判据是 >, 不是 >=)");
+   check(validate(p).empty(), "validate() 不管这条闸 (读 CSV / 存参数照常)");
+
+   /* 起扫那一刻必须真拦下来, 而且**不建文件** */
+   caseBegin("spiral: 速度闸拦在起扫, 文件不建");
+   {
+      QTemporaryDir dir;
+      const QString csv = dir.filePath("spiral_gate.csv");
+      Rig r;
+      Params g = p;
+      g.meter_interval_ms = 700;
+      r.ctrl.setParams(g);
+      check(r.ctrl.paramsError().isEmpty(), "参数体检本身是过的",
+            r.ctrl.paramsError().toStdString());
+      check(!r.ctrl.runError().isEmpty(), "runError() 才把这条说出来");
+      QString err;
+      check(!r.startScan(csv, &err), "起扫被拒");
+      check(err.contains(QStringLiteral("采样间距")), "理由是采样间距", err.toStdString());
+      check(!QFileInfo::exists(csv), "被拒时一个字节都没写");
+      check(r.ctrl.state() == ScanController::State::Idle, "状态还停在 Idle");
+   }
+}
+
+static void test_spiral_run()
+{
+   QTemporaryDir dir;
+   check(dir.isValid(), "temp dir");
+
+   /* 5×5 顺时针, 连续行进跑到底。8 段 (手算 5,4,4,3,3,2,2,2), 每格一行、一笔 */
+   caseBegin("spiral: 5×5 顺时针不停车跑完, 每格一行一笔");
+   const QString csv = dir.filePath("spiral_cw.csv");
+   Rig rig;
+   Params p = Rig::onFlyParams();
+   p.mode = ScanMode::SpiralCW;
+   rig.ctrl.setParams(p);
+   rig.ctrl.rebuildPlan();
+   checkEq(rig.ctrl.totalPoints(), 25, "5x5 = 25 点");
+   rig.meter.setValue(2.5);
+   rig.meter.setRamp(1.0);          /* 每笔不同: 一格的值能唯一对上某一笔 */
+
+   QString err;
+   check(rig.startScan(csv, &err), "start accepted", err.toStdString());
+   check(rig.ctrl.onTheFly(), "控制器把这一轮认作连续行进");
+   check(rig.runToIdle(), "the run reaches Done");
+   check(rig.ctrl.state() == ScanController::State::Done, "state is Done");
+   checkEq(rig.ctrl.completedPoints(), 25, "25 cells completed");
+   checkEq(rig.ctrl.pendingPoints(), 0, "待补点数归零");
+
+   check(rig.fed_trav > 25, "行进期间确实在收采样");
+   checkEq(rig.fed_read, 0, "一次都没走「停下取平均」那一路");
+   checkEq(rig.fed_other, 0, "也没有采样落在扫描之外");
+
+   /* 8 段 × 每段最多 4 次下发 (段首 startPoint 两次 + 段尾两次); 逐点停是 50 次 */
+   check(rig.bus.ntarget <= 4 * 8 + 2, "一段只下发几次目标 (段内不停车)");
+   check(rig.bus.ntarget < 50, "明显少于逐点停的 2 × 25 次");
+
+   std::string text;
+   check(readCsvText(csv, &text, &err), "csv readable", err.toStdString());
+   const CsvTable tb = parseCsvTable(text);
+   checkEq((long long)tb.rows.size(), 25, "CSV 里恰好 25 个数据行 (一格一行)");
+   check(text.find("mode=4") != std::string::npos, "表头写 mode=4 (顺时针)");
+   check(tb.col("flags") >= 0 && tb.col("pos_y_pul") >= 0, "列名都在");
+
+   /* 行序 == buildPlan 的顺序 (螺旋就是扫描顺序), 且起点在左上角 */
+   const std::vector<Point> plan = buildPlan(p);
+   int order_bad = 0;
+   for (size_t i = 0; i < tb.rows.size() && i < plan.size(); i++)
+      if (tb.cell(i, "ix") != std::to_string(plan[i].ix)
+          || tb.cell(i, "iy") != std::to_string(plan[i].iy))
+         order_bad++;
+   checkEq(order_bad, 0, "CSV 行序与点列顺序一致");
+   check(tb.cell(0, "ix") == "0" && tb.cell(0, "iy") == "4", "第一格是左上角 (0,4)");
+   check(tb.cell(24, "ix") == "2" && tb.cell(24, "iy") == "2", "最后一格是中心 (2,2)");
+
+   const int64_t halfx = 12500;            /* 0.5 mm × 50000 / 2 */
+   const int64_t halfy = 12500;
+   int ok_rows = 0, onfly_rows = 0, in_window = 0, from_a_sample = 0;
+   for (size_t i = 0; i < tb.rows.size(); i++)
+   {
+      if (tb.cell(i, "ok") == "1")
+         ok_rows++;
+      if (tb.cell(i, "flags") == "onfly")
+         onfly_rows++;
+
+      const int64_t x     = std::atoll(tb.cell(i, "x_pul").c_str());
+      const int64_t y     = std::atoll(tb.cell(i, "y_pul").c_str());
+      const int64_t posx  = std::atoll(tb.cell(i, "pos_x_pul").c_str());
+      const int64_t posy  = std::atoll(tb.cell(i, "pos_y_pul").c_str());
+      if (std::llabs(posx - x) <= halfx && std::llabs(posy - y) <= halfy)
+         in_window++;
+
+      /* 值必须能在采样流水里找到**同一笔** (值 + 那一刻两轴的位置都对得上) */
+      const double w = std::atof(tb.cell(i, "watts").c_str());
+      for (const Rig::FedSample &f : rig.fed_hist)
+      {
+         if (f.st == ScanController::State::Traversing && f.pos0 == (int32_t)posx
+             && f.pos1 == (int32_t)posy && std::fabs(f.w - w) < 1e-6)
+         {
+            from_a_sample++;
+            break;
+         }
+      }
+   }
+   checkEq(ok_rows, 25, "每格都采到了 (ok=1)");
+   checkEq(onfly_rows, 25, "每行的 flags 都是 onfly");
+   checkEq(in_window, 25, "每一笔的两轴位置都在格中心 ±半格以内");
+   checkEq(from_a_sample, 25, "每一格的值都来自某一笔采样, 不是平均");
+
+   /* 段首 / 段末那两格是**停着采**的 → 两轴都正好落在格中心。8 段 × 2 = 16 格 */
+   const int leg_sizes[] = {5, 4, 4, 3, 3, 2, 2, 2};
+   int centered_ends = 0;
+   size_t at = 0;
+   for (int sz : leg_sizes)
+   {
+      if (at + (size_t)sz > tb.rows.size())
+         break;
+      const size_t a = at;
+      const size_t b = at + (size_t)sz - 1;
+      if (tb.cell(a, "pos_x_pul") == tb.cell(a, "x_pul")
+          && tb.cell(a, "pos_y_pul") == tb.cell(a, "y_pul"))
+         centered_ends++;
+      if (tb.cell(b, "pos_x_pul") == tb.cell(b, "x_pul")
+          && tb.cell(b, "pos_y_pul") == tb.cell(b, "y_pul"))
+         centered_ends++;
+      at += (size_t)sz;
+   }
+   checkEq(centered_ends, 16, "每段首尾两格采在正中心 (那两处是停着等来的)");
+
+   /* 5×4 顺时针: 竖边比横边长 (resY = 2/3 > resX = 0.5)。**每行的 pos_y 都在格中心半格
+    * 之内**才是"竖段上的采样也跟着 Y 走"的直接证据 —— X 那根在竖段上恒等于格中心,
+    * 只看它的老写法在这里什么也证明不了 */
+   caseBegin("spiral: 5×4 顺时针 —— 竖段上的读数也落在格中心的半格内");
+   {
+      Rig r;
+      Params q = Rig::onFlyParams();
+      q.mode = ScanMode::SpiralCW;
+      q.ny = 4;
+      r.ctrl.setParams(q);
+      r.ctrl.rebuildPlan();
+      checkEq(r.ctrl.totalPoints(), 20, "5x4 = 20 点");
+      r.meter.setValue(3.0);
+
+      const QString c = dir.filePath("spiral_cw_5x4.csv");
+      check(r.startScan(c, &err), "start", err.toStdString());
+      check(r.runToIdle(), "跑到底");
+      checkEq(r.ctrl.completedPoints(), 20, "20 格全采到");
+
+      std::string t;
+      check(readCsvText(c, &t, &err), "read back", err.toStdString());
+      const CsvTable tt = parseCsvTable(t);
+      const int64_t hx = (int64_t)std::llround(resX(q) * q.pulses_per_unit / 2.0);
+      const int64_t hy = (int64_t)std::llround(resY(q) * q.pulses_per_unit / 2.0);
+      int wx = 0, wy = 0;
+      for (size_t i = 0; i < tt.rows.size(); i++)
+      {
+         const int64_t x    = std::atoll(tt.cell(i, "x_pul").c_str());
+         const int64_t y    = std::atoll(tt.cell(i, "y_pul").c_str());
+         const int64_t posx = std::atoll(tt.cell(i, "pos_x_pul").c_str());
+         const int64_t posy = std::atoll(tt.cell(i, "pos_y_pul").c_str());
+         if (std::llabs(posx - x) <= hx)
+            wx++;
+         if (std::llabs(posy - y) <= hy)
+            wy++;
+      }
+      checkEq((long long)tt.rows.size(), 20, "恰好 20 行");
+      checkEq(wx, 20, "X 都在格中心 ±半格以内");
+      checkEq(wy, 20, "Y 都在格中心 ±半格以内 (竖段上真正起作用的是这一条)");
+      check(t.find("mode=4") != std::string::npos, "表头写 mode=4");
+   }
+
+   /* 逆时针: 表头写 mode=5, 第一格在右上角 */
+   caseBegin("spiral: 逆时针 —— 从右上角起绕, 表头 mode=5");
+   {
+      Rig r;
+      Params q = Rig::onFlyParams();
+      q.mode = ScanMode::SpiralCCW;
+      r.ctrl.setParams(q);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(1.5);
+
+      const QString c = dir.filePath("spiral_ccw.csv");
+      check(r.startScan(c, &err), "start", err.toStdString());
+      check(r.ctrl.onTheFly(), "也是连续行进");
+      check(r.runToIdle(), "跑到底");
+      checkEq(r.ctrl.completedPoints(), 25, "25 格全采到");
+
+      std::string t;
+      check(readCsvText(c, &t, &err), "read back", err.toStdString());
+      check(t.find("mode=5") != std::string::npos, "表头写 mode=5 (逆时针)");
+      const CsvTable tt = parseCsvTable(t);
+      checkEq((long long)tt.rows.size(), 25, "25 行");
+      check(tt.cell(0, "ix") == "4" && tt.cell(0, "iy") == "4", "第一格是右上角 (4,4)");
+      check(tt.cell(1, "ix") == "3" && tt.cell(1, "iy") == "4", "第二步沿上边往左");
+      check(tt.cell(23, "ix") == "3" && tt.cell(23, "iy") == "2",
+            "倒数第二格是中心右边一格 (3,2), 最后一格才是中心");
+   }
+
+   /* 逐点停的环形: 停留 40 —— 与行模式同一条路 (Dwelling → Reading → 平均) */
+   caseBegin("spiral: 停留 40 的环形仍是逐点停");
+   {
+      Rig r;
+      Params q = Rig::smallParams();
+      q.mode = ScanMode::SpiralCW;
+      r.ctrl.setParams(q);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(7.0);
+
+      const QString c = dir.filePath("spiral_slow.csv");
+      check(r.startScan(c, &err), "start", err.toStdString());
+      check(!r.ctrl.onTheFly(), "不是连续行进");
+      check(r.runToIdle(), "跑到底");
+      checkEq(r.ctrl.completedPoints(), 25, "25 格全采到");
+      checkEq(r.fed_trav, 0, "一次都没进过 Traversing");
+      checkEq(r.bus.ntarget, 50, "每点两轴各一次 = 逐点停的写法");
+
+      std::string t;
+      check(readCsvText(c, &t, &err), "read back", err.toStdString());
+      const CsvTable tt = parseCsvTable(t);
+      int bad_flags = 0;
+      for (size_t i = 0; i < tt.rows.size(); i++)
+         if (!tt.cell(i, "flags").empty())
+            bad_flags++;
+      checkEq(bad_flags, 0, "ok 行的 flags 一律留空 (没有 onfly)");
+   }
+
+   /* 暂停 → 继续: 跑到竖边中间停一下, 已写的行不动, 继续后补齐且不重采 */
+   caseBegin("spiral: 竖段中途暂停 —— 当前格不留半行, 继续后补齐");
+   {
+      Rig r;
+      Params q = Rig::onFlyParams();
+      q.mode = ScanMode::SpiralCCW;
+      r.ctrl.setParams(q);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(4.0);
+
+      const QString c = dir.filePath("spiral_pause.csv");
+      check(r.startScan(c, &err), "start", err.toStdString());
+      check(r.runUntil([&] { return r.ctrl.completedPoints() >= 7; }, 60000),
+            "走到左边那条竖边的中途");
+      r.ctrl.pause();
+      check(r.ctrl.state() == ScanController::State::Paused, "paused");
+
+      const int done_at_pause = r.ctrl.completedPoints();
+      for (int k = 0; k < 20; k++)
+         r.stepOnce();
+      checkEq(r.ctrl.completedPoints(), done_at_pause, "暂停期间没有新行写出");
+
+      r.ctrl.resumeRun();
+      check(r.ctrl.state() == ScanController::State::Moving, "back to Moving");
+      check(r.ctrl.onTheFly(), "继续之后仍是连续行进");
+      check(r.runToIdle(), "finishes after resuming");
+      checkEq(r.ctrl.completedPoints(), 25, "all 25 done after resume");
+
+      std::string t;
+      check(readCsvText(c, &t, &err), "read back", err.toStdString());
+      const CsvTable pt = parseCsvTable(t);
+      int dup = 0;
+      for (size_t i = 0; i < pt.rows.size(); i++)
+         for (size_t k = i + 1; k < pt.rows.size(); k++)
+            if (pt.cell(i, "ix") == pt.cell(k, "ix")
+                && pt.cell(i, "iy") == pt.cell(k, "iy"))
+               dup++;
+      checkEq((long long)pt.rows.size(), 25, "暂停/继续之后仍是 25 行");
+      checkEq(dup, 0, "没有哪一格被写了两行");
+   }
+
+   /* 中止 → 续扫: 洞会断段, 但补出来的行仍是一格一行、都标 onfly */
+   caseBegin("spiral: 中止后从 CSV 续扫 —— 补满 25 格, 每格一行");
+   {
+      Rig r;
+      Params q = Rig::onFlyParams();
+      q.mode = ScanMode::SpiralCW;
+      r.ctrl.setParams(q);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(5.0);
+
+      const QString c = dir.filePath("spiral_abort.csv");
+      check(r.startScan(c, &err), "start", err.toStdString());
+      check(r.runUntil([&] { return r.ctrl.completedPoints() >= 9; }, 60000), "走完一圈多");
+      r.ctrl.abort(QStringLiteral("操作员按了中止"));
+      check(r.ctrl.state() == ScanController::State::Aborted, "aborted");
+
+      std::string t;
+      check(readCsvText(c, &t, &err), "read back", err.toStdString());
+      const CsvTable at = parseCsvTable(t);
+      check((int)at.rows.size() >= 9, "已写出的行都在");
+
+      Rig r2;
+      r2.ctrl.setParams(q);
+      r2.ctrl.rebuildPlan();
+      r2.ctrl.setZeroEpoch(0);
+      r2.meter.setValue(6.0);
+
+      QString why;
+      check(r2.resumeScan(c, false, &err, &why), "resume accepted",
+            (err + " | " + why).toStdString());
+      check(r2.ctrl.onTheFly(), "续扫的这条路也自动是连续行进");
+      checkEq(r2.ctrl.completedPoints(), (long long)at.rows.size(), "文件里已有的格子算作进度");
+      checkEq(r2.ctrl.pendingPoints(), 25 - (int)at.rows.size(), "待补的只有没采的那几格");
+
+      check(r2.runToIdle(), "the resume finishes");
+      checkEq(r2.ctrl.completedPoints(), 25, "补完就是 25 格");
+
+      std::string t2;
+      check(readCsvText(c, &t2, &err), "read back", err.toStdString());
+      const CsvTable ft = parseCsvTable(t2);
+      int dup = 0, bad_flags = 0, bad_ok = 0;
+      for (size_t i = 0; i < ft.rows.size(); i++)
+      {
+         if (ft.cell(i, "flags").find("onfly") == std::string::npos)
+            bad_flags++;
+         if (ft.cell(i, "ok") != "1")
+            bad_ok++;
+         for (size_t k = i + 1; k < ft.rows.size(); k++)
+            if (ft.cell(i, "ix") == ft.cell(k, "ix")
+                && ft.cell(i, "iy") == ft.cell(k, "iy"))
+               dup++;
+      }
+      checkEq((long long)ft.rows.size(), 25, "续扫之后总共 25 行");
+      checkEq(dup, 0, "没有一个格子被重采两行");
+      checkEq(bad_flags, 0, "两段写下的都是 onfly");
+      checkEq(bad_ok, 0, "全部采到了");
+   }
+
+   /* 单点重测: 永远逐点停 (停留 0 也一样), flags 只有 retest */
+   caseBegin("spiral: 单点重测永远逐点停");
+   {
+      Rig r;
+      Params q = Rig::onFlyParams();
+      q.mode = ScanMode::SpiralCW;
+      r.ctrl.setParams(q);
+      r.ctrl.rebuildPlan();
+      r.meter.setValue(1.0);
+
+      const QString c = dir.filePath("spiral_retest.csv");
+      check(r.startScan(c, &err), "start", err.toStdString());
+      check(r.runToIdle(), "first pass finishes");
+
+      std::string before;
+      check(readCsvText(c, &before, &err), "read back", err.toStdString());
+      const int rows_before = countSub(before, "\n");
+
+      r.meter.setValue(99.0);
+      const int read_before = r.fed_read;
+      const int trav_before = r.fed_trav;
+
+      check(r.retestAt(2, 3, &err), "retest accepted", err.toStdString());
+      check(!r.ctrl.onTheFly(), "停留 0 也不把重测判成连续行进");
+      check(r.runToIdle(), "retest finishes");
+      checkNear(r.ctrl.cellValue(2, 3), 99.0, "重测那一格取了新值");
+      checkNear(r.ctrl.cellValue(0, 4), 1.0, "别格不动");
+      checkEq(r.fed_read - read_before, 1, "照「每点采样」停在中心采 (缺省 1 笔)");
+      checkEq(r.fed_trav, trav_before, "一笔都没落进 Traversing");
+
+      std::string after;
+      check(readCsvText(c, &after, &err), "read back", err.toStdString());
+      checkEq(countSub(after, "\n"), rows_before + 1, "恰好追加一行");
+      const CsvTable ft = parseCsvTable(after);
+      const std::string &fl = ft.cell(ft.rows.size() - 1, "flags");
+      check(fl.find("retest") != std::string::npos, "那一行标着 retest", fl);
+      check(fl.find("onfly") == std::string::npos, "没有 onfly (重测是停下采的)", fl);
+   }
+}
+
 static void test_aborts()
 {
    caseBegin("abort: 撞硬件限位 → 自动中止");
@@ -3944,7 +4738,7 @@ static void test_prefs()
       check(prefsLoad(ini).params.mode == ScanMode::Serpentine, "老键 serp 不当数, 回缺省");
 
       /* 手改成一个越界的数: 走 modeFromIndex 夹回缺省。**不许直接强转** —— 界面拿到的
-       * 是"四个下拉项里的第几个", 越界的下标会让 setCurrentIndex 拿到 -1, 下拉变空白 */
+       * 是"六个下拉项里的第几个", 越界的下标会让 setCurrentIndex 拿到 -1, 下拉变空白 */
       {
          QSettings s(ini, QSettings::IniFormat);
          s.setValue(QStringLiteral("scan/mode"), 99);
@@ -3965,6 +4759,21 @@ static void test_prefs()
          s.sync();
       }
       check(prefsLoad(ini).params.mode == ScanMode::RandomRepeat, "3 照读 = 随机 (可重复)");
+
+      /* 两个环形走法存回来还是 4/5 (追加的那两个, 0..3 的历史含义不动) */
+      {
+         QSettings s(ini, QSettings::IniFormat);
+         s.setValue(QStringLiteral("scan/mode"), (int)ScanMode::SpiralCW);
+         s.sync();
+      }
+      check(prefsLoad(ini).params.mode == ScanMode::SpiralCW, "4 照读 = 由外向内 (顺时针)");
+
+      {
+         QSettings s(ini, QSettings::IniFormat);
+         s.setValue(QStringLiteral("scan/mode"), (int)ScanMode::SpiralCCW);
+         s.sync();
+      }
+      check(prefsLoad(ini).params.mode == ScanMode::SpiralCCW, "5 照读 = 由外向内 (逆时针)");
    }
 
    caseBegin("prefs: 旧 ini 的 res_unit 折算成点数, 新键优先, 保存时删旧键");
@@ -9179,6 +9988,12 @@ int main(int argc, char **argv)
    test_arrive();
    test_run();
    test_onfly_run();
+   test_spiral_plan();
+   test_spiral_legs();
+   test_spiral_stats();
+   test_spiral_estimate();
+   test_spiral_gate();
+   test_spiral_run();
    test_aborts();
    test_retest();
    test_preflight();

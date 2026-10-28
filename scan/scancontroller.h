@@ -2,8 +2,8 @@
  * scan/scancontroller.h —— 扫描状态机: 只活在 GUI 线程里 (不碰总线, 不用加锁), 节拍由外部
  * 30Hz QTimer 喂 tick(now_ms), 时间一律用单调钟 (QElapsedTimer)。
  * 状态 Idle/Moving/Dwelling/Reading → 下一个点 / Done; Paused / Aborted 可从任意状态进入。
- * 连续行进 (2026-10-29, docs/scan_sweep.md §54) 那一路是 Moving → Traversing → 下一行,
- * 行内不停车, 每格只取经过中心最近的一笔采样。
+ * 连续行进 (2026-10-29, docs/scan_sweep.md §54) 那一路是 Moving → Traversing → 下一段,
+ * 段内不停车, 每格只取经过中心最近的一笔采样 ("段" = 一行或一条边, 见 legAxis)。
  * 自动中止的条件每个 tick 都查 (含暂停中), 见 healthProblem() 与 externalWantChanged()。
  */
 #pragma once
@@ -44,8 +44,8 @@ public:
       Moving,    /* 已下发目标, 等两轴到位且稳 (含 settle 窗口) */
       Dwelling,  /* 到了, 停 dwell_ms */
       Reading,
-      /* 连续行进 (2026-10-29, §54): 行末目标已下发, 整行不停车地走; 每格取经过中心
-       * 最近的一笔采样。行首/行末各停在中心等一笔 (见 beginTraverse/issueTraverseTarget) */
+      /* 连续行进 (2026-10-29, §54): 段末目标已下发, 整段不停车地走; 每格取经过中心
+       * 最近的一笔采样。段首/段末各停在中心等一笔 (见 beginTraverse/issueTraverseTarget) */
       Traversing,
       Paused,    /* 冻住, 保持力矩; 继续时会重新走完当前点 */
       Aborted,
@@ -232,14 +232,17 @@ private:
    void advance();                      /* 当前点收尾 → 下一个点 / Done */
 
    /* ---- 连续行进 (2026-10-29, docs/scan_sweep.md §54) ---- */
-   void beginTraverse();                /* Moving 到位 → 进这一段 (行首先停在中心等一笔) */
-   void issueTraverseTarget();          /* 行首那笔到手 → 下发段尾目标, 整行不停车 */
+   void beginTraverse();                /* Moving 到位 → 进这一段 (段首先停在中心等一笔) */
+   void issueTraverseTarget();          /* 段首那笔到手 → 下发段尾目标, 整段不停车 */
    /* 位置往前走就把当前格收掉、槽位 +1 (判据是"离下一格中心更近" = 过了中点)。
     * 会写 CSV —— 失败时内部已 abort, 调用方接着 return 就行 */
    void syncOnFlyCell(const BusTelem &t);
    bool finishOnFlyCell(int cell, bool have);   /* false = 写失败, 已 abort */
    void advanceLeg();                   /* 一段走完 → 下一段 / 整轮结束 */
-   /* advance() 与 advanceLeg() 共用的收尾: 清点列、清行段、置 stale、Done、runFinished */
+   /* 这一段沿哪根轴走 (2026-10-29): 0 = X, 1 = Y, -1 = 段太短判不出。行那两种恒为 X;
+    * 环形有竖边, 所以要按段问一次 (见 buildSpiralLegs) */
+   int  legAxis(const std::vector<int> &leg) const;
+   /* advance() 与 advanceLeg() 共用的收尾: 清点列、清段表、置 stale、Done、runFinished */
    void finishRun();
    /* finishPoint / finishOnFlyCell 共用的一段: 补 retest 后缀、写文件 (失败即 abort)、
     * 更新三个结果数组、发 pointLogged。**返回 false = 已经中止, 调用方必须当场 return** */
@@ -286,16 +289,19 @@ private:
 
    /* ---- 连续行进 (2026-10-29, §54)。m_onfly 为假时下面那些一个都不参与 ---- */
    bool    m_onfly = false;      /* armRun 里按 onFly(m_run_p) 定死, 一轮里不变 */
-   /* 行段: 每一段 = 同一行里**待扫**格子的 m_plan 下标, 按扫描顺序 (从右往左那一行也是
-    * 这个顺序)。续扫留下的空洞格之间隔着已采格, 仍然算同一段 —— 中间那些格不停 */
+   /* 段表: 每一段 = **待扫**格子的 m_plan 下标, 按扫描顺序。
+    *   行那两种 (逐行往返 / 每行同向): 一段 = 同一行。续扫留下的空洞格之间隔着已采格,
+    *     仍然算同一段 —— 中间那些格不停。
+    *   两种环形 (2026-10-29): 一段 = 一条边上同轴同向的连续格 (buildSpiralLegs), 拐角处
+    *     断段。段轴因此**不是恒为 X**, 逐个间一次见 legAxis。 */
    std::vector<std::vector<int>> m_legs;
    size_t  m_leg_i = 0;          /* 当前段 */
    size_t  m_leg_slot = 0;       /* 段内正在采的格子槽位 */
    size_t  m_leg_slot0 = 0;      /* 暂停续走从哪个槽位开始 */
-   bool    m_of_started = false; /* 行首那笔已到, 段尾目标已下发 */
+   bool    m_of_started = false; /* 段首那笔已到, 段尾目标已下发 */
    bool    m_of_at_end = false;  /* 段尾到位这件事已经处理过 (别每拍重入) */
    bool    m_of_stop_wait = false; /* 段尾已到位, 在等"停稳之后到齐"的那一笔 */
-   int64_t m_flush_deadline_ms = 0; /* 行首/行末等一笔的期限; 0 = 不在等 */
+   int64_t m_flush_deadline_ms = 0; /* 段首/段末等一笔的期限; 0 = 不在等 */
 
    /* 当前格的一笔候选采样: 只留离格中心最近的那一笔 (连续行进每格只出一行) */
    bool     m_of_have = false;

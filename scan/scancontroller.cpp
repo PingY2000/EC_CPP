@@ -487,9 +487,11 @@ bool ScanController::armRun(QString *err)
    /* 连续行进 (2026-10-29, §54): 走法在**这一刻**定死。运行中把「单点停留」改成 0
     * 不会切换 —— 那个框运行中仍可改 (用户定的), 所以必须按 m_run_p 留一份结果。
     *
-    * 行段 = 同一行里**待扫**的格子。行模式的 m_order 本来就是行主序 (buildPlan 按 iy 外层
-    * 循环, 蛇形只在行内反向), 续扫滤掉已采点之后仍然按行连续 —— 于是"iy 相同且相邻"就是
-    * 一行。中间的已采格不进段, 走过去不停。
+    * 段的切法按走法分两支 (2026-10-29 加第二支):
+    *   行那两种: 段 = 同一行里**待扫**的格子。m_order 本来就是行主序 (buildPlan 按 iy 外层
+    *     循环, 蛇形只在行内反向), 续扫滤掉已采点之后仍然按行连续 —— 于是"iy 相同且相邻"
+    *     就是一行。中间的已采格不进段, 走过去不停。
+    *   两种环形: 段 = 一条边上同轴同向的连续格 (buildSpiralLegs), 拐角处断段。
     *
     * 逐点停的一轮也要清: 上一轮留下的段不许漏进来 (m_onfly 为假时下面全不参与)。 */
    /* 单点重测**永远逐点停** (用户 2026-10-29 定): 重测是把这一格认真再量一遍, 照「每点采样」
@@ -500,12 +502,23 @@ bool ScanController::armRun(QString *err)
    m_legs.clear();
    if (m_onfly)
    {
-      for (size_t k = 0; k < m_order.size(); k++)
+      if (modeSpiral(m_run_p.mode))
       {
-         const int iy = m_plan[(size_t)m_order[k]].iy;
-         if (m_legs.empty() || m_plan[(size_t)m_legs.back().back()].iy != iy)
-            m_legs.push_back(std::vector<int>());
-         m_legs.back().push_back(m_order[k]);
+         /* 环形: 段是**直线段** (同一条边上同轴同向的连续格), 拐角处断 (2026-10-29)。
+          * 不能沿用下面按 iy 分组那一套: 竖边上 iy 每格都在变, 那样切出来每格都是独立一段,
+          * 连续行进就退化成逐点停了。 */
+         m_legs = buildSpiralLegs(m_plan, m_order);
+      }
+      else
+      {
+         /* 行那两种原样保留 (一行不动): 一行中间隔着已采格也不断段, 走到那里不停 */
+         for (size_t k = 0; k < m_order.size(); k++)
+         {
+            const int iy = m_plan[(size_t)m_order[k]].iy;
+            if (m_legs.empty() || m_plan[(size_t)m_legs.back().back()].iy != iy)
+               m_legs.push_back(std::vector<int>());
+            m_legs.back().push_back(m_order[k]);
+         }
       }
    }
    m_leg_i = 0;
@@ -1001,11 +1014,20 @@ void ScanController::feedMeterSample(int64_t ms, double watts, bool ok)
 
       /* 中心窗口: 离格中心不超过半格 (+位置容差)。中点分界已经保证"属于这一格", 这一条防的
        * 是续扫留下的空洞格 —— 那两个待补格之间隔着已采格, 而那个已采格上采的一笔按中点分界
-       * 是"属于"待补格的。没有这一条, 名字叫"中心读数"而值可能取自隔壁半格之外。 */
-      const int64_t half = (int64_t)std::llround(resX(m_p) * m_p.pulses_per_unit / 2.0);
-      const int64_t d    = std::abs((int64_t)t.ax[0].pos - (int64_t)pt.x_pul);
-      if (d > half + (int64_t)posTolPul(m_p))
+       * 是"属于"待补格的。没有这一条, 名字叫"中心读数"而值可能取自隔壁半格之外。
+       *
+       * **两轴都查** (2026-10-29, 环形有竖边): 行那两种的 Y 本来就停在格中心 (Moving 已按
+       * 容差到位), 多查一根不影响它们; 竖段上真正起作用的是 Y 这一根。候选距离取两轴的
+       * **较大者** —— 只用 X 的话, 竖段上每一笔的 X 偏差都是 0, 候选永远停在第一笔, 于是
+       * "离中心最近"在竖段上退化成"第一笔"。 */
+      const int64_t halfx = (int64_t)std::llround(resX(m_p) * m_p.pulses_per_unit / 2.0);
+      const int64_t halfy = (int64_t)std::llround(resY(m_p) * m_p.pulses_per_unit / 2.0);
+      const int64_t tol   = (int64_t)posTolPul(m_p);
+      const int64_t dx    = std::abs((int64_t)t.ax[0].pos - (int64_t)pt.x_pul);
+      const int64_t dy    = std::abs((int64_t)t.ax[1].pos - (int64_t)pt.y_pul);
+      if (dx > halfx + tol || dy > halfy + tol)
          return;
+      const int64_t d = std::max(dx, dy);
 
       /* 段尾那次"停稳之后再等一笔": 这一笔到了, 下一拍就收尾 (见 tick) */
       m_of_stop_wait = false;
@@ -1186,12 +1208,13 @@ void ScanController::finishRun()
 
 /* ================= 连续行进 (2026-10-29, docs/scan_sweep.md §54) =================
  *
- * 一套"行段" (leg): 同一行里待扫的格子, 按扫描顺序。状态机在段里只做三件事:
- *   1. 行首停在中心, 等一笔采样 (行首本来就要停, 不多一次停车);
- *   2. 下发段尾目标, 整行不停车地走; 采样照常到齐, 每格只留离中心最近的那一笔;
- *   3. 段尾停在中心, 再等一笔"停稳之后到齐"的采样, 然后换行。
+ * 一套"段" (leg): 待扫的格子按扫描顺序排成一条**直线**。行那两种里一段就是一行, 两种环形
+ * 里一段是矩形的一条边 (同轴同向, 拐角断段, 见 buildSpiralLegs)。状态机在段里只做三件事:
+ *   1. 段首停在中心, 等一笔采样 (段首本来就要停, 不多一次停车);
+ *   2. 下发段尾目标, 整段不停车地走; 采样照常到齐, 每格只留离中心最近的那一笔;
+ *   3. 段尾停在中心, 再等一笔"停稳之后到齐"的采样, 然后换段。
  *
- * 为什么行首/行末要等一笔: 那两处滑台本来就停着, 而"最近的一笔"在没有停住的时候只能取到
+ * 为什么段首/段末要等一笔: 那两处滑台本来就停着, 而"最近的一笔"在没有停住的时候只能取到
  * 半个采样间隔以内的近似 —— 停住之后到齐的那一笔位置就是中心, 不用白不用。
  */
 
@@ -1260,16 +1283,41 @@ void ScanController::issueTraverseTarget()
    m_of_started        = true;
 }
 
+int ScanController::legAxis(const std::vector<int> &leg) const
+{
+   /* 段的轴由**头两格**定: buildSpiralLegs 建段时就是拿这一对定下方向的, 段内其余各步
+    * 必须与它同轴同向 (不同就断段了)。行那两种同理 —— 一行之内 iy 不变, 差的一定是 ix。 */
+   if (leg.size() < 2)
+      return -1;
+   const int a = leg[0];
+   const int b = leg[1];
+   if (a < 0 || b < 0 || (size_t)a >= m_plan.size() || (size_t)b >= m_plan.size())
+      return -1;
+
+   const Point &pa = m_plan[(size_t)a];
+   const Point &pb = m_plan[(size_t)b];
+   if (pa.iy == pb.iy && pa.ix != pb.ix)
+      return 0;
+   if (pa.ix == pb.ix && pa.iy != pb.iy)
+      return 1;
+   return -1;                     /* 同格 / 斜步: 判不出, 不猜 */
+}
+
 void ScanController::syncOnFlyCell(const BusTelem &t)
 {
    if (!m_onfly || m_leg_i >= m_legs.size())
       return;
 
    const std::vector<int> &leg = m_legs[m_leg_i];
-   const int32_t pos = t.ax[0].pos;
+   const int ax = legAxis(leg);
+   if (ax < 0)                    /* 单格段: 没有"走到下一格"可言, 段尾那笔照旧收尾 */
+      return;
 
-   /* 判据写成**离谁更近**, 不写"pos_x 大于中点": 蛇形与同向都有从右往左走的那一行,
-    * 按坐标大小判会永远不前进。槽位只许往前走 (滑台不会倒着扫)。
+   const int32_t pos = t.ax[ax].pos;
+
+   /* 判据写成**离谁更近**, 不写"坐标大于中点": 蛇形与同向都有从右往左走的那一行,
+    * 环形还有往上 / 往左走的竖边横边, 按坐标大小判会永远不前进。槽位只许往前走
+    * (滑台不会倒着扫)。
     *
     * 收尾会写 CSV —— finishOnFlyCell 写失败时内部已经 abort, 这里当场 return,
     * 后面的槽位不再动 */
@@ -1278,8 +1326,11 @@ void ScanController::syncOnFlyCell(const BusTelem &t)
       const Point &cur = m_plan[(size_t)leg[m_leg_slot]];
       const Point &nxt = m_plan[(size_t)leg[m_leg_slot + 1]];
 
-      const int64_t dc = std::abs((int64_t)pos - (int64_t)cur.x_pul);
-      const int64_t dn = std::abs((int64_t)pos - (int64_t)nxt.x_pul);
+      const int64_t c = (ax == 0) ? (int64_t)cur.x_pul : (int64_t)cur.y_pul;
+      const int64_t n = (ax == 0) ? (int64_t)nxt.x_pul : (int64_t)nxt.y_pul;
+
+      const int64_t dc = std::abs((int64_t)pos - c);
+      const int64_t dn = std::abs((int64_t)pos - n);
       if (dn >= dc)
          break;
 
