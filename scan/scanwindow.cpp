@@ -4744,19 +4744,63 @@ void ScanWindow::onPauseClicked()
    refresh();
 }
 
+bool ScanWindow::ensureEnabledForResume()
+{
+   const BusTelem t = m_thr->telemetry();
+
+   /* 有故障就不代按「使能」: 那一按本来就只会被驱动器拒 (故障位没清), 让 beginLoadedRun
+    * → armRun 报它自己那一句 —— 它带轴号与 6041h bit3, 比这里编一句准 */
+   if (t.fault)
+      return true;
+
+   bool any_off = false;
+   for (int i = 0; i < t.naxis && i < 2; i++)
+      if (!t.ax[i].enabled)
+         any_off = true;
+
+   if (!any_off)
+      return true;
+
+   m_resumeArm   = true;
+   m_resumeArmMs = m_clock.elapsed();
+   m_thr->postEnable();
+   hint(QStringLiteral("正在使能, 使能后自动继续。"), false);
+   refresh();
+   return false;
+}
+
 void ScanWindow::onResumeRunClicked()
 {
-   /* 两个来源 (2026-09-29): 打开态 = 开始补点 (要报错), 暂停态 = 接着跑完当前点 (void) */
-   if (m_ctl->loaded())
+   /* 已经在等使能了: 这一按不作数 (refresh 那边会使能完再走一次这条路) */
+   if (m_resumeArm)
+      return;
+
+   /* 三个来源 (2026-10-29 加第二个): 打开态 = 开始补点; 中止态 = 接着扫没采过的点;
+    * 暂停态 = 接着跑完当前点。前两个都走 beginLoadedRun —— 它把几何 / 零点世代 / armRun
+    * 的全部前提重查一遍, 与"打开一份 CSV 接着补"是同一条路 (见 stageResumeAfterAbort)。 */
+   if (m_ctl->loaded() || m_ctl->state() == ScanController::State::Aborted)
    {
+      const bool after_abort = (m_ctl->state() == ScanController::State::Aborted);
+
+      /* 掉使能是最常见的一种自动中止 —— 而 armRun 的第一道闸就是"两轴都得使能"。
+       * 先把使能补上 (异步), 使能回来之后 refresh() 会再走一次本函数。 */
+      if (!ensureEnabledForResume())
+         return;
+
       QString err;
       if (!m_ctl->beginLoadedRun(&err))
       {
-         hint(err, true);      /* 留在打开态: 接好线 / 换一份再按一次就行 */
+         hint(err, true);      /* 留在原状态: 接好线 / 换一份 / 改回几何再按一次 */
          refresh();
          return;
       }
-      hint(QStringLiteral("开始补 %1 点。").arg(m_ctl->pendingPoints()), false);
+
+      /* 自动中止那条红横幅在接着扫之后就没有意义了 (它说的是"已中止") */
+      m_banner->setVisible(false);
+      hint(after_abort
+              ? QStringLiteral("继续扫描: 剩 %1 点, 写入同一 CSV。").arg(m_ctl->pendingPoints())
+              : QStringLiteral("开始补 %1 点。").arg(m_ctl->pendingPoints()),
+           false);
    }
    else
    {
@@ -5053,6 +5097,39 @@ void ScanWindow::refresh()
    m_ctl->tick(m_clock.elapsed());
 
    const BusTelem t = m_thr->telemetry();
+
+   /* ---- 「继续」那一按先要过一次使能 (2026-10-29) ----
+    * 人只按一次「继续」: 按下那一刻轴没使能, 就先发使能, 由这里每拍看一眼 bit2。
+    * 回来了就再走一次 onResumeRunClicked (那时的 m_resumeArm 已经清掉, 走的是正常那一路);
+    * 5 s 还没回来就放弃 —— 多半是驱动器自己拒了 (STO / 故障位 / 从站不在 OP), 那种情况下
+    * 再等也不会变, 而屏幕上会一直是"正在使能"。
+    *
+    * 已经不在中止态了 (另开一轮 / 打开一份 / 换一份) 或总线没了: 这一按作废。
+    * 断线这一条不能省 —— 断开之后 t.naxis 是 0, 下面那个 any_off 会算成"全使能了",
+    * 于是一按就"使能成功"了 (假的) */
+   if (m_resumeArm && (m_ctl->state() != ScanController::State::Aborted || !t.connected))
+      m_resumeArm = false;
+
+   if (m_resumeArm)
+   {
+      bool any_off = false;
+      for (int i = 0; i < t.naxis && i < 2; i++)
+         if (!t.ax[i].enabled)
+            any_off = true;
+
+      if (!any_off)
+      {
+         m_resumeArm = false;
+         /* 延到这一拍之后: onResumeRunClicked → beginLoadedRun 会发 stateChanged,
+          * 而它的槽就是 refresh() 自己 —— 就地调就是在自己身上重入 */
+         QTimer::singleShot(0, this, &ScanWindow::onResumeRunClicked);
+      }
+      else if (m_clock.elapsed() - m_resumeArmMs > 5000)
+      {
+         m_resumeArm = false;
+         hint(QStringLiteral("使能没有成功, 扫描未继续。请检查驱动器状态后按「使能」。"), true);
+      }
+   }
 
    /* 零点世代的唯一同步点 (2026-09-22 改)。工作线程在**真写 m_origin[] 的那三处**各 +1
     * (第一次取零点 / 回零 / 设为区域中心), 界面只在这里跟一发。
@@ -5379,9 +5456,13 @@ void ScanWindow::refresh()
     * 打开态那一路还多一条**待补点数 > 0** (2026-09-30): 一份已经采完的 CSV 装得进来
     * (那时它在屏幕上是"一张完整的图"), 而它没有任何要补的点 —— 按钮亮着按下去只会换来
     * 一句拒绝。判据与控制器 beginLoadedRun() 那道闸是同一个算式 */
+   /* 「继续」第三个来源 (2026-10-29): **中止之后接着扫剩下的点**。判据与上面那两个同一条
+    * (有待补的点才亮), 而"中止态下还剩几个点"是 abortInternal 当场排好的 —— 一趟扫到
+    * 最后一格才停时它就是 0, 按钮照旧是灰的, 按下去只会换来一句拒绝。 */
    m_btnResume->setEnabled(m_connected
                            && (st == ScanController::State::Paused
-                               || (loaded && m_ctl->pendingPoints() > 0)));
+                               || ((loaded || st == ScanController::State::Aborted)
+                                   && m_ctl->pendingPoints() > 0)));
    /* 「中止」**刻意不判连接** (2026-09-30): 它是"退出去"的那一个 —— 装载态下总线断了, 人得
     * 能按它放弃这次打开、把几何解锁; 判上连接就成了"断了线就卡在装载态里出不来"。
     * 它不向上面的「开始扫描 / 继续 / 重测选中点」看齐, 是因为那三个要**发新动作**,

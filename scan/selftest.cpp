@@ -4197,6 +4197,58 @@ static void test_aborts()
       check(r.ctrl.state() == ScanController::State::Aborted, "losing an enable aborts");
    }
 
+   caseBegin("abort: 中止之后「继续」接着扫没采过的点 (2026-10-29)");
+   {
+      Rig r;
+      r.ctrl.setParams(Rig::smallParams());
+      r.ctrl.rebuildPlan();
+      QString err;
+      check(r.startScan(QDir::tempPath() + "/scan_continue.csv", &err), "start", err.toStdString());
+      const int total = r.ctrl.totalPoints();
+
+      r.runUntil([&] { return r.ctrl.completedPoints() >= 3; });
+
+      r.bus.setEnabled(1, false);                /* 掉使能 → 自动中止 */
+      check(r.runUntil([&] { return r.ctrl.state() == ScanController::State::Aborted; }, 5000),
+            "aborted");
+
+      /* 中止那一刻就把"还剩哪些点"排好了: 总数 - 已采。中止时手上那一格没写进 CSV,
+       * 于是它落在这份清单里, 接着扫会整个重走一遍 */
+      const int done = r.ctrl.completedPoints();
+      checkEq(r.ctrl.pendingPoints(), total - done, "剩的点数 = 总数 - 已采");
+
+      /* 使能回来之后按「继续」。界面那一按会先补使能, 这里直接补 */
+      r.bus.setEnabled(1, true);
+      check(r.beginLoadedRun(&err), "continue from Aborted", err.toStdString());
+      check(r.ctrl.state() == ScanController::State::Moving
+               || r.ctrl.state() == ScanController::State::Traversing,
+            "continue really moves (它不是只把状态改回去)");
+      check(r.runToIdle(120000), "the rest finishes");
+      check(r.ctrl.state() == ScanController::State::Done, "done");
+      checkEq(r.ctrl.completedPoints(), total, "整片网格采完");
+   }
+
+   caseBegin("abort: 中止之后改了几何就接不上 (那一份清单的下标已经不作数)");
+   {
+      Rig r;
+      r.ctrl.setParams(Rig::smallParams());
+      r.ctrl.rebuildPlan();
+      QString err;
+      check(r.startScan(QDir::tempPath() + "/scan_continue_geom.csv", &err),
+            "start", err.toStdString());
+      r.runUntil([&] { return r.ctrl.completedPoints() >= 1; });
+      r.ctrl.abort(QStringLiteral("测试"));
+
+      Params p = Rig::smallParams();
+      p.nx = 4;
+      p.ny = 4;
+      r.ctrl.setParams(p);
+      r.ctrl.rebuildPlan();
+
+      check(!r.beginLoadedRun(&err), "refused after the geometry changed");
+      check(err.contains(QStringLiteral("几何")), "那句话说清了是几何", err.toStdString());
+   }
+
    caseBegin("abort: 拔网线 (WKC 连续不足)");
    {
       Rig r;

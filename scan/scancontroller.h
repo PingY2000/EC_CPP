@@ -48,6 +48,10 @@ public:
        * 最近的一笔采样。段首/段末各停在中心等一笔 (见 beginTraverse/issueTraverseTarget) */
       Traversing,
       Paused,    /* 冻住, 保持力矩; 继续时会重新走完当前点 */
+      /* 自动或人工中止。**不是终点** (2026-10-29): 中止那一刻就把"还剩哪些点"排好了
+       * (stageResumeAfterAbort), 文件句柄与已采数据一个都不动, 于是「继续」能接着往下扫
+       * —— 走的是与"打开一份 CSV 接着补点"同一条路 (beginLoadedRun), 不是另一条旁路。
+       * 它仍然**不算 running**: 滑台一步都不动, 参数栏是解锁的 (与 Loaded 同类) */
       Aborted,
       Done       /* 全部点跑完 */
    };
@@ -135,6 +139,11 @@ public:
    bool newFile(QString *err);
 
    /* 断点续扫, 拆成两步 (2026-09-29: 打开 CSV 之后**不直接开跑**, 先把数据读进来)。
+    *
+    * **中止之后也走这一条** (2026-10-29): abortInternal 在进 Aborted 之前把没采过的点排成
+    * m_order (stageResumeAfterAbort), 于是 beginLoadedRun 在这里就是「继续」的实现 ——
+    * 几何 / 零点世代 / armRun 的全部前提照旧重查一遍。它不区分 m_order 是哪来的:
+    * 打开一份 CSV 得到的, 与中止之后剩下的, 是同一个东西。
     *
     * loadResume: 读一个已有 CSV, 校验几何一致 → 只补没采过的点 → 继续追加同一个文件,
     * 然后**停在 State::Loaded** —— 上半场已经画在画布上、要补的点已经算好、句柄开着,
@@ -251,6 +260,10 @@ private:
    void enter(State s);
    void stopMotion();                   /* postStop + 丢掉未决读数 */
    void abortInternal(const QString &why, bool automatic);
+   /* 中止之后**预备**一条接着扫的路 (2026-10-29): 按 m_done 把没采过的点排成 m_order,
+    * 并把 m_ord_i / m_run_ms / m_load_epoch 摆成交接的样子。只预备, 不启动 ——
+    * 真开动是操作员按「继续」→ beginLoadedRun 的事。 */
+   void stageResumeAfterAbort();
    /* 三个结果数组归零, **网格尺寸保持原样** (cellDone 是按 m_nx 索引进来的, 不能 clear)。
     * 只有"放弃装载"与"新建"那两条路要它 */
    void clearResults();

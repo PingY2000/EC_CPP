@@ -308,7 +308,12 @@ QString ScanController::stateText() const
    /* 连续行进 (2026-10-29, §54)。这一句进画布 HUD, 与上面那几条同一个字数上限 */
    case State::Traversing: return QStringLiteral("连续行进中");
    case State::Paused:   return QStringLiteral("已暂停 (目标冻结, 保持力矩)");
-   case State::Aborted:  return QStringLiteral("已中止");
+   /* 中止之后还剩多少点是**当场排好的** (stageResumeAfterAbort), 于是这一行能直接告诉人
+    * "还能接着扫" —— 不然「继续」那一颗按钮亮着是没有解释的 (2026-10-29) */
+   case State::Aborted:  return m_order.empty()
+                                ? QStringLiteral("已中止")
+                                : QStringLiteral("已中止 (剩 %1 点, 可继续)")
+                                     .arg(pendingPoints());
    case State::Done:     return QStringLiteral("本轮结束");
    }
    return QString();
@@ -804,24 +809,35 @@ bool ScanController::loadResume(const QString &csv_path, bool accept_zero_epoch_
  * 拦下时留在装载态 (一个字节不动), 接好线 / 重开一份再按一次就行。 */
 bool ScanController::beginLoadedRun(QString *err)
 {
-   if (m_st != State::Loaded)
+   /* 两个来源 (2026-10-29): 打开一份 CSV 停在装载态, 或者上一轮被中止 (Aborted)。
+    * 后者由 stageResumeAfterAbort 把 m_order 排成"没采过的点", 其余前提一字不差 ——
+    * 所以这里**不分成两条路**, 只有下面那几句文案要分 (对着屏幕的人看到的是两件事)。 */
+   const bool after_abort = (m_st == State::Aborted);
+
+   if (m_st != State::Loaded && !after_abort)
       return fail(err, QStringLiteral("还没打开一份 CSV, 请先「打开 CSV」。"));
 
    /* **排在 sameGeom 与 armRun 前面** (2026-09-30): armRun 里同样有一句空 order 的拒绝,
     * 但它排在"未连接总线 / 不在 OP / 正在回零 / 功率计未打开"**之后** —— 打开一份采完的文件
     * 又恰好掉过线时, 屏幕上先看到的会是「未连接总线」, 一句与现象毫不相干的话。 */
    if (m_order.empty())
-      return fail(err, QStringLiteral(
-         "这份 CSV 的点已全部采完, 没有要补的点。请改用「重测选中点」。"));
+      return fail(err, after_abort
+         ? QStringLiteral("这一轮的点已全部跑完, 没有可继续的点。请改用「重测选中点」。")
+         : QStringLiteral("这份 CSV 的点已全部采完, 没有要补的点。请改用「重测选中点」。"));
 
    if (!sameGeom(m_run_p, m_p))
-      return fail(err, QStringLiteral("打开时那份几何已被改过, 请「中止」后重新打开这份 CSV。"));
+      return fail(err, after_abort
+         ? QStringLiteral("中止之后几何被改过, 这一轮接不上了。请用「打开 CSV」补点。")
+         : QStringLiteral("打开时那份几何已被改过, 请「中止」后重新打开这份 CSV。"));
 
    if (m_zero_epoch != m_load_epoch)
-      return fail(err,
-         QStringLiteral("打开之后零点被搬动过 (第 %1 次 → 第 %2 次)。"
-                        "请「中止」后重新打开这份 CSV。")
-            .arg(m_load_epoch).arg(m_zero_epoch));
+      return fail(err, after_abort
+         ? QStringLiteral("中止之后零点被搬动过 (第 %1 次 → 第 %2 次), 这一轮接不上了。"
+                          "请用「打开 CSV」补点。")
+              .arg(m_load_epoch).arg(m_zero_epoch)
+         : QStringLiteral("打开之后零点被搬动过 (第 %1 次 → 第 %2 次)。"
+                          "请「中止」后重新打开这份 CSV。")
+              .arg(m_load_epoch).arg(m_zero_epoch));
 
    return armRun(err);   /* 成功时 armRun 已经 startPoint → enter(Moving) */
 }
@@ -959,6 +975,11 @@ void ScanController::abortInternal(const QString &why, bool automatic)
    m_flush_deadline_ms = 0;
 
    m_cur = -1;
+
+   /* 中止之后**留下接着扫的路** (2026-10-29, 用户原话「出现中止后让我可以直接点击继续」):
+    * 把没采过的点排成一份清单, 文件句柄与三个结果数组一个都不动。**只预备, 不启动** ——
+    * 滑台一步都不许因为"中止"而自己动起来, 开动是操作员按「继续」的事。 */
+   stageResumeAfterAbort();
    enter(State::Aborted);
 
    /* 不关文件: 中止之后常要单点重测, 而重测就是往这个文件里追加 (每行都已 flush)。
@@ -968,6 +989,51 @@ void ScanController::abortInternal(const QString &why, bool automatic)
    if (automatic && !why.isEmpty())
       emit autoAborted(why);
    emit runFinished(false);
+}
+
+/* 中止之后把"还剩哪些点"排好 (2026-10-29)。
+ *
+ * 口径与 loadResume 的后半段**逐字一致**: 那边是从 CSV 里读回一张 mask 再按 m_plan 顺序
+ * 挑出 mask 为 0 的格; 这里手上就有那张 mask —— 它就是 m_done (走过 = 写过一行, 两者
+ * 由 logAndMark 一处同时更新)。于是「打开一份 CSV 接着补」与「中止之后接着扫」在控制器
+ * 里是**同一件事**, 走同一个 beginLoadedRun, 没有第二条无人看守的旁路。
+ *
+ * ★ 下标必须是 **m_plan 的下标**, 网格下标只用来查 m_done。两者在蛇形与随机那几种里
+ *   根本不是一个东西 (2026-10-11 那次修的就是拿 mask[i] 配 m_plan[i])。
+ * ★ 中止那一刻正在走的那一格**不在 m_done 里** —— logAndMark 没跑过, CSV 里也没有它 ——
+ *   所以它自然落在这份清单里, 接着扫会把它整个重走一遍 (半份采样已在 stopMotion 里丢了)。
+ */
+void ScanController::stageResumeAfterAbort()
+{
+   m_ord_i      = 0;
+   m_run_ms     = -1;          /* CSV 的 elapsed_ms 从接上的那一刻重算 (与 loadResume 同) */
+   m_bad_wkc    = 0;
+   m_load_epoch = m_zero_epoch;
+
+   if (m_is_retest)
+   {
+      /* 单点重测: m_order 本来就是那一个点, 而它没写进 CSV —— 接着把它走完就是「继续」。
+       * 这一支**不能**按 m_done 重排: 重测的往往正是早就采过的那一格, m_done 已经是 1。 */
+      return;
+   }
+
+   if (m_endless)
+   {
+      /* 「随机 (可重复)」的池子永远是整片网格 (与 loadResume 同一个理由: 那一轮没有
+       * "采完了"这回事, 按 m_done 过滤会把池子越扫越小) */
+      m_order.resize(m_plan.size());
+      std::iota(m_order.begin(), m_order.end(), 0);
+      return;
+   }
+
+   m_order.clear();
+   for (size_t i = 0; i < m_plan.size(); i++)
+   {
+      const Point &q    = m_plan[i];
+      const size_t cell = (size_t)q.iy * (size_t)m_nx + (size_t)q.ix;
+      if (cell < m_done.size() && !m_done[cell])
+         m_order.push_back((int)i);
+   }
 }
 
 void ScanController::beginReading()

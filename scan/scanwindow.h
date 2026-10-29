@@ -122,6 +122,10 @@ private:
    void onStartClicked();
    void onPauseClicked();
    void onResumeRunClicked();
+   /* 「继续」那一按的使能前戏 (2026-10-29): 轴没使能就地发一条使能, 并记下"使能完就接着扫"
+    * 的意愿 —— 人只按一次。返回 false = 已经去使能了, 调用方当场 return (refresh 接手)。
+    * 有故障时不代按 (那一按本来就会被驱动器拒), 交给 armRun 报它自己那句。 */
+   bool ensureEnabledForResume();
    void onAbortClicked();
    void onRetestClicked();
    /* 设备信息回来了: 真机那几行填选项表 / 当前选中项。**灰不灰与露不露都不归这里管**,
@@ -660,6 +664,14 @@ private:
    QString m_commBanner;
    bool m_warnedLive = false;
    int  m_autoStop   = 0;     /* 自动中止弹窗的防重入 */
+
+   /* 「继续」按下去时轴还没使能 (2026-10-29): 已经向工作线程发了使能, **使能一回来就接着扫**。
+    * 使能要等工作线程阻塞着走完 6040h 那几步 (最长约 1 s/轴), 所以这一按不能同步等 ——
+    * 由 refresh() 每拍看一眼 6041h bit2, 回来了就再走一次 onResumeRunClicked。
+    * 起表的是 m_resumeArmMs: 5 s 还没回来就放弃 (多半是驱动器拒了: STO / 故障 / 不在 OP),
+    * 硬等只会让人以为程序卡死。 */
+   bool    m_resumeArm   = false;
+   int64_t m_resumeArmMs = 0;
    QString m_last_dir;
 };
 
